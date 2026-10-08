@@ -91,7 +91,7 @@ import subprocess
 from pathlib import Path
 
 __all__ = ["build_arm_elf", "build_local_elf", "toolchain_status",
-           "generate_driver"]
+           "generate_driver", "write_readme"]
 
 #: Set by the BSP linker script (``thirdparty/arch/cortexa78_0/lscript.ld``):
 #: noc_ddr4_C0_DDR_LOW0 is 0x80000000. Generation fails rather than emitting a
@@ -466,6 +466,11 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         " * graph node in execution order.",
         " */",
         "#include <stdint.h>",
+        # stdio for the debug helpers below. Not optional even without them:
+        # a printf dropped in by hand would otherwise be an implicit
+        # declaration returning int, which is a C11 constraint violation that
+        # gcc only warns about.
+        "#include <stdio.h>",
         "#include <string.h>",
         "",
         '#include "tvm_graph_types.h"',
@@ -506,6 +511,8 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         "static int64_t shape_store[%d][GRAPH_MAX_NDIM];" % len(sids),
         "static DLTensor tensors[%d];" % len(sids),
         "",
+        # After `tensors[]`, because graph_dump_tensor indexes it.
+        _DEBUG_HELPERS_C,
     ]
 
     # Per-tensor DLTensor init.
@@ -579,12 +586,15 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
             # so there is genuinely nothing to call.
             lines.append(f"    /* node {node_idx}: {fn} (elided) */")
             continue
-        arg_eids = [eid(src, slot) for src, slot, _ in node["inputs"]]
+        in_eids = [eid(src, slot) for src, slot, _ in node["inputs"]]
         n_out = int(node["attrs"].get("num_outputs", 1))
-        arg_eids += [eid(node_idx, k) for k in range(n_out)]
+        out_eids = [eid(node_idx, k) for k in range(n_out)]
+        arg_eids = in_eids + out_eids
         for slot, tensor_idx in enumerate(arg_eids):
             lines.append(f"    args[{slot}].v_handle = &tensors[{tensor_idx}];")
+        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "in")
         lines.append(f"    {fn}(args, codes, {len(arg_eids)}, 0, 0, 0);")
+        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "out")
         lines.append("")
         n_calls += 1
 
@@ -607,6 +617,112 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         print(f"  [arm] driver: {n_calls} kernel calls, {len(sizes)} buffers "
               f"({total / 1e6:.1f} MB), {n_params} params")
     return summary
+
+
+_DEBUG_HELPERS_C = """\
+/* ── Debug helpers ─────────────────────────────────────────────────────────
+ *
+ * A DLDataType is a 4-byte STRUCT {code, bits, lanes}, not an integer.
+ * `printf("%d", t.dtype)` is undefined behaviour that happens to print the
+ * struct's little-endian packing -- `code | bits<<8 | lanes<<16` -- so an
+ * int16 tensor reads as the meaningless 69632 (0x011000) and a uint8 one as
+ * 67585 (0x010101). dl_dtype_str decodes it instead.
+ *
+ * All three are static inline: unused they cost no code and warn about
+ * nothing, so they are always emitted and always available to a printf
+ * dropped into graph_run() by hand.
+ */
+#define DL_CODE_INT    0
+#define DL_CODE_UINT   1
+#define DL_CODE_FLOAT  2
+#define DL_CODE_BFLOAT 4
+
+/* How many elements the GRAPH_TRACE dumps show. Override at compile time. */
+#ifndef GRAPH_TRACE_ELEMS
+#define GRAPH_TRACE_ELEMS 8
+#endif
+
+static inline const char *dl_code_name(uint8_t code) {
+    switch (code) {
+    case DL_CODE_INT:    return "int";
+    case DL_CODE_UINT:   return "uint";
+    case DL_CODE_FLOAT:  return "float";
+    case DL_CODE_BFLOAT: return "bfloat";
+    default:             return "?";
+    }
+}
+
+/* "int16", "uint8", "float32x4" -- into CALLER-supplied storage, so two calls
+ * in one printf cannot clobber each other the way a shared static would. */
+static inline const char *dl_dtype_str(DLDataType dt, char *buf, size_t n) {
+    if (dt.lanes == 1)
+        snprintf(buf, n, "%s%u", dl_code_name(dt.code), (unsigned)dt.bits);
+    else
+        snprintf(buf, n, "%s%ux%u", dl_code_name(dt.code), (unsigned)dt.bits,
+                 (unsigned)dt.lanes);
+    return buf;
+}
+
+/* Shape, dtype, and the first `n` ELEMENTS -- elements, not bytes.
+ * A 16-bit tensor dumped as bytes reads "98 ff 9e ff", which is little-endian
+ * -104, -98: the single most common way to misread this output. */
+static inline void graph_dump_tensor(const char *tag, int idx, int n) {
+    const DLTensor *t = &tensors[idx];
+    unsigned key = ((unsigned)t->dtype.code << 8) | (unsigned)t->dtype.bits;
+    char ds[24];
+    long long numel = 1;
+    printf("%s tensors[%d] %s [", tag, idx, dl_dtype_str(t->dtype, ds, sizeof ds));
+    for (int i = 0; i < t->ndim; ++i) {
+        printf("%lld%s", (long long)t->shape[i], (i + 1 < t->ndim) ? "," : "");
+        numel *= (long long)t->shape[i];
+    }
+    /* Clamp, or a scalar parameter (ndim 0, numel 1 -- the zero-points are
+     * exactly this) is dumped past the end of a 2-byte buffer. */
+    if ((long long)n > numel) n = (int)numel;
+    printf("] =");
+    for (int i = 0; i < n; ++i) {
+        switch (key) {
+        case (DL_CODE_INT   << 8) | 8:
+            printf(" %d", ((const int8_t *)t->data)[i]); break;
+        case (DL_CODE_UINT  << 8) | 8:
+            printf(" %u", ((const uint8_t *)t->data)[i]); break;
+        case (DL_CODE_INT   << 8) | 16:
+            printf(" %d", ((const int16_t *)t->data)[i]); break;
+        case (DL_CODE_UINT  << 8) | 16:
+            printf(" %u", ((const uint16_t *)t->data)[i]); break;
+        case (DL_CODE_INT   << 8) | 32:
+            printf(" %d", (int)((const int32_t *)t->data)[i]); break;
+        case (DL_CODE_UINT  << 8) | 32:
+            printf(" %u", (unsigned)((const uint32_t *)t->data)[i]); break;
+        case (DL_CODE_FLOAT << 8) | 32:
+            printf(" %.6f", (double)((const float *)t->data)[i]); break;
+        default:    /* unknown width: raw bytes, which is all we can say */
+            printf(" %02x", ((const unsigned char *)t->data)[i]); break;
+        }
+    }
+    printf("\\n");
+}
+"""
+
+
+def _trace_lines(call_idx: int, fn: str, in_eids: list, out_eids: list,
+                 where: str) -> list:
+    """``#ifdef GRAPH_TRACE`` dump around one kernel call. ``where`` is in|out.
+
+    Generated rather than hand-added, so instrumenting a node survives the
+    next ``deploy_flow.py`` run -- editing ``graph_driver.c`` directly does
+    not, the file is overwritten every time.
+    """
+    out = ["#ifdef GRAPH_TRACE"]
+    if where == "in":
+        out.append(f'    printf("[{call_idx:02d}] {fn}\\n");')
+        out += [f'    graph_dump_tensor("   in ", {t}, GRAPH_TRACE_ELEMS);'
+                for t in in_eids]
+    else:
+        out += [f'    graph_dump_tensor("   out", {t}, GRAPH_TRACE_ELEMS);'
+                for t in out_eids]
+    out.append("#endif")
+    return out
 
 
 #: Scratch for TVMBackendAllocWorkspace. Kernels allocate inside a fused op
@@ -870,6 +986,21 @@ LOCALOBJ := localobj
 LOCAL_CFLAGS ?= -O2 -std=gnu11 -D__AIESIM__ \\
                 -I. -I$(REPO)/include -I$(REPO)/src/aietensorop/conv2dstem
 LOCAL_LDLIBS ?= -lm
+
+# `make TRACE=1` (or `make local TRACE=1`) compiles in graph_driver.c's
+# per-node tensor dumps -- shape, DECODED dtype ("int16", not the raw 69632
+# packing of the DLDataType struct), and the first few elements of every
+# kernel input and output. They live behind #ifdef GRAPH_TRACE, so a normal
+# build carries none of it. TRACE_ELEMS=N changes how many elements each dump
+# shows (default 8).
+#
+# This is why instrumenting a node does NOT mean editing graph_driver.c: that
+# file is regenerated by deploy_flow.py and hand edits are overwritten.
+ifdef TRACE
+TRACE_DEFS := -DGRAPH_TRACE $(if $(TRACE_ELEMS),-DGRAPH_TRACE_ELEMS=$(TRACE_ELEMS),)
+CFLAGS       += $(TRACE_DEFS)
+LOCAL_CFLAGS += $(TRACE_DEFS)
+endif
 
 # Layer basenames carry their NN_ prefix, so flattening them into localobj/
 # is collision-free; vpath is what lets a flat localobj/NN_op.o find its
@@ -1172,6 +1303,206 @@ def _parse_top1(stdout: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  README
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: Written next to the sources it describes, and regenerated with them, so it
+#: cannot drift from the Makefile it documents. Placeholders are @@NAME@@
+#: rather than ``{}``/``$`` because the text is full of literal C braces and
+#: make ``$(VAR)`` references.
+_README_MD = """\
+# `arm_build/` — the generated program around TVM's kernels
+
+Generated by `src/frontend/tvmrelay/arm_build.py`. **Do not edit by hand** —
+every file here is rewritten by the next `deploy_flow.py` or `arm_build.py`
+run, including this README. Change the generator instead.
+
+`relay.build(target="c")` gives kernels but not a program: no `main`, no
+weights in memory, nothing calling the kernels in order. This folder is the
+missing half.
+
+## Build
+
+```bash
+make                     # main.elf      — baremetal aarch64, for the board
+make local               # main_local.elf — x86, this host
+make run-local           # build the host ELF and run it
+make TRACE=1             # either target, with per-layer tensor dumps
+make clean               # both; clean-local for just the host artifacts
+make CROSS=... CPU=...   # retarget
+make -j8
+```
+
+`make` needs the Vitis cross toolchain (`source script/setup.sh
+--path-set-only`); `make local` needs only the host gcc.
+
+## Files
+
+| file | what it is |
+|---|---|
+| `graph_driver.c` | one static buffer per `storage_id`, weights pointed into the blob, one call per graph node in order (@@CALLS@@ calls, @@BUFFERS@@ buffers, @@BUFBYTES@@) |
+| `tvm_runtime_shim.c` | the four runtime symbols the kernels reference — a bump allocator and an error sink |
+| `main.c` | entry point; feeds `input_image.h`, prints the top-5 with logits, per-phase timing, and the `device_teardown done` line `verify_host.sh` greps |
+| `input_image.h` | the preprocessed photo as `static const float[@@INELEMS@@]` |
+| `imagenet_labels.h` | the 1000 class names |
+| `tvm_graph_types.h`, `tvm/runtime/c_*_api.h` | baremetal stand-ins, so the kernel C is used **verbatim** rather than patched |
+| `weights.bin` | `resnet18_params.bin`, linked in via `ld -r -b binary` |
+| `Makefile` | the build recipe — nothing is hidden in Python |
+| `liblayers.a` | built: the @@LAYERS@@ per-layer objects from stage 5 — **the kernels** |
+| `localobj/` | built: host objects for `make local`, kept apart from the aarch64 ones |
+
+`graph_driver.c` and `weights.bin` are a **matched pair**: the driver has the
+blob's byte offsets baked in as literals, and `save_param_dict` orders its
+output differently run to run. Never copy one over the other from a different
+build — the weights land at the wrong offsets and the result is silently
+garbage.
+
+## Tracing tensors between layers — `make TRACE=1`
+
+`graph_driver.c` carries a dump of every kernel's inputs and outputs behind
+`#ifdef GRAPH_TRACE`. A normal build compiles none of it.
+
+```bash
+make local TRACE=1 run-local        # host, traced, run it
+make TRACE=1                        # board ELF, traced
+make local TRACE=1 TRACE_ELEMS=16   # 16 elements per tensor (default 8)
+```
+
+```
+[00] tvmgen_default_fused_divide_round_add_clip_cast_subtract_layout_transform
+   in  tensors[0] float32 [1,3,224,224] = -1.929532 -1.929532 -1.912407 ...
+   in  tensors[1] int16 [] = 113
+   out tensors[2] int16 [1,1,224,224,3] = -104 -98 -87 -104 -98 -86
+[01] tvmgen_default_fused_nn_contrib_conv2d_NCHWc_add_..._a7e8b96f394601f9_
+   in  tensors[2] int16 [1,1,224,224,3] = -104 -98 -87 -104 -98 -86
+   in  tensors[3] int16 [16,1,7,7,3,4] = -2 0 -52 25 -18 0
+   out tensors[9] uint8 [1,16,112,112,4] = 46 97 14 0 30 89
+```
+
+### Why not just add a `printf`
+
+You can — `dl_code_name()`, `dl_dtype_str()` and `graph_dump_tensor()` are
+`static inline` in `graph_driver.c` and always emitted, so an ad-hoc `printf`
+can call them. But **this file is regenerated**, and a hand-added dump is gone
+after the next `deploy_flow.py` run. `TRACE=1` is not.
+
+### `Input tensor data type: 69632`
+
+That is what `printf("%d", tensors[i].dtype)` prints, and it is not a type
+code. `DLDataType` is a 4-byte **struct**, so passing it to `%d` is undefined
+behaviour that happens to print its little-endian packing:
+
+```c
+typedef struct { uint8_t code; uint8_t bits; uint16_t lanes; } DLDataType;
+value = code | (bits << 8) | (lanes << 16)
+```
+
+```
+69632 = 0x00011000
+          |   | +---- code  = 0x00 = 0   -> kDLInt
+          |   +------ bits  = 0x10 = 16
+          +---------- lanes = 0x0001 = 1        ==> int16
+```
+
+Codes: **0** `int`, **1** `uint`, **2** `float`, **4** `bfloat`. The values
+this graph actually produces:
+
+| printed | hex | dtype |
+|---|---|---|
+| 67584 | `0x010100` | `int8` |
+| 67585 | `0x010101` | `uint8` |
+| 69632 | `0x011000` | `int16` |
+| 66304 | `0x010300` | `int32` |
+| 73730 | `0x012002` | `float32` |
+
+`dl_dtype_str()` prints `int16` instead. To fix an existing hand-written line:
+
+```c
+char ds[24];
+printf("Input tensor data type: %s\\n", dl_dtype_str(tensors[2].dtype, ds, sizeof ds));
+```
+
+Shapes have the same trap: `shape` is `int64_t *`, so `printf("%d", shape[i])`
+is also wrong — use `printf("%lld", (long long)shape[i])`.
+
+### Dump elements, not bytes
+
+A byte dump of an int16 tensor reads `98 ff 9e ff a9 ff`. That is
+little-endian `-104, -98, -87`, and reading it as bytes is the most common way
+to misread this output — it is also why `conv2dstem_image.h` and TVM's layer 0
+look like different data when they are bit-identical quantization.
+`graph_dump_tensor()` switches on `(code, bits)` and prints decoded values. It
+clamps the count to the tensor's element count, because the zero-point
+parameters are `ndim 0` / `numel 1` and dumping 8 of those would read past a
+2-byte buffer.
+
+## `make local` — the same C on x86
+
+`main_local.elf` is the same `graph_driver.c`, the same layer sources, the
+same `weights.bin` and the same `main.c`, linked for this host. It prints the
+top-5 the board would, so the result is checkable without flashing anything.
+
+It is **not** the cross build with a different `-mcpu`. The BSP paths and the
+baremetal link recipe (`--specs=nosys.specs`, `--defsym end=__bss_end__`,
+`-T lscript.ld`) are dropped, and two flags have to be added — both failures
+point *into* `include/aie_timer.h`, not at your code:
+
+| flag | without it |
+|---|---|
+| `-D__AIESIM__` | `fatal error: xtime_l.h: No such file` — the header falls through to the BSP-only branch |
+| `-std=gnu11`, not `-std=c11` | `'CLOCK_MONOTONIC' undeclared` — it is POSIX, which strict ISO mode hides |
+| `-lm` | the BSP supplied libm inside `-lxil`'s group |
+
+Objects go to `localobj/`, deliberately **not** `local/`: that is the phony
+target's name, and make would read `local/x.o: ... | local` as circular, drop
+the order-only prerequisite, and then fail with a misleading `can't create
+local/x.o: No such file or directory`.
+
+An **AIE-offloaded build cannot be linked here** and says so up front — the
+archives are aarch64 and their kernels run on the array. Re-run
+`deploy_flow.py` without `--aie-offload`/`--aiegraph`.
+
+## Where the kernels come from
+
+By default the per-layer sources stage 5 split out: `../layers/NN_op/NN_op.c`
+-> `NN_op.o` beside its source -> `liblayers.a`, so editing one operator
+recompiles one translation unit. The monolithic `../resnet18.c` is the
+fallback when stage 5 was skipped (`--no-split`). Exactly one of the two is
+wired in; if neither resolves, `make` stops with a named error instead of a
+wall of undefined `tvmgen_default_*` references.
+
+## More
+
+- `src/frontend/tvmrelay/README.md` — the whole flow, stage by stage
+- skill `tvmlocalhostelf` — `make local`, `TRACE=1`, the dtype packing
+- skill `conv2dstemfixture` — why TVM's layer 0 and the AIE fixture differ
+"""
+
+
+def write_readme(build: Path, summary: dict, layers: int = 0,
+                 verbose: bool = True) -> Path:
+    """Write ``arm_build/README.md`` describing what was just generated.
+
+    Regenerated with the sources so it cannot drift from the Makefile it
+    documents -- the same reason the recipe itself lives in a generated file
+    rather than inside Python.
+    """
+    mb = summary.get("buffer_bytes", 0) / 1e6
+    text = _README_MD
+    for key, val in (("@@CALLS@@", str(summary.get("calls", "?"))),
+                     ("@@BUFFERS@@", str(summary.get("buffers", "?"))),
+                     ("@@BUFBYTES@@", f"{mb:.1f} MB"),
+                     ("@@INELEMS@@", str(summary.get("input_elems", "?"))),
+                     ("@@LAYERS@@", str(layers) if layers else "per-layer")):
+        text = text.replace(key, val)
+    path = build / "README.md"
+    path.write_text(text)
+    if verbose:
+        print(f"  [arm] readme  : {path}")
+    return path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Build
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1235,6 +1566,9 @@ def build_arm_elf(out_dir, repo_root=None, c_name="resnet18.c",
     summary["layer_objects"] = len(layer_sources(out_dir / "layers"))
     if verbose:
         print(f"  [arm] makefile: {makefile}")
+    summary["readme"] = str(write_readme(build, summary,
+                                         layers=summary["layer_objects"],
+                                         verbose=verbose))
 
     # Before the cross-toolchain gate on purpose: a box with no Vitis install
     # is exactly where a local ELF is worth having.

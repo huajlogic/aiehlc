@@ -143,13 +143,109 @@ range, with no zero-point in the op, in `QConfig`, or in the C++ pass. That is
 also why it skips the first conv, where raw-pixel dynamic range hurts a
 symmetric scale most.
 
-**Why the default is the bigger ELF.** The generic `qnn_conv2d_legalize`
-upcasts operands to int16 so zero-points can be folded by subtraction
-(`legalizations.py:115`); targets with a fast int8 path register their own
-(`cpu`/`arm_cpu`/`cuda`/`hexagon`), and `target="c"` registers none. The values
-are genuine int8 — all 22 weight tensors verify within `[-127, 127]` — so this
-is storage width, not a quantization failure. Registering a `"c"` legalization
-that keeps int8 and folds the zero-point into the accumulator would close it.
+**Why the default is the bigger ELF — conv operands are stored int16.** The
+values are genuine int8 (all 22 weight tensors verify within `[-127, 127]`);
+this is storage width, not a quantization failure. It costs real bytes:
+**99.5%** of `weights.bin` (23.4 of 23.5 MB) and **94%** of the activation
+buffers (24.2 of 25.7 MB) are int16.
+
+It is *not* the generic `qnn_conv2d_legalize` — that returns `None`.
+`Target("c")` carries `keys=['cpu']`, so the **Intel** registration
+`_qnn_conv2d_legalize_intel_cpu` fires (`legalizations.py:520`). Its gate is
+`is_fast_int8_on_intel()` → `target_has_features("sse4.2")`, false for a
+C-source target, so it falls to `helper_no_fast_int8_hw_legalization`, which
+casts **data and kernel** to int16 and subtracts the zero-points eagerly
+(`legalizations.py:192`).
+
+**int8 operands are the default** (`pe_target.py`); `--no-pe-int8` restores the
+int16 behaviour for A/B comparison. The right way to say "my PE takes int8" is
+to give the target its own key, not to patch the x86 rule:
+
+```python
+Target("c -keys=pe_int8,cpu", host="c")       # pe_target.pe_target()
+```
+
+`qnn_conv2d_legalize` is a `tvm.target.generic_func`, so it tries the keys in
+order: `pe_int8` wins, and `cpu` stays available for everything else —
+operator strategies, schedules, `conv2d_alter_op` — which are all registered
+there and must still resolve. Monkeypatching `register("cpu", override=True)`
+also works but silently retargets every x86 build in the process.
+
+The rule registered on that key is TVM's own `helper_change_dtypes_to_int8`,
+written for Nvidia `dp4a`, and it is exactly the AIE convention:
+
+```
+x_i8  = x_u8 - 128
+zp_i8 = zp   - 128        # 113 -> -15
+```
+
+with the shifted zero-point folded into the bias by `QnnConv2DCanonicalize` —
+the same algebra as `conv2dstem`'s `+128·Σw` bias fold, reached from the Relay
+side instead of by hand. It returns `None` once the operands are already int8,
+which is what stops the legalize pass looping.
+
+Measured end to end (`deploy_flow.py --local`, ResNet-18, dog.jpg):
+
+| | `--no-pe-int8` (old) | **default** |
+|---|---|---|
+| conv weight dtype | `int16` | **`int8`** |
+| `weights.bin` | 23,484,752 B | **11,851,606 B** |
+| activation buffers | 25.7 MB | **18.6 MB** |
+| `main.elf` (board) | 24,409,664 B | **12,795,600 B** |
+| `main_local.elf` (x86) | 24,253,696 B | **12,654,648 B** |
+| graph nodes / unique kernels | 30 / 28 | 120 / 64 |
+| top-1 | 258, logit 12.017338 | **identical** |
+
+The output is bit-identical because this is algebra on the same int8 values,
+not a different quantization — the weights measure `[-127, 127]` with 255
+distinct levels either way. The cost is the four-term expansion made explicit:
+4× the graph nodes, an extra `nn_pad` and `cast_sum` reduction per conv, and
+int32 scratch for the zero-point correction terms.
+
+**What stays int32, and must.** Only the *operands* narrow. Measured by role:
+
+| role | dtype | min | max |
+|---|---|---|---|
+| weight | `int8` | -127 | 127 |
+| bias | `int32` | -3,834,368 | 2,873,728 |
+| requant multiplier | `int32` | 1,073,764,180 | 2,147,291,785 |
+| requant shift | `int32` | 6 | 27 |
+
+The bias lives at the **accumulator** scale `s_x·s_w`, so it is ~10⁶× the real
+value — 23 bits here. The multiplier is a fixed-point scale in `[2³⁰, 2³¹)`,
+int32 by construction. Both are int32 in every int8 scheme (TFLite, ONNX QDQ,
+PyTorch); narrowing them would be arithmetically wrong, not an optimization.
+Together they are 0.5% of the blob — the 99.5% is the weights.
+
+Note this is the *CPU* path reaching the same convention the AIE offload
+already uses by hand: shift by 128 so the activation fits int8, with `128·Σw`
+folded into the bias (skill **byocaieoffload**).
+
+### It is switched OFF under `--aie-offload` / `--aiegraph`
+
+int8 legalization makes the four-term expansion explicit, which restructures
+the graph — 30 → 120 nodes, 28 → 64 layer folders — and **renumbers `layers/`**.
+The ResNet stem moves from index **1** to index **6**. `--aie-layers` selects by
+that index, so leaving int8 on would make the documented default
+(`--aie-layers 1`, "the 7x7/s2 stem") pick a `layout_transform` and offload
+nothing, silently.
+
+So the default is three-state, not a boolean:
+
+| invocation | operands | why |
+|---|---|---|
+| *(nothing)* | **int8** | the default |
+| `--no-pe-int8` | int16 | forced off |
+| `--pe-int8` | int8 | forced on |
+| `--aie-offload` / `--aiegraph` | int16 | auto-off, with a printed reason |
+| `--aie-offload --pe-int8` | int8 | forced on — **re-check `--aie-layers`** against `layers/` first |
+
+The auto-off prints what it did:
+
+```
+[1/7] pe     : int8 operand legalization OFF -- it renumbers layers/ and --aie-layers selects by index
+[1/7]          (pass --pe-int8 to force it; re-check your --aie-layers against layers/ if you do)
+```
 
 **`FakeQuantizationToInteger` is not optional** on this path. A QDQ import is
 *simulated* quantization: left alone it stays `dequantize → fp32 op →
@@ -484,6 +580,85 @@ Re-splitting is safe to repeat: it clears previously-generated `.c`/`.o` from
 leaves empty. Files you add yourself — an AIE kernel beside the generated C,
 a notes file — are left alone, and their folder survives with them.
 
+## `network_md.py` — `network.md`, the compiled graph as a document
+
+Written on every run, next to the generated C:
+
+```bash
+PYTHONPATH=src python src/frontend/tvmrelay/network_md.py worklocal/tvmrelay_deploy
+```
+
+`resnet18_graph.json` holds every shape, dtype and edge in the network, but as
+400 KB of flat JSON whose connectivity is `node_row_ptr` arithmetic.
+`network.md` is the readable form:
+
+| section | what |
+|---|---|
+| Summary | counts, input/output tensor, which kernels are invoked more than once |
+| Dataflow | a **Mermaid flowchart** — real topology, residual skips as dotted edges, every edge labelled with the dtype and shape it carries |
+| Layers | one row per kernel call: folder, kernel, producers, and **`dtype[shape]` for every input, output and parameter, each parameter named by role** (`weight`, `bias`, …) |
+| Layer detail | every argument of every call, with its **role**, kernel arg slot, graph name, entry index, dtype, shape, storage id and bytes |
+| Parameters | the 137 constants rolled up by dtype and the 10 largest — where `weights.bin`'s 23.5 MB goes |
+| Buffer reuse | what TVM's storage aliasing saves, and which storage ids are shared |
+
+Written **after** the offload and aiegraph stages, so it always describes the
+graph that was finally compiled rather than the first one.
+
+Three things it is deliberately careful about, each a real source of confusion:
+
+- **Entry indices, not node indices.** A node's k-th output is tensor
+  `node_row_ptr[node] + k`, and that is what the shape/dtype arrays — and
+  `graph_driver.c`'s `tensors[]` — are indexed by. So a row lines up with a
+  `make TRACE=1` dump line with no translation.
+- **Layer folders are matched by kernel symbol, not position.** Stage 5 writes
+  one folder per *distinct* kernel (28 here) while the graph makes 30 calls,
+  because two fused groups are invoked twice. Matching positionally mislabels
+  every row after the first repeat.
+- **Parameters are excluded from the diagram.** 137 of the 143 buffers are
+  weights; drawing them buries the topology. They are still accounted for in
+  the per-layer tables.
+
+### Parameter roles are read out of the C, not guessed
+
+TVM names constants `p0, p1, …` by argument slot, which says nothing about
+whether a tensor is a weight or a requantization shift. `kernel_param_usage`
+classifies each one by **how the generated kernel uses it**:
+
+```c
+conv MAC    ... * ((int32_t)((int16_t*)p1_1)[...])            -> weight
+epilogue    acc + p2_1[c]                                     -> bias
+                - p3_1[c]                                     -> zero-point
+            * ((int64_t)p4_1[c])                              -> requant multiplier
+            >> ((int64_t)(p6_1[c] + 31))                      -> requant shift
+```
+
+Three things this gets right that a plausible shortcut does not:
+
+- **Slot, not name.** Layer 29 takes `p131..p136` from the graph and calls them
+  `p1..p6` inside the kernel. Keying on the graph name mislabels every layer
+  after the constants stop being numbered from 1.
+- **Cast width, not rank.** The two multiplies are told apart by `int32_t` vs
+  `int64_t`, because the accumulator multiply must widen and the MAC must not.
+  A "rank ≥ 4 means weight" rule looks fine on convs (`[16,1,7,7,3,4]`) and
+  silently calls the **dense** weight (`[125,512,8]`, rank 3) a multiplier —
+  that bug gave 20 weights for a network that has 21.
+- **`unused` is reported, not named.** Every quantized layer has a slot the
+  body never reads (the left-shift operand of
+  `fixed_point_multiply_per_axis`, constant-folded to zero). Calling it
+  "left shift" would be a tidier lie. For the same reason `copied` is its own
+  role — the kernel re-lays-out that constant into NCHWc without doing
+  arithmetic on it, so it has no additive or multiplicative role to report.
+
+Roles are read from the per-layer split when stage 5 ran, and from the
+monolithic `resnet18.c` otherwise, so `--no-split` is covered too. If neither
+is on disk the role is a bare `param`: with no C to read, `unused` in
+particular must not be guessed, since it asserts the kernel never touches the
+tensor.
+
+Coverage is checkable: 21 weight (20 convs + 1 dense), 21 bias, 21 requant
+multiplier, 21 requant shift, 21 unused, 32 zero-point — 137, every parameter
+accounted for, none falling through to a generic label.
+
 ## `arm_build.py` — stage 6, the board ELF
 
 ```bash
@@ -510,6 +685,7 @@ missing pieces from `resnet18_graph.json` instead, into `arm_build/`:
 | `weights.bin` | `resnet18_params.bin`, linked in via `ld -r -b binary` |
 | `liblayers.a` | the per-layer objects from stage 5, one per operator — **the kernels** |
 | `Makefile` | the build recipe |
+| `README.md` | generated too — the build targets, the file inventory with this run's actual numbers, `TRACE=1`, the `DLDataType` packing, and the `make local` flags, written next to the sources so it cannot drift from the Makefile it documents |
 
 ### Where the kernels come from
 
@@ -595,6 +771,49 @@ One Makefile subtlety worth not re-discovering: `LDLIBS` must stay a single
 unbroken token. The commas are `-Wl` separators, so a `\` line continuation
 splits it and ld goes looking for a library literally named
 `-lxilstandalone,...`.
+
+### Tracing tensors between layers — `make TRACE=1`
+
+`graph_driver.c` carries a dump of every kernel's inputs and outputs behind
+`#ifdef GRAPH_TRACE`. A normal build compiles none of it (`.text` is
+byte-identical); `TRACE=1` turns it on for either target:
+
+```bash
+make TRACE=1                       # board ELF, traced
+make local TRACE=1 run-local       # host ELF, traced, run it
+make local TRACE=1 TRACE_ELEMS=16  # 16 elements per tensor instead of 8
+```
+
+```
+[00] tvmgen_default_fused_divide_round_add_clip_cast_subtract_layout_transform
+   in  tensors[0] float32 [1,3,224,224] = -1.929532 -1.929532 -1.912407 ...
+   in  tensors[1] int16 [] = 113
+   out tensors[2] int16 [1,1,224,224,3] = -104 -98 -87 -104 -98 -86
+[01] tvmgen_default_fused_nn_contrib_conv2d_NCHWc_add_..._a7e8b96f394601f9_
+   in  tensors[2] int16 [1,1,224,224,3] = -104 -98 -87 -104 -98 -86
+   in  tensors[3] int16 [16,1,7,7,3,4] = -2 0 -52 25 -18 0
+   out tensors[9] uint8 [1,16,112,112,4] = 46 97 14 0 30 89
+```
+
+Two things this gets right that a hand-added `printf` does not:
+
+**The dtype is decoded.** `DLDataType` is a 4-byte *struct*
+`{code, bits, lanes}`, so `printf("%d", t.dtype)` is undefined behaviour that
+happens to print the little-endian packing `code | bits<<8 | lanes<<16` —
+int16 comes out as `69632` (`0x011000`) and uint8 as `67585`. `dl_dtype_str()`
+prints `int16`. The codes are 0 int, 1 uint, 2 float, 4 bfloat.
+
+**It dumps elements, not bytes.** A byte dump of an int16 tensor reads
+`98 ff 9e ff`, which is little-endian `-104, -98` — the single most common way
+to misread this output. `graph_dump_tensor()` switches on `(code, bits)` and
+prints decoded values, clamping to the element count so a scalar parameter
+(`ndim 0`) is not read past the end of its 2-byte buffer.
+
+`dl_code_name`, `dl_dtype_str` and `graph_dump_tensor` are `static inline` and
+always emitted, so a `printf` you drop into `graph_run()` by hand can use them
+immediately. But prefer `TRACE=1`: **`graph_driver.c` is generated**, and
+`deploy_flow.py` overwrites hand edits on the next run. Change
+`arm_build._trace_lines`/`_DEBUG_HELPERS_C` if the trace itself needs to change.
 
 ### `--local` — the same C, run on this host
 

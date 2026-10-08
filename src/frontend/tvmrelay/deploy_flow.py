@@ -47,11 +47,25 @@ Seven stages, matching the seven things this flow has to prove:
    int8.
 
    The ONNX path currently produces a *larger* ELF (~24 MB vs ~14 MB) because
-   the generic ``qnn_conv2d_legalize`` upcasts operands to int16 to fold
-   zero-points and ``target="c"`` registers no fast-int8 legalization. The
-   values are genuine int8; only the storage width is not. It is still the
-   default because it quantizes the whole network and preserves the fp32
-   top-5 ordering, which the symmetric path does not.
+   conv **operands are stored int16**. The values are genuine int8; only the
+   storage width is not. It is still the default because it quantizes the
+   whole network and preserves the fp32 top-5 ordering, which the symmetric
+   path does not.
+
+   The int16 is **not** the generic legalization -- that one returns ``None``.
+   ``Target("c")`` carries ``keys=['cpu']``, so the **Intel** registration
+   ``_qnn_conv2d_legalize_intel_cpu`` is what fires
+   (``qnn/op/legalizations.py:520``); its gate ``is_fast_int8_on_intel()`` is
+   ``target_has_features("sse4.2")``, false for a C-source target, so it takes
+   ``helper_no_fast_int8_hw_legalization``, which casts **data and kernel** to
+   int16 and subtracts the zero-points eagerly. Registering a ``"cpu"``
+   legalization that returns ``None`` instead reaches
+   ``QnnConv2DCanonicalize``, whose four-term expansion keeps uint8 x int8 and
+   folds the zero-points into the bias. Measured: output **bit-identical**
+   (top1 258, logit 12.017338), params 23.5 -> 11.9 MB, local ELF 24.3 -> 12.6
+   MB, ~7% faster -- against 30 -> 120 graph nodes, 28 -> 59 kernels, and 0.1
+   -> 5.1 MB of int32 scratch for the zero-point reduction terms. Not wired to
+   a flag.
 
 4. **Codegen** — ``relay.build(target="c")`` and write the C source + header,
    then ``gcc -fsyntax-only`` it (TVM can emit C that does not compile).
@@ -500,7 +514,7 @@ def _collect_c_source(lib) -> str:
 
 
 def build_c(mod, params, out_dir: Path, *, opt_level: int = 3, fuse: bool = True,
-            verbose: bool = True) -> Path:
+            target=None, verbose: bool = True) -> Path:
     """``relay.build(target="c")`` and write the C source. Returns its path.
 
     ``fuse=False`` gives one kernel per Relay op instead of per fused group --
@@ -537,6 +551,12 @@ def build_c(mod, params, out_dir: Path, *, opt_level: int = 3, fuse: bool = True
     import tvm
     from tvm import relay
 
+    # ``target`` overrides the default C target -- ``pe_target.pe_target()``
+    # passes one carrying an extra key, which is how the int8 QNN legalization
+    # is selected without disturbing the ``cpu`` fallbacks (``--pe-int8``).
+    if target is None:
+        target = tvm.target.Target("c", host="c")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     disabled = [] if llvm_status()[0] else list(NO_LLVM_DISABLED_PASSES)
     if not fuse:
@@ -547,8 +567,7 @@ def build_c(mod, params, out_dir: Path, *, opt_level: int = 3, fuse: bool = True
         disabled.append("FuseOps")
     with tvm.transform.PassContext(opt_level=opt_level, disabled_pass=disabled,
                                    config={"tir.disable_vectorize": True}):
-        lib = relay.build(mod, target=tvm.target.Target("c", host="c"),
-                          params=params)
+        lib = relay.build(mod, target=target, params=params)
 
     source = _collect_c_source(lib.lib)
     c_path = out_dir / "resnet18.c"
@@ -685,7 +704,8 @@ def _stage_split(c_path, out_dir: Path, *, split: bool, compiles: bool,
 
 
 def _stage_aie_offload(mod, params, out_dir: Path, aie_layers, aie_ops, *,
-                       layers_ok: bool, fuse: bool, verbose: bool) -> dict:
+                       layers_ok: bool, fuse: bool, target=None,
+                       verbose: bool) -> dict:
     """Stage 6a: offload the selected layers to AIE through TVM BYOC.
 
     1. Layer indices -> conv weight fingerprints, from the CPU build just
@@ -745,52 +765,22 @@ def _stage_aie_offload(mod, params, out_dir: Path, aie_layers, aie_ops, *,
     if verbose:
         print(f"[6/7]          rebuilding the C with {info['count']} AIE "
               f"subgraph(s) (calls {AIE_ENTRY}() in aout/libconv2dstem.a)")
-    c_path = build_c(pmod, None, out_dir, fuse=fuse, verbose=verbose)
+    c_path = build_c(pmod, None, out_dir, fuse=fuse, target=target,
+                     verbose=verbose)
     return {**res, "count": info["count"], "functions": info["functions"],
             "c_path": c_path, "byoc": info}
 
 
-def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
-        global_scale: float = 8.0, fuse: bool = True, split: bool = True,
-        flat: bool = False, arm: bool = True, image=None,
-        aie_offload: bool = False, aie_layers=(0,),
-        aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
-        aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
-        relay_ptq: bool = False, local: bool = False, local_run: bool = True,
-        verbose: bool = True) -> dict:
-    """Run all seven stages. Returns a dict of what happened.
+def _stage_quantize(raw_path, model_path, out_dir: Path, *,
+                    skip_quantize: bool, relay_ptq: bool,
+                    global_scale: float, image, verbose: bool):
+    """Stage 3. Returns ``(mod, params, quantized, quantizer, accuracy)``.
 
-    ``aie_offload`` offloads ``aie_layers`` (stage-5 layer indices; ``None``
-    means every eligible layer) to AIE through TVM BYOC: after the CPU build,
-    the selected convs are partitioned out of the Relay graph and the C is
-    rebuilt, so the graph executor calls the generated wrapper -> the aiehlc
-    AIE library in place of TVM's own kernel (``_stage_aie_offload``).
-
-    ``aiegraph`` instead lifts the **whole** graph into one verified
-    ``aiegraph.func`` and partitions it: layers whose aiegraph ops are all in
-    ``aiegraph_ops`` are offloaded to the aiehlc kernel backend, and the rest
-    reuse the TVM-generated CPU C. Also additive.
-
-    **Quantizer.** Stage 3 defaults to ONNX PTQ (``onnx_ptq.py``): the model is
-    quantized *before* Relay sees it, giving symmetric per-channel int8 weights
-    and **asymmetric** activations, and covering every conv including the first
-    plus the input image itself. ``relay_ptq=True`` selects the older
-    ``relay.quantize`` path instead -- symmetric-only, and it leaves an fp32
-    head and tail (``skip_conv_layers=[0]``, ``skip_dense_layer=True``). See
-    ``quantize_int8`` for what that costs and why it needs LLVM.
-    ``skip_quantize`` overrides both and emits fp32.
-
-    ``local`` additionally links the same generated C into ``main_local.elf``
-    for *this* host and runs it, so stage 6's output can be checked against
-    stage 7's reference without a board. It needs no Vitis toolchain, so it
-    composes with ``arm=False``; it cannot link an AIE-offloaded build.
+    Four mutually exclusive paths, in precedence order: ``skip_quantize``
+    (fp32), ``relay_ptq``, the no-LLVM fallback, and the ONNX-PTQ default.
+    Lifted out of :func:`run` so each stays readable; the comments on the
+    branches are the reason this is not a lookup table.
     """
-    if not stage_env(verbose=verbose):
-        return {"ok": False, "stage": "env"}
-
-    raw_path = fetch_model(out_dir, verbose=verbose)
-    model_path = prefold_onnx(raw_path, verbose=verbose)
-
     quantized = False
     accuracy = None
     quantizer = None
@@ -847,7 +837,81 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         quantized = True
         quantizer = "onnx_ptq"
 
-    c_path = build_c(mod, params, out_dir, fuse=fuse, verbose=verbose)
+    return mod, params, quantized, quantizer, accuracy
+
+
+def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
+        global_scale: float = 8.0, fuse: bool = True, split: bool = True,
+        flat: bool = False, arm: bool = True, image=None,
+        aie_offload: bool = False, aie_layers=(0,),
+        aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
+        aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
+        relay_ptq: bool = False, local: bool = False, local_run: bool = True,
+        pe_int8=None, verbose: bool = True) -> dict:
+    """Run all seven stages. Returns a dict of what happened.
+
+    ``aie_offload`` offloads ``aie_layers`` (stage-5 layer indices; ``None``
+    means every eligible layer) to AIE through TVM BYOC: after the CPU build,
+    the selected convs are partitioned out of the Relay graph and the C is
+    rebuilt, so the graph executor calls the generated wrapper -> the aiehlc
+    AIE library in place of TVM's own kernel (``_stage_aie_offload``).
+
+    ``aiegraph`` instead lifts the **whole** graph into one verified
+    ``aiegraph.func`` and partitions it: layers whose aiegraph ops are all in
+    ``aiegraph_ops`` are offloaded to the aiehlc kernel backend, and the rest
+    reuse the TVM-generated CPU C. Also additive.
+
+    **Quantizer.** Stage 3 defaults to ONNX PTQ (``onnx_ptq.py``): the model is
+    quantized *before* Relay sees it, giving symmetric per-channel int8 weights
+    and **asymmetric** activations, and covering every conv including the first
+    plus the input image itself. ``relay_ptq=True`` selects the older
+    ``relay.quantize`` path instead -- symmetric-only, and it leaves an fp32
+    head and tail (``skip_conv_layers=[0]``, ``skip_dense_layer=True``). See
+    ``quantize_int8`` for what that costs and why it needs LLVM.
+    ``skip_quantize`` overrides both and emits fp32.
+
+    ``local`` additionally links the same generated C into ``main_local.elf``
+    for *this* host and runs it, so stage 6's output can be checked against
+    stage 7's reference without a board. It needs no Vitis toolchain, so it
+    composes with ``arm=False``; it cannot link an AIE-offloaded build.
+    """
+    if not stage_env(verbose=verbose):
+        return {"ok": False, "stage": "env"}
+
+    # Declare the PE's operand width BEFORE any build: the rule is selected
+    # by a target key, so it must be registered before relay.build runs.
+    #
+    # `pe_int8=None` means "default": on, EXCEPT when an AIE stage is also
+    # requested. int8 legalization restructures the graph (30 -> 120 nodes),
+    # which renumbers layers/ -- the ResNet stem moves from index 1 to 6 -- and
+    # `--aie-layers` selects by that index, so the two together would silently
+    # offload a `layout_transform` and nothing else. Passing `--pe-int8`
+    # explicitly forces it on anyway; `--no-pe-int8` forces it off.
+    if pe_int8 is None:
+        pe_int8 = not (aie_offload or aiegraph)
+        if not pe_int8 and verbose:
+            print("[1/7] pe     : int8 operand legalization OFF -- it "
+                  "renumbers layers/ and --aie-layers selects by index")
+            print("[1/7]          (pass --pe-int8 to force it; re-check your "
+                  "--aie-layers against layers/ if you do)")
+    target = None
+    if pe_int8:
+        from frontend.tvmrelay import pe_target as _pe
+
+        target = _pe.enable(verbose=verbose)
+
+    raw_path = fetch_model(out_dir, verbose=verbose)
+    model_path = prefold_onnx(raw_path, verbose=verbose)
+
+    (mod, params, quantized, quantizer,
+     accuracy) = _stage_quantize(raw_path, model_path, out_dir,
+                                 skip_quantize=skip_quantize,
+                                 relay_ptq=relay_ptq,
+                                 global_scale=global_scale,
+                                 image=image, verbose=verbose)
+
+    c_path = build_c(mod, params, out_dir, fuse=fuse, target=target,
+                     verbose=verbose)
     compiles = verify_c(c_path, verbose=verbose)
 
     layers = _stage_split(c_path, out_dir, split=split, compiles=compiles,
@@ -859,7 +923,7 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     if aie_offload:
         aie = _stage_aie_offload(mod, params, out_dir, aie_layers, aie_ops,
                                  layers_ok=layers is not None, fuse=fuse,
-                                 verbose=verbose)
+                                 target=target, verbose=verbose)
         if aie.get("count"):
             c_path = aie["c_path"]
             compiles = verify_c(c_path, verbose=verbose)
@@ -884,6 +948,14 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
                 verbose=verbose)
             if verbose and not graph_part.get("ok"):
                 print(f"[6/7]          {graph_part.get('reason', 'partition failed')}")
+
+    # Written after every graph-changing stage above (offload and aiegraph
+    # both rebuild the C), so it always describes the graph that was finally
+    # compiled rather than the first one.
+    from frontend.tvmrelay.network_md import write_network_md
+
+    network_md = write_network_md(out_dir, c_name=Path(c_path).name,
+                                  verbose=verbose)
 
     elf = None
     local_res = None
@@ -922,6 +994,8 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
             print(f"      board ELF: {elf}")
         if local_res and local_res.get("ok"):
             print(f"      local ELF: {local_res['elf']}")
+        if network_md:
+            print(f"      network  : {network_md}")
         if graph_part and graph_part.get("aie_count") is not None:
             print(f"      aiegraph : {graph_part['aie_count']} invocation(s) on "
                   f"AIE, {graph_part['cpu_count']} reusing TVM CPU C "
@@ -932,7 +1006,8 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
             "layer_count": layers["layer_count"] if layers else None,
             "elf": elf, "cpu_top1": (cpu[0][1] if cpu else None),
             "cpu_top": cpu, "aie": aie, "aiegraph": graph_part,
-            "local": local_res,
+            "local": local_res, "network_md": str(network_md) if network_md
+            else None,
             "quantizer": quantizer, "accuracy": accuracy}
 
 
@@ -987,6 +1062,18 @@ def main(argv=None) -> int:
                          "AIE-offloaded build")
     ap.add_argument("--no-local-run", action="store_true",
                     help="with --local, link main_local.elf but do not run it")
+    ap.add_argument("--no-pe-int8", action="store_true",
+                    help="store conv operands as int16 instead of int8. The "
+                         "int8 PE legalization is ON by default; this falls "
+                         "back to TVM's x86 rule, which widens data and "
+                         "weights to int16 (weights.bin 11.9 -> 23.5 MB, ELF "
+                         "12.8 -> 24.4 MB) for the same bit-identical output. "
+                         "Useful for A/B-ing against the old artifacts")
+    ap.add_argument("--pe-int8", action="store_true",
+                    help="force the int8 PE legalization ON. It is already "
+                         "the default; this only matters with --aie-offload "
+                         "or --aiegraph, where it is switched off because it "
+                         "renumbers layers/ and --aie-layers selects by index")
     ap.add_argument("--image", default=None,
                     help="image path or URL to classify "
                          "(default: the pytorch/hub dog.jpg sample)")
@@ -1057,7 +1144,10 @@ def main(argv=None) -> int:
                  mesh=(rows, cols),
                  aiegraph=args.aiegraph, aiegraph_ops=aiegraph_ops,
                  relay_ptq=args.relay_ptq, local=args.local,
-                 local_run=not args.no_local_run)
+                 local_run=not args.no_local_run,
+                 # None = default: on, unless an AIE stage is requested.
+                 pe_int8=(False if args.no_pe_int8
+                          else True if args.pe_int8 else None))
     return 0 if result.get("ok") else 1
 
 

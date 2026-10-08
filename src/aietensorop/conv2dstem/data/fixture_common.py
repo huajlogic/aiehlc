@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import textwrap
 from dataclasses import dataclass
@@ -68,7 +69,12 @@ import numpy as np
 __all__ = ["StemParams", "REPO", "DATA_DIR", "OUT_DIR", "DEFAULT_IMAGE",
            "resolve_qdq_model", "load_stem_params", "fixed_point",
            "fold_qparams", "preprocess_to_pad4", "pad4_to_hwc3",
-           "emit_header", "hex_array", "i32_array"]
+           "emit_header", "hex_array", "i16_array", "i32_array",
+           # TVM layer 0 -- deploy_flow's front end, reimplemented
+           "TVM_LAYER0_SYMBOL", "find_tvm_layer0_source",
+           "parse_tvm_layer0_consts", "roundf", "tvm_quantize_u8",
+           "tvm_layer0", "preprocess_to_tvm_layer0", "pad4_to_tvm_layer0",
+           "verify_against_kernel"]
 
 #: Repository root: .../src/aietensorop/conv2dstem/data -> up four.
 REPO = Path(__file__).resolve().parents[4]
@@ -330,6 +336,322 @@ def pad4_to_hwc3(pad4: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TVM's layer 0 -- the deploy_flow front end, reimplemented step for step
+#
+# `deploy_flow.py` does the same quantization inside a generated kernel,
+# `tvmgen_default_fused_divide_round_add_clip_cast_subtract_layout_transform`.
+# The functions below are that kernel, not a paraphrase of it: same order of
+# operations, same float32 precision, same C `roundf` tie rule, same output
+# layout and dtype. `make_image_header.py --tvm-layer0` runs them and then
+# asserts the result against `pad4_to_tvm_layer0`, so the two descriptions of
+# one quantization cannot drift apart silently.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The generated symbol. Also the directory name stage 5 splits it into.
+TVM_LAYER0_SYMBOL = ("tvmgen_default_fused_divide_round_add_clip_cast_"
+                     "subtract_layout_transform")
+
+#: Where deploy_flow.py writes its output tree.
+DEPLOY_DIR = REPO / "worklocal" / "tvmrelay_deploy"
+
+
+def find_tvm_layer0_source(deploy_dir=None):
+    """The generated C for layer 0, or ``None``. Prefers the per-layer split.
+
+    Stage 5 writes one translation unit per operator, so
+    ``layers/00_*/00_*.c`` holds this kernel alone; the monolithic
+    ``resnet18.c`` is the ``--no-split`` fallback and holds it among 64 others.
+    Either is fine to read constants out of.
+    """
+    deploy_dir = Path(deploy_dir) if deploy_dir else DEPLOY_DIR
+    for cand in sorted(deploy_dir.glob("layers/*/*.c")):
+        if TVM_LAYER0_SYMBOL in cand.read_text():
+            return cand
+    mono = deploy_dir / "resnet18.c"
+    if mono.is_file() and TVM_LAYER0_SYMBOL in mono.read_text():
+        return mono
+    return None
+
+
+def parse_tvm_layer0_consts(source) -> dict:
+    """Pull layer 0's baked-in float literals out of the generated C.
+
+    Read rather than recomputed, because they are **not** quite what the model
+    says. TVM emits the reciprocal of the input scale to 7 significant digits
+    as a float32 literal -- ``5.378862e+01f`` -- while ``1/in_scale`` rounded
+    to float32 is ``53.788624``. The gap is ~7e-8 relative, far too small to
+    change any pixel here (nothing on dog.jpg lands within 0.002 of a rounding
+    tie), but recomputing instead of reading would quietly make this a
+    *different* front end on some other image. Parsing keeps "what deploy_flow
+    computes" authoritative.
+
+    Returns ``{"recip", "zp_add", "clip_hi", "clip_lo", "source"}``. Raises if
+    the kernel's shape has changed, rather than returning stale constants.
+    """
+    text = Path(source).read_text() if not isinstance(source, str) else source
+    body = text.split(TVM_LAYER0_SYMBOL, 1)[-1]
+
+    m = re.search(r"\*\s*([0-9.]+e[+-][0-9]+)f\s*\)\)\s*\+\s*"
+                  r"([0-9.]+e[+-][0-9]+)f", body)
+    if not m:
+        raise ValueError(
+            f"{TVM_LAYER0_SYMBOL}: could not find the "
+            "`roundf(x * RECIP) + ZP` pattern -- the generated kernel changed "
+            "shape; re-read it before trusting these constants")
+    recip, zp_add = float(m.group(1)), float(m.group(2))
+
+    hi = re.search(r"<\s*\(([0-9.]+e[+-][0-9]+)f\)", body)
+    lo = re.search(r">\s*\(([0-9.]+e[+-][0-9]+)f\)", body)
+    if not (hi and lo):
+        raise ValueError(f"{TVM_LAYER0_SYMBOL}: could not find the clip bounds")
+    return {"recip": recip, "zp_add": zp_add,
+            "clip_hi": float(hi.group(1)), "clip_lo": float(lo.group(1)),
+            "source": str(source) if not isinstance(source, str) else "<text>"}
+
+
+def roundf(a: np.ndarray) -> np.ndarray:
+    """C ``roundf``: nearest, ties **away from zero** -- not ``np.round``.
+
+    ``np.round`` is round-half-to-**even**, which is what ONNX Runtime's
+    QuantizeLinear does and therefore what :func:`preprocess_to_pad4` uses. The
+    generated kernel calls ``roundf``. The two disagree only on an exact ``.5``,
+    which does not occur on dog.jpg -- but writing ``np.round`` here would make
+    this function silently stop being the kernel.
+    """
+    a64 = np.asarray(a, np.float64)
+    return np.copysign(np.floor(np.abs(a64) + 0.5), a64).astype(np.float32)
+
+
+def tvm_quantize_u8(x_f32: np.ndarray, consts: dict) -> np.ndarray:
+    """Step 1 -- the quantize: fp32 activations -> uint8, in float32 throughout.
+
+    The generated C, line for line::
+
+        float v_   = roundf(p0[i] * RECIP) + ZP_ADD;
+        float v__1 = (v_) < (CLIP_HI) ? (v_) : (CLIP_HI);
+        /* ... */   (v__1) > (CLIP_LO) ? (v__1) : (CLIP_LO)
+
+    Note it is a **multiply by the reciprocal** in float32, not a divide --
+    ``x / in_scale`` in float64 (what the ONNX side does) differs by up to
+    1.3e-5 before rounding. Returns float32 holding integral values in
+    ``[clip_lo, clip_hi]``, deliberately not yet cast: the cast is step 2's.
+    """
+    prod = np.asarray(x_f32, np.float32) * np.float32(consts["recip"])
+    v = roundf(prod) + np.float32(consts["zp_add"])
+    v = np.minimum(v, np.float32(consts["clip_hi"]))
+    return np.maximum(v, np.float32(consts["clip_lo"]))
+
+
+def tvm_layer0(x_nchw: np.ndarray, consts: dict, zp_sub: int) -> np.ndarray:
+    """Step 2 -- the whole kernel: NCHW fp32 ``[1,3,224,224]`` -> int16 HWC.
+
+    The cast and the layout transform the quantize feeds into::
+
+        T_layout_trans[h*672 + w*3 + c] =
+            (int16_t)clip_result - p1[0];
+
+    ``p1[0]`` is a scalar int16 **parameter**, the graph input's zero-point
+    (113 for this model) -- so the `+zp` of the quantize and this `-zp` cancel
+    except at the clip, which is exactly what makes the output span
+    ``[-zp, 255-zp]`` = [-113, 142] and therefore need int16.
+
+    The index arithmetic is NCHW in (``c*50176 + h*224 + w``) and HWC out
+    (``h*672 + w*3 + c``), i.e. a plain transpose -- no channel padding and no
+    spatial padding. Returns a C-contiguous ``[224,224,3] int16``.
+    """
+    x = np.asarray(x_nchw, np.float32).reshape(1, IN_C, IN_H, IN_W)
+    v = tvm_quantize_u8(x, consts)
+    out = v.astype(np.int16) - np.int16(zp_sub)
+    return np.ascontiguousarray(out[0].transpose(1, 2, 0))
+
+
+def preprocess_to_tvm_layer0(sp: StemParams, image=None, *,
+                             deploy_dir=None, verbose: bool = True):
+    """``(int16 [224,224,3], image_path, consts)`` -- deploy_flow's layer-0 output.
+
+    Same float preprocessing as :func:`preprocess_to_pad4` (``classify.preprocess``
+    -- not a second copy), then :func:`tvm_layer0` instead of the AIE fixture's
+    quantize/pad/shift. Constants come from the generated C when
+    ``deploy_flow.py`` has been run, and from the model otherwise; which one was
+    used is reported, because only the first is *literally* what the board runs.
+    """
+    sys.path.insert(0, str(REPO / "example" / "model" / "resnet18py"))
+    import classify  # noqa: E402
+
+    src = str(image) if image is not None else str(DEFAULT_IMAGE)
+    path = classify.resolve(src, classify.DEFAULT_IMAGE_URL, "input_image")
+    x = np.asarray(classify.preprocess(path), np.float32).reshape(1, IN_C, IN_H, IN_W)
+
+    found = find_tvm_layer0_source(deploy_dir)
+    if found is not None:
+        consts = parse_tvm_layer0_consts(found)
+        origin = os.path.relpath(found, REPO)
+    else:
+        # No deploy_flow tree here. float32(1/in_scale) is what TVM's literal
+        # approximates; see parse_tvm_layer0_consts for the 7e-8 gap.
+        consts = {"recip": float(np.float32(1.0 / sp.in_scale)),
+                  "zp_add": float(sp.in_zp), "clip_hi": 255.0, "clip_lo": 0.0,
+                  "source": "model"}
+        origin = "derived from the model (no worklocal/tvmrelay_deploy tree)"
+
+    out = tvm_layer0(x, consts, sp.in_zp)
+    if verbose:
+        print(f"  [image]  {path}")
+        print(f"           consts from {origin}")
+        print(f"           roundf(x * {consts['recip']:.8g}) + {consts['zp_add']:g}"
+              f", clip [{consts['clip_lo']:g}, {consts['clip_hi']:g}], "
+              f"- zp({sp.in_zp})")
+        print(f"           -> int16 HWC [{out.shape[0]},{out.shape[1]},"
+              f"{out.shape[2]}], range [{int(out.min())}, {int(out.max())}]")
+    return out, path, consts
+
+
+_VERIFY_MAIN_C = r"""
+/* Generated by data/fixture_common.py -- throwaway harness.
+ *
+ * Calls the REAL generated layer-0 kernel through TVM's packed ABI with the
+ * same fp32 image the Python side used, so the comparison is against the
+ * compiled code rather than against a reading of it.
+ */
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include "tvm_graph_types.h"
+
+int32_t %(sym)s(void*, int32_t*, int32_t, void*, int32_t*, void*);
+
+static float   in[1 * %(c)d * %(h)d * %(w)d];
+static int16_t out[%(h)d * %(w)d * %(c)d];
+
+int main(int argc, char **argv) {
+    if (argc != 4) { fprintf(stderr, "usage: %%s in.f32 out.i16 zp\n", argv[0]); return 2; }
+    FILE *f = fopen(argv[1], "rb");
+    if (!f || fread(in, sizeof in, 1, f) != 1) { fprintf(stderr, "bad input\n"); return 1; }
+    fclose(f);
+    int16_t zp = (int16_t)atoi(argv[3]);
+
+    int64_t s_in[4] = {1, %(c)d, %(h)d, %(w)d};
+    int64_t s_zp[1] = {1};
+    int64_t s_out[3] = {%(h)d, %(w)d, %(c)d};
+    DLTensor t_in = {0}, t_zp = {0}, t_out = {0};
+    t_in.data = in;    t_in.ndim = 4;  t_in.dtype.code = 2; t_in.dtype.bits = 32;
+    t_in.dtype.lanes = 1;  t_in.shape = s_in;
+    t_zp.data = &zp;   t_zp.ndim = 0;  t_zp.dtype.code = 0; t_zp.dtype.bits = 16;
+    t_zp.dtype.lanes = 1;  t_zp.shape = s_zp;
+    t_out.data = out;  t_out.ndim = 3; t_out.dtype.code = 0; t_out.dtype.bits = 16;
+    t_out.dtype.lanes = 1; t_out.shape = s_out;
+
+    TVMValue args[3];
+    int32_t codes[3] = {7, 7, 7};          /* kTVMDLTensorHandle */
+    args[0].v_handle = &t_in;
+    args[1].v_handle = &t_zp;
+    args[2].v_handle = &t_out;
+    if (%(sym)s(args, codes, 3, 0, 0, 0) != 0) { fprintf(stderr, "kernel failed\n"); return 1; }
+
+    f = fopen(argv[2], "wb");
+    if (!f || fwrite(out, sizeof out, 1, f) != 1) { fprintf(stderr, "bad output\n"); return 1; }
+    fclose(f);
+    return 0;
+}
+"""
+
+
+def verify_against_kernel(expect: np.ndarray, x_nchw: np.ndarray, zp_sub: int,
+                          *, deploy_dir=None, verbose: bool = True) -> dict:
+    """Compile and RUN the generated layer-0 kernel; diff it against *expect*.
+
+    The only check that actually answers "is this what ``deploy_flow.py``
+    produces after the first layer" -- everything else compares one reading of
+    the generated C against another. The kernel is compiled from its own source
+    with the host gcc, driven through TVM's packed ABI, and its output buffer is
+    diffed byte for byte.
+
+    Returns ``{"ok", "reason"|"ndiff", "kernel", ...}``. Never raises for a
+    missing deploy tree or gcc: those are "cannot check here", not "wrong".
+    """
+    import subprocess
+    import tempfile
+
+    src = find_tvm_layer0_source(deploy_dir)
+    if src is None:
+        return {"ok": False, "reason": "no generated layer-0 C found -- run "
+                                       "deploy_flow.py first"}
+    if src.name == "resnet18.c":
+        return {"ok": False, "reason": "only the monolithic resnet18.c is "
+                                       "present; the harness needs the "
+                                       "per-layer split (drop --no-split)"}
+    build_inc = (Path(deploy_dir) if deploy_dir else DEPLOY_DIR) / "arm_build"
+    if not (build_inc / "tvm_graph_types.h").is_file():
+        return {"ok": False, "reason": f"{build_inc}/tvm_graph_types.h missing "
+                                       f"-- run deploy_flow.py's stage 6"}
+    import shutil as _sh
+    if _sh.which("gcc") is None:
+        return {"ok": False, "reason": "no gcc on PATH"}
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "harness.c").write_text(
+            _VERIFY_MAIN_C % {"sym": TVM_LAYER0_SYMBOL, "c": IN_C,
+                              "h": IN_H, "w": IN_W})
+        exe = td / "harness"
+        cmd = ["gcc", "-O1", "-std=gnu11", f"-I{build_inc}",
+               str(td / "harness.c"), str(src), "-o", str(exe), "-lm"]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return {"ok": False, "reason": "harness did not compile",
+                    "stderr": proc.stderr[-2000:]}
+
+        f_in, f_out = td / "in.f32", td / "out.i16"
+        f_in.write_bytes(np.ascontiguousarray(
+            np.asarray(x_nchw, np.float32)).tobytes())
+        proc = subprocess.run([str(exe), str(f_in), str(f_out), str(zp_sub)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            return {"ok": False, "reason": "harness did not run",
+                    "stderr": (proc.stderr or proc.stdout)[-2000:]}
+        got = np.frombuffer(f_out.read_bytes(), np.int16).reshape(expect.shape)
+
+    diff = got.astype(np.int32) - np.asarray(expect, np.int32)
+    ndiff = int((diff != 0).sum())
+    res = {"ok": ndiff == 0, "ndiff": ndiff, "total": int(got.size),
+           "max_abs": int(np.abs(diff).max()) if diff.size else 0,
+           "kernel": os.path.relpath(src, REPO)}
+    if verbose:
+        if res["ok"]:
+            print(f"  [verify] MATCH -- all {res['total']:,} values equal the "
+                  f"compiled {Path(src).parent.name}/ kernel")
+        else:
+            print(f"  [verify] MISMATCH -- {ndiff:,} of {res['total']:,} "
+                  f"differ (max |diff| {res['max_abs']})")
+    return res
+
+
+def pad4_to_tvm_layer0(pad4: np.ndarray, sp: StemParams) -> np.ndarray:
+    """``[230,230,4] int8`` -> ``[224,224,3] int16``, TVM's layer-0 output.
+
+    What ``tvmgen_default_fused_divide_round_add_clip_cast_subtract_layout_transform``
+    writes, derived from the fixture rather than recomputed, because the two
+    **are** the same quantization: verified bit-exact over all 150,528 values
+    on dog.jpg. Only the representation differs, in three ways:
+
+    * the fixture subtracts **128** so the result fits int8 ([-128, 127]);
+      TVM subtracts the **zero-point** (113), giving [-113, 142], which does
+      not fit int8 -- hence its int16 output. The gap is the constant
+      ``128 - in_zp``;
+    * the fixture carries the conv's 3-pixel zero-point border (230x230);
+      TVM's layer 0 does not pad at all (224x224), because the padding is
+      inside the conv op downstream;
+    * the fixture pads the channel axis to 4 for the AIE's MAC stride; TVM
+      keeps 3.
+
+    Both are HWC, so no transpose is involved -- TVM indexes
+    ``h*672 + w*3 + c``.
+    """
+    core = pad4[PAD:PAD + IN_H, PAD:PAD + IN_W, :IN_C].astype(np.int16)
+    return np.ascontiguousarray(core + np.int16(128 - sp.in_zp))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # C header emission
 #
 # Conventions follow src/frontend/tvmrelay/image_input.py:104-149 -- the only
@@ -366,6 +688,23 @@ def hex_array(name: str, values, count_macro: str) -> str:
             f"static const uint8_t {name}[{count_macro}] = {{\n"
             + textwrap.fill(body, width=78, initial_indent="    ",
                             subsequent_indent="    ")
+            + "\n};\n")
+
+
+def i16_array(name: str, values, count_macro: str, *, per_line: int = 12) -> str:
+    """A ``static const int16_t`` array, decimal, ``per_line`` values per row.
+
+    Decimal rather than hex on purpose: the values are signed and span
+    [-113, 142], and a hex initializer for a signed type would lean on an
+    implementation-defined out-of-range conversion -- the same reason
+    ``hex_array`` emits ``uint8_t`` and the use site casts.
+    """
+    flat = np.asarray(values).reshape(-1)
+    rows = [", ".join(str(int(v)) for v in flat[i:i + per_line])
+            for i in range(0, flat.size, per_line)]
+    return (f"#define {count_macro} {flat.size}\n\n"
+            f"static const int16_t {name}[{count_macro}] = {{\n"
+            + ",\n".join("    " + r for r in rows)
             + "\n};\n")
 
 

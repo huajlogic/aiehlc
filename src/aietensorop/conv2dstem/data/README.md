@@ -41,10 +41,86 @@ triggers a 10–25 minute source build.
 |---|---|
 | `dog.jpg` | The fixture image — the pytorch-hub sample, a Samoyed |
 | `fixture_common.py` | Model parsing, qparam folding, image pipeline, header emitter |
-| `make_image_header.py` | → `../conv2dstem_image.h`, `int8 [230,230,4]` |
+| `make_image_header.py` | → `../conv2dstem_image.h`, `int8 [230,230,4]`; `--tvm-layer0` → `../conv2dstem_image_tvm.h`, `int16 [224,224,3]` |
 | `make_weights_header.py` | → `../conv2dstem_weights.h`, `int8 [64,7,7,3]` + 64 qparams |
 | `groundtruth.py` | → `../conv2dstem_golden.h`, `uint8 [112,112,64]`; also `--applog` |
 | `stem_fixture.npz` | The arrays the weight header was built from, pinned for `groundtruth.py` |
+
+## Comparing against TVM's layer 0
+
+The TVM flow quantizes the same image in its own layer 0,
+`tvmgen_default_fused_divide_round_add_clip_cast_subtract_layout_transform`
+(`worklocal/tvmrelay_deploy/layers/00_*/`). Dumping both and finding they
+disagree is expected and **not a bug** — the arithmetic is identical, the
+representation is not. Verified bit-exact over all 150,528 values on `dog.jpg`:
+
+| | `conv2dstem_image.h` | TVM layer 0 |
+|---|---|---|
+| offset | `x_u8 - 128` | `x_u8 - in_zp` (113) — a constant **+15** apart |
+| dtype | `int8`, [-128, 127] | `int16`; [-113, 142] does not fit int8 |
+| border | 3 px of `in_zp` → `[230,230]` | none, `[224,224]` — TVM pads inside the conv op downstream |
+| channels | 4 (ch3 = alignment pad, always 0) | 3 |
+| layout | HWC | HWC (`h*672 + w*3 + c`) |
+
+So a hexdump of TVM's output starts `98 ff 9e ff a9 ff …` — that is **int16
+little-endian**, `0xff98 = -104`, not a byte stream. The fixture starts
+`f1 f1 f1 00 …` because its first row is the zero-point border
+(`0xf1 = -15 = 113 - 128`) and every fourth byte is the alignment pad.
+
+To emit TVM's form — what `deploy_flow.py` holds after its first layer:
+
+```bash
+python3 make_image_header.py --tvm-layer0                  # -> ../conv2dstem_image_tvm.h
+python3 make_image_header.py --tvm-layer0 --verify-kernel  # + diff vs the compiled kernel
+```
+
+This does **not** convert the fixture. It runs the kernel's own two steps, in
+the same order and the same float32 precision
+(`fixture_common.tvm_quantize_u8` → `tvm_layer0`):
+
+```c
+v = roundf(x * 53.78862f) + 113.0f           /* quantize */
+v = min(v, 255.0f);  v = max(v, 0.0f)        /* clip     */
+out[h*672 + w*3 + c] = (int16_t)v - p1[0]    /* cast + layout, p1[0] = 113 */
+```
+
+Three details that are easy to get subtly wrong, and are why this is a
+reimplementation rather than a formula:
+
+- The float literals are **read out of the generated C**
+  (`parse_tvm_layer0_consts`), not recomputed. TVM emits the scale reciprocal
+  to 7 significant digits — `5.378862e+01f` — which is *not*
+  `float32(1/in_scale) = 53.788624`. The gap is ~7e-8 relative; harmless here,
+  but recomputing would quietly make this a different front end.
+- It is a **multiply by the reciprocal in float32**, not `x / in_scale` in
+  float64. Those differ by up to 1.3e-5 before rounding.
+- `roundf` is round-half-**away-from-zero**; `np.round` (and ONNX Runtime's
+  QuantizeLinear, hence `preprocess_to_pad4`) is round-half-to-**even**.
+  `fixture_common.roundf` implements the C rule.
+
+The last two only bite within ~1e-5 of a `.5` tie. On `dog.jpg` nothing comes
+closer than 0.002, so both front ends agree exactly — but a different image
+could make them differ by 1 LSB on a handful of pixels. That is the first place
+to look if the two ever disagree sparsely.
+
+### Checking it against the real kernel
+
+`--verify-kernel` compiles `layers/00_*/00_*.c` from its own source with the
+host gcc, drives it through TVM's packed ABI on the same image, and diffs the
+output buffer. It is the only check that compares against the *compiled code*
+rather than against a reading of it:
+
+```
+  [verify] MATCH -- all 150,528 values equal the compiled 00_divide_round_..._transform/ kernel
+```
+
+It needs stage 5's per-layer split and stage 6's `arm_build/tvm_graph_types.h`;
+without them it reports what is missing instead of failing. Every run (with or
+without `--verify-kernel`) additionally asserts the result equals
+`pad4_to_tvm_layer0(pad4)`, so the two front ends cannot drift apart silently.
+
+Neither mode overwrites `conv2dstem_image.h` — `conv2dstem.cc` consumes that
+one and needs the int8 / pre-padded form.
 
 ## Why the headers are not in this directory
 

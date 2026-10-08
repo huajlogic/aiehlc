@@ -70,6 +70,17 @@ weights + 64 folded qparams), and `conv2dstem_golden.h` (CPU ground truth, which
 baremetal board under xsdb has no channel but the console). This matters: with
 real weights the peak accumulator is **1,023,225**, so an int16 accumulator
 wraps — the old synthetic `[-4,4]×{-1,0,1}` fixture could not show that.
+`conv2dstem_image.h` and **TVM's layer 0**
+(`tvmgen_default_fused_divide_round_add_clip_cast_subtract_layout_transform`) are
+the *same* quantization — bit-exact over all 150,528 values — in different
+representations: `−128` vs `−zp(113)` (a constant +15), int8 vs **int16** (TVM's
+`98 ff` is LE int16 `−104`, not two bytes), `[230,230,4]` pre-padded vs
+`[224,224,3]` unpadded. `make_image_header.py --tvm-layer0` reimplements the
+kernel's two steps (`tvm_quantize_u8` → `tvm_layer0`, literals **parsed from the
+generated C**, C `roundf` tie rule) and emits `conv2dstem_image_tvm.h`;
+`--verify-kernel` compiles and runs the real kernel and diffs it. Skill
+**conv2dstemfixture**.
+
 Generated headers must land **flat** in the app source dir, not in `data/` —
 `aiehlc.sh:532` copies user headers with a non-recursive `*.h` glob flattened to
 basename and the host compile only gets `-I<worklocal>`, so a `data/` header
@@ -186,6 +197,57 @@ They coexist with `libconv2dstem.a` despite both carrying the AIE runtime,
 because `ld` pulls only members that resolve an undefined symbol. **Not yet
 wired:** `graph_driver.c` still calls the CPU kernel for those layers, so the
 archives link but contribute nothing.
+
+**int8 operands are the DEFAULT (`--no-pe-int8` opts out).** The quantizer emits genuine
+int8 (all 11,678,912 ResNet-18 weights measure inside `[-127,127]`, 255 levels);
+what widens them is **legalization**, which describes the *hardware*, not the
+numbers. `Target("c")` has `keys=['cpu']`, so the Intel rule fires,
+`is_fast_int8_on_intel()` is false for a C target, and
+`helper_no_fast_int8_hw_legalization` casts data **and** weights to int16.
+`pe_target.py` says otherwise via a target key — `Target("c -keys=pe_int8,cpu")`,
+so `generic_func` picks the int8 rule while `cpu` still serves schedules and
+`conv2d_alter_op`; patching `register("cpu", override=True)` works too but
+retargets every x86 build in the process. The rule is TVM's own
+`helper_change_dtypes_to_int8` = `x_i8 = x_u8 − 128`, `zp −= 128`, zero-point
+folded into the bias by `QnnConv2DCanonicalize` — the same algebra as
+conv2dstem's `+128·Σw`. Measured: output **bit-identical**, `weights.bin`
+23.5 → 11.9 MB, board ELF 24.4 → 12.8 MB, against 30 → 120 graph nodes.
+**Auto-OFF under `--aie-offload` / `--aiegraph`**: the restructuring renumbers
+`layers/` (the stem moves from index 1 to 6) and `--aie-layers` selects by index,
+so leaving it on would silently offload a `layout_transform`; the flow prints why
+and `--pe-int8` forces it back on. **Bias,
+requant multiplier and shift stay int32 and must** — bias lives at the
+`s_x·s_w` accumulator scale (23 bits here), the multiplier is a fixed-point
+scale in `[2³⁰,2³¹)`; together 0.5% of the blob.
+
+**`network.md` documents the compiled graph.** `network_md.py` (run every
+`deploy_flow.py`, after the offload/aiegraph stages so it reflects the *final*
+graph) turns `resnet18_graph.json` into `worklocal/tvmrelay_deploy/network.md`:
+summary, a **Mermaid** dataflow chart with residual skips as dotted edges, a
+per-call layer table carrying `dtype[shape]` for every input, output **and
+parameter**, a per-argument detail table, a parameter rollup by dtype, and what
+buffer aliasing saves. **Parameter roles** (`weight` / `bias` / `zero-point` /
+`requant multiplier` / `requant shift` / `unused`) are read out of the generated
+C by `kernel_param_usage`, keyed on the kernel's **arg slot** (layer 29's graph
+`p131..p136` are `p1..p6` inside the kernel) and splitting the two multiplies by
+**cast width** `int32_t` vs `int64_t` — a rank-based rule calls the rank-3 dense
+weight a multiplier. Indices printed are **entry indices**
+(`node_row_ptr[node]+k`) so rows line up with `make TRACE=1` dumps, and layer
+folders are matched by **kernel symbol** — stage 5 writes one folder per distinct
+kernel (28) while the graph makes 30 calls, so positional matching mislabels
+everything after the first repeated kernel.
+
+**Tracing between layers: `make TRACE=1`, never a hand edit.** `graph_driver.c`
+carries a per-node dump of every kernel input/output behind `#ifdef GRAPH_TRACE`
+(`TRACE_ELEMS=N` for width); a normal build compiles none of it. It decodes the
+dtype — `DLDataType` is a 4-byte **struct**, so `printf("%d", t.dtype)` is UB that
+prints `code | bits<<8 | lanes<<16`, i.e. int16 shows as `69632`, uint8 as `67585`
+— and dumps **elements, not bytes** (a byte dump of int16 reads `98 ff` = `-104`).
+`dl_dtype_str`/`graph_dump_tensor` are `static inline` and always emitted. Hand
+edits to `graph_driver.c` are overwritten by the next `deploy_flow.py` run; change
+`arm_build._trace_lines` / `_DEBUG_HELPERS_C` instead. All of it is restated in the
+**generated** `arm_build/README.md` (`arm_build.write_readme` / `_README_MD`), which
+carries each run's real numbers — edit the template, never the copy.
 
 **`--local` runs the same C on x86.** `deploy_flow.py --local` (or `make local` /
 `make run-local` in `arm_build/`) links `main_local.elf` from the *same* generated
@@ -379,6 +441,7 @@ Read the matching skill when the task fits:
 | Pipeline "succeeds" but emits an EMPTY module (0 routing connections, no BCF/PRX → `Couldn't open aie2ps.prx`): `__global__` in a comment, or a prototype above the kernel | aiesourcetextrewrite |
 | `deploy_flow.py` emits fp32 instead of the default int8, `target.build.llvm is not enabled`, missing `onnx`, or stage-5 split silently skipped | tvmrelaynollvm |
 | Run the TVM-generated ResNet C on x86 (`--local` / `make local`): `xtime_l.h: No such file`, `'CLOCK_MONOTONIC' undeclared`, `Circular ... dependency dropped`, stack-smash in `graph_run` | tvmlocalhostelf |
+| int8 model whose conv weights/activations are **stored int16** (`weights.bin` 23.5 MB, `network.md` says `int16`); telling TVM the PE takes int8 (`--pe-int8`, `Target("c -keys=pe_int8,cpu")`); why bias/multiplier/shift are int32 by design | tvmint8legalize |
 | PT2E int8 → torch-mlir yields no `!torch.qint8` / no `linalg.*_q` (fusion passes look like no-ops); TOSA "failed to legalize `dequantize_per_channel`"; `pip install torchvision` upgrading torch | torchmlirquantfusion |
 | TVM `--aie-offload` (BYOC → AIE): fused boundary, uint8 shift, zero-point padding, weight-fingerprint layer mapping, conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
 | conv2dstem real-data fixture: generated header can't live in a subdir; zero-point border; `shift = -exponent`; golden self-check over the console | conv2dstemfixture |
