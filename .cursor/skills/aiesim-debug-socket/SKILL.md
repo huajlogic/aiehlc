@@ -1,9 +1,9 @@
-<!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
-     SPDX-License-Identifier: Apache-2.0 -->
 ---
 name: aiesim-debug-socket
 description: How the aiehlc aiesim (aie2pssimmsm) simulator serves live debug register reads/writes over a Unix socket, and the SystemC thread-affinity constraint behind it. Use when changing src/sim/aiehlc_dbg_server.*, the PS wrapper's debug threads, the runsim.sh debug env, or when live sim reads hang, refuse, or crash the simulator.
 ---
+<!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: Apache-2.0 -->
 
 # aiesim debug register socket
 
@@ -144,14 +144,13 @@ cannot drift). aiedbg's `_load_dbg_info_addr_params` reads it into
 | `AIEHLC_DBG_POLL_NS` | drain-thread timed backstop (ns) | 1000 |
 | `AIEHLC_DBG_VERBOSE` | server stderr diagnostics | off |
 
-## aiedbg side (sibling checkout)
+## Debug UI side
 
 `schedule_debug_server.py`: `_sim_watch_dbg_socket` picks `<example>/dbg` for
 `sim_kind=="aiesim"` (vs `<example>/ipc` for IPC) and loads `dbg_info.json`; the
 watcher is started for both kinds; the three live gates (`/grid`, `/cmd`,
 `/aiegdb`) block aiesim only when `not _sim_ipc_ready`; `_devices_for_ui` sets
-`live_reads` for aiesim. Contract also noted in `adapters/aiehlc.py` and
-`docs/debug-ui/bundle-contract.md`.
+`live_reads` for aiesim.
 
 **Three front-ends must follow the socket, not just one.** Each caches the
 backend differently, so each needs its own hook:

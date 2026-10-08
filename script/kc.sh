@@ -81,6 +81,42 @@ redefine_symbols() {
     done
 }
 
+encode_aot_ctrlpkt() {
+    local func_name="$1"
+    local output_dir="$2"
+    local gen="$3"
+    local manifest="./ctrlpkt_manifest.json"
+    [ -f "$manifest" ] || return 0
+    grep -q "\"func\":\"${func_name}\"" "$manifest" || return 0
+
+    local tool="${output_dir}/aiehlc_ctrlpkt"
+    dbg_echo "Building aiehlc_ctrlpkt encoder"
+    bash "${AIEHLC_ROOT_DIR}/script/build_ctrlpkt_tool.sh" "$tool" "$gen"
+    if [ $? -ne 0 ]; then
+        echo "Error: aiehlc_ctrlpkt build failed"
+        return 1
+    fi
+    local hdr="./kernel_${func_name}_ctrlpkt.h"
+    local dbg="./ctrlpkt"
+    rm -rf "$dbg"
+    "$tool" --manifest "$manifest" --func "$func_name" --elf "${output_dir}/kernel" --gen "$gen" --out "$hdr" \
+        --debug-dir "$dbg"
+    if [ $? -ne 0 ]; then
+        echo "Error: aiehlc_ctrlpkt encode failed"
+        return 1
+    fi
+    echo "AOT control packets: $(pwd)/${hdr#./}"
+    if [ -f ./ctrlpkt_sites.txt ]; then
+        "$tool" --sites ./ctrlpkt_sites.txt --host-cc ./host.cc --out-sites ./host_ctrlpkt.h --debug-dir "$dbg"
+        if [ $? -ne 0 ]; then
+            echo "Error: aiehlc_ctrlpkt sites encode failed"
+            return 1
+        fi
+        echo "AOT control packets: $(pwd)/host_ctrlpkt.h"
+    fi
+    echo "AOT control packets debug dump: $(pwd)/${dbg#./}/index.h"
+}
+
 # Emit DWARF line-table artifacts next to the kernel ELF:
 #   <out>/kernel.decodedline.txt  - readelf --debug-dump=decodedline (human readable)
 #   <out>/kernel.linemap.json     - parsed addr->file:line map for aiediag
@@ -507,6 +543,12 @@ fi
 redefine_symbols "$obj_file" "$func_name" "$objcopy_tool"
 if [ $? -ne 0 ]; then
     echo "Error: objcopy symbol renaming failed"
+    return 1
+fi
+
+encode_aot_ctrlpkt "$func_name" "$output_dir" "$aie_version"
+if [ $? -ne 0 ]; then
+    echo "Error: AOT control-packet encoding failed"
     return 1
 fi
 

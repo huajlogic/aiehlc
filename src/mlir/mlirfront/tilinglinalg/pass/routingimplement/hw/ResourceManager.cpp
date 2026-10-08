@@ -923,6 +923,8 @@ void ResourceMgr::reserveControlPlaneResources(rt_res_gen gen) {
         }
     }
     reserveControlSpinePorts(gen, spineCol);
+    if (cp.exclusive && cp.shimRow)
+        reserveShimRowControl(spineCol);
 
     controlPlaneReserved_ = true;
     std::cout << "[ResourceMgr] control-plane resources reserved (gen=" << (int)gen << " pktidmask=0x" << std::hex
@@ -955,6 +957,36 @@ void ResourceMgr::reserveControlSpinePorts(rt_res_gen gen, int spineCol) {
     }
 }
 
+void ResourceMgr::reserveShimRowControl(int spineCol) {
+    auto it = shimTiles_.find(TileCoord{0, spineCol});
+    if (it == shimTiles_.end())
+        throw std::runtime_error("shim-row control spine column has no shim DMA");
+    if (!it->second->allocate(DMADIRECTION::MM2S, RT_RES_SHIMROW_CH, kControlPlaneOwner) ||
+        !it->second->allocate(DMADIRECTION::S2MM, RT_RES_SHIMROW_CH, kControlPlaneOwner))
+        throw std::runtime_error("shim-row control DMA channel reservation conflicts with a data-plane DataIO");
+    auto reserve = [&](RoutingTile &t, PortDirection d, PortRole r, int portNum) {
+        if (!t.reservePortNumber(d, r, portNum, kControlPlaneOwner))
+            throw std::runtime_error("shim-row control port reservation conflicts with an existing route");
+    };
+    if (isTileInPartition(0, spineCol)) {
+        RoutingTile &spine = tile(0, spineCol);
+        reserve(spine, PortDirection::South, PortRole::Master,
+                (int)spine.getPortnumFromPortIdx(PortDirection::South, PortRole::Master, RT_RES_SHIMROW_CH));
+        reserve(spine, PortDirection::South, PortRole::Slave,
+                (int)spine.getPortnumFromPortIdx(PortDirection::South, PortRole::Slave, RT_RES_SHIMROW_CH));
+        for (PortRole r : {PortRole::Master, PortRole::Slave})
+            reserve(spine, PortDirection::East, r, RT_RES_SHIMROW_PORT);
+    }
+    for (int col = spineCol + 1; col < cols(); ++col) {
+        if (!isTileInPartition(0, col))
+            continue;
+        RoutingTile &t = tile(0, col);
+        for (PortDirection d : {PortDirection::West, PortDirection::East})
+            for (PortRole r : {PortRole::Master, PortRole::Slave})
+                reserve(t, d, r, RT_RES_SHIMROW_PORT);
+    }
+}
+
 std::optional<ControlShimPlacement> ResourceMgr::findFreeControlChannels(int col) const {
     auto it = shimTiles_.find(TileCoord{0, col});
     if (it == shimTiles_.end())
@@ -972,7 +1004,7 @@ std::optional<ControlShimPlacement> ResourceMgr::findFreeControlChannels(int col
     return p;
 }
 
-bool ResourceMgr::reserveControlShimBds(int col) {
+bool ResourceMgr::reserveControlShimBds(int col, bool shimRow) {
     if (col < 0 || col >= cols())
         return false;
     RoutingTile &shim = tile(0, col);
@@ -981,6 +1013,11 @@ bool ResourceMgr::reserveControlShimBds(int col) {
         ok &= shim.reserveBd(bd, kControlPlaneOwner);
     for (int bd = RT_RES_CTRL_ACK_BD_LO; bd <= RT_RES_CTRL_ACK_BD_HI; ++bd)
         ok &= shim.reserveBd(bd, kControlPlaneOwner);
+    if (shimRow) {
+        for (int bd = RT_RES_SHIMROW_BD_LO; bd <= RT_RES_SHIMROW_BD_HI; ++bd)
+            ok &= shim.reserveBd(bd, kControlPlaneOwner);
+        ok &= shim.reserveBd(RT_RES_SHIMROW_ACK_BD, kControlPlaneOwner);
+    }
     return ok;
 }
 

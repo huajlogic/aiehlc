@@ -1,9 +1,9 @@
-<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
-     SPDX-License-Identifier: Apache-2.0 -->
 ---
 name: aiesimloaddebug
 description: Debug AIE simulator (aie2pssimmsm) segfaults. Two families — (1) load-time crash at PS.so load, before "AIEHLC PS IP started", usually a stale script/sim/build/kernel_elf_init.cc referencing the wrong _binary_kernel_<name>_start symbol so dlopen of aiehlc_ps.so fails; (2) runtime crash after "Loading kernel..." inside XAie_LoadElfMem → BlockWrite32 → MathEngine::try_sideband_fast_write → invalidate_operation_cache, caused by a num_tiles="0" Work_gen5/reports/aiehlc.xpe that makes the ISS disable all tiles ("Iss used row and col 0 0"). Use when a --platform sim run crashes at elaboration or during kernel load.
 ---
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: Apache-2.0 -->
 
 # AIE Simulator PS.so Load-Crash Debug
 
@@ -108,7 +108,7 @@ Compare the crashing tiling PS.so to a working single-kernel PS.so (build `tutor
 - **Undefined symbols:** `nm -D -u aiehlc_ps.so` — any unresolved symbol the simulator can't provide fails `dlopen`.
 - **Global constructors:** `nm aiehlc_ps.so | grep _GLOBAL__sub_I_` and `objdump -h aiehlc_ps.so | grep init_array` — a constructor that runs at load and crashes.
 - **NEEDED libs:** `objdump -p aiehlc_ps.so | grep NEEDED` — a missing/incompatible dependency.
-- **Missing sim stub:** `--sim-tiles` (i.e. `--stub-tiles`) needs `script/sim/build/stub_kernel_build/stub_kernel`, built from `example/aiesim_test/stub_kernel.cc`. That directory is **untracked in git** — absent on clean checkouts. runsim.sh must build the stub under `--stub-tiles`, not only `--stub-all`.
+- **Missing sim stub:** `--sim-tiles` (i.e. `--stub-tiles`) needs `script/sim/build/stub_kernel_build/stub_kernel`, built by `script/sim/Makefile` from `src/sim/stub_kernel.cc` + `stub_kernel.bcf`. runsim.sh must build the stub under `--stub-tiles`, not only `--stub-all`.
 
 ## Pitfalls / do-not-waste-time-on
 

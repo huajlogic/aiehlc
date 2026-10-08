@@ -19,6 +19,7 @@
 #include "passroutingprovenancemap.h"
 #include "passroutingresourcemap.h"
 #include "passdfschedulekernelaggregation.h"
+#include "passapitocontrolpacket.h"
 #include "passgroupregwrite.h"
 #include "passschedulecanonicalize.h"
 #include "passschedulesequentialop.h"
@@ -324,16 +325,37 @@ static bool planControlColumn(mlir::ModuleOp module, bool reserveControlPlane, i
                      << meshCols << ", partition cols=" << partCols << ").\n";
         return false;
     }
+    auto shimBdAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_shim_bd_ctrl");
+    bool shimBd = shimBdAttr && shimBdAttr.getInt() != 0;
+    mlir::OpBuilder b(module.getContext());
+    module->setAttr("routing.control_plan_shim_bd_ctrl", b.getI64IntegerAttr(0));
+    if (shimBd && (!reserveControlPlane || !spare || meshCols > RT_RES_SHIMROW_MAX_COLS)) {
+        llvm::errs() << "[TilingLinalg] WARNING: #pragma control_plan_shim_bd_ctrl needs "
+                        "#pragma control_plan_op_control_packet, a spare control column west of the mesh, and at "
+                        "most "
+                     << RT_RES_SHIMROW_MAX_COLS << " mesh columns (mesh cols=" << meshCols
+                     << ", partition cols=" << partCols << "); shim BDs stay on MMIO.\n";
+        shimBd = false;
+    }
+    auto cpModeAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_packet_mode");
+    if (cpModeAttr && cpModeAttr.getInt() != 0 && !reserveControlPlane) {
+        llvm::errs() << "[TilingLinalg] WARNING: #pragma control_packet_mode(aot) needs "
+                        "#pragma control_plan_op_control_packet; using JIT.\n";
+        module->setAttr("routing.control_packet_mode", b.getI64IntegerAttr(0));
+    }
     if (!reserveControlPlane || !spare)
         return true;
     placement.col = relStartCol;
     placement.mm2sCh = 0;
     placement.s2mmCh = 0;
     placement.exclusive = true;
+    placement.shimRow = shimBd;
     dataStartCol = relStartCol + 1;
     publishControlPlacement(module, placement);
-    std::cout << "[TilingLinalg] control plane: dedicated shim col " << placement.col << " (MM2S ch0 / S2MM ch0); "
-              << "data plane uses cols [" << dataStartCol << "," << relEndCol << "]" << std::endl;
+    module->setAttr("routing.control_plan_shim_bd_ctrl", b.getI64IntegerAttr(shimBd ? 1 : 0));
+    std::cout << "[TilingLinalg] control plane: dedicated shim col " << placement.col << " (MM2S ch0 / S2MM ch0"
+              << (shimBd ? "; shim-row BD control on MM2S ch1 / S2MM ch1" : "") << "); data plane uses cols ["
+              << dataStartCol << "," << relEndCol << "]" << std::endl;
     return true;
 }
 
@@ -935,6 +957,10 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                         "#pragma CONTROL_PLAN_GROUP_REG_WRITE).\n";
     }
 
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::APIToControlPacketPass>(), irDir, stage,
+                               "APIToControlPacketPass"))
+        return false;
+
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
                                irDir, stage, "DfscheduleToApiPass"))
@@ -952,6 +978,17 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<CoreTraceInsertPass>(traceTiles), irDir, stage,
                                "CoreTraceInsertPass"))
         return false;
+
+    {
+        int aotPartCols = (partStartCol >= 0 && partEndCol >= 0) ? partEndCol - partStartCol + 1 : 0;
+        int aotGen = aieGen.size() > 3 ? std::atoi(aieGen.c_str() + 3) : 2;
+        if (!runPipelineSinglePass(ctx, hostModule,
+                                   std::make_unique<mlir::APIToControlPacketPass>(
+                                       mlir::APIToControlPacketPass::Phase::Emit, outputDir,
+                                       partStartCol < 0 ? 0 : partStartCol, aotPartCols, aotGen),
+                                   irDir, stage, "APIToControlPacketPass(emit)"))
+            return false;
+    }
 
     // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
     if (!runPipelineSinglePass(ctx, kernelModule,
@@ -1154,6 +1191,33 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         // The user source provides main() and calls host_canonicalized() via __aie_launch().
         if (!userRewrittenSource.empty()) {
             stream << "\n// ===== User source (preserved from original file) =====\n";
+
+            bool aotKpkt = false;
+            int kpktNresp = 0;
+            if (auto a = hostModule->getAttrOfType<mlir::IntegerAttr>("routing.control_packet_aot"))
+                aotKpkt = a.getInt() != 0;
+            if (auto a = hostModule->getAttrOfType<mlir::IntegerAttr>("routing.control_packet_nresp"))
+                kpktNresp = a.getInt();
+            auto emitKpktSet = [&](const char *indent) {
+                if (!aotKpkt)
+                    return;
+                stream << indent << "__Runtime_ctrl_kernel_pkt_set(kernel_" << computeKernelName
+                       << "_ctrlpkt, (unsigned int)sizeof(kernel_" << computeKernelName << "_ctrlpkt));\n";
+                stream << indent << "__Runtime_ctrl_aot_register(&host_ctrlpkt_table);\n";
+            };
+            if (aotKpkt) {
+                std::string manifestPath = outputDir + "/ctrlpkt_manifest.json";
+                std::error_code mec;
+                llvm::raw_fd_ostream mstream(manifestPath, mec, llvm::sys::fs::OF_None);
+                if (!mec) {
+                    mstream << "{\"entries\":[{\"func\":\"" << computeKernelName << "\",\"nresp\":" << kpktNresp
+                            << ",\"stream_id\":16,\"reset\":1}]}\n";
+                    std::cout << "[TilingLinalg] wrote AOT control-packet manifest: " << manifestPath << std::endl;
+                } else {
+                    llvm::errs() << "[TilingLinalg] WARNING: cannot write " << manifestPath << "; AOT disabled.\n";
+                    aotKpkt = false;
+                }
+            }
 
             // Count total args on the host function (includes XAie_DevInst* dev as arg 0)
             unsigned numArgs = 0;
@@ -1444,6 +1508,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_start[];\n";
             stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
             stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
+            if (aotKpkt)
+                stream << "#include \"kernel_" << computeKernelName << "_ctrlpkt.h\"\n"
+                       << "#include \"host_ctrlpkt.h\"\n\n";
 
             // Helper: emit __Runtime_sync_for_dev calls for ALL buffers before DMA.
             // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
@@ -1472,6 +1539,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << ", ...) {\n";
                 stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                emitKpktSet("    ");
                 // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
                 emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
@@ -1496,6 +1564,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "        dev = __Runtime_explicit_init();\n";
                 stream << "    }\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                emitKpktSet("    ");
                 // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
                 emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
@@ -1512,6 +1581,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
                 stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                emitKpktSet("    ");
                 stream << "    " << hostFuncName << "(dev);\n";
                 stream << "}\n";
 
@@ -1527,6 +1597,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "        dev = __Runtime_explicit_init();\n";
                 stream << "    }\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                emitKpktSet("    ");
                 stream << "    " << hostFuncName << "(dev);\n";
                 stream << "    __Runtime_explicit_teardown(dev);\n";
                 stream << "}\n";

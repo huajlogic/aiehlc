@@ -1,9 +1,9 @@
-<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
-     SPDX-License-Identifier: Apache-2.0 -->
 ---
 name: xaieapiverify
 description: Verify correct XAie API usage in generated code (routing.cc, host.cc) by analyzing function calls against driver validation rules. Use when generated code needs verification before HW execution, or when debugging XAie errors from board runs.
 ---
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: Apache-2.0 -->
 
 # XAie API Verify
 

@@ -26,6 +26,7 @@ import threading
 import queue
 import argparse
 import glob
+import re
 import shlex
 
 try:
@@ -86,6 +87,17 @@ PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
 # which differs only in the image name) -- the debug UI passes this through
 # from a debug_ui_config.json entry's hw_env.
 VEK385PDI = os.environ.get("VEK385PDI") or f"/home/{username}/aiehlc/vek385.pdi"
+# Rev B boards run the segmented-configuration vek385_base platform, whose boot
+# image is split in two: the boot PDI (PLM, PS, NoC) must be programmed before
+# the PLD PDI (PL + AIE), back to back. Rev A boots from the single VEK385PDI.
+VEK385_REV = (os.environ.get("VEK385_REV") or "a").lower()
+VEK385_BOOT_PDI = (os.environ.get("VEK385_BOOT_PDI")
+                   or f"/home/{username}/aiehlc/vek385revb_boot.pdi")
+VEK385_PLD_PDI = (os.environ.get("VEK385_PLD_PDI")
+                  or f"/home/{username}/aiehlc/vek385revb_pld.pdi")
+ALLGMIOBOOT_PDI_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "../../thirdparty/allgmioboot",
+    "platform/_x/link/vivado/vpl/prj/prj.runs/impl_1"))
 #XSDB_ALT_PATH = "/everest/set_vnc_bkup/vnc/t50/es1/tools/Labtools/9999.0/bin/xsdb"
 XSDB_ALT_PATH = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/bin/xsdb"
 VITIS_SETTINGS = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/settings64.sh"
@@ -208,6 +220,7 @@ def find_elf_file(filename=None, auto_yes=False):
 def console_reader(child, output_queue, stop_event):
     """Thread function to continuously read console output from Connection 2."""
     buffer = ""
+    tail = ""
     while not stop_event.is_set():
         try:
             # Read any available output without blocking for long
@@ -215,12 +228,15 @@ def console_reader(child, output_queue, stop_event):
             if output:
                 buffer += output
                 output_queue.put(output)
-                if "telnet>" in output:
-                    output_queue.put("[console_reader] telnet escape detected — resuming session\n")
-                    try:
-                        child.send("\r")
-                    except Exception:
-                        pass
+                window = tail + output
+                tail = window[-16:]
+                if "Connection closed by foreign host" in window:
+                    output_queue.put("[console_reader] UART session dropped\n")
+                    tail = ""
+                elif "telnet>" in window:
+                    child.sendline("quit")
+                    output_queue.put("[console_reader] telnet command mode, quit; UART session dropped\n")
+                    tail = ""
         except pexpect.TIMEOUT:
             # No data available, continue polling
             continue
@@ -275,7 +291,63 @@ def exit_xsdb_and_poweroff(child):
     print("[Connection 1] Power off complete")
 
 
-def setup_first_connection():
+def boot_pdis(board_rev):
+    """Remote PDIs to `device program`, in order, for this board revision."""
+    if board_rev == "b":
+        return [VEK385_BOOT_PDI, VEK385_PLD_PDI]
+    return [VEK385PDI]
+
+
+def program_pdi(child, pdi):
+    """`device program` one PDI; raise on a PLM stall or an xsdb error."""
+    print(f"[Connection 1] Programming PDI: {pdi}")
+    # Wait on a result marker, not the next xsdb% prompt: earlier commands
+    # (`conn` launching hw_server) leave extra prompts that would match early.
+    # `[set r OK]` keeps the echoed command line from matching the marker.
+    child.sendline(f'if {{[catch {{device program {pdi}}} e]}} '
+                   f'{{puts "PDIRES_[set r FAIL]: $e"}} else {{puts "PDIRES_[set r OK]"}}')
+    index = child.expect([r'PDIRES_OK', r'PDIRES_FAIL: ([^\r\n]*)', r'PLM stalled'], timeout=300)
+    if index == 2:
+        child.expect(r'xsdb%', timeout=60)
+        raise RuntimeError(
+            f"PLM stalled while programming {pdi}. "
+            "The board may need a power cycle. Run 'plm log' for details."
+        )
+    err = child.match.group(1).strip() if index == 1 else ""
+    child.expect(r'xsdb%', timeout=60)
+    if index == 1:
+        raise RuntimeError(f"device program {pdi} failed: {err}")
+
+
+def stage_pdis(local_dir, board_rev):
+    """SCP rev B's boot/PLD PDIs from local_dir to the remote paths xsdb programs."""
+    if board_rev != "b":
+        print("Error: --stage-pdi only applies to --board-rev b")
+        return False
+    pairs = []
+    for suffix, remote in (("_boot.pdi", VEK385_BOOT_PDI), ("_pld.pdi", VEK385_PLD_PDI)):
+        hits = sorted(glob.glob(os.path.join(local_dir, f"*{suffix}")))
+        if len(hits) != 1:
+            print(f"Error: expected exactly one *{suffix} in {local_dir}, found {hits}")
+            return False
+        pairs.append((hits[0], remote))
+    try:
+        remote_dirs = sorted({os.path.dirname(r) for _, r in pairs})
+        subprocess.run(["ssh", host, "mkdir -p " + " ".join(map(shlex.quote, remote_dirs))],
+                       check=True, capture_output=True, text=True, timeout=30)
+        for local, remote in pairs:
+            print(f">>> Staging {local} -> {host}:{remote}")
+            subprocess.run(["scp", local, f"{host}:{remote}"],
+                           check=True, capture_output=True, text=True, timeout=300)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"Error staging PDIs: {e}")
+        if getattr(e, "stderr", None):
+            print(e.stderr.strip())
+        return False
+    return True
+
+
+def setup_first_connection(board_rev="a"):
     """
     First SSH connection: Setup xsdb and program device.
     Returns the pexpect child process for further commands.
@@ -339,18 +411,9 @@ def setup_first_connection():
     # Step 8: Target 1
     child.sendline("tar 1")
     child.expect(r'xsdb%', timeout=60)
-    print("[Connection 1] Programming PDI...")
-
-    # Step 9: Program device – detect PLM stall and abort early
-    child.sendline(f"device program {VEK385PDI}")
-    index = child.expect([r'xsdb%', r'PLM stalled'], timeout=120)
-    if index == 1:
-        # Consume the rest of the error output up to the prompt
-        child.expect(r'xsdb%', timeout=60)
-        raise RuntimeError(
-            "PLM stalled during PDI programming. "
-            "The board may need a power cycle. Run 'plm log' for details."
-        )
+    # Step 9: Program device (rev B: boot PDI, then PLD PDI)
+    for pdi in boot_pdis(board_rev):
+        program_pdi(child, pdi)
     print("[Connection 1] PDI programmed, waiting for PS POR release...")
     time.sleep(15)  # allow PLM to fully initialise before continuing
     print("[Connection 1] Targeting APU core (Cortex-A78AE #0.0)...")
@@ -380,6 +443,18 @@ def setup_first_connection():
     print("[Connection 1] Setup complete!")
     
     return child
+
+
+def uart_reconnect_step(conn, chunk, st):
+    dropped = "Connection closed by foreign host" in chunk or "UART session dropped" in chunk
+    if dropped:
+        st["pending"] = True
+    if st.get("pending") and re.search(r'Systest[#>]', chunk) and st.get("count", 0) < 4:
+        st["pending"] = False
+        st["count"] = st.get("count", 0) + 1
+        print(f"\n[Connection 2] UART dropped, reconnecting to {console_port} ({st['count']})")
+        conn.sendline(f"connect {console_port}")
+    return dropped
 
 
 def setup_second_connection():
@@ -562,6 +637,8 @@ Examples:
   %(prog)s -y                   # Use default aout/main.elf without prompting
   %(prog)s -y /path/to/main.elf # Use custom ELF without prompting
   %(prog)s -nonreboot test.elf  # Run ELF but keep board on for manual debug
+  %(prog)s --board-rev b        # Rev B: program boot PDI, then PLD PDI
+  %(prog)s main.elf --board-rev b --stage-pdi   # Rev B, first SCP freshly built allgmioboot PDIs
         """
     )
     parser.add_argument(
@@ -582,7 +659,27 @@ Examples:
         default=False,
         help="Keep board powered on after test (no xsdb exit, no power off) for manual debug"
     )
+    parser.add_argument(
+        "--board-rev",
+        choices=("a", "b"),
+        default=VEK385_REV,
+        help="VEK385 board revision (default: $VEK385_REV or 'a'). "
+             "a: program $VEK385PDI. b: program $VEK385_BOOT_PDI then $VEK385_PLD_PDI"
+    )
+    parser.add_argument(
+        "--stage-pdi",
+        nargs="?",
+        const=ALLGMIOBOOT_PDI_DIR,
+        default=None,
+        metavar="DIR",
+        help="Rev B only: after rebuilding the PDIs, SCP the *_boot.pdi and *_pld.pdi "
+             "from DIR over $VEK385_BOOT_PDI / $VEK385_PLD_PDI before programming "
+             f"(default DIR: {ALLGMIOBOOT_PDI_DIR})"
+    )
     args = parser.parse_args()
+    if args.board_rev not in ("a", "b"):
+        print(f"Error: VEK385_REV must be 'a' or 'b', got '{args.board_rev}'")
+        sys.exit(1)
 
     # Step 0: Find ELF file using smart selection
     local_elf = find_elf_file(args.elf_file, auto_yes=args.yes)
@@ -593,8 +690,12 @@ Examples:
     print("Palboard ELF Test Script")
     print(f"Host: {host}")
     print(f"ELF File: {local_elf}")
+    print(f"Board rev: {args.board_rev.upper()}  PDI(s): {' -> '.join(boot_pdis(args.board_rev))}")
     print("=" * 60)
-    
+
+    if args.stage_pdi and not stage_pdis(args.stage_pdi, args.board_rev):
+        sys.exit(1)
+
     # Step 1: Copy ELF file to remote server
     success, remote_elf_path = copy_elf_to_remote(local_elf)
     if not success:
@@ -608,11 +709,37 @@ Examples:
     try:
         # Step 2-3: Setup first connection and program device
         print("\n>>> Setting up first connection...")
-        conn1 = setup_first_connection()
+        conn1 = setup_first_connection(board_rev=args.board_rev)
         
         # Step 4: Setup second connection for console output
         print("\n>>> Setting up second connection...")
         conn2 = setup_second_connection()
+
+        # Read the UART before the ELF runs. com3's telnet session sometimes
+        # drops as soon as it attaches; reconnect and only then download.
+        console_thread = threading.Thread(
+            target=console_reader,
+            args=(conn2, console_output_queue, stop_console_thread)
+        )
+        console_thread.start()
+        uart_ready = False
+        uart_seen = 0.0
+        uart_st = {}
+        settle_deadline = time.time() + 45
+        while time.time() < settle_deadline:
+            while not console_output_queue.empty():
+                chunk = console_output_queue.get()
+                print(chunk, end='', flush=True)
+                if uart_reconnect_step(conn2, chunk, uart_st):
+                    uart_seen = 0.0
+                elif not uart_seen and not uart_st.get("pending") and chunk.strip():
+                    uart_seen = time.time()
+            if uart_seen and time.time() - uart_seen >= 3 and not uart_st.get("pending"):
+                uart_ready = True
+                break
+            time.sleep(0.5)
+        if not uart_ready:
+            print("\n[Connection 2] UART did not stay up; continuing anyway")
 
         # Step 5: Download ELF file
         print("\n>>> Downloading ELF file...")
@@ -636,13 +763,6 @@ Examples:
             print("Test FAILED (PLM stall)")
             print("=" * 60)
             sys.exit(1)
-
-        # Start console reader thread after ELF is running
-        console_thread = threading.Thread(
-            target=console_reader,
-            args=(conn2, console_output_queue, stop_console_thread)
-        )
-        console_thread.start()
 
         # Poll console output instead of fixed sleep:
         #   - Finish early when "device_teardown done" is seen (program completed)
@@ -672,8 +792,9 @@ Examples:
                 print(chunk, end='', flush=True)
                 output_detected = True
                 got_new = True
+                uart_reconnect_step(conn2, chunk, uart_st)
                 # Check for completion marker
-                if "device_teardown done" in chunk:
+                if "device_teardown done" in chunk or "test end" in chunk or "PASS:" in chunk or "FAIL:" in chunk:
                     program_done = True
 
             if got_new:

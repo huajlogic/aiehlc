@@ -367,6 +367,34 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBA> win_a, aie::port<inpu
     }
 }
 
+#ifndef MATMUL_LAUNCHES
+#define MATMUL_LAUNCHES 2
+#endif
+
+struct PerfSnap {
+    unsigned long long ph[4], wio, kelf, kfill, krst, plan, sync, pmap;
+    unsigned int pmapn;
+    int aot;
+};
+
+static void perf_snap(PerfSnap *s) {
+    *s = PerfSnap{};
+    __Runtime_phase_cycles(s->ph, NULL);
+    __Runtime_wait_io_cycles(&s->wio, NULL);
+    __Runtime_kload_split_cycles(&s->kelf, NULL, &s->krst, NULL);
+    __Runtime_setup_split_cycles(&s->plan, NULL, &s->sync, NULL);
+    __Runtime_pmap_print_cycles(&s->pmap, &s->pmapn);
+    __Runtime_kload_fill_cycles(&s->kfill, NULL, &s->aot);
+}
+
+static void perf_print(const char *tag, int launch, double ms, const PerfSnap *a, const PerfSnap *b) {
+    printf("%s wall_ms=%.3f ctrlpkt=%s sync=%llu plan=%llu kload=%llu elf=%llu elf_fill=%llu rst=%llu "
+           "bdcfg=%llu coreen=%llu startio=%llu wait_io=%llu pmap_print=%llu launch=%d\n",
+           tag, ms, b->aot ? "aot" : "jit", b->sync - a->sync, b->plan - a->plan, b->ph[0] - a->ph[0],
+           b->kelf - a->kelf, b->kfill - a->kfill, b->krst - a->krst, b->ph[1] - a->ph[1], b->ph[2] - a->ph[2],
+           b->ph[3] - a->ph[3], b->wio - a->wio, b->pmap - a->pmap, launch);
+}
+
 int main() {
     __Runtime_ctrl_high_throughput_enable(1);
     __Runtime_ctrl_pmap_enable(1);
@@ -378,54 +406,56 @@ int main() {
     aieMesh mesh = device.partition({0, HW_COLS, 0, 6}, HW_ROWS, HW_COLS);
     int8_t *A = (int8_t *)device.alloc(M * K * sizeof(int8_t) * 4);
     int8_t *B = (int8_t *)device.alloc(K * N * sizeof(int8_t) * 4);
-    int8_t *C = (int8_t *)device.alloc(M * N * sizeof(int8_t) * 4);
+    int8_t *Cs[MATMUL_LAUNCHES];
+    for (int l = 0; l < MATMUL_LAUNCHES; l++) {
+        Cs[l] = (int8_t *)device.alloc(M * N * sizeof(int8_t) * 4);
+        for (int i = 0; i < M * N; i++)
+            Cs[l][i] = 0;
+    }
     for (int i = 0; i < M * K; i++)
         A[i] = (int8_t)((i % 7) - 3);
     for (int i = 0; i < K * N; i++)
         B[i] = (int8_t)((i % 5) - 2);
-    for (int i = 0; i < M * N; i++)
-        C[i] = 0;
-
-    XTime t_start, t_end;
-    XTime_GetTime(&t_start);
-    matmul<<<mesh>>>(A, B, C, M, N, K);
-    XTime_GetTime(&t_end);
-    double elapsed_ms = 1.0 * (t_end - t_start) / COUNTS_PER_SECOND * 1000.0;
-    printf("aie matmul time: %.3f ms\n", elapsed_ms);
-    {
-        unsigned long long ph[4] = {0, 0, 0, 0};
-        unsigned int phc[4] = {0, 0, 0, 0};
-        unsigned long long wio = 0ULL, kelf = 0ULL, krst = 0ULL, plan = 0ULL, sync = 0ULL, pmap = 0ULL;
-        unsigned int wion = 0U, kelfn = 0U, krstn = 0U, pmapn = 0U;
-        __Runtime_phase_cycles(ph, phc);
-        __Runtime_wait_io_cycles(&wio, &wion);
-        __Runtime_kload_split_cycles(&kelf, &kelfn, &krst, &krstn);
-        __Runtime_setup_split_cycles(&plan, NULL, &sync, NULL);
-        __Runtime_pmap_print_cycles(&pmap, &pmapn);
-        printf("[PERF] variant=ctrl_pkt sync=%llu plan=%llu kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu "
-               "startio=%llu wait_io=%llu pmap_print=%llu pmap_lines=%u\n",
-               sync, plan, ph[0], kelf, krst, ph[1], ph[2], ph[3], wio, pmap, pmapn);
+    double wall_ms[MATMUL_LAUNCHES];
+    PerfSnap snap[MATMUL_LAUNCHES + 1];
+    perf_snap(&snap[0]);
+    for (int l = 0; l < MATMUL_LAUNCHES; l++) {
+        int8_t *C = Cs[l];
+        XTime t_start, t_end;
+        XTime_GetTime(&t_start);
+        matmul<<<mesh>>>(A, B, C, M, N, K);
+        XTime_GetTime(&t_end);
+        wall_ms[l] = 1.0 * (t_end - t_start) / COUNTS_PER_SECOND * 1000.0;
+        perf_snap(&snap[l + 1]);
+        printf("aie matmul time: %.3f ms launch=%d\n", wall_ms[l], l + 1);
+        perf_print("[PERF] variant=ctrl_pkt", l + 1, wall_ms[l], &snap[l], &snap[l + 1]);
     }
-#ifndef DEBUG_NOCOMPUTE
-    int result = verify_matmul(A, B, C);
-#else
+    for (int l = 0; l < MATMUL_LAUNCHES; l++)
+        perf_print("[FINAL_PERF]", l + 1, wall_ms[l], &snap[l], &snap[l + 1]);
     int result = 0;
-    printf("test end=----------------------------------%.3f ms\n", elapsed_ms);
-#endif
-    {
-        unsigned long long ph[4] = {0, 0, 0, 0}, wio = 0ULL, kelf = 0ULL, krst = 0ULL, plan = 0ULL, sync = 0ULL;
-        unsigned long long pmap = 0ULL;
-        __Runtime_phase_cycles(ph, NULL);
-        __Runtime_wait_io_cycles(&wio, NULL);
-        __Runtime_kload_split_cycles(&kelf, NULL, &krst, NULL);
-        __Runtime_setup_split_cycles(&plan, NULL, &sync, NULL);
-        __Runtime_pmap_print_cycles(&pmap, NULL);
-        printf("[FINAL_PERF] wall_ms=%.3f sync=%llu plan=%llu kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu "
-               "startio=%llu wait_io=%llu pmap_print=%llu\n",
-               elapsed_ms, sync, plan, ph[0], kelf, krst, ph[1], ph[2], ph[3], wio, pmap);
+    for (int l = 1; l < MATMUL_LAUNCHES; l++) {
+        int diff = 0;
+        for (int i = 0; i < M * N; i++) {
+            if (Cs[l][i] == Cs[0][i])
+                continue;
+            if (diff < 8)
+                printf("[RELAUNCH] launch=%d C[%d][%d] = %d, launch 1 = %d\n", l + 1, i / N, i % N, (int)Cs[l][i],
+                       (int)Cs[0][i]);
+            diff++;
+        }
+        printf("[RELAUNCH] launch=%d differs_from_launch1=%d of %d\n", l + 1, diff, M * N);
+        result |= diff != 0;
     }
+    if (result)
+        printf("FAIL: a relaunch output differs from launch 1\n");
+#ifndef DEBUG_NOCOMPUTE
+    result |= verify_matmul(A, B, Cs[0]);
+#else
+    printf("test end=----------------------------------%.3f ms\n", wall_ms[0]);
+#endif
     device.free(A);
     device.free(B);
-    device.free(C);
+    for (int l = 0; l < MATMUL_LAUNCHES; l++)
+        device.free(Cs[l]);
     return result;
 }

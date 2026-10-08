@@ -192,6 +192,8 @@ static bool parsedControlPlanGroupRegWrite = false;
 // programs every core tile's DMA over the config bus).
 static bool parsedKernelConfigOffload = false;
 static bool parsedControlPlanDedicatedShim = false;
+static bool parsedControlPlanShimBdCtrl = false;
+static int parsedControlPacketMode = 0;
 // Compute tiles to core-trace, from #pragma aie_trace(col,row) (mesh/partition-
 // relative). Repeatable and range-expanded (col:col2, row:row2 -> rectangle).
 // Each spec may carry an optional mem-module DMA/stream selection (2nd tuple).
@@ -3618,6 +3620,35 @@ class AieControlPlanDedicatedShimPragmaHandler : public clang::PragmaHandler {
     }
 };
 
+class AieControlPlanShimBdCtrlPragmaHandler : public clang::PragmaHandler {
+  public:
+    AieControlPlanShimBdCtrlPragmaHandler() : PragmaHandler("control_plan_shim_bd_ctrl") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedControlPlanShimBdCtrl = true;
+        llvm::outs() << "[aiehlc] Detected #pragma control_plan_shim_bd_ctrl\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
+class AieControlPacketModePragmaHandler : public clang::PragmaHandler {
+  public:
+    AieControlPacketModePragmaHandler() : PragmaHandler("control_packet_mode") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        PP.Lex(Tok);
+        if (Tok.is(clang::tok::l_paren)) {
+            PP.Lex(Tok);
+            if (Tok.is(clang::tok::identifier)) {
+                llvm::StringRef mode = Tok.getIdentifierInfo()->getName();
+                parsedControlPacketMode = mode.equals_insensitive("aot") ? 1 : 0;
+                llvm::outs() << "[aiehlc] Detected #pragma control_packet_mode(" << mode << ")\n";
+            }
+        }
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
 class MyFrontendAction : public ASTFrontendAction {
 public:
 		MyFrontendAction() {
@@ -3672,6 +3703,8 @@ public:
             PP.AddPragmaHandler(new AieControlPlanGroupRegWritePragmaHandler());
             PP.AddPragmaHandler(new AieKernelConfigOffloadPragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanDedicatedShimPragmaHandler());
+            PP.AddPragmaHandler(new AieControlPlanShimBdCtrlPragmaHandler());
+            PP.AddPragmaHandler(new AieControlPacketModePragmaHandler());
 
             return true;
 		}
@@ -4694,6 +4727,10 @@ public:
                                         fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
                         module->setAttr("routing.control_plan_dedicated_shim",
                                         fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
+                        module->setAttr("routing.control_plan_shim_bd_ctrl",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedControlPlanShimBdCtrl ? 1 : 0));
+                        module->setAttr("routing.control_packet_mode",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedControlPacketMode));
                     }
 
                     // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -5381,6 +5418,10 @@ public:
                                     fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
                     module->setAttr("routing.control_plan_dedicated_shim",
                                     fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
+                    module->setAttr("routing.control_plan_shim_bd_ctrl",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedControlPlanShimBdCtrl ? 1 : 0));
+                    module->setAttr("routing.control_packet_mode",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedControlPacketMode));
                 }
 
                 // Replace aie::get_*() calls in kernel body with computed integer literals
