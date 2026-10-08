@@ -601,8 +601,52 @@ PYTHONPATH=src python src/frontend/tvmrelay/network_md.py worklocal/tvmrelay_dep
 | Parameters | the 137 constants rolled up by dtype and the 10 largest — where `weights.bin`'s 23.5 MB goes |
 | Buffer reuse | what TVM's storage aliasing saves, and which storage ids are shared |
 
-Written **after** the offload and aiegraph stages, so it always describes the
-graph that was finally compiled rather than the first one.
+### One generator, three ways in
+
+There is exactly **one** implementation — `network_md.write_network_md` — and
+it is pure: given the same files on disk it emits byte-identical output
+(verified: all three routes produce the same md5).
+
+| route | when it runs |
+|---|---|
+| `deploy_flow.py` | automatically, stage 6, no flag — `deploy_flow.py:984` |
+| `python network_md.py <out_dir>` | on demand, over whatever is on disk |
+| `from ... import write_network_md` | same, from Python |
+
+So they never disagree about *logic*. What differs is **what is on disk when
+they run**:
+
+- `deploy_flow.py` calls it **after** `build_c`, the layer split, and the
+  offload/aiegraph stages, so the graph, `weights.bin`, `manifest.json` and
+  the per-layer `.c` are all fresh and mutually consistent — it describes the
+  graph that was *finally* compiled, not the first one.
+- A standalone call reads the tree as it stands. On a complete tree that is
+  identical; on a half-built or mixed one it faithfully describes what it
+  finds.
+
+It needs four inputs, and degrades differently for each:
+
+| input | if absent |
+|---|---|
+| `<stem>_graph.json` | returns `None`, prints `skipped` — nothing to describe |
+| `<stem>_params.bin` | **every constant reclassifies as an activation** → `parameters \| 0`, no `param` rows |
+| `layers/manifest.json` | folder column shows `—`; roles fall back to the monolithic `resnet18.c` |
+| the kernel `.c` | roles become a bare `param` |
+
+The second one used to be silent, and it reads exactly like a model with no
+weights. It now says so, on stdout and at the top of the document:
+
+```
+[net] WARNING: parameter blob missing resnet18_params.bin -- every weight is
+      reported as an activation, so the document says 0 parameters.
+```
+
+Both the document and `arm_build/graph_driver.c` also carry a `graph-sha`
+line, so "are these two from the same build?" is one command:
+
+```bash
+grep -m1 graph-sha network.md arm_build/graph_driver.c
+```
 
 Three things it is deliberately careful about, each a real source of confusion:
 
@@ -611,9 +655,39 @@ Three things it is deliberately careful about, each a real source of confusion:
   `graph_driver.c`'s `tensors[]` — are indexed by. So a row lines up with a
   `make TRACE=1` dump line with no translation.
 - **Layer folders are matched by kernel symbol, not position.** Stage 5 writes
-  one folder per *distinct* kernel (28 here) while the graph makes 30 calls,
-  because two fused groups are invoked twice. Matching positionally mislabels
-  every row after the first repeat.
+  one folder per *distinct* kernel while the graph makes more calls than that,
+  because repeated fused groups share one function. Matching positionally
+  mislabels every row after the first repeat.
+
+### Three different things are called "layer 01"
+
+They are separate numbering spaces and they only coincide by accident:
+
+| number | what it counts | where you see it |
+|---|---|---|
+| **call index** | kernel calls in execution order (121) | `network.md`'s `#` column, and `[01]` in a `make TRACE=1` dump |
+| **layer index** | *distinct* kernels, in first-use order (65) | the `NN_` prefix on a `layers/NN_*` folder |
+| `--aie-layers` | the layer index **of the first build** | `--aie-offload` |
+
+So `[01] tvmgen_default_fused_layout_transform` in a trace and a folder named
+`01_contrib_conv2d_...` can both exist and have nothing to do with each other.
+`network.md` pairs them for you: its `#` is the call index, and the `layer`
+column is the folder that call's kernel actually lives in.
+
+**And `layers/` accumulates folders across builds.** `_clear_stale` removes
+generated `.c`/`.o` and then any directory that leaves empty — deliberately
+keeping non-empty ones, because that is how an AIE-offloaded layer's `aie/`
+artifacts survive a re-split. The cost is that a folder from an older,
+differently-shaped graph lingers once anything else drops a file into it, so
+`ls layers/` can show two `01_*` folders. Stage 5 now names them:
+
+```
+[5/7]          NOTE 2 stale folder(s) from an earlier build are still on disk
+               and are NOT this graph: 01_contrib_conv2d_..., ...
+```
+
+and `manifest.json` records them under `stale_dirs`. The manifest is the
+authority on what the current graph contains; the directory listing is not.
 - **Parameters are excluded from the diagram.** 137 of the 143 buffers are
   weights; drawing them buries the topology. They are still accounted for in
   the per-layer tables.

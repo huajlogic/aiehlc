@@ -545,7 +545,28 @@ def split_layers(c_path, graph_path=None, out_dir=None, verify=True,
         manifest["syntax_check"] = "skipped (TVM headers not found)"
         print("  [split] syntax check skipped -- TVM headers not found")
 
+    # Directories this run did NOT produce. `_clear_stale` deliberately keeps
+    # a non-empty folder -- that is how an AIE-offloaded layer's `aie/`
+    # artifacts survive a re-split -- but the side effect is that a folder
+    # from an older, differently-shaped graph lingers forever once anything
+    # else drops a file into it. Two builds then leave two `01_*` folders side
+    # by side, and `ls layers/` silently disagrees with the manifest. Deleting
+    # them is not safe (that is exactly the AIE case); naming them is.
+    live = {e["dir"] for e in entries if e.get("dir")} if group else set()
+    manifest["stale_dirs"] = sorted(
+        p.name for p in out_dir.iterdir()
+        if p.is_dir() and p.name not in live) if group else []
+
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    if manifest["stale_dirs"] and verbose:
+        n = len(manifest["stale_dirs"])
+        print(f"  [split] {n} directory(ies) left over from an earlier build, "
+              f"NOT part of this graph (manifest.stale_dirs):")
+        for name in manifest["stale_dirs"][:3]:
+            print(f"      {name}/")
+        if n > 3:
+            print(f"      ... and {n - 3} more")
 
     if verbose:
         if group:

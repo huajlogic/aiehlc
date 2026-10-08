@@ -212,17 +212,33 @@ retargets every x86 build in the process. The rule is TVM's own
 folded into the bias by `QnnConv2DCanonicalize` — the same algebra as
 conv2dstem's `+128·Σw`. Measured: output **bit-identical**, `weights.bin`
 23.5 → 11.9 MB, board ELF 24.4 → 12.8 MB, against 30 → 120 graph nodes.
-**Auto-OFF under `--aie-offload` / `--aiegraph`**: the restructuring renumbers
-`layers/` (the stem moves from index 1 to 6) and `--aie-layers` selects by index,
-so leaving it on would silently offload a `layout_transform`; the flow prints why
-and `--pe-int8` forces it back on. **Bias,
+**ON for the AIE paths too** (it used to auto-disable there). The old guard was
+that int8 renumbers `layers/` — the stem moves from **index 1 to 6** — while
+`--aie-layers` selected positionally. Selection now resolves a layer to its conv
+by **weight fingerprint** (`byoc.aie_annotate.weight_fingerprint`: values sorted,
+cast int64, hashed), which is layout- and dtype-independent — the same weights
+hash identically as int8/NCHW, int16/NCHW and int16/NCHWc — and `check_targets`
+demands one Relay conv matching fingerprint *and* geometry. Keeping int8 off was
+also wrong on its own terms: the AIE kernel eats int8, so int16 legalization left
+the offloaded conv's operands the one thing not in the hardware's width.
+`--aie-layers` **defaults to 6**; a stale index now reports `not a conv -- only
+convs offload` rather than offloading the wrong op. `--aiegraph` still maps 0
+layers, but it already did (`byoc_aie_plan.md:160`, "0/28 eligible, confirmed") —
+it keys on fused *names* (`conv2d_add_relu`) that legalization renames. **Bias,
 requant multiplier and shift stay int32 and must** — bias lives at the
 `s_x·s_w` accumulator scale (23 bits here), the multiplier is a fixed-point
 scale in `[2³⁰,2³¹)`; together 0.5% of the blob.
 
-**`network.md` documents the compiled graph.** `network_md.py` (run every
-`deploy_flow.py`, after the offload/aiegraph stages so it reflects the *final*
-graph) turns `resnet18_graph.json` into `worklocal/tvmrelay_deploy/network.md`:
+**`network.md` documents the compiled graph.** One generator —
+`network_md.write_network_md`, pure and byte-reproducible — reached three ways:
+`deploy_flow.py` stage 6 (automatic, no flag), the `network_md.py` CLI, or a
+direct import. They never differ in logic, only in *what is on disk* when they
+run; deploy_flow calls it after the offload/aiegraph stages so it reflects the
+*final* graph. Missing `<stem>_params.bin` makes every constant reclassify as an
+activation (`parameters | 0`, no `param` rows) — now warned about loudly instead
+of silently. `network.md` and `graph_driver.c` both carry a `graph-sha` line;
+`grep -m1 graph-sha network.md arm_build/graph_driver.c` says whether they are
+the same build. It turns `resnet18_graph.json` into `worklocal/tvmrelay_deploy/network.md`:
 summary, a **Mermaid** dataflow chart with residual skips as dotted edges, a
 per-call layer table carrying `dtype[shape]` for every input, output **and
 parameter**, a per-argument detail table, a parameter rollup by dtype, and what
@@ -234,8 +250,15 @@ C by `kernel_param_usage`, keyed on the kernel's **arg slot** (layer 29's graph
 weight a multiplier. Indices printed are **entry indices**
 (`node_row_ptr[node]+k`) so rows line up with `make TRACE=1` dumps, and layer
 folders are matched by **kernel symbol** — stage 5 writes one folder per distinct
-kernel (28) while the graph makes 30 calls, so positional matching mislabels
-everything after the first repeated kernel.
+kernel while the graph makes more calls, so positional matching mislabels
+everything after the first repeated kernel. **Three numbering spaces are all
+called "layer 01"**: the call index (`network.md`'s `#`, and `[01]` in a
+`TRACE=1` dump), the folder's `NN_` prefix (distinct kernels, first-use order),
+and `--aie-layers` (the folder index *of the first build*). `layers/` also
+accumulates folders across builds — `_clear_stale` keeps non-empty dirs on
+purpose, so AIE `aie/` artifacts survive — so two `01_*` folders can coexist;
+stage 5 names the leftovers and `manifest.json` lists them in `stale_dirs`. The
+manifest is the authority, not `ls layers/`.
 
 **Tracing between layers: `make TRACE=1`, never a hand edit.** `graph_driver.c`
 carries a per-node dump of every kernel input/output behind `#ifdef GRAPH_TRACE`

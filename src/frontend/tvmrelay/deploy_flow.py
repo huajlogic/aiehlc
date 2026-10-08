@@ -700,6 +700,15 @@ def _stage_split(c_path, out_dir: Path, *, split: bool, compiles: bool,
         shown = [f"{e[key]}{'' if flat else '/'}" for e in layers["layers"][:4]]
         print(f"[5/7]          {', '.join(shown)}, ... "
               f"({layers['layer_count']} in execution order)")
+        # Folders from an earlier, differently-shaped graph survive on disk
+        # (see split_layers._clear_stale). Unreported, two builds leave two
+        # `01_*` folders and `ls layers/` disagrees with the manifest.
+        stale = layers.get("stale_dirs") or []
+        if stale:
+            print(f"[5/7]          NOTE {len(stale)} stale folder(s) from an "
+                  f"earlier build are still on disk and are NOT this graph: "
+                  f"{', '.join(stale[:2])}"
+                  f"{', ...' if len(stale) > 2 else ''}")
     return layers
 
 
@@ -843,7 +852,7 @@ def _stage_quantize(raw_path, model_path, out_dir: Path, *,
 def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         global_scale: float = 8.0, fuse: bool = True, split: bool = True,
         flat: bool = False, arm: bool = True, image=None,
-        aie_offload: bool = False, aie_layers=(0,),
+        aie_offload: bool = False, aie_layers=(6,),   # keep in step with --aie-layers
         aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
         aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
         relay_ptq: bool = False, local: bool = False, local_run: bool = True,
@@ -881,19 +890,37 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     # Declare the PE's operand width BEFORE any build: the rule is selected
     # by a target key, so it must be registered before relay.build runs.
     #
-    # `pe_int8=None` means "default": on, EXCEPT when an AIE stage is also
-    # requested. int8 legalization restructures the graph (30 -> 120 nodes),
-    # which renumbers layers/ -- the ResNet stem moves from index 1 to 6 -- and
-    # `--aie-layers` selects by that index, so the two together would silently
-    # offload a `layout_transform` and nothing else. Passing `--pe-int8`
-    # explicitly forces it on anyway; `--no-pe-int8` forces it off.
+    # `pe_int8=None` means "default: on", for every path including the AIE ones.
+    #
+    # This used to auto-disable under --aie-offload / --aiegraph, because int8
+    # legalization restructures the graph (30 -> 120 nodes) and renumbers
+    # `layers/` -- the ResNet stem moves from index 1 to 6 -- while
+    # `--aie-layers` was read as a position into the Relay graph. That guard is
+    # obsolete: selection now resolves a layer to its conv by WEIGHT FINGERPRINT
+    # (`byoc.aie_annotate.weight_fingerprint` -- sorted values hashed as int64),
+    # which is layout- and dtype-independent by construction, and
+    # `check_targets` demands exactly one Relay conv matching both the
+    # fingerprint and the geometry before anything is offloaded. Verified: the
+    # same weights hash identically as int8/NCHW, int16/NCHW and int16/NCHWc.
+    # `--aiegraph` never took a selection at all.
+    #
+    # Keeping it off was also the wrong default on its own terms: the AIE kernel
+    # consumes int8, so legalizing to int16 meant the offloaded conv's operands
+    # were the one thing NOT in the width the hardware wants.
+    #
+    # `--aie-layers` indices DO still move (the stem is 6, not 1) -- that was
+    # never the thing protecting correctness, since a wrong index now reports
+    # "not a conv -- only convs offload" and offloads nothing rather than
+    # offloading the wrong op.
+    #
+    # `--aiegraph` maps layers by fused NAME (`conv2d_add_relu` -> conv_bn_relu),
+    # and the legalized groups are called
+    # `contrib_conv2d_NCHWc_subtract_add_add_subtract_...`, so it matches 0
+    # layers here. That is NOT a regression from this change: it already matched
+    # 0/28 under the ONNX-PTQ default (doc/design/byoc_aie_plan.md:160). It runs
+    # clean and links; it just offloads nothing until that mapping is updated.
     if pe_int8 is None:
-        pe_int8 = not (aie_offload or aiegraph)
-        if not pe_int8 and verbose:
-            print("[1/7] pe     : int8 operand legalization OFF -- it "
-                  "renumbers layers/ and --aie-layers selects by index")
-            print("[1/7]          (pass --pe-int8 to force it; re-check your "
-                  "--aie-layers against layers/ if you do)")
+        pe_int8 = True
     target = None
     if pe_int8:
         from frontend.tvmrelay import pe_target as _pe
@@ -1082,10 +1109,12 @@ def main(argv=None) -> int:
                          "the generated C calls the aiehlc AIE library "
                          "(aout/libconv2dstem.a) in place of TVM's kernel. "
                          "Only the ResNet-18 stem has an AIE kernel today")
-    ap.add_argument("--aie-layers", default="1",
+    ap.add_argument("--aie-layers", default="6",
                     help="which layers to offload, as numbered in layers/ by "
                          "the CPU build: an index, a comma list, or 'all' "
-                         "(default: 1, the 7x7/s2 stem)")
+                         "(default: 6, the 7x7/s2 stem under the int8-legalized "
+                         "graph -- it was 1 before int8 split each conv into a "
+                         "zero-point chain; check layers/ if unsure)")
     ap.add_argument("--aie-ops", default=",".join(AIE_OP_KINDS),
                     help=f"op kinds eligible for AIE "
                          f"(default: {','.join(AIE_OP_KINDS)})")
