@@ -274,16 +274,57 @@ prints `code | bits<<8 | lanes<<16`, i.e. int16 shows as `69632`, uint8 as `6758
 `dl_dtype_str`/`graph_dump_tensor` are `static inline` and always emitted.
 
 `TRACE=1` *also* writes **every kernel input and output in full** as a
-compilable C hex header (`GRAPH_TRACE_HEX`, `graph_dump_hex`), one file per
-tensor per call, into **`layeriohex/` next to the running ELF** — so `make local
-run-local` fills `arm_build/layeriohex/`. Stem = C identifier prefix =
-`l<call>_<kernel>_<in|out><slot>`; the call index makes it unique, so the kernel
-name is truncated (`_HEX_NAME_FN_CHARS`) to stay under a 255-byte filename.
+compilable C hex header (`GRAPH_TRACE_HEX`), into **`layeriohex/` next to the
+running ELF** — so `make local run-local` fills `arm_build/layeriohex/`.
+**Two files per call, not one per tensor**: all inputs merge into
+`l06_<op>_in.h` and all outputs into `l06_<op>_out.h`, each tensor under its own
+variable prefix, so a conv's activation + weight + six quant constants are one
+`#include` (`graph_hex_file_begin` / `_tensor` / `_file_end`;
+`graph_dump_hex` = all three, for the one-per-file `param_*.h`). File stem =
+`l<call>_<op>_<in|out>`; variable prefix adds the slot and, for a parameter, its
+name and role — `l06_nn_contrib_conv2d_NCHWc_in1_p0_weight`. The op slug is deliberately
+**short** (`_HEX_NAME_FN_CHARS` = 30, cut at a word boundary, `tvmgen_default_fused_`
+prefix and trailing content hash stripped): the call index already makes the stem
+unique, so the symbol is description not identity, and at full length 95 identical
+characters pushed the distinguishing part off the edge of a terminal. The full
+symbol stays on the first line **inside** each file. 417 files (240 in/out
+groups + 177 params) holding 446 tensors, all stems unique. `graph_dump_hex` is
+`static inline` — under `TRACE_HEX_PARAMS=0` nothing calls it, and a plain
+`static` warns; **`-fsyntax-only` does not report `-Wunused-function`**, so the
+trace flag matrix must be compiled for real (`-c`) to catch it.
 Header carries `_DTYPE`/`_NDIM`/`_ELEMS`/`_BYTES` + `_shape[]` so it decodes on
 its own; the payload is **bytes** (the on-the-wire buffer image) where
 `graph_dump_tensor` gives elements. Knobs: `TRACE_HEX=0` off, `TRACE_HEX_MAX=N`
 cap (sets `_TRUNCATED`), `make clean-hex`. ~100 MB on int8 ResNet-18 — params are
-kernel inputs and are dumped per call, deliberately. **Only the hosted build gets
+kernel inputs and are dumped per call, deliberately.
+
+**Activations carry their producer**, because a layer can take several and a
+bare `(in)` cannot tell them apart (`_dataflow`/`_flow_note`): `in, from call
+[05] repeat_multiply_layout`, `in, network input`, `out, read by call [07]`.
+The trap this closes: layer 06's `in[2]` is `int32[1,16,112,112,4]`, the **same
+geometry as the conv's own output** (`uint8`), so it reads like a feedback edge.
+It is not — it is call [05]'s output, the tail of the `cast_sum → multiply →
+avg_pool2d → repeat_multiply` chain from call [02], which is qnn's
+**weight-zero-point correction term** (`term2`); the kernel subtracts it, hence
+the `subtract` in its fused name. Dtype is the giveaway, not shape. All 148
+producer claims verified against the graph JSON.
+
+**Parameters are named, not just numbered.** A conv's `_in3`/`_in4`/`_in6` are
+indistinguishable, so every input that is a graph parameter gets
+`_<name>_<role>` (`_in1_p0_weight`, `_in6_p5_requant_multiplier`) plus
+`weights.bin@<off>+<n>` in the provenance, and `graph_dump_params()` writes each
+constant **once** by name (`param_p0_weight.h`) — deduplicated, including ones no
+call reads. `TRACE_HEX_PARAMS=0` drops that set (~72 MB). Roles come from
+`network_md.kernel_param_usage`/`param_role`, the same classifier behind
+`network.md`'s tables — verified to agree for all 41 parameter-bearing calls.
+Two traps: `pN` is literally `args[N]` in the generated C, so a classifier slot
+indexes the driver's input list directly; and **a role may only be applied to a
+slot that is also a parameter** — the classifier labels activations too, and
+layer 06's image input lands in an `add`, so it would file as a "bias". A slot
+absent from `kernel_param_usage` means `unused`, which is a verdict, not a
+missing entry — `_param_roles` fills every slot so the two cannot be confused.
+
+**Only the hosted build gets
 `-DGRAPH_TRACE_HEX_FILES`**: a baremetal board has no filesystem, so it streams
 the identical text over the console between `===BEGIN layeriohex/...===` markers
 and `arm_build.split_layeriohex(log)` cuts it back into byte-identical files

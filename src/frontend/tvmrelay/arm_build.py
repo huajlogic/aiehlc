@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -484,13 +485,21 @@ def _driver_init(sids, shapes, dltypes, offsets, nodes, eid) -> list:
 
 
 def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
-                    verbose: bool = True) -> dict:
+                    c_source=None, verbose: bool = True) -> dict:
     """Emit ``graph_driver.c``, ``tvm_runtime_shim.c`` and ``main.c``.
 
     The driver replaces TVM's C++ graph runtime with straight-line C: one
     static buffer per distinct ``storage_id`` (TVM has already done the
     liveness analysis and aliased what it can), the weights pointed at the
     linked blob, and one call per graph node in order.
+
+    *c_source* is the generated module C (``resnet18.c``). It is read only to
+    name the ``GRAPH_TRACE_HEX`` parameter dumps by ROLE -- weight, bias,
+    zero-point, requant multiplier, requant shift -- which cannot be told apart
+    from the graph alone: they are all just int32 constants wired into a kernel.
+    Optional, because this function is callable on a graph with no C beside it;
+    without it the dumps still carry each parameter's graph name, only not what
+    it does.
 
     Returns a summary dict (buffer count, workspace bytes, node count).
     """
@@ -593,6 +602,19 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
                                         offsets, nodes, eid)
     lines += init_lines
 
+    # Entry index -> (graph name, blob offset, bytes) for every weight, as
+    # opposed to an activation. Drives the layeriohex naming: "which of these
+    # is a parameter, which parameter, and what does it do" is the first thing
+    # asked of a traced call, and none of it is visible from the tensor.
+    # The blob offset rides along so a dumped weight can be checked straight
+    # against weights.bin.
+    param_of = {eid(i): (node["name"], *offsets[node["name"]])
+                for i, node in enumerate(nodes)
+                if node.get("op") == "null" and node["name"] in offsets}
+    roles = _param_roles(c_source, nodes)
+    flow = _dataflow(nodes, eid)
+    lines += _param_dump_lines(param_of, roles, nodes, eid)
+
     # The input node: first arg_node with no matching parameter.
     input_idx = next(i for i, node in enumerate(nodes)
                      if node.get("op") == "null"
@@ -613,16 +635,16 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         "    int32_t codes[GRAPH_MAX_ARGS];",
         "    for (int i = 0; i < GRAPH_MAX_ARGS; ++i)",
         "        codes[i] = 7;   /* kTVMDLTensorHandle */",
+        # Here rather than in main.c: graph_init() has run by now (main.c calls
+        # it first), the constants are in their buffers, and a second inference
+        # must not rewrite 177 files.
+        "#ifdef GRAPH_TRACE_HEX",
+        "#ifndef GRAPH_TRACE_HEX_NO_PARAMS",
+        "    { static int once; if (!once) { once = 1; graph_dump_params(); } }",
+        "#endif",
+        "#endif",
         "",
     ]
-
-    # Entry indices that hold a weight rather than an activation. Only used to
-    # label the layeriohex provenance comment: both are kernel inputs and both
-    # are dumped, but "which of these is a parameter" is the first question
-    # asked of a traced call, and it is not visible from the tensor itself.
-    param_eids = frozenset(eid(i) for i, node in enumerate(nodes)
-                           if node.get("op") == "null"
-                           and node["name"] in offsets)
 
     n_calls = 0
     for node_idx, node in enumerate(nodes):
@@ -640,9 +662,11 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         arg_eids = in_eids + out_eids
         for slot, tensor_idx in enumerate(arg_eids):
             lines.append(f"    args[{slot}].v_handle = &tensors[{tensor_idx}];")
-        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "in", param_eids)
+        tl = dict(param_of=param_of, roles=roles.get(fn, {}), nodes=nodes,
+                  flow=flow)
+        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "in", **tl)
         lines.append(f"    {fn}(args, codes, {len(arg_eids)}, 0, 0, 0);")
-        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "out", param_eids)
+        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "out", **tl)
         lines.append("")
         n_calls += 1
 
@@ -813,13 +837,41 @@ static void graph_hex_close(FILE *f, const char *name) {
 }
 #endif
 
-/* `name` is the file stem AND the C identifier prefix. It is generated
- * (l<NN>_<fn>_<in|out><slot>), so it is unique per call and a valid
- * identifier by construction -- nothing here has to sanitize it.
- * `provenance` is the static description arm_build.py already knows: call
- * index, kernel symbol, argument slot, and whether the tensor is a parameter.
+/* Open one layeriohex file: header comment and include guard.
+ * `stem` is the filename AND the guard name. Returns 0 if it could not be
+ * opened, so the caller skips the whole group rather than writing a file with
+ * a guard and no `#endif`. */
+static FILE *graph_hex_file_begin(const char *stem, const char *title) {
+    FILE *f = graph_hex_open(stem);
+    if (!f) return 0;
+    fprintf(f, "/* Written by graph_driver.c under `make TRACE=1` -- "
+               "regenerated every run, do not edit.\\n"
+               " * %s\\n */\\n", title);
+    fprintf(f, "#ifndef LAYERIOHEX_%s_H\\n#define LAYERIOHEX_%s_H\\n", stem, stem);
+    return f;
+}
+
+static void graph_hex_file_end(FILE *f, const char *stem) {
+    fprintf(f, "\\n#endif\\n");
+    graph_hex_close(f, stem);
+}
+
+/* One tensor -- macros, shape, hex bytes -- into an ALREADY-OPEN file.
+ *
+ * A layer's inputs all land in one `..._in.h` and its outputs in one
+ * `..._out.h`, each under its own `var` prefix, so one `#include` brings in
+ * everything that call saw instead of nine.
+ *
+ * `var` is the C identifier prefix, generated as
+ * `l<NN>_<op>_<in|out><slot>[_<param>_<role>]`: unique within the file by the
+ * argument slot, and a valid identifier by construction, so nothing here has
+ * to sanitize it. `prov` is the static description arm_build.py already knows
+ * -- argument slot, tensor index, and for a parameter its name, role and
+ * offset in weights.bin.
  */
-static void graph_dump_hex(const char *name, int idx, const char *provenance) {
+static void graph_hex_tensor(FILE *f, const char *var, int idx,
+                             const char *prov) {
+    const char *name = var;
     const DLTensor *t = &tensors[idx];
     char ds[24];
     long long numel = 1, nbytes, shown;
@@ -830,13 +882,7 @@ static void graph_dump_hex(const char *name, int idx, const char *provenance) {
     if (GRAPH_TRACE_HEX_MAX_BYTES > 0 && shown > GRAPH_TRACE_HEX_MAX_BYTES)
         shown = GRAPH_TRACE_HEX_MAX_BYTES;
 
-    FILE *f = graph_hex_open(name);
-    if (!f) return;
-    fprintf(f, "/* Written by graph_driver.c under `make TRACE=1` -- "
-               "regenerated every run, do not edit.\\n"
-               " * %s\\n */\\n", provenance);
-    fprintf(f, "#ifndef LAYERIOHEX_%s_H\\n#define LAYERIOHEX_%s_H\\n\\n",
-            name, name);
+    fprintf(f, "\\n/* %s */\\n", prov);
     fprintf(f, "#define %s_DTYPE \\"%s\\"\\n", name,
             dl_dtype_str(t->dtype, ds, sizeof ds));
     fprintf(f, "#define %s_NDIM  %d\\n", name, t->ndim);
@@ -858,36 +904,230 @@ static void graph_dump_hex(const char *name, int idx, const char *provenance) {
         if ((i % 16) == 15) fputc('\\n', f);
     }
     if (shown % 16) fputc('\\n', f);
-    fprintf(f, "};\\n\\n#endif\\n");
-    graph_hex_close(f, name);
+    fprintf(f, "};\\n");
+}
+
+/* One tensor alone in its own file -- what graph_dump_params() wants, since a
+ * graph constant belongs to no single layer.
+ *
+ * `static inline`, like the other optional helpers above: under
+ * GRAPH_TRACE_HEX_NO_PARAMS there is no graph_dump_params() to call it, and a
+ * plain `static` would warn (-Wunused-function) in a build that is otherwise
+ * clean. -fsyntax-only does NOT report this, so it has to be compiled for real
+ * to see it. */
+static inline void graph_dump_hex(const char *name, int idx, const char *prov) {
+    FILE *f = graph_hex_file_begin(name, prov);
+    if (!f) return;
+    graph_hex_tensor(f, name, idx, prov);
+    graph_hex_file_end(f, name);
 }
 #endif  /* GRAPH_TRACE_HEX */
 """
 
 
-#: Longest kernel-symbol slice allowed inside a layeriohex file stem. The call
-#: index already makes the stem unique, so this only has to keep
-#: ``l07_<fn>_in2.h`` inside a filesystem's 255-byte name limit -- TVM's fused
-#: names run past 180 characters on their own.
-_HEX_NAME_FN_CHARS = 90
+def _dataflow(nodes: list, eid) -> tuple:
+    """``(produced_by, consumed_by, call_of)`` over entry indices.
 
+    Answers the question a bare ``(in)`` label cannot: where did this activation
+    come from, and who reads what this call produced. Layer 06 takes two
+    activations -- its feature map from call [01], and an ``int32`` tensor from
+    call [05] with the *same* geometry as its own output, which reads exactly
+    like the conv's output fed back into itself until you see the producer.
 
-def _hex_name(call_idx: int, fn: str, where: str, slot: int) -> str:
-    """File stem and C identifier prefix for one traced tensor.
-
-    ``l03_fused_nn_contrib_conv2d_NCHWc_add_..._in1``. Unique by the call
-    index, so the truncated kernel name is provenance rather than identity.
-    The leading letter matters: the stem is pasted straight into
-    ``static const ... <stem>_data``, and an identifier cannot start with a
-    digit.
+    ``call_of`` maps a node index to the call index used in the trace, counting
+    the same way the emission loop does -- ``__nop`` nodes are elided and do not
+    take a number, so any other rule would shift every label after the first one.
     """
-    short = fn[len("tvmgen_default_"):] if fn.startswith("tvmgen_default_") else fn
-    short = "".join(c if (c.isalnum() or c == "_") else "_" for c in short)
-    return f"l{call_idx:02d}_{short[:_HEX_NAME_FN_CHARS]}_{where}{slot}"
+    produced_by, consumed_by, call_of = {}, {}, {}
+    n = 0
+    for i, node in enumerate(nodes):
+        if node.get("op") == "tvm_op" and node["attrs"]["func_name"] != "__nop":
+            call_of[i] = n
+            n += 1
+        for k in range(int(node.get("attrs", {}).get("num_outputs", 1))):
+            produced_by[eid(i, k)] = i
+    for i, node in enumerate(nodes):
+        if node.get("op") != "tvm_op":
+            continue
+        for src, slot, _ in node.get("inputs", []):
+            consumed_by.setdefault(eid(src, slot), []).append(i)
+    return produced_by, consumed_by, call_of
+
+
+def _flow_note(eid_: int, where: str, nodes: list, flow: tuple) -> str:
+    """Human-readable origin (for an input) or destination (for an output)."""
+    produced_by, consumed_by, call_of = flow
+    if where == "in":
+        src = produced_by.get(eid_)
+        if src is None:
+            return "in"
+        node = nodes[src]
+        if node.get("op") != "tvm_op":
+            return "in, network input"
+        fn = node["attrs"]["func_name"]
+        if fn == "__nop":
+            return "in, from an elided reshape"
+        return f"in, from call [{call_of[src]:02d}] {_kernel_slug(fn)}"
+    readers = [call_of[c] for c in consumed_by.get(eid_, []) if c in call_of]
+    if not readers:
+        return "out, network output"
+    return "out, read by " + ", ".join(f"call [{c:02d}]" for c in readers)
+
+
+def _param_roles(c_source, nodes: list) -> dict:
+    """``{kernel symbol: {arg slot: role}}`` read out of the generated C.
+
+    Reuses ``network_md.kernel_param_usage`` / ``param_role`` -- the same
+    classifier that labels ``network.md``'s parameter tables, so the two cannot
+    disagree about what a constant is for. It keys on the kernel's own ``pN``
+    argument slot, and ``pN`` is literally ``args[N]`` in the emitted C
+    (``void* p0 = ((TVMValue*)args)[0].v_handle``), so a slot indexes the
+    driver's input list directly.
+
+    **Only a slot that is also a parameter may take its role.** The classifier
+    labels every slot it sees, activations included -- layer 06's image input
+    lands in an ``add`` and would otherwise be filed as a "bias". The caller
+    gates on ``param_of``.
+
+    Returns ``{}`` when there is no C to read, or when anything about it is
+    unexpected: a missing label is a cosmetic loss, while a wrong one sends
+    whoever reads the dump after the wrong tensor.
+    """
+    if not c_source:
+        return {}
+    try:
+        from frontend.tvmrelay.network_md import kernel_param_usage, param_role
+
+        src = Path(c_source).read_text()
+    except Exception:
+        return {}
+    out = {}
+    for node in nodes:
+        if node.get("op") != "tvm_op":
+            continue
+        fn = node["attrs"]["func_name"]
+        if fn == "__nop" or fn in out:
+            continue
+        try:
+            usage = kernel_param_usage(src, fn)
+            # EVERY input slot, not just the ones the C mentions. A slot the
+            # kernel never references is "unused" -- a real verdict, and the
+            # one network.md prints -- and leaving it out of the dict would
+            # make it indistinguishable from "no C was read at all".
+            out[fn] = {slot: param_role(usage.get(slot, set()))
+                       for slot in range(len(node["inputs"]))}
+        except Exception:
+            out[fn] = {}
+    return out
+
+
+def _role_slug(role: str) -> str:
+    """``"requant multiplier"`` -> ``"requant_multiplier"``.
+
+    The stem is pasted into ``static const ... <stem>_data``, so a role with a
+    space or a hyphen in it would emit C that does not compile.
+    """
+    return "".join(c if (c.isalnum() or c == "_") else "_" for c in role)
+
+
+def _param_dump_lines(param_of: dict, roles: dict, nodes: list, eid) -> list:
+    """``graph_dump_params()`` -- every parameter once, by name and role.
+
+    The per-call dumps already carry parameters, but only as the Nth input of
+    some kernel: a weight shared by several calls is written once per call, and
+    a parameter no traced call reads is never written at all. This is the
+    by-name view -- one file per graph constant, deduplicated, including the
+    ones the classifier calls ``unused``.
+
+    It is a separate switch (``TRACE_HEX_PARAMS=0``) because the blob is 11.9 MB
+    and hex is ~6x, so this alone is ~72 MB on top of the per-call dumps.
+    """
+    # The first kernel slot each parameter is wired into -- that is the only
+    # place its role is observable, since a role comes from how the C uses it.
+    role_of = {}
+    for node_idx, node in enumerate(nodes):
+        if node.get("op") != "tvm_op":
+            continue
+        fn = node["attrs"]["func_name"]
+        for slot, (src, s, _) in enumerate(node["inputs"]):
+            e = eid(src, s)
+            if e in param_of and e not in role_of:
+                role_of[e] = roles.get(fn, {}).get(slot, "")
+
+    out = ["#ifdef GRAPH_TRACE_HEX",
+           "#ifndef GRAPH_TRACE_HEX_NO_PARAMS",
+           "/* Every graph constant, once, named by what it IS rather than by",
+           " * which argument of which kernel happened to reference it. */",
+           "static void graph_dump_params(void) {"]
+    for e, (name, off, nbytes) in sorted(param_of.items()):
+        role = role_of.get(e, "") or "unused"
+        stem = f"param_{name}_{_role_slug(role)}"
+        out.append(f'    graph_dump_hex("{stem}", {e}, "graph parameter {name} '
+                   f'({role}) = tensors[{e}] -- weights.bin@{off}+{nbytes}");')
+    out += ["}", "#endif", "#endif", ""]
+    return out
+
+
+#: Budget for the descriptive op slug inside a layeriohex stem. Small on
+#: purpose. The call index already makes the stem unique, so the kernel name is
+#: there to say what the layer DOES, not to identify it -- and a 95-character
+#: symbol repeated across ten files means ``ls`` shows ten identical-looking
+#: names whose only difference is off the right edge of the terminal. The full
+#: symbol is on the first line inside every file, so nothing is lost.
+_HEX_NAME_FN_CHARS = 30
+
+#: A trailing content hash on a fused symbol
+#: (``..._per_channel_ca76d0071d109ff1_``). Pure noise in a filename.
+_FN_HASH_TAIL = re.compile(r"_[0-9a-f]{8,}_?$")
+
+
+def _kernel_slug(fn: str) -> str:
+    """Short, readable op name for a file stem: ``nn_contrib_conv2d_NCHWc``.
+
+    Drops TVM's ``tvmgen_default_fused_`` prefix and the trailing content hash,
+    then takes whole ``_``-separated words up to :data:`_HEX_NAME_FN_CHARS` --
+    cutting mid-word gives ``..._fixed_point_multip`` and reads like damage.
+    Two different kernels may well slug the same; that is fine and cannot
+    collide, because the call index disambiguates.
+    """
+    for prefix in ("tvmgen_default_fused_", "tvmgen_default_", "fused_"):
+        if fn.startswith(prefix):
+            fn = fn[len(prefix):]
+            break
+    fn = _FN_HASH_TAIL.sub("", fn)
+    fn = "".join(c if (c.isalnum() or c == "_") else "_" for c in fn)
+    out = ""
+    for word in fn.split("_"):
+        if not word:
+            continue
+        if out and len(out) + 1 + len(word) > _HEX_NAME_FN_CHARS:
+            break
+        out = f"{out}_{word}" if out else word
+    return out[:_HEX_NAME_FN_CHARS] or "op"
+
+
+def _hex_name(call_idx: int, fn: str, where: str, slot=None,
+              suffix: str = "") -> str:
+    """Name for a traced group or one tensor in it.
+
+    ``slot=None`` gives the **file** stem, ``l06_nn_contrib_conv2d_NCHWc_in`` --
+    one file for all of a call's inputs, one for its outputs. With a slot it
+    gives the **variable** prefix inside that file,
+    ``l06_nn_contrib_conv2d_NCHWc_in1_p0_weight`` -- layer, what it does, which
+    argument, and for a parameter which one and what it is for.
+
+    The leading letter matters: both are pasted straight into C -- as an include
+    guard and as ``static const ... <var>_data`` -- and an identifier cannot
+    start with a digit. *suffix* carries the parameter name and role, the whole
+    point being that ``_in3`` on its own says nothing.
+    """
+    tail = "" if slot is None else str(slot)
+    return f"l{call_idx:02d}_{_kernel_slug(fn)}_{where}{tail}{suffix}"
 
 
 def _trace_lines(call_idx: int, fn: str, in_eids: list, out_eids: list,
-                 where: str, param_eids=frozenset()) -> list:
+                 where: str, param_of=None, roles=None, nodes=None,
+                 flow=None) -> list:
     """``#ifdef GRAPH_TRACE`` dump around one kernel call. ``where`` is in|out.
 
     Generated rather than hand-added, so instrumenting a node survives the
@@ -898,10 +1138,23 @@ def _trace_lines(call_idx: int, fn: str, in_eids: list, out_eids: list,
     ``graph_dump_tensor`` prints the first few DECODED elements to the console,
     and ``graph_dump_hex`` (``GRAPH_TRACE_HEX``, which ``TRACE=1`` turns on
     unless ``TRACE_HEX=0``) writes the whole buffer to ``layeriohex/`` as a C
-    header. *param_eids* only shapes the provenance comment -- weights are
-    kernel inputs like any other and are dumped too, since a mismatch is as
-    often in a parameter as in an activation.
+    header.
+
+    **One file per direction, not per tensor.** All of a call's inputs go into
+    ``l06_<op>_in.h`` and its outputs into ``l06_<op>_out.h``, each tensor under
+    its own variable prefix. A conv's activation, weight and six quantization
+    constants are one ``#include`` rather than eight, and the set cannot be
+    split up by accident.
+
+    Parameters are dumped like any other input -- a mismatch is as often in a
+    weight as in an activation -- but they are NAMED: *param_of* gives the graph
+    constant behind an entry index and *roles* what the kernel does with that
+    argument slot, so the variable is ``..._in1_p0_weight`` rather than
+    ``..._in1``. A role is applied only to a slot that is also in *param_of*:
+    the classifier labels activations too, and layer 06's image input lands in
+    an ``add``, which would file it as a "bias".
     """
+    param_of, roles = param_of or {}, roles or {}
     eids = in_eids if where == "in" else out_eids
     tag = "   in " if where == "in" else "   out"
     out = ["#ifdef GRAPH_TRACE"]
@@ -909,14 +1162,34 @@ def _trace_lines(call_idx: int, fn: str, in_eids: list, out_eids: list,
         out.append(f'    printf("[{call_idx:02d}] {fn}\\n");')
     out += [f'    graph_dump_tensor("{tag}", {t}, GRAPH_TRACE_ELEMS);'
             for t in eids]
-    out.append("#ifdef GRAPH_TRACE_HEX")
+
+    stem = _hex_name(call_idx, fn, where)
+    title = (f"call [{call_idx:02d}] {fn} -- {len(eids)} {where}put(s)")
+    out += ["#ifdef GRAPH_TRACE_HEX",
+            "    {",
+            f'        FILE *hf = graph_hex_file_begin("{stem}", "{title}");',
+            "        if (hf) {"]
     for slot, t in enumerate(eids):
-        role = "param" if t in param_eids else where
-        prov = (f"call [{call_idx:02d}] {fn} -- {where}[{slot}] "
-                f"= tensors[{t}] ({role})")
-        out.append(f'    graph_dump_hex("{_hex_name(call_idx, fn, where, slot)}"'
-                   f', {t}, "{prov}");')
-    out += ["#endif", "#endif"]
+        suffix = ""
+        if where == "in" and t in param_of:
+            name, off, nbytes = param_of[t]
+            role = roles.get(slot, "") or "param"
+            suffix = f"_{name}_{_role_slug(role)}"
+            what = f"param {name}, {role}, weights.bin@{off}+{nbytes}"
+        elif flow and nodes is not None:
+            # An activation: say where it came from / goes to. Without this a
+            # tensor that merely SHARES a shape with this call's output reads
+            # like the output fed back in.
+            what = _flow_note(t, where, nodes, flow)
+        else:
+            what = where
+        prov = f"{where}[{slot}] = tensors[{t}] ({what})"
+        var = _hex_name(call_idx, fn, where, slot, suffix)
+        out.append(f'            graph_hex_tensor(hf, "{var}", {t}, "{prov}");')
+    out += [f'            graph_hex_file_end(hf, "{stem}");',
+            "        }",
+            "    }",
+            "#endif", "#endif"]
     return out
 
 
@@ -1240,6 +1513,12 @@ LOCAL_LDLIBS ?= -lm
 # TRACE_HEX=0 keeps the console trace but drops the headers; TRACE_HEX_MAX=N
 # caps each file at N bytes of payload.
 #
+# Parameters are dumped twice over, on purpose: once per call that reads them
+# (named `..._in1_p0_weight.h`, so a layer's view is complete on its own), and
+# once by name in `param_p0_weight.h` (deduplicated, and covering constants no
+# traced call reads). TRACE_HEX_PARAMS=0 drops the second set -- it is the
+# expensive one, since the whole 11.9 MB blob in hex is ~72 MB.
+#
 # Only the HOSTED build gets -DGRAPH_TRACE_HEX_FILES. A baremetal board has no
 # filesystem -- under xsdb the console is the only channel -- so there the same
 # text streams to stdout between BEGIN/END markers and
@@ -1251,6 +1530,9 @@ TRACE_DEFS := -DGRAPH_TRACE $(if $(TRACE_ELEMS),-DGRAPH_TRACE_ELEMS=$(TRACE_ELEM
 ifneq ($(TRACE_HEX),0)
 TRACE_DEFS += -DGRAPH_TRACE_HEX \\
               $(if $(TRACE_HEX_MAX),-DGRAPH_TRACE_HEX_MAX_BYTES=$(TRACE_HEX_MAX),)
+ifeq ($(TRACE_HEX_PARAMS),0)
+TRACE_DEFS += -DGRAPH_TRACE_HEX_NO_PARAMS
+endif
 LOCAL_HEX_DEFS := -DGRAPH_TRACE_HEX_FILES
 endif
 CFLAGS       += $(TRACE_DEFS)
@@ -1646,14 +1928,41 @@ make local TRACE=1 TRACE_HEX=0      # console trace only, no layeriohex/
 
 `TRACE=1` does two things. The lines above are the first; the second is that
 **every** kernel input and output is written out *in full* as a compilable C
-header of hex bytes, one file per tensor per call, into `layeriohex/` —
-relative to wherever the ELF runs, so `make local run-local` fills
-`arm_build/layeriohex/`.
+header of hex bytes into `layeriohex/` — relative to wherever the ELF runs, so
+`make local run-local` fills `arm_build/layeriohex/`.
+
+**Two files per call**, not one per tensor: everything a layer read goes into
+`..._in.h` and everything it wrote into `..._out.h`, each tensor under its own
+variable name. A conv's activation, weight and six quantization constants are
+one `#include` rather than eight, and the set cannot be split up by accident.
 
 ```
-layeriohex/l00_fused_divide_round_add_clip_cast_subtract_layout_transform_in0.h
-layeriohex/l00_fused_divide_round_add_clip_cast_subtract_layout_transform_out0.h
-layeriohex/l01_fused_nn_contrib_conv2d_NCHWc_add_..._in1.h
+layeriohex/l06_nn_contrib_conv2d_NCHWc_in.h     <- all 9 inputs
+layeriohex/l06_nn_contrib_conv2d_NCHWc_out.h    <- the output
+layeriohex/param_p0_weight.h                    <- by name, once (see below)
+```
+
+```c
+/* Written by graph_driver.c under `make TRACE=1` -- regenerated every run, do not edit.
+ * call [06] tvmgen_default_fused_nn_contrib_conv2d_NCHWc_..._ca76d0071d109ff1_ -- 9 input(s)
+ */
+#ifndef LAYERIOHEX_l06_nn_contrib_conv2d_NCHWc_in_H
+#define LAYERIOHEX_l06_nn_contrib_conv2d_NCHWc_in_H
+
+/* in[0] = tensors[2] (in, from call [01] layout_transform) */
+#define l06_nn_contrib_conv2d_NCHWc_in0_DTYPE "int8"
+#define l06_nn_contrib_conv2d_NCHWc_in0_ELEMS 158700LL
+static const long long l06_nn_contrib_conv2d_NCHWc_in0_shape[5] = { 1, 1, 230, 230, 3 };
+static const unsigned char l06_nn_contrib_conv2d_NCHWc_in0_data[158700LL] = { ... };
+
+/* in[1] = tensors[3] (param p0, weight, weights.bin@3895354+9408) */
+#define l06_nn_contrib_conv2d_NCHWc_in1_p0_weight_DTYPE "int8"
+static const long long l06_nn_contrib_conv2d_NCHWc_in1_p0_weight_shape[6] = { 16, 1, 7, 7, 3, 4 };
+static const unsigned char l06_nn_contrib_conv2d_NCHWc_in1_p0_weight_data[9408LL] = { ... };
+
+/* in[5] = tensors[11] (param p4, zero-point, weights.bin@3617582+256) */
+...
+#endif
 ```
 
 ```c
@@ -1676,9 +1985,105 @@ static const unsigned char l01_..._in1_data[18816LL] = {
 #endif
 ```
 
-The stem is `l<call>_<kernel>_<in|out><slot>`, which is both the filename and
-the C identifier prefix — the call index makes it unique, so the kernel name
-is only provenance and is truncated to keep the filename under 255 bytes.
+The **file** stem is `l<call>_<op>_<in|out>`; the **variable** prefix inside it
+adds the argument slot and, for a parameter, its name and role:
+`l<call>_<op>_<in|out><slot>[_<param>_<role>]`. Both are pasted straight into C
+— as the include guard and as `static const … <var>_data`.
+
+The **op slug is deliberately short** (30 chars, cut at a word boundary, with
+TVM's `tvmgen_default_fused_` prefix and the trailing content hash removed).
+The call index already makes the stem unique, so the op name is there to say
+what the layer *does*, not to identify it — and the raw symbol is 95
+characters, which made ten files in one layer look identical in `ls` with the
+only difference off the right edge of the terminal. Everything that
+distinguishes a file from its neighbours is now inside the first 40 characters,
+and the **full symbol is still on the first line inside every file**, so
+nothing is lost:
+
+```c
+/* Written by graph_driver.c under `make TRACE=1` -- regenerated every run, do not edit.
+ * call [06] tvmgen_default_fused_nn_contrib_conv2d_NCHWc_subtract_add_add_subtract_fixed_point_multiply_per_ca76d0071d109ff1_
+ *   -- in[1] = tensors[3] (param p0, weight, weights.bin@3895354+9408)
+ */
+```
+
+Two kernels may well slug the same; that cannot collide, because the call index
+disambiguates. Verified on int8 ResNet-18: **417 files** (240 in/out groups +
+177 parameters) holding 446 tensors, all stems unique.
+
+### Activations say where they came from
+
+A layer can take **several** activations, and a bare `(in)` on each is not
+enough to tell them apart. Layer 06 is the standard trap:
+
+```
+in[0] = tensors[2] (in, from call [01] layout_transform)        int8  [1,1,230,230,3]
+in[2] = tensors[8] (in, from call [05] repeat_multiply_layout)  int32 [1,16,112,112,4]
+out[0] = tensors[15] (out, read by call [07])                   uint8 [1,16,112,112,4]
+```
+
+`in[2]` has the **same geometry as this call's own output**, so it reads like
+the conv's output fed back into itself. It is not: it is the output of call
+[05], the tail of the `cast_sum -> multiply -> avg_pool2d -> repeat_multiply`
+chain that starts at call [02]. That chain is qnn's **weight-zero-point
+correction term** — sum the input over channels, window-sum it with the same
+7x7/s2 geometry, scale by the per-output-channel kernel zero point — and the
+kernel *subtracts* it, which is the `subtract` in its own fused name. The
+dtypes are the giveaway: the correction is `int32`, the conv's output `uint8`.
+
+So every activation carries its producer, `network input` if it is the image,
+and every output carries its readers or `network output`. Verified: all 148
+producer claims agree with the graph JSON.
+
+### Parameters are named, not just numbered
+
+A conv takes its activation, its weight, and five or six int32 constants. As
+`_in3` / `_in4` / `_in6` those are indistinguishable, so every input that is a
+graph **parameter** carries its name and its role:
+
+| role | what it is |
+|---|---|
+| `weight` | the int32 MAC multiply |
+| `bias` | added into the accumulator |
+| `zero_point` | subtracted |
+| `requant_multiplier` | the **int64**-widened multiply |
+| `requant_shift` | the requantization shift |
+| `copied` | only re-laid-out, no arithmetic role |
+| `unused` | wired in, never referenced |
+
+The role comes from `network_md.kernel_param_usage` / `param_role` — the same
+classifier behind `network.md`'s parameter tables, so the two cannot disagree
+about what a constant is for; the labels are cross-checked against it for all
+41 parameter-bearing calls. It keys on the kernel's own argument slot, and
+`pN` is literally `args[N]` in the generated C, so a slot indexes this list
+directly. **Only a slot that is also a parameter takes a role**: the classifier
+labels activations too, and layer 06's image input lands in an `add`, which
+would otherwise file it as a "bias".
+
+The provenance line also carries the blob offset, so a dumped weight is
+checkable straight against `weights.bin`:
+
+```
+ * call [06] tvmgen_default_fused_nn_contrib_conv2d_NCHWc_... -- in[1]
+ *   = tensors[3] (param p0, weight, weights.bin@3895354+9408)
+```
+
+```bash
+dd if=weights.bin bs=1 skip=3895354 count=9408 of=ref.bin   # == the dumped bytes
+```
+
+### `param_*.h` — every constant once, by name
+
+The `..._in.h` groups are per **call**, so a weight read by several calls
+appears in each of their headers. `graph_dump_params()` is the other view: one
+file per graph constant — `param_p0_weight.h`, `param_p5_requant_multiplier.h`
+— deduplicated, and covering constants no traced call reads at all. These stay
+one-per-file rather than merged, because a graph constant belongs to no single
+layer and the merged file would be the whole 72 MB blob. It runs once, from the
+top of `graph_run()`, after `graph_init()` has filled the buffers.
+
+`TRACE_HEX_PARAMS=0` drops this set and keeps the per-call ones. It is the
+expensive half: the blob is 11.9 MB and hex is ~6x, so it alone is ~72 MB.
 
 **Bytes, not decoded elements, and on purpose.** This is the on-the-wire image
 of the buffer; the element view is what `graph_dump_tensor()` prints. The
@@ -1689,14 +2094,16 @@ way to misread this data.
 | knob | effect |
 |---|---|
 | `TRACE_HEX=0` | keep the console trace, write no headers |
+| `TRACE_HEX_PARAMS=0` | drop the `param_*.h` set, keep the per-call dumps |
 | `TRACE_HEX_MAX=N` | cap each file at N bytes of payload (`_TRUNCATED` is defined in the header when it bites) |
 | `make clean-hex` | delete `layeriohex/` — deliberately **not** part of `clean-local`, so rebuilding does not discard a dump |
 
-It is not small: the full int8 ResNet-18 is roughly **100 MB** of text, because
-parameters are kernel inputs too and a weight used by one call is dumped for
-that call. They are dumped rather than skipped because a mismatch lands in a
-parameter as often as in an activation — `TRACE_HEX_MAX` is the lever when you
-only need the leading bytes.
+It is not small: the full int8 ResNet-18 is roughly **100 MB** of text for the
+per-call dumps plus **~72 MB** for `param_*.h`, because parameters are kernel
+inputs too and a weight read by several calls is dumped for each of them. They
+are dumped rather than skipped because a mismatch lands in a parameter as often
+as in an activation — `TRACE_HEX_MAX` is the lever when you only need the
+leading bytes, and `TRACE_HEX_PARAMS=0` when you only need the activations.
 
 #### On the board there is no filesystem
 
@@ -1880,7 +2287,8 @@ def build_arm_elf(out_dir, repo_root=None, c_name="resnet18.c",
 
     build = out_dir / "arm_build"
     build.mkdir(exist_ok=True)
-    summary = generate_driver(graph, params, build, verbose=verbose)
+    summary = generate_driver(graph, params, build, c_source=out_dir / c_name,
+                              verbose=verbose)
     _write_tvm_header_stubs(build)
     shutil.copyfile(params, build / "weights.bin")
 
