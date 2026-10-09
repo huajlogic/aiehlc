@@ -603,6 +603,63 @@ static void stage_weights(const int8_t *wts, const conv2dstem_qparam *qp) {
     }
 }
 
+// Same destination as stage_weights(), from TVM's PACKED filter layout.
+//
+// TVM's x86 NCHWc schedule splits the output channels by oc_bn=4 and stores
+// the filter as [oc_chunk][kh][kw][ic][oc_block] -- `oc` is the OUTER product
+// oc_chunk*4 + oc_block, so a filter's 147 taps are strided 4 apart rather
+// than contiguous. This library's layout is the plain [f][kh][kw][ic].
+// Only the SOURCE index differs; the destination and the quant-param tail are
+// byte-for-byte what stage_weights() writes, which is what lets the two be
+// compared directly (the layout round-trip check in the commit that added
+// this: both produce an identical g_wts_bt).
+//
+// The stride constants are TVM's own, read off the generated kernel:
+//   oc_chunk 588 = KH*KW*INPUT_C*OC_BLOCK,  kh 84 = KW*INPUT_C*OC_BLOCK,
+//   kw 12 = INPUT_C*OC_BLOCK,               ic 4 = OC_BLOCK
+static void stage_weights_nchwc(const int8_t *wts, const conv2dstem_qparam *qp) {
+    for (int occ = 0; occ < CONV2DSTEM_OC_CHUNK; occ++) {
+        for (int ocb = 0; ocb < CONV2DSTEM_OC_BLOCK; ocb++) {
+            const int f = occ * CONV2DSTEM_OC_BLOCK + ocb;
+            for (int kh = 0; kh < KERNEL_H; kh++) {
+                for (int kw = 0; kw < KERNEL_W; kw++) {
+                    const int src = occ * (KERNEL_H * KERNEL_W * INPUT_C * CONV2DSTEM_OC_BLOCK) +
+                                    kh * (KERNEL_W * INPUT_C * CONV2DSTEM_OC_BLOCK) +
+                                    kw * (INPUT_C * CONV2DSTEM_OC_BLOCK) + ocb;
+                    const int dst = f * K + (kh * KERNEL_W + kw) * INPUT_C_ALIGN;
+                    for (int c = 0; c < INPUT_C; c++)
+                        g_wts_bt[dst + c] = wts[src + c * CONV2DSTEM_OC_BLOCK];
+                }
+            }
+            // Identical to stage_weights()'s tail: the four quant params hide
+            // in the pad channel of taps 0..15, little-endian, where the MAC
+            // loop (which stops at SP_REAL_C) cannot see them.
+            int8_t *brow = &g_wts_bt[f * K];
+            const int32_t fields[4] = {qp[f].bias, qp[f].zero_point, qp[f].multiplier, qp[f].shift};
+            for (int i = 0; i < 4; i++) {
+                const uint32_t u = (uint32_t)fields[i];
+                for (int b = 0; b < 4; b++)
+                    brow[(i * 4 + b) * INPUT_C_ALIGN + SP_PARAM_TAP_OFF] = (int8_t)((u >> (8 * b)) & 0xFF);
+            }
+        }
+    }
+}
+
+// Scatter the AIE result -- HWC [112][112][64] -- into TVM's NCHW4c
+// [16][112][112][4]. Pure index shuffle; every byte is copied exactly once.
+static void collect_ofm_nchwc(uint8_t *ofm) {
+    for (int occ = 0; occ < CONV2DSTEM_OC_CHUNK; occ++) {
+        for (int oh = 0; oh < OUTPUT_H; oh++) {
+            for (int ow = 0; ow < OUTPUT_W; ow++) {
+                const int dst = ((occ * OUTPUT_H + oh) * OUTPUT_W + ow) * CONV2DSTEM_OC_BLOCK;
+                const int src = (oh * OUTPUT_W + ow) * NUM_FILTERS + occ * CONV2DSTEM_OC_BLOCK;
+                for (int ocb = 0; ocb < CONV2DSTEM_OC_BLOCK; ocb++)
+                    ofm[dst + ocb] = g_ofm[src + ocb];
+            }
+        }
+    }
+}
+
 void conv2d_stem_invalidate_weights(void) { g_wts_src = nullptr; }
 
 void conv2d_stem_release(void) {
@@ -701,6 +758,43 @@ int conv2d_stem_prepadded(const int8_t *ifm_pad, const int8_t *wts, const conv2d
 
     stage_ifm_prepadded(ifm_pad);
     return stem_run(wts, qp, ofm);
+}
+
+// Fused conv in TVM's PACKED layouts -- the exact operator the deployed graph
+// calls (see conv2dstem.h for the four shapes).
+//
+// Deliberately a separate entry rather than a change to
+// conv2d_stem_prepadded(): that one is the BYOC wrapper's contract, and the
+// two differ only in layout, so folding them would silently reinterpret every
+// weight and output byte for the offload path.
+//
+// The input needs no conversion at all -- TVM's [230,230,3] zero-point-padded
+// tensor is already exactly what stage_ifm_prepadded() consumes.
+int conv2d_stem_nchwc(const int8_t *ifm_pad, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm) {
+    if (!ifm_pad || !wts || !qp || !ofm)
+        return CONV2DSTEM_ERR_NULL_ARG;
+
+    const int rc = ensure_staging();
+    if (rc != CONV2DSTEM_OK)
+        return rc;
+
+    stage_ifm_prepadded(ifm_pad);
+
+    // Same re-pack-on-pointer-change rule as stem_run(); spelled out here
+    // because the packing function differs, so this cannot call stem_run().
+    if (g_wts_src != wts) {
+        stage_weights_nchwc(wts, qp);
+        g_wts_src = wts;
+    }
+
+    aieSetDevice(0);
+    aieArray device;
+    aieMesh mesh = device.partition({3, 6, 0, 6}, HW_ROWS, HW_COLS);
+
+    conv2d_spatial<<<mesh>>>(g_ifm_pad, g_wts_bt, g_ofm, M, N, K);
+
+    collect_ofm_nchwc(ofm);
+    return CONV2DSTEM_OK;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

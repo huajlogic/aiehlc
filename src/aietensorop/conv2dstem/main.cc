@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * conv2dstem — driver main() for the ResNet-18 stem convolution.
+ * conv2dstem — driver main() reproducing TVM's ResNet-18 stem layer on AIE.
  *
  * This is an aiehlc ENTRY FILE: it owns main() and #includes the kernel source,
  * so one command produces host.cc (device init, DMA/mesh setup, the launch), the
@@ -21,48 +21,61 @@
  * -- in contrast to building conv2dstem.cc directly, which has no main() and is
  * archived into libconv2dstem.a for the TVM BYOC path (skill: hostlibrarymode).
  *
- * ── What this runs on ──────────────────────────────────────────────────────
+ * ── What this runs ─────────────────────────────────────────────────────────
  *
- * REAL data, not a synthetic pattern: the actual int8-quantized ResNet-18
- * conv1 applied to an actual photograph. Three generated headers carry it,
- * all produced by src/aietensorop/conv2dstem/data/ (see data/README.md):
+ * Not a fixture: the actual data the deployed network carries, for the actual
+ * operator it calls. Both headers are `layeriohex` dumps of call [01] of the
+ * compiled int8 ResNet-18 graph (`make TRACE=1`, see arm_build/README.md) —
  *
- *   conv2dstem_image.h    [230,230,4] int8  the fixture image, already
- *                                           ImageNet-preprocessed, quantized,
- *                                           zero-point-padded and HWC4 —
- *                                           byte-for-byte g_ifm_pad's layout
- *   conv2dstem_weights.h  [64,7,7,3] int8   the real conv1 weights, plus the
- *                                           64 folded {bias, zp, mult, shift}
- *   conv2dstem_golden.h   [112,112,64] u8   the CPU ground truth to check against
+ *   01_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi
  *
- * This matters beyond realism. The previous synthetic fixture fed values in
- * [-4,4] x {-1,0,1}, which keeps the accumulator inside int16; with the real
- * weights the peak |accumulator| is 1,023,225, so an int16 accumulator would
- * silently wrap on roughly every output. Only real data exercises that.
+ * whose inputs and output `network.md` describes. So the comparison below is
+ * against what TVM's own kernel produced for that layer, byte for byte, rather
+ * than against a CPU model of it.
  *
- * Because the image header already has the kernel's exact [230,230,4] layout,
- * the host does no scatter at all — stage_ifm_pad4() is a straight memcpy.
- * That is why this file no longer talks about "raw caller-facing shapes": the
- * staging has moved off the board and into the generator.
+ *   conv2d_stem_in_weight.h    the layer's 8 inputs:
+ *       in0  int8  [1,1,230,230,3]  the activation, already spatially padded
+ *                                   with the INPUT ZERO-POINT (-15 = uint8
+ *                                   113 - 128), not with zero
+ *       in1  int8  [16,1,7,7,3,4]   weights, OIHW3i4o packed
+ *       in2  int32 [1,16,1,1,4]     zero-point   (subtracted)
+ *       in3  int32 [1,16,1,1,4]     bias         (added)
+ *       in4  int32 [1,16,1,1,4]     zero-point   (subtracted) -- all zero here
+ *       in5  int32 [16,4]           requant multiplier
+ *       in6  int32 [16,4]           unused by the kernel      -- all zero here
+ *       in7  int32 [16,4]           requant shift
+ *   conv2d_stem_out_golden.h   out0 uint8 [1,16,112,112,4], the layer's result
+ *
+ * The op is
+ *     acc = sum_{kh,kw,ic} ifm * w                                    (int32)
+ *     v   = (int64(acc + bias - zp_a - zp_b) * mult + (1 << (sh+30))) >> (sh+31)
+ *     out = clamp(v, 0, 255)
+ * which is exactly conv2d_stem_nchwc()'s arithmetic once the two zero-point
+ * terms are folded -- see fold_qparams() for why that fold is checked and not
+ * assumed. Verified before this file was written: all 802,816 outputs
+ * recomputed from these headers match conv2d_stem_out_golden.h.
+ *
+ * Real data matters beyond realism. The old synthetic fixture fed values in
+ * [-4,4] x {-1,0,1}, keeping the accumulator inside int16; here the peak
+ * |accumulator| measures 1,023,225, so an int16 accumulator would silently
+ * wrap on roughly every output. Only real data exercises that.
  ******************************************************************************/
 // Brings in the kernel, the staging helpers and the geometry #defines. The
 // geometry arrives with it, so parameter.h must NOT also be included here --
 // the two spell OUTPUT_H/K differently (same values) and would redefine them.
 #include "conv2dstem.cc"
 
-// Generated fixtures. Their element-count macros are all CONV2DSTEM_DATA_*,
-// deliberately disjoint from conv2dstem.h's CONV2DSTEM_* names — reusing
-// CONV2DSTEM_WTS_ELEMS here would be a macro redefinition with a different
-// token sequence. Regenerate with data/*.py, never hand-edit.
-#include "conv2dstem_image.h"
-#include "conv2dstem_weights.h"
+// The layer's inputs. Generated by `make TRACE=1` in the TVM flow and copied
+// here FLAT -- aiehlc.sh collects user headers with a non-recursive *.h glob
+// flattened to basename, so a header left in a subdirectory parses in the
+// frontend and then fails at cross-g++ (skill: conv2dstemfixture).
+#include "conv2d_stem_in_weight.h"
 
-// The golden output is ~800 KB of .rodata and is derived from the two headers
-// above, so it is gitignored rather than committed. Build without it and the
-// app still runs — it just does not self-check.
+// The golden is ~5 MB of .rodata, so it is gitignored rather than committed.
+// Build without it and the app still runs -- it just does not self-check.
 #if defined(__has_include)
-#if __has_include("conv2dstem_golden.h")
-#include "conv2dstem_golden.h"
+#if __has_include("conv2d_stem_out_golden.h")
+#include "conv2d_stem_out_golden.h"
 #define CONV2DSTEM_HAVE_GOLDEN 1
 #endif
 #endif
@@ -73,6 +86,25 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+// Shorthand for the generated names, which carry the call index and kernel
+// slug. Keeping the raw spellings in one place means a regenerated header with
+// a different hash suffix is a one-line fix rather than a hunt.
+#define TVM_IN0 l01_nn_contrib_conv2d_NCHWc_in0_data
+#define TVM_WTS l01_nn_contrib_conv2d_NCHWc_in1_p0_weight_data
+#define TVM_ZPA l01_nn_contrib_conv2d_NCHWc_in2_p1_zero_point_data
+#define TVM_BIAS l01_nn_contrib_conv2d_NCHWc_in3_p2_bias_data
+#define TVM_ZPB l01_nn_contrib_conv2d_NCHWc_in4_p3_zero_point_data
+#define TVM_MULT l01_nn_contrib_conv2d_NCHWc_in5_p4_requant_multiplier_data
+#define TVM_UNUSED l01_nn_contrib_conv2d_NCHWc_in6_p5_unused_data
+#define TVM_SHIFT l01_nn_contrib_conv2d_NCHWc_in7_p6_requant_shift_data
+#define TVM_GOLDEN l01_nn_contrib_conv2d_NCHWc_out0_data
+
+// At most this many mismatch coordinates are printed before the verdict line.
+#ifndef CONV2DSTEM_MAX_REPORTED_MISMATCHES
+#define CONV2DSTEM_MAX_REPORTED_MISMATCHES 16
+#endif
 
 // Declared, not included: the runtime header (src/mlir/runtime/aie_runtime.h)
 // pulls in the XAie driver headers, which this plain host TU does not need.
@@ -82,19 +114,62 @@ void *__Runtime_Alloc(size_t bytes);
 
 // The generated arrays are uint8_t — a hex initializer for int8_t would lean on
 // an implementation-defined out-of-range conversion — so they are cast at the
-// point of use. These are the only two casts in the file.
-static const int8_t *fixture_ifm(void) { return (const int8_t *)conv2dstem_ifm_pad4; }
-static const int8_t *fixture_wts(void) { return (const int8_t *)conv2dstem_wts; }
+// point of use.
+static const int8_t *tvm_ifm(void) { return (const int8_t *)TVM_IN0; }
+static const int8_t *tvm_wts(void) { return (const int8_t *)TVM_WTS; }
 
-// conv2dstem_qp is a flat int32 block of 64 x {bias, zero_point, multiplier,
-// shift}; conv2dstem_qparam is exactly that struct. The reinterpretation is
-// only sound if the struct has no padding, which this asserts at compile time.
-static_assert(sizeof(conv2dstem_qparam) == 4 * sizeof(int32_t),
-              "conv2dstem_qparam is padded; conv2dstem_qp cannot be reinterpreted");
-static const conv2dstem_qparam *fixture_qp(void) { return (const conv2dstem_qparam *)conv2dstem_qp; }
+// Read one int32 out of a generated byte array.
+//
+// A pointer cast would be wrong twice over: `_data[]` is `unsigned char[]`,
+// which the compiler need only align to 1, so `(const int32_t *)` can be an
+// unaligned load -- a fault on the A78, not a slow path -- and it would also
+// bake in the host's endianness. The dump is little-endian by definition
+// (graph_dump_hex writes the buffer's own bytes), so assemble it explicitly.
+static int32_t rd_i32(const unsigned char *p, int idx) {
+    const unsigned char *b = p + (size_t)idx * 4u;
+    return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
+}
 
 /*
- * Compare the AIE output against the CPU ground truth, element for element.
+ * Fold the layer's six parameter arrays into conv2dstem_qparam[64].
+ *
+ * TVM's lowering subtracts TWO zero-point terms, `acc + bias - zp_a - zp_b`,
+ * while conv2dstem_qparam has a single `zero_point` field. The two are only
+ * equivalent while one of them vanishes. For this quantization zp_b and the
+ * unused array are identically zero -- but that is a property of THIS model
+ * (symmetric per-channel weights), not a guarantee, so it is checked. A future
+ * regeneration with a non-zero zp_b must fail here rather than quietly compute
+ * wrong pixels, which is what folding it into `zero_point` by addition would
+ * do if the kernel ever grew a second use for the field.
+ *
+ * Returns CONV2DSTEM_OK, or CONV2DSTEM_ERR_BAD_QPARAM naming the channel.
+ */
+static int fold_qparams(conv2dstem_qparam *qp) {
+    for (int oc = 0; oc < NUM_FILTERS; oc++) {
+        const int32_t zp_b = rd_i32(TVM_ZPB, oc);
+        const int32_t unused = rd_i32(TVM_UNUSED, oc);
+        if (zp_b != 0 || unused != 0) {
+            printf("ERROR: channel %d has a second zero-point (%d) or a live 'unused' param (%d).\n"
+                   "       conv2dstem_qparam carries ONE zero-point field; this layer no longer\n"
+                   "       folds onto it. Regenerate conv2d_stem_in_weight.h or extend the struct.\n",
+                   oc, (int)zp_b, (int)unused);
+            return CONV2DSTEM_ERR_BAD_QPARAM;
+        }
+        qp[oc].bias = rd_i32(TVM_BIAS, oc);
+        qp[oc].zero_point = rd_i32(TVM_ZPA, oc);
+        qp[oc].multiplier = rd_i32(TVM_MULT, oc);
+        qp[oc].shift = rd_i32(TVM_SHIFT, oc);
+    }
+    return CONV2DSTEM_OK;
+}
+
+/*
+ * Compare the AIE output against the layer's real output, element for element.
+ *
+ * Coordinates are decoded as NCHW4c -- the layout conv2d_stem_nchwc() writes --
+ * so `oc` is the OUTER product oc_chunk*4 + oc_block. Decoding this buffer as
+ * HWC, the way the old fixture path did, names a different pixel for every
+ * reported mismatch.
  *
  * Prints at most CONV2DSTEM_MAX_REPORTED_MISMATCHES coordinate lines, then one
  * verdict line. The cap is not cosmetic: apppaltest.py gives the run a 300 s
@@ -108,13 +183,14 @@ static const conv2dstem_qparam *fixture_qp(void) { return (const conv2dstem_qpar
 static int check_against_golden(const uint8_t *ofm) {
     int mismatches = 0;
     for (int i = 0; i < OFM_ELEMS; i++) {
-        if (ofm[i] != conv2dstem_golden_ofm[i]) {
+        if (ofm[i] != TVM_GOLDEN[i]) {
             if (mismatches < CONV2DSTEM_MAX_REPORTED_MISMATCHES) {
-                const int oh = i / (OUTPUT_W * NUM_FILTERS);
-                const int ow = (i / NUM_FILTERS) % OUTPUT_W;
-                const int f = i % NUM_FILTERS;
-                printf("[conv2dstem] MISMATCH ofm[oh=%d,ow=%d,f=%d] (flat %d): got %d, want %d\n", oh, ow, f, i, ofm[i],
-                       conv2dstem_golden_ofm[i]);
+                const int ocb = i % CONV2DSTEM_OC_BLOCK;
+                const int ow = (i / CONV2DSTEM_OC_BLOCK) % OUTPUT_W;
+                const int oh = (i / (CONV2DSTEM_OC_BLOCK * OUTPUT_W)) % OUTPUT_H;
+                const int occ = i / (CONV2DSTEM_OC_BLOCK * OUTPUT_W * OUTPUT_H);
+                printf("[conv2dstem] MISMATCH ofm[occ=%d,oh=%d,ow=%d,ocb=%d] (oc=%d, flat %d): got %d, want %d\n", occ,
+                       oh, ow, ocb, occ * CONV2DSTEM_OC_BLOCK + ocb, i, ofm[i], TVM_GOLDEN[i]);
             }
             mismatches++;
         }
@@ -127,43 +203,52 @@ static int check_against_golden(const uint8_t *ofm) {
 #endif
 
 int main() {
-    printf("=== ResNet-18 stem conv2d on AIE ===\n");
-    printf("    Input:  [%d, %d, %d] padded to [%d, %d, %d]\n", CONV2DSTEM_INPUT_H, CONV2DSTEM_INPUT_W,
-           CONV2DSTEM_INPUT_C, INPUT_H_PAD, INPUT_W_PAD, INPUT_C_ALIGN);
-    printf("    Filter: [%d, %d, %d, %d]\n", CONV2DSTEM_NUM_FILTERS, CONV2DSTEM_KERNEL_H, CONV2DSTEM_KERNEL_W,
-           CONV2DSTEM_INPUT_C);
-    printf("    Output: [%d, %d, %d]  (stride %d, pad %d)\n", CONV2DSTEM_OUTPUT_H, CONV2DSTEM_OUTPUT_W,
-           CONV2DSTEM_NUM_FILTERS, CONV2DSTEM_STRIDE, CONV2DSTEM_PAD);
-    printf("    Data:   real int8 ResNet-18 conv1 on the fixture image\n");
+    printf("=== ResNet-18 stem conv2d on AIE (TVM layer 01) ===\n");
+    printf("    Op:     01_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi\n");
+    printf("    Input:  int8  [%d, %d, %d]  (zero-point padded, %d-channel)\n", INPUT_H_PAD, INPUT_W_PAD,
+           CONV2DSTEM_INPUT_C, CONV2DSTEM_INPUT_C);
+    printf("    Filter: int8  [%d, %d, %d, %d, %d]  OIHW3i4o\n", CONV2DSTEM_OC_CHUNK, CONV2DSTEM_KERNEL_H,
+           CONV2DSTEM_KERNEL_W, CONV2DSTEM_INPUT_C, CONV2DSTEM_OC_BLOCK);
+    printf("    Output: uint8 [%d, %d, %d, %d]  NCHW4c  (stride %d, pad %d)\n", CONV2DSTEM_OC_CHUNK,
+           CONV2DSTEM_OUTPUT_H, CONV2DSTEM_OUTPUT_W, CONV2DSTEM_OC_BLOCK, CONV2DSTEM_STRIDE, CONV2DSTEM_PAD);
+    printf("    Data:   the deployed int8 ResNet-18 graph's own layer-01 tensors\n");
 
-    // The fixture is const .rodata and needs no DMA alignment: the weights and
-    // qparams are only ever read on the host (stage_weights packs them into the
-    // aligned g_wts_bt), and the image is memcpy'd into the aligned g_ifm_pad.
-    // Only the output buffer is allocated.
-    uint8_t *ofm = (uint8_t *)__Runtime_Alloc(CONV2DSTEM_OFM_ELEMS * sizeof(uint8_t));
+    // The headers are const .rodata and need no DMA alignment: the weights and
+    // params are only ever read on the host (stage_weights_nchwc packs them
+    // into the aligned g_wts_bt), and the image is scattered into the aligned
+    // g_ifm_pad. Only the output buffer is allocated.
+    uint8_t *ofm = (uint8_t *)__Runtime_Alloc(CONV2DSTEM_OFM_NCHWC_ELEMS * sizeof(uint8_t));
     if (!ofm) {
         printf("ERROR: host buffer allocation failed.\n");
         return 1;
     }
 
-    int rc = ensure_staging();
+    // 64 x 4 int32 = 1 KB; fine on the stack, and keeping it there means no
+    // second allocation to fail or leak.
+    conv2dstem_qparam qp[NUM_FILTERS];
+    int rc = fold_qparams(qp);
     if (rc != CONV2DSTEM_OK) {
-        printf("ERROR: staging allocation failed (rc=%d).\n", rc);
         free(ofm);
-        return 1;
+        printf("conv2dstem done (rc=%d).\n", rc);
+        return rc;
     }
 
-    // The image header is already in g_ifm_pad's exact layout, so this is a
-    // copy rather than the scatter conv2d_stem()/conv2d_stem_prepadded() do.
-    stage_ifm_pad4(fixture_ifm());
-    rc = stem_run(fixture_wts(), fixture_qp(), ofm);
+    rc = conv2d_stem_nchwc(tvm_ifm(), tvm_wts(), qp, ofm);
+    if (rc != CONV2DSTEM_OK)
+        printf("ERROR: conv2d_stem_nchwc failed (rc=%d).\n", rc);
+
+    // print out first 16 element of the output feature map
+    for (int i = 0; i < 16 && i < CONV2DSTEM_OFM_NCHWC_ELEMS; i++) {
+        printf("%02x ", ofm[i]);
+    }
+    printf("\n");
 
 #if CONV2DSTEM_HAVE_GOLDEN
     if (rc == CONV2DSTEM_OK)
         rc = check_against_golden(ofm);
 #else
-    printf("[conv2dstem] conv2dstem_golden.h absent -- no self-check. "
-           "Generate it with data/groundtruth.py.\n");
+    printf("[conv2dstem] conv2d_stem_out_golden.h absent -- no self-check. Copy it from\n"
+           "             worklocal/tvmrelay_deploy/arm_build/layeriohex/ (make TRACE=1).\n");
 #endif
 
     free(ofm);

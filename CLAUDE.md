@@ -60,6 +60,34 @@ kernel. The splice is deliberately **opaque** (no `#line`) because kernel export
 and the host `RewriteBuffer` both key off the kernel's `FileID` — see skill
 **aiehlcincludekernel** before changing it.
 
+**`main.cc` now runs TVM's layer 01, not the hand-built fixture.** It drives
+`conv2d_stem_nchwc()` from `conv2d_stem_in_weight.h` — the `layeriohex` dump of
+call [01] (`01_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi`)
+— and self-checks against that layer's own output (`conv2d_stem_out_golden.h`),
+so the app reproduces an operator the deployed graph actually runs rather than a
+model of it. **The kernel's arithmetic was already correct**: all 802,816 outputs
+recompute exactly from these headers using the existing
+`(acc + bias − zp) · mult >> (shift+31)` epilogue. Only *layout* differed, and
+both conversions are host-side — the AIE core, the `GemmSpace` descriptors and
+the DMA are untouched:
+
+| | TVM layer 01 | library | bridge |
+|---|---|---|---|
+| input | `int8[230,230,3]`, zp-padded (**−15**, = uint8 113−128) | same | **none** — `stage_ifm_prepadded()` already widens 3→4 |
+| weights | `int8[16,7,7,3,4]` OIHW3i4o | `int8[64,7,7,3]` OHWI | `stage_weights_nchwc()` |
+| output | `uint8[16,112,112,4]` NCHW4c | `uint8[112,112,64]` HWC | `collect_ofm_nchwc()` |
+
+`conv2d_stem_nchwc()` is a **new entry alongside** `conv2d_stem_prepadded()`,
+which is untouched (94 insertions, 0 deletions) so `--aie-offload` is unaffected.
+Two traps: TVM subtracts **two** zero-point terms (`acc + bias − zp_a − zp_b`)
+while `conv2dstem_qparam` has one field — the fold is only valid because `zp_b`
+and the `unused` param measure identically zero here, so `main.cc:fold_qparams()`
+**checks** it per channel and refuses rather than computing wrong pixels; and the
+header's `_data[]` is `unsigned char[]`, so reading the int32 params via a
+`(const int32_t *)` cast is an unaligned load that faults on the A78 — assemble
+the bytes (`rd_i32`). Mismatch coordinates decode as NCHW4c (`occ,oh,ow,ocb`),
+not HWC. Skill: **conv2dstemtvmlayer**.
+
 **conv2dstem runs on real data.** `src/aietensorop/conv2dstem/data/` generates
 three committed-or-derived headers from a photo and the int8-quantized
 ResNet-18: `conv2dstem_image.h` (`int8[230,230,4]`, already preprocessed,
@@ -197,6 +225,28 @@ They coexist with `libconv2dstem.a` despite both carrying the AIE runtime,
 because `ld` pulls only members that resolve an undefined symbol. **Not yet
 wired:** `graph_driver.c` still calls the CPU kernel for those layers, so the
 archives link but contribute nothing.
+
+**qnn zero-point folding is the DEFAULT (`--no-fold-qnn-zp` opts out).** A
+quantized conv lowers to `term1 − term2 − term3 + term4`; `Conv2DCombineTerms`
+(`tvm-0.16/src/relay/qnn/op/convolution.cc:633`) drops **term2 and term4 when the
+kernel zero point is zero** — which it is for all 20 convs here, the quantizer
+being *symmetric* per-channel. It did not fire, for a narrow reason: the integer
+it tests is only read when `IsConstScalar(kernel_zero_point)`
+(`convolution.cc:747`), and `Constant::is_scalar()` is strictly **`ndim == 0`**
+(`include/tvm/relay/expr.h:80`). Per-channel quant makes the zero point a `[64]`
+**tensor**, so the test fails, `dynamic_zp` is set, both zero points fall back to
+`-1`, and the `else` branch emits term2 unconditionally. The elision keys on
+**scalar-ness, not on the values being zero** — per-*tensor* symmetric takes the
+fast path, per-*channel* symmetric misses it. term2 depends on the live input, so
+`FoldConstant` cannot remove it; it lowers to a real
+`cast_sum → multiply → avg_pool2d → repeat_multiply_layout_transform` chain
+**per conv**. `qnn_fold_zp.fold_scalar_zero_points` rewrites an all-**equal**
+(not merely all-zero) constant zero point to rank-0 before
+`qnn.CanonicalizeOps`, so TVM's own elision fires. Must run before `build_c`
+**and** before `partition_for_aie` — both canonicalize internally, after which
+there is nothing left to fold. Measured on int8 ResNet-18: **120 → 41 kernel
+calls**, 42 → 0 correction nodes, buffers 18.58 → 14.29 MB, logits bit-identical.
+`kernel_scale` stays per-channel — the requantization genuinely is.
 
 **int8 operands are the DEFAULT (`--no-pe-int8` opts out).** The quantizer emits genuine
 int8 (all 11,678,912 ResNet-18 weights measure inside `[-127,127]`, 255 levels);
@@ -528,10 +578,12 @@ Read the matching skill when the task fits:
 | Pipeline "succeeds" but emits an EMPTY module (0 routing connections, no BCF/PRX → `Couldn't open aie2ps.prx`): `__global__` in a comment, or a prototype above the kernel | aiesourcetextrewrite |
 | `deploy_flow.py` emits fp32 instead of the default int8, `target.build.llvm is not enabled`, missing `onnx`, or stage-5 split silently skipped | tvmrelaynollvm |
 | Run the TVM-generated ResNet C on x86 (`--local` / `make local`): `xtime_l.h: No such file`, `'CLOCK_MONOTONIC' undeclared`, `Circular ... dependency dropped`, stack-smash in `graph_run` | tvmlocalhostelf |
+| Quantized graph has ~3x the kernel calls of its operator count (120 vs 41); dead `cast_sum → multiply → avg_pool2d → repeat_multiply` chains per conv computing/subtracting zeros; a conv input with the same shape as its own output | qnnscalarzeropoint |
 | int8 model whose conv weights/activations are **stored int16** (`weights.bin` 23.5 MB, `network.md` says `int16`); telling TVM the PE takes int8 (`--pe-int8`, `Target("c -keys=pe_int8,cpu")`); why bias/multiplier/shift are int32 by design | tvmint8legalize |
 | PT2E int8 → torch-mlir yields no `!torch.qint8` / no `linalg.*_q` (fusion passes look like no-ops); TOSA "failed to legalize `dequantize_per_channel`"; `pip install torchvision` upgrading torch | torchmlirquantfusion |
 | TVM `--aie-offload` (BYOC → AIE): fused boundary, uint8 shift, zero-point padding, weight-fingerprint layer mapping, conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
 | conv2dstem real-data fixture: generated header can't live in a subdir; zero-point border; `shift = -exponent`; golden self-check over the console | conv2dstemfixture |
+| Drive conv2dstem from a real TVM layer's `layeriohex` dump (`conv2d_stem_nchwc`, OIHW3i4o/NCHW4c bridges); plausible-but-wrong pixels after a layout change; int32 quant params read as garbage or fault on the A78; mismatch coords name the wrong pixel | conv2dstemtvmlayer |
 | `--aie-offload` says `non-4D shapes; not a conv2d` for every layer, or a layer gets another layer's geometry (`K=0`); TVM 5-D NCHWc vs aiehlc's d1..d4 | nchwclayoutfold |
 | `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aiebackend` (two LLVMs) | aiebackendtvmllvm |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |

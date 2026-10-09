@@ -875,7 +875,7 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
         aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
         relay_ptq: bool = False, local: bool = False, local_run: bool = True,
-        pe_int8=None, verbose: bool = True) -> dict:
+        pe_int8=None, fold_qnn_zp: bool = True, verbose: bool = True) -> dict:
     """Run all seven stages. Returns a dict of what happened.
 
     ``aie_offload`` offloads ``aie_layers`` (stage-5 layer indices; ``None``
@@ -900,6 +900,12 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     head and tail (``skip_conv_layers=[0]``, ``skip_dense_layer=True``). See
     ``quantize_int8`` for what that costs and why it needs LLVM.
     ``skip_quantize`` overrides both and emits fp32.
+
+    ``fold_qnn_zp`` (on; ``--no-fold-qnn-zp`` opts out) collapses each conv's
+    all-equal per-channel kernel zero point to a rank-0 scalar so TVM's own
+    four-term elision fires. Output-preserving, and it removes the dead
+    ``cast_sum -> multiply -> avg_pool2d -> repeat_multiply`` chains: measured
+    **120 -> 41 kernel calls** on int8 ResNet-18. See ``qnn_fold_zp.py``.
 
     ``local`` additionally links the same generated C into ``main_local.elf``
     for *this* host and runs it, so stage 6's output can be checked against
@@ -959,6 +965,14 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
                                  relay_ptq=relay_ptq,
                                  global_scale=global_scale,
                                  image=image, verbose=verbose)
+
+    # Before build_c, and before _stage_aie_offload's partition_for_aie: both
+    # run qnn.CanonicalizeOps internally, and once that has expanded the four
+    # terms there is nothing left to fold.
+    if fold_qnn_zp:
+        from frontend.tvmrelay import qnn_fold_zp
+
+        mod = qnn_fold_zp.fold_scalar_zero_points(mod, verbose=verbose)
 
     c_path = build_c(mod, params, out_dir, fuse=fuse, target=target,
                      verbose=verbose)
@@ -1126,6 +1140,15 @@ def main(argv=None) -> int:
                          "default on every path, AIE ones included -- this flag "
                          "only makes that explicit, e.g. to override an earlier "
                          "--no-pe-int8 in a wrapper script")
+    ap.add_argument("--no-fold-qnn-zp", action="store_true",
+                    help="keep qnn's dead zero-point correction chains. They "
+                         "are emitted because TVM's four-term elision tests "
+                         "whether the kernel zero point is a SCALAR, and "
+                         "per-channel quantization makes it a [64] tensor -- "
+                         "even when every element is 0. Folding it to a scalar "
+                         "takes int8 ResNet-18 from 120 to 41 kernel calls for "
+                         "bit-identical output; this flag turns that off to "
+                         "A/B against the old graph")
     ap.add_argument("--image", default=None,
                     help="image path or URL to classify "
                          "(default: the pytorch/hub dog.jpg sample)")
@@ -1202,6 +1225,7 @@ def main(argv=None) -> int:
                  aiegraph=args.aiegraph, aiegraph_ops=aiegraph_ops,
                  relay_ptq=args.relay_ptq, local=args.local,
                  local_run=not args.no_local_run,
+                 fold_qnn_zp=not args.no_fold_qnn_zp,
                  # None = default: on, AIE stages included.
                  pe_int8=(False if args.no_pe_int8
                           else True if args.pe_int8 else None))

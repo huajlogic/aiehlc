@@ -60,6 +60,7 @@ extern "C" {
 #define CONV2DSTEM_OK 0
 #define CONV2DSTEM_ERR_NULL_ARG (-1)
 #define CONV2DSTEM_ERR_ALLOC (-2)
+#define CONV2DSTEM_ERR_BAD_QPARAM (-3)
 
 ///
 
@@ -158,6 +159,45 @@ int conv2d_stem(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *q
  * conv2d_stem().
  */
 int conv2d_stem_prepadded(const int8_t *ifm_pad, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm);
+
+/* ── TVM NCHWc entry ────────────────────────────────────────────────────────
+ *
+ * Buffer sizes for conv2d_stem_nchwc(), which speaks TVM's *packed* layouts
+ * rather than this library's own. Shapes are the ones the deployed graph
+ * actually carries for
+ *   01_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi
+ */
+#define CONV2DSTEM_OC_BLOCK 4                                              /* oc_bn, TVM's inner split */
+#define CONV2DSTEM_OC_CHUNK (CONV2DSTEM_NUM_FILTERS / CONV2DSTEM_OC_BLOCK) /* 16 */
+#define CONV2DSTEM_WTS_NCHWC_ELEMS CONV2DSTEM_WTS_ELEMS                    /* 9408, repacked */
+#define CONV2DSTEM_OFM_NCHWC_ELEMS CONV2DSTEM_OFM_ELEMS                    /* 802816, repacked */
+
+/*
+ * Same fused op as conv2d_stem_prepadded(), in TVM's packed layouts.
+ *
+ * This is the exact operator TVM's graph calls, verified bit-for-bit: all
+ * 802,816 outputs recomputed from the quantization below match the deployed
+ * graph's own output.
+ *
+ *   ifm_pad : int8   [230][230][3]        NCHW3c  -- border included, padded
+ *                                         with the INPUT ZERO-POINT (-15 here,
+ *                                         = uint8 113 - 128), not with zero
+ *   wts     : int8   [16][7][7][3][4]     OIHW3i4o, oc = oc_chunk*4 + oc_block
+ *   qp      : 64 entries, plain `oc` order (NOT chunk-major)
+ *   ofm     : uint8  [16][112][112][4]    NCHW4c
+ *
+ * The arithmetic is identical to conv2d_stem_prepadded(); only the layouts
+ * differ, and both conversions are host-side. TVM's lowering subtracts TWO
+ * zero-point terms (`acc + bias - zp_a - zp_b`) where conv2dstem_qparam has
+ * one field. For this model the second is identically zero, so the single
+ * `zero_point` field is exact -- but that is a property of this quantization,
+ * not a guarantee, so the caller must fold the two itself and
+ * conv2d_stem_nchwc() has no way to check. See main.cc, which asserts it.
+ *
+ * Returns CONV2DSTEM_OK or a negative CONV2DSTEM_ERR_* code. Same caching and
+ * reentrancy rules as conv2d_stem().
+ */
+int conv2d_stem_nchwc(const int8_t *ifm_pad, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm);
 
 /*
  * Force the next conv2d_stem() call to re-pack the weight buffer. Use after
