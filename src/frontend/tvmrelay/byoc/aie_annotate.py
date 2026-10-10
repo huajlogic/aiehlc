@@ -2,13 +2,27 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
-"""Annotation pass: hand the SELECTED matched composite functions to AIE.
+"""Step 2 of the BYOC flow: SELECT which fused composites go to the AIE.
 
 The second of the four BYOC files. ``AnnotateTarget`` offloads everything that
 matches; ``--aie-offload --aie-layers`` asks for specific layers, so this pass
 inserts ``compiler_begin``/``compiler_end`` itself, around the composites whose
 conv was selected. ``MergeCompilerRegions`` + ``PartitionGraph`` then work as
 usual.
+
+Two questions, asked in this order
+----------------------------------
+1. *Did the user ask for this layer?* -- its ``aie.weight_fp`` tag (stamped by
+   ``aie_fuse``) is in ``selected``.
+2. *Can the kernel run it?* -- ``aie_patterns.kernel_can_run``, which returns a
+   reason.
+
+Keeping these apart is the whole point of the fuse/select split. Fusion is now
+geometry-agnostic, so a layer that the AIE cannot take still becomes a composite
+and still reaches this pass, where it is turned down BY NAME and inlined back.
+Before the split the geometry gate sat in the ``MergeComposite`` checker, so
+such a layer never fused, "malformed" and "not the stem" were the same silence,
+and the inline-back path below was unreachable code.
 
 A conv is identified by its WEIGHTS, not its position
 -----------------------------------------------------
@@ -35,6 +49,10 @@ import numpy as np
 from tvm import relay
 from tvm.relay.op.annotation import compiler_begin, compiler_end
 
+from frontend.tvmrelay.byoc.aie_patterns import (ATTR_LAYER_ID, ATTR_WEIGHT_FP,
+                                                 composite_name, find_conv,
+                                                 kernel_can_run)
+
 __all__ = ["ConvSelectAnnotator", "AIE_COMPILER_NAME", "weight_fingerprint"]
 
 #: The codegen name registered with TVM. It must match the registration name of
@@ -59,67 +77,101 @@ def _conv_geometry(conv) -> dict:
             "stride": int(conv.attrs.strides[0])}
 
 
-def _find_conv(expr):
-    found = []
-    relay.analysis.post_order_visit(
-        expr, lambda e: found.append(e) if isinstance(e, relay.Call)
-        and getattr(e.op, "name", "") == "nn.conv2d" else None)
-    return found[0] if found else None
-
-
 class ConvSelectAnnotator(relay.ExprMutator):
-    """Mark the ``Composite`` functions whose conv weight fingerprint is in *selected*
-    (``None``: every composite the pattern accepted).
+    """Offload the composites that were both asked for AND are runnable.
 
-    Composites that are not selected are inlined back (see ``visit_call``).
-    ``convs`` records ``{fingerprint, geometry, composite, offloaded}`` for
-    every conv -- matched or not -- for the caller to verify.
+    *selected* is a ``{weight_fingerprint: layer_index}`` mapping (a bare
+    iterable of fingerprints also works, giving ``None`` layer numbers; ``None``
+    means every composite the kernel can run).
+
+    Composites that are not offloaded -- not selected, or selected but rejected
+    by ``kernel_can_run`` -- are inlined back (see ``visit_call``). ``convs``
+    records ``{fingerprint, geometry, composite, offloaded[, reason]}`` for every
+    conv, matched or not, for the caller to verify; ``rejected`` maps the
+    fingerprint of an asked-for-but-unrunnable layer to its reason.
     """
 
     def __init__(self, selected, pattern_name: str,
                  compiler: str = AIE_COMPILER_NAME):
         super().__init__()
-        self.selected = None if selected is None else set(selected)
+        if selected is None:
+            self.selected = None
+        elif isinstance(selected, dict):
+            self.selected = dict(selected)
+        else:
+            self.selected = {fp: None for fp in selected}
         self.compiler = compiler
         self.pattern_name = pattern_name
         self.convs = []
-
-    def _is_target_composite(self, op) -> bool:
-        if not isinstance(op, relay.Function):
-            return False
-        comp = op.attrs["Composite"] if op.attrs and "Composite" in op.attrs else None
-        return comp is not None and str(comp) == self.pattern_name
-
-    def _record(self, conv, composite: bool, offloaded: bool) -> None:
-        self.convs.append({"fingerprint": self._fingerprint(conv),
-                           **_conv_geometry(conv),
-                           "composite": composite, "offloaded": offloaded})
+        self.rejected = {}
 
     @staticmethod
     def _fingerprint(conv):
         w = conv.args[1]
         return weight_fingerprint(w.data.numpy()) if isinstance(w, relay.Constant) else None
 
+    def _identity(self, op, conv):
+        """The composite's fingerprint: the step-1 tag, else recomputed.
+
+        The fallback is not decoration. If the tag were ever lost -- a pass that
+        rebuilds Function attrs, a composite formed somewhere other than
+        ``aie_fuse`` -- trusting only the attribute would select NOTHING, which
+        on the console is indistinguishable from "the pattern did not match".
+        Recomputing costs one hash and keeps selection correct either way.
+        """
+        if op.attrs and ATTR_WEIGHT_FP in op.attrs:
+            return str(op.attrs[ATTR_WEIGHT_FP])
+        return self._fingerprint(conv) if conv is not None else None
+
+    def _record(self, conv, composite: bool, offloaded: bool,
+                fingerprint=None, reason=None) -> None:
+        if conv is None:
+            return
+        rec = {"fingerprint": (fingerprint if fingerprint is not None
+                               else self._fingerprint(conv)),
+               **_conv_geometry(conv),
+               "composite": composite, "offloaded": offloaded}
+        if reason:
+            rec["reason"] = reason
+        self.convs.append(rec)
+
     def visit_call(self, call):
         new_args = [self.visit(a) for a in call.args]
         op = call.op
 
-        if not self._is_target_composite(op):
+        if composite_name(op) != self.pattern_name:
             if getattr(op, "name", "") == "nn.conv2d":
                 self._record(call, composite=False, offloaded=False)
             return relay.Call(self.visit(op) if isinstance(op, relay.Function) else op,
                               new_args, call.attrs, call.type_args, call.span)
 
-        conv = _find_conv(op.body)
-        take = self.selected is None or self._fingerprint(conv) in self.selected
-        self._record(conv, composite=True, offloaded=take)
+        conv = find_conv(op.body)
+        fp = self._identity(op, conv)
+        want = self.selected is None or (fp is not None and fp in self.selected)
+        # Only ask the kernel about layers somebody wants -- the answer for the
+        # rest is "nobody asked", not "the AIE cannot do it".
+        ok, reason = kernel_can_run(op.body) if want else (False, "not selected")
+        take = want and ok
+        self._record(conv, composite=True, offloaded=take, fingerprint=fp,
+                     reason=None if take else reason)
+
         if not take:
+            if want and fp is not None:
+                self.rejected[fp] = reason
             # Inline the composite back. A Composite function left in main has
             # neither a Compiler nor a Primitive attribute, and TECompiler dies:
             #   Check failed: (prim_fns) is false: primitive functions not set
             # Inlining = bind the params to the args, then take the body.
+            #
+            # This runs for every fused-but-not-offloaded layer, so it is on the
+            # hot path now that fusion is geometry-agnostic -- and the whole C is
+            # rebuilt from this module, so it has to round-trip exactly. That is
+            # what verify_aie_stem.py's whole-network logit check covers.
             return relay.bind(op.body, dict(zip(op.params, new_args)))
 
+        layer = None if self.selected is None else self.selected.get(fp)
+        if layer is not None:
+            op = op.with_attr(ATTR_LAYER_ID, int(layer))
         begins = [compiler_begin(a, self.compiler) for a in new_args]
         out = relay.Call(op, begins, call.attrs, call.type_args, call.span)
         return compiler_end(out, self.compiler)
@@ -131,6 +183,8 @@ class ConvSelectAnnotator(relay.ExprMutator):
     def report(self) -> str:
         """One-line summary the caller can print directly."""
         matched = sum(1 for c in self.convs if c["composite"])
+        asked = "all" if self.selected is None else len(self.selected)
+        extra = f", {len(self.rejected)} rejected" if self.rejected else ""
         return (f"annotated {self.annotated} {self.pattern_name} for AIE "
-                f"({'all' if self.selected is None else len(self.selected)} conv(s) selected; "
-                f"{matched}/{len(self.convs)} convs match the pattern)")
+                f"({asked} conv(s) selected{extra}; "
+                f"{matched}/{len(self.convs)} convs fused)")

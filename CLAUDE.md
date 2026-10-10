@@ -60,7 +60,23 @@ kernel. The splice is deliberately **opaque** (no `#line`) because kernel export
 and the host `RewriteBuffer` both key off the kernel's `FileID` — see skill
 **aiehlcincludekernel** before changing it.
 
-**`main.cc` now runs TVM's layer 01, not the hand-built fixture.** It drives
+**Build it with `src/aietensorop/conv2dstem/buildtest.sh`**, not by calling
+aiehlc directly: the entry file's two data headers are *generated* artifacts
+(`layeriohex` dumps) and are not committed, so the script regenerates them —
+`make local TRACE=1` in `worklocal/tvmrelay_deploy/arm_build` → run
+`main_local.elf` → copy `l01_..._in.h`/`_out.h` in as
+`conv2d_stem_in_weight.h`/`conv2d_stem_out_golden.h` → source `aiehlc.sh`.
+`--skip-trace` reuses the dumps on disk, `--no-aiehlc` stops after the copy.
+Two traps it exists to handle: the Makefile's objects **don't depend on
+CFLAGS**, so without a `clean-local` first a previous *untraced* build is
+relinked and writes no dumps at all (silent no-op); and **`aiehlc.sh` writes its
+`aout/` tree relative to the CWD**, not to the entry file, so running it from
+the app directory produces `src/aietensorop/conv2dstem/aout/` while any older
+`$REPO/aout/` sits there and makes a success check pass against a *stale* ELF —
+the script pins the cwd and additionally requires the ELF to be newer than the
+run.
+
+**`test_conv2d.cc` runs TVM's layer 01, not a hand-built fixture.** It drives
 `conv2d_stem_nchwc()` from `conv2d_stem_in_weight.h` — the `layeriohex` dump of
 call [01] (`01_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi`)
 — and self-checks against that layer's own output (`conv2d_stem_out_golden.h`),
@@ -422,9 +438,47 @@ generated wrapper → `conv2d_stem_prepadded()` in `aout/libconv2dstem.a` (built
 from `src/aietensorop/conv2dstem/conv2dstem.cc` by `aiehlc.sh` in library mode —
 skill **hostlibrarymode**; aiehlc generates the init/partition/launch caller).
 `--byoc-aie` was merged into this flag. Code: `src/frontend/tvmrelay/byoc/`
-(`aie_patterns`, `aie_annotate`, `aie_codegen`, `aie_byoc`) + `aie_offload.py`;
-design **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)**; check
+(`aie_patterns`, `aie_fuse`, `aie_annotate`, `aie_codegen`, `aie_byoc`) +
+`aie_offload.py`; design
+**[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)**; check
 `byoc/verify_aie_stem.py` (bit-exact vs TVM, incl. all 1000 logits).
+
+**`--aie-offload` also runs the aiegraph lift** over the same `--aie-layers`
+selection, because BYOC writes no per-layer artifacts. That is what puts
+`layers/01_*/aie/` on disk, as `aiegraph.conv_bn` H=230 Cin=3 Cout=64 K=7 s2.
+A conv with exactly that stem geometry is **not** built from the generic
+placeholder body (`kernels.conv_bn_body`: int16 acc, dummy quant): `aie_stem_lib`
+runs `aiehlc.sh` on `conv2dstem.cc` in a scratch cwd and installs
+`aout/worklocal/` as the layer's `aie/` (`conv2d_spatial.cc`, `host.cc`,
+`kernel.cc`, `routing.cc`, `build/libconv2dstem.a`). That is the logic
+`test_conv2d.cc` verifies bit-exact: `kernel.cc`/`routing.cc`/bcf/prx are
+byte-identical to its build, and `host.cc` is a strict subset (it lacks only
+`test_conv2d.cc`'s `main()` driver). `partition.json` records `backend: aiehlc`
++ `source`. It adds ~80 s per run. It is additive (every `.c` is
+untouched), so `worklocal/tvmrelay_deploy/test/run_test.sh` holds `layers/` to
+the **default-flow** `layers-golden/` and checks `aie/` separately. aiegraph
+used to lift 0 convs under int8 because `_conv_geometry` read 4-D only; it now
+folds NCHWc through `aie_offload._layer_geometry`. Skill: **aieoffloadaiegraph**.
+
+**Four steps, one per file, and only the first is TVM's.** `partition_for_aie` is
+orchestration over **1 fuse** (`aie_fuse`: canonicalize → `MergeComposite` → tag
+`aie.weight_fp`) → **2 select** (`aie_annotate`: fingerprint ∈ selection *and*
+`kernel_can_run` → tag `aie.layer_id`) → **3 partition** (`MergeCompilerRegions`
+→ `PartitionGraph`) → **4 codegen** (`aie_codegen`: `relay.ext.aie`, dispatched
+on the composite name via `_EMITTERS`). **"Fuse" names two different things and
+they cannot be reordered**: step 1 is `MergeComposite`, while TVM's `FuseOps` is
+TE-level fusion and is the *last* pass of the second `relay.build`, necessarily
+after partitioning so it only fuses what stayed on the CPU — "byoc before fuse"
+is correct, not a bug. Fusion is deliberately **geometry-agnostic**: the stem
+gate used to sit in the `MergeComposite` checker, so only the one offloadable
+layer ever fused, "malformed" and "not the stem" were the same silence, and the
+inline-back path was unreachable. `check_fused_qconv` is shape-only;
+`kernel_can_run` is capability and returns `(ok, reason)`, which is what
+separates `info["unmatched"]` (did not fuse) from `info["rejected"]` (fused,
+unrunnable, with the reason). The cost: **inline-back is now hot** — ~12 convs
+fuse and are inlined back per run, and the whole C is rebuilt from that module,
+so `verify_aie_stem.py`'s whole-network logit check is the regression gate, not
+a formality. Skill: **byocfusesplit**.
 
 Non-obvious and each one silently wrong if broken — see skill **byocaieoffload**:
 the subgraph is the **fused** op (conv → requantize → ReLU → uint8), because that
@@ -582,10 +636,12 @@ Read the matching skill when the task fits:
 | int8 model whose conv weights/activations are **stored int16** (`weights.bin` 23.5 MB, `network.md` says `int16`); telling TVM the PE takes int8 (`--pe-int8`, `Target("c -keys=pe_int8,cpu")`); why bias/multiplier/shift are int32 by design | tvmint8legalize |
 | PT2E int8 → torch-mlir yields no `!torch.qint8` / no `linalg.*_q` (fusion passes look like no-ops); TOSA "failed to legalize `dequantize_per_channel`"; `pip install torchvision` upgrading torch | torchmlirquantfusion |
 | TVM `--aie-offload` (BYOC → AIE): fused boundary, uint8 shift, zero-point padding, weight-fingerprint layer mapping, conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
+| BYOC four-step split: "fuse" means two things (`MergeComposite` vs TVM's `FuseOps`); adding a second AIE kernel/pattern; `--aie-layers N` silently offloads nothing and says nothing about why; CPU layers change when only the AIE layer should have | byocfusesplit |
 | conv2dstem real-data fixture: generated header can't live in a subdir; zero-point border; `shift = -exponent`; golden self-check over the console | conv2dstemfixture |
 | Drive conv2dstem from a real TVM layer's `layeriohex` dump (`conv2d_stem_nchwc`, OIHW3i4o/NCHW4c bridges); plausible-but-wrong pixels after a layout change; int32 quant params read as garbage or fault on the A78; mismatch coords name the wrong pixel | conv2dstemtvmlayer |
 | `--aie-offload` says `non-4D shapes; not a conv2d` for every layer, or a layer gets another layer's geometry (`K=0`); TVM 5-D NCHWc vs aiehlc's d1..d4 | nchwclayoutfold |
 | `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aiebackend` (two LLVMs) | aiebackendtvmllvm |
+| `run_test.sh` check 3: no `aie/` under the offloaded layer; `--aiegraph` lifts 0 convs under int8 (`non-4D shapes`); may `--aie-offload` change `layers/` vs golden | aieoffloadaiegraph |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |

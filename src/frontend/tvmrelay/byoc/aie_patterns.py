@@ -35,13 +35,26 @@ Canonicalize first, then match. Matching ``qnn.*`` directly fails: MergeComposit
 lifts the scale/zero-point constants into composite parameters and qnn's own
 canonicalization then dies on ``GetScalarFromConstant`` (verified).
 
-``check_fused_qconv`` holds the constraints
--------------------------------------------
-The pattern only covers the shape. The checker rejects anything the kernel
-cannot reproduce bit-exactly -- a non-zero weight zero-point (C1 makes the
-result data-dependent), any left shift, a clip other than [0, 255] -- and,
-until the kernel learns more shapes, anything that is not the stem geometry.
-Every rejection carries a reason (``AIE_BYOC_DEBUG=1``), because "did not
+Two gates, deliberately separate: shape, then capability
+--------------------------------------------------------
+``check_fused_qconv`` is the ``MergeComposite`` gate and tests SHAPE ONLY -- is
+this a well-formed fused qconv. ``kernel_can_run`` tests CAPABILITY -- can
+``libconv2dstem.a`` reproduce it bit-exactly -- and is called during selection
+(``aie_annotate``), not during fusion.
+
+They used to be one function, and the cost was real: the stem geometry gate
+lived in the ``MergeComposite`` checker, so a layer the kernel could not take
+never became a composite at all. "Malformed" and "not the stem" were the same
+silence, the inline-back path in ``aie_annotate`` was unreachable, and there was
+nowhere to stand to ask "what WOULD it take to offload layer 7".
+
+So: fusion is geometry-agnostic and describes the graph; capability describes
+this one kernel and belongs to the step that picks layers. ``kernel_can_run``
+returns ``(ok, reason)`` rather than only ``_debug``-printing, because the
+caller has to be able to report why a layer the user explicitly asked for
+stayed on the APU.
+
+Rejections from either gate print under ``AIE_BYOC_DEBUG=1``, because "did not
 match" and "matched but rejected" look identical in the final IR.
 """
 
@@ -55,11 +68,40 @@ from tvm import relay
 from tvm.relay.dataflow_pattern import is_constant, is_op, wildcard
 
 __all__ = ["pattern_table", "fused_qconv_pattern", "check_fused_qconv",
-           "extract_fused", "FusedConv", "AIE_PATTERN_NAME", "STEM_GEOMETRY"]
+           "kernel_can_run", "extract_fused", "FusedConv", "AIE_PATTERN_NAME",
+           "STEM_GEOMETRY", "ATTR_WEIGHT_FP", "ATTR_LAYER_ID", "composite_name",
+           "find_conv", "conv_geometry"]
 
 #: Name of the composite function. After PartitionGraph it shows up in the
 #: ``Composite`` attribute, and codegen dispatches on this name.
 AIE_PATTERN_NAME = "aie.qconv_fused"
+
+#: Identity of a fused layer, stamped on the composite function in step 1
+#: (``aie_fuse``). The sorted-weight hash, not a position: Relay's post-order and
+#: the graph executor's order differ (see ``aie_annotate``), so an index is wrong
+#: on one side or the other.
+ATTR_WEIGHT_FP = "aie.weight_fp"
+
+#: The ``--aie-layers`` number, attached in step 2 once the fingerprint resolves
+#: to one. Only SELECTED composites carry it: it is a name for reporting and
+#: error messages, where ATTR_WEIGHT_FP is the identity.
+ATTR_LAYER_ID = "aie.layer_id"
+
+
+def composite_name(fn):
+    """The ``Composite`` attribute of *fn*, or ``None`` if it is not a composite."""
+    if not isinstance(fn, relay.Function) or not fn.attrs:
+        return None
+    return str(fn.attrs["Composite"]) if "Composite" in fn.attrs else None
+
+
+def find_conv(expr):
+    """The first ``nn.conv2d`` under *expr*, or ``None``."""
+    found = []
+    relay.analysis.post_order_visit(
+        expr, lambda e: found.append(e) if isinstance(e, relay.Call)
+        and getattr(e.op, "name", "") == "nn.conv2d" else None)
+    return found[0] if found else None
 
 #: The ONE geometry `libconv2dstem.a` implements: ResNet-18 conv1,
 #: ifm[224,224,3] (*) wts[64,7,7,3], stride 2, pad 3 -> ofm[112,112,64].
@@ -199,69 +241,114 @@ def extract_fused(root) -> FusedConv:
         clip=clip, out_dtype=out_dtype)
 
 
-def _stem_geometry_ok(conv) -> bool:
-    """Exact-match the one convolution `libconv2dstem.a` implements."""
-    attrs = conv.attrs
+def conv_geometry(conv) -> dict:
+    """The six fields ``STEM_GEOMETRY`` compares, or ``None`` if unreadable.
+
+    Shapes come off ``checked_type`` for the activation and off the Constant for
+    the weight, so this still works on a composite body whose input is a param
+    Var that no ``InferType`` has reached yet.
+    """
     try:
         in_shape = [int(v) for v in conv.args[0].checked_type.shape]
-        w_shape = [int(v) for v in conv.args[1].checked_type.shape]
-    except Exception as exc:
-        _debug(f"reject: cannot read shapes off the conv ({exc})")
-        return False
+        w = conv.args[1]
+        w_shape = [int(v) for v in (w.data.shape if isinstance(w, relay.Constant)
+                                    else w.checked_type.shape)]
+    except Exception:
+        return None
     if len(in_shape) != 4 or len(w_shape) != 4:
-        _debug(f"reject: unexpected rank in={in_shape} w={w_shape}")
-        return False
-    got = {
+        return None
+    return {
         "in_hw": (in_shape[2], in_shape[3]),
         "in_c": in_shape[1],
         "kernel": (w_shape[2], w_shape[3]),
-        "strides": tuple(int(v) for v in attrs.strides),
-        "padding": tuple(int(v) for v in attrs.padding),
+        "strides": tuple(int(v) for v in conv.attrs.strides),
+        "padding": tuple(int(v) for v in conv.attrs.padding),
         "out_c": w_shape[0],
     }
+
+
+def _stem_geometry_ok(conv) -> tuple:
+    """Exact-match the one convolution `libconv2dstem.a` implements. ``(ok, reason)``."""
+    got = conv_geometry(conv)
+    if got is None:
+        return False, "cannot read the conv's shapes"
     for field, expect in STEM_GEOMETRY.items():
         if got[field] != expect:
-            _debug(f"reject: not the stem -- {field}={got[field]} != {expect}")
-            return False
-    return True
+            return False, f"not the stem -- {field}={got[field]} != {expect}"
+    return True, "stem geometry"
 
 
 def check_fused_qconv(root) -> bool:
-    """Can ``libconv2dstem.a`` reproduce this fused op bit-exactly?"""
+    """Is this a well-formed fused qconv? SHAPE ONLY -- capability is ``kernel_can_run``.
+
+    This is the ``MergeComposite`` gate, so it decides what FUSES, not what the
+    AIE can run. Keep it geometry-agnostic: a layer that fuses but that this
+    kernel cannot take is inlined back by ``aie_annotate`` and costs nothing,
+    whereas a layer that never fuses cannot be reported on at all.
+    """
     try:
         f = extract_fused(root)
     except (ValueError, AttributeError, IndexError) as exc:
-        _debug(f"reject: {exc}")
+        _debug(f"no match: {exc}")
         return False
-    conv = f.conv
-    if int(conv.attrs.groups) != 1 or str(conv.attrs.data_layout) != "NCHW":
-        _debug(f"reject: groups={conv.attrs.groups} layout={conv.attrs.data_layout}")
+    # NCHW is structural to this pattern family, not a limit of the kernel:
+    # extract_fused and conv_geometry both index positionally.
+    layout = str(f.conv.attrs.data_layout)
+    if layout != "NCHW":
+        _debug(f"no match: layout={layout}, want NCHW")
         return False
-    try:
-        in_dtype = str(conv.args[0].checked_type.dtype)
-    except Exception:
-        in_dtype = "?"
-    if in_dtype != "uint8" or str(f.weight.dtype) != "int8":
-        _debug(f"reject: dtypes in={in_dtype} w={f.weight.dtype}, want uint8 x int8")
-        return False
-    if f.wzp.any():
-        _debug("reject: non-zero weight zero-point -- the result depends on sum(x)")
-        return False
-    if f.lshift_required or f.lshift.any():
-        _debug("reject: left shift in the requantize -- the kernel only right-shifts")
-        return False
-    if (f.rshift < 0).any():
-        _debug("reject: negative right shift")
-        return False
-    if f.clip != (0.0, 255.0) or f.out_dtype != "uint8":
-        _debug(f"reject: clip={f.clip} out={f.out_dtype}, want [0,255] -> uint8")
-        return False
-    if not _stem_geometry_ok(conv):
-        return False
-    _debug("accept: stem fused qconv")
+    _debug(f"fused qconv: {conv_geometry(f.conv)}")
     return True
 
 
+def kernel_can_run(root) -> tuple:
+    """Can ``libconv2dstem.a`` reproduce this fused op bit-exactly? ``(ok, reason)``.
+
+    Capability, not shape -- called during SELECTION, so a layer the user asked
+    for by number can be turned down with a reason instead of silently staying
+    on the APU. Every rejection here is something the core's
+    ``(acc + bias - zp) * mult >> (shift+31)`` epilogue cannot express.
+
+    Not fail-closed on its own, and does not need to be: ``aie_codegen`` re-checks
+    the dtypes and the full signature on the PARTITIONED function, where types
+    always exist, and raises. That is why an unreadable input dtype defers here
+    rather than rejecting.
+    """
+    try:
+        f = extract_fused(root)
+    except (ValueError, AttributeError, IndexError) as exc:
+        return False, str(exc)
+    conv = f.conv
+    if int(conv.attrs.groups) != 1:
+        return False, f"groups={conv.attrs.groups}, the kernel does dense conv only"
+    try:
+        in_dtype = str(conv.args[0].checked_type.dtype)
+    except Exception:
+        in_dtype = None          # no InferType here yet; aie_codegen will check
+    if in_dtype is not None and in_dtype != "uint8":
+        return False, f"input dtype {in_dtype}, want uint8"
+    if str(f.weight.dtype) != "int8":
+        return False, f"weight dtype {f.weight.dtype}, want int8"
+    if f.wzp.any():
+        return False, "non-zero weight zero-point -- the result depends on sum(x)"
+    if f.lshift_required or f.lshift.any():
+        return False, "left shift in the requantize -- the kernel only right-shifts"
+    if (f.rshift < 0).any():
+        return False, "negative right shift"
+    if f.clip != (0.0, 255.0) or f.out_dtype != "uint8":
+        return False, f"clip={f.clip} out={f.out_dtype}, want [0,255] -> uint8"
+    ok, why = _stem_geometry_ok(conv)
+    if not ok:
+        return False, why
+    return True, "stem fused qconv"
+
+
 def pattern_table():
-    """The ``[(name, pattern, checker)]`` that ``MergeComposite`` expects."""
+    """The ``[(name, pattern, checker)]`` that ``MergeComposite`` expects.
+
+    One entry today. A second kernel is a pure addition here plus an emitter in
+    ``aie_codegen._EMITTERS`` keyed by the same name; nothing else dispatches on
+    the composite name. Order matters if two patterns can match the same chain --
+    ``MergeComposite`` tries them in order, so the most specific goes first.
+    """
     return [(AIE_PATTERN_NAME, fused_qconv_pattern(), check_fused_qconv)]

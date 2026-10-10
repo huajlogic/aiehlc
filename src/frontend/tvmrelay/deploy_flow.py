@@ -772,8 +772,10 @@ def _stage_aie_offload(mod, params, out_dir: Path, aie_layers, aie_ops, *,
     if not targets:
         return {"count": 0, **res}
 
+    # The mapping, not just its keys: the layer number rides along into the IR as
+    # aie.layer_id, so codegen and errors can name the --aie-layers argument.
     fp_layer = {t["fingerprint"]: layer for layer, t in targets.items()}
-    pmod, info = aie_byoc.partition_for_aie(mod, params, convs=set(fp_layer),
+    pmod, info = aie_byoc.partition_for_aie(mod, params, convs=fp_layer,
                                             verbose=verbose)
     bad = _aie.check_targets(targets, info["convs"])
     if bad:
@@ -783,10 +785,16 @@ def _stage_aie_offload(mod, params, out_dir: Path, aie_layers, aie_ops, *,
             for line in bad[:5]:
                 print(f"              {line}")
         return {"count": 0, "mapping_errors": bad, **res}
-    for fp in info["unmatched"]:
-        if verbose:
-            print(f"  [aie] layer {fp_layer[fp]:02d}: no AIE kernel for this conv "
-                  f"yet -- stays on the APU (AIE_BYOC_DEBUG=1 for the reason)")
+    if verbose:
+        # Two different outcomes, and they used to look the same. "unmatched" =
+        # the layer did not even fuse (the pattern does not describe its shape);
+        # "rejected" = it fused, and the kernel said why it cannot run it.
+        for fp, why in info.get("rejected", {}).items():
+            print(f"  [aie] layer {fp_layer[fp]:02d}: fused, but no AIE kernel "
+                  f"can run it -- {why}; stays on the APU")
+        for fp in info["unmatched"]:
+            print(f"  [aie] layer {fp_layer[fp]:02d}: does not match any AIE "
+                  f"pattern -- stays on the APU (AIE_BYOC_DEBUG=1 for the reason)")
     if not info["count"]:
         return {"count": 0, **res, "byoc": info}
 
@@ -871,7 +879,7 @@ def _stage_quantize(raw_path, model_path, out_dir: Path, *,
 def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         global_scale: float = 8.0, fuse: bool = True, split: bool = True,
         flat: bool = False, arm: bool = True, image=None,
-        aie_offload: bool = False, aie_layers=(6,),   # keep in step with --aie-layers
+        aie_offload: bool = False, aie_layers=(1,),   # keep in step with --aie-layers
         aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
         aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
         relay_ptq: bool = False, local: bool = False, local_run: bool = True,
@@ -882,7 +890,9 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     means every eligible layer) to AIE through TVM BYOC: after the CPU build,
     the selected convs are partitioned out of the Relay graph and the C is
     rebuilt, so the graph executor calls the generated wrapper -> the aiehlc
-    AIE library in place of TVM's own kernel (``_stage_aie_offload``).
+    AIE library in place of TVM's own kernel (``_stage_aie_offload``). It also
+    runs the ``aiegraph`` lift below over the same selection, which is what
+    writes ``layers/NN_op/aie/`` -- BYOC itself writes no per-layer artifacts.
 
     ``aiegraph`` instead lifts the **whole** graph into one verified
     ``aiegraph.func`` and partitions it: layers in ``aie_layers`` whose aiegraph
@@ -931,23 +941,26 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     # fingerprint and the geometry before anything is offloaded. Verified: the
     # same weights hash identically as int8/NCHW, int16/NCHW and int16/NCHWc.
     # `--aiegraph` now takes the same `--aie-layers` selection (it used to take
-    # none), so both ways in target the same conv: layer 6, the stem.
+    # none), so both ways in target the same conv: layer 1, the stem.
     #
     # Keeping it off was also the wrong default on its own terms: the AIE kernel
     # consumes int8, so legalizing to int16 meant the offloaded conv's operands
     # were the one thing NOT in the width the hardware wants.
     #
-    # `--aie-layers` indices DO still move (the stem is 6, not 1) -- that was
-    # never the thing protecting correctness, since a wrong index now reports
-    # "not a conv -- only convs offload" and offloads nothing rather than
-    # offloading the wrong op.
+    # `--aie-layers` indices DO still move with any pass that adds or removes
+    # graph nodes -- the stem has been index 1 (fp32), then 6 (int8 legalized),
+    # then 1 again (int8 + the qnn zero-point fold, today's default). That was
+    # never the thing protecting correctness: a wrong index that lands on a
+    # non-conv reports "not a conv -- only convs offload" and offloads nothing.
+    # It does NOT protect against landing on a DIFFERENT conv, which resolves
+    # fine and then matches no pattern -- check the geometry the stage prints.
     #
-    # `--aiegraph` maps layers by fused NAME (`conv2d_add_relu` -> conv_bn_relu),
-    # and the legalized groups are called
-    # `contrib_conv2d_NCHWc_subtract_add_add_subtract_...`, so it matches 0
-    # layers here. That is NOT a regression from this change: it already matched
-    # 0/28 under the ONNX-PTQ default (doc/design/byoc_aie_plan.md:160). It runs
-    # clean and links; it just offloads nothing until that mapping is updated.
+    # `--aiegraph` maps layers by fused op list (`conv2d` present -> conv_bn /
+    # conv_bn_relu). It used to lift 0 convs here, not because of the names but
+    # because the int8 graph is 5-D NCHWc and its geometry reader took 4-D only
+    # ("non-4D shapes; not a conv2d"); it now folds NCHWc via
+    # aie_offload._layer_geometry, so all 20 convs lift and layer 1 (the stem,
+    # 230x230x3 -> 64ch K7s2) gets an aie/ build.
     if pe_int8 is None:
         pe_int8 = True
     target = None
@@ -996,8 +1009,14 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
 
     # Whole-graph aiegraph + AIE/CPU partition. Also additive: CPU layers keep
     # reusing the stage-5 C, and AIE layers keep theirs too so the ELF links.
+    #
+    # --aie-offload runs it too, over the same --aie-layers selection: BYOC
+    # above only swaps the call in resnet18.c and writes no per-layer AIE
+    # artifacts, while this lifts the selected conv into aiegraph and emits
+    # layers/NN_op/aie/ (host.cc/kernel.cc/routing.cc). Every layer's .c is left
+    # exactly as stage 5 wrote it, so layers/ still matches the default flow.
     graph_part = None
-    if aiegraph:
+    if aiegraph or aie_offload:
         if layers is None:
             if verbose:
                 print("[6/7] aiegrph: skipped -- needs stage 5's layers/")
@@ -1157,14 +1176,15 @@ def main(argv=None) -> int:
                          "the generated C calls the aiehlc AIE library "
                          "(aout/libconv2dstem.a) in place of TVM's kernel. "
                          "Only the ResNet-18 stem has an AIE kernel today")
-    ap.add_argument("--aie-layers", default="6",
+    ap.add_argument("--aie-layers", default="1",
                     help="which layers to offload, as numbered in layers/ by "
                          "the CPU build: an index, a comma list, or 'all'. "
                          "Applies to BOTH --aie-offload and --aiegraph "
-                         "(default: 6, the 7x7/s2 conv stem under the "
-                         "int8-legalized graph -- it was 1 before int8 split "
-                         "each conv into a zero-point chain; check layers/ if "
-                         "unsure)")
+                         "(default: 1, the 7x7/s2 conv stem. It moved 1 -> 6 "
+                         "when int8 legalization split each conv into a "
+                         "zero-point chain, then back to 1 when --fold-qnn-zp "
+                         "removed those chains again; with --no-fold-qnn-zp it "
+                         "is 6. Check layers/ if unsure)")
     ap.add_argument("--aie-ops", default=",".join(AIE_OP_KINDS),
                     help=f"op kinds eligible for AIE "
                          f"(default: {','.join(AIE_OP_KINDS)})")

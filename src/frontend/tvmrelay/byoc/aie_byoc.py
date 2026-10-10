@@ -2,26 +2,37 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
-"""BYOC entry point: pattern table + annotation + codegen, chained in order.
+"""BYOC entry point: the four steps, chained in order.
 
 ``deploy_flow --aie-offload`` calls ``partition_for_aie(mod, params, convs=...)``
-with the conv weight fingerprints ``aie_offload.resolve_conv_targets`` selected. Merging,
-partitioning and host-side compilation are TVM's job; this calls them in order.
+with what ``aie_offload.resolve_conv_targets`` selected. This file is the
+orchestration; each step lives in its own module:
 
-The pass order matters
-----------------------
-``InferType`` -> ``FoldConstant`` -> ``qnn.CanonicalizeOps`` -> ``FoldConstant``
--> ``MergeComposite`` -> **annotation** -> ``InferType`` ->
-``MergeCompilerRegions`` -> ``PartitionGraph``
+==== ================= ====================================================
+step module            what it does
+==== ================= ====================================================
+1    ``aie_fuse``      canonicalize, ``MergeComposite``, tag ``aie.weight_fp``
+2    ``aie_annotate``  select by fingerprint + ``kernel_can_run``, tag
+                       ``aie.layer_id``, ``compiler_begin``/``end``
+3    *here*            ``MergeCompilerRegions`` + ``PartitionGraph``
+4    ``aie_codegen``   ``relay.ext.aie``, dispatched on the composite name
+==== ================= ====================================================
 
-* ``CanonicalizeOps`` before matching: see ``aie_patterns`` -- matching ``qnn.*``
-  directly makes qnn's own canonicalization die on lifted constants.
-* ``FoldConstant`` AFTER canonicalization too: the expansion leaves the
-  zero-point correction (``C2``) as an expression over constants, and the
-  fused pattern needs it as a single ``Constant``.
-* Annotation after ``MergeComposite``: the unit to wrap is the whole composite.
-* ``InferType`` after annotation: ``compiler_begin/end`` carry no type, and
-  ``PartitionGraph`` needs types to find the boundaries.
+Why step 1 is separate from steps 2-3
+-------------------------------------
+It used to be inlined here, with the stem geometry gate inside the
+``MergeComposite`` checker -- so the only layer that ever fused was the one the
+AIE could already run. Fusing is now geometry-agnostic and selection owns
+capability, which is what lets a layer be turned down by name. See ``aie_fuse``.
+
+Do not confuse it with TVM's ``FuseOps``, which is TE-level operator fusion,
+runs inside the second ``relay.build``, and necessarily comes AFTER partitioning
+so that it only fuses what stayed on the CPU.
+
+``InferType`` after annotation
+------------------------------
+``compiler_begin``/``compiler_end`` carry no type, and ``PartitionGraph`` needs
+types to find the boundaries.
 
 Partition before ``AlterOpLayout``
 ----------------------------------
@@ -35,11 +46,11 @@ from __future__ import annotations
 
 import tvm
 from tvm import relay
-from tvm.relay.qnn import transform as qnn_transform
 
 from frontend.tvmrelay.byoc import aie_codegen  # noqa: F401  registers relay.ext.aie
 from frontend.tvmrelay.byoc.aie_annotate import AIE_COMPILER_NAME, ConvSelectAnnotator
-from frontend.tvmrelay.byoc.aie_patterns import AIE_PATTERN_NAME, pattern_table
+from frontend.tvmrelay.byoc.aie_fuse import fuse_layers
+from frontend.tvmrelay.byoc.aie_patterns import AIE_PATTERN_NAME
 
 __all__ = ["partition_for_aie", "count_composites", "partition_summary"]
 
@@ -84,38 +95,24 @@ def partition_summary(mod, compiler: str = AIE_COMPILER_NAME) -> dict:
 
 
 def partition_for_aie(mod, params=None, convs=(), verbose: bool = True):
-    """Partition the fused qconvs whose weight fingerprint is in *convs*
-    (``None``: all that match). Returns ``(mod, info)``.
+    """Fuse, select, partition. Returns ``(mod, info)``.
 
-    ``info["convs"]`` lists every conv with its fingerprint, geometry and
-    whether it was offloaded -- the caller cross-checks it against TVM's graph.
-    A selected conv that does not match the pattern is simply not offloaded
-    (``info["unmatched"]``); it is never forced onto the AIE.
+    *convs* is a ``{weight_fingerprint: layer_index}`` mapping (a bare iterable of
+    fingerprints also works; ``None`` means every composite the kernel can run).
+
+    ``info["convs"]`` lists every conv with its fingerprint, geometry and whether
+    it was offloaded -- the caller cross-checks it against TVM's graph. A
+    selected conv is never forced onto the AIE: if it did not fuse it lands in
+    ``info["unmatched"]``, and if it fused but the kernel cannot run it, in
+    ``info["rejected"]`` with the reason.
     """
-    # Work on a copy: the caller's module is still the CPU build's input.
-    mod = tvm.IRModule(dict(mod.functions), dict(mod.type_definitions))
-    if params:
-        mod["main"] = relay.build_module.bind_params_by_name(mod["main"], params)
-
-    mod = tvm.transform.Sequential([
-        relay.transform.InferType(),
-        relay.transform.FoldConstant(),
-        qnn_transform.CanonicalizeOps(),
-        relay.transform.InferType(),
-        relay.transform.FoldConstant(),
-        relay.transform.InferType(),
-        relay.transform.MergeComposite(pattern_table()),
-    ])(mod)
-
+    mod, fuse_info = fuse_layers(mod, params, verbose=verbose)
     matched = count_composites(mod)
-    if verbose:
-        print(f"  [aie-byoc] MergeComposite matched {matched} {AIE_PATTERN_NAME} "
-              f"(AIE_BYOC_DEBUG=1 prints every rejection reason)")
 
     annotator = ConvSelectAnnotator(selected=convs, pattern_name=AIE_PATTERN_NAME)
     mod["main"] = annotator.visit(mod["main"])
     if verbose:
-        print(f"  [aie-byoc] {annotator.report()}")
+        print(f"  [aie-byoc] 2/4 select: {annotator.report()}")
 
     mod = tvm.transform.Sequential([
         relay.transform.InferType(),
@@ -126,11 +123,14 @@ def partition_for_aie(mod, params=None, convs=(), verbose: bool = True):
 
     summary = partition_summary(mod)
     if verbose:
-        print(f"  [aie-byoc] partitioned out {summary['count']} AIE subgraph(s)"
+        print(f"  [aie-byoc] 3/4 part  : {summary['count']} AIE subgraph(s)"
               + (f": {', '.join(summary['functions'])}" if summary["functions"] else ""))
 
     offloaded = {c["fingerprint"] for c in annotator.convs if c["offloaded"]}
+    asked = set(convs or ())
     info = {"matched": matched, "annotated": annotator.annotated,
-            "convs": annotator.convs,
-            "unmatched": sorted(set(convs or ()) - offloaded), **summary}
+            "convs": annotator.convs, "composites": fuse_info["composites"],
+            "rejected": dict(annotator.rejected),
+            "unmatched": sorted(asked - offloaded - set(annotator.rejected)),
+            **summary}
     return mod, info

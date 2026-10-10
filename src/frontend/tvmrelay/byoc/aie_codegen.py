@@ -2,13 +2,20 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
-"""Codegen: what a partitioned-out AIE subgraph compiles into.
+"""Step 4 of the BYOC flow: what a partitioned-out AIE subgraph compiles into.
 
-The third of the four BYOC files. After ``PartitionGraph``, TVM calls
-``relay.ext.aie`` for every function with ``Compiler="aie"``; this module is that
-callback. It returns a C source module (``CSourceModuleCreate``), so the wrapper
-lands in ``resnet18.c`` next to TVM's own kernels and is compiled and linked by
-``arm_build.py`` like everything else.
+After ``PartitionGraph``, TVM calls ``relay.ext.aie`` for every function with
+``Compiler="aie"``; this module is that callback. It returns a C source module
+(``CSourceModuleCreate``), so the wrapper lands in ``resnet18.c`` next to TVM's
+own kernels and is compiled and linked by ``arm_build.py`` like everything else.
+
+Dispatch is on the COMPOSITE NAME
+---------------------------------
+``_EMITTERS`` maps ``Composite`` attribute -> emitter. A second AIE kernel is
+then a ``aie_patterns.pattern_table`` entry plus an entry in that dict: nothing
+else in the flow branches on which op this is. The composite also carries
+``aie.layer_id`` from step 2, so an error here can name the ``--aie-layers``
+argument that produced it instead of an anonymous ``tvmgen_default_aie_main_0``.
 
 What the wrapper does
 ---------------------
@@ -43,11 +50,14 @@ import numpy as np
 import tvm
 from tvm import relay
 
-from frontend.tvmrelay.byoc.aie_patterns import AIE_PATTERN_NAME, STEM_GEOMETRY, extract_fused
+from frontend.tvmrelay.byoc.aie_patterns import (AIE_PATTERN_NAME, ATTR_LAYER_ID,
+                                                 STEM_GEOMETRY, composite_name,
+                                                 extract_fused)
 # The symbol arm_build keys the libconv2dstem.a link off -- one definition.
 from frontend.tvmrelay.arm_build import AIE_ENTRY
 
-__all__ = ["aie_compiler", "register", "emit_c_for_function", "fold_qparams", "AIE_ENTRY"]
+__all__ = ["aie_compiler", "register", "emit_c_for_function", "emit_stem",
+           "fold_qparams", "AIE_ENTRY"]
 
 #: Keep in sync with aie_annotate.AIE_COMPILER_NAME.
 _COMPILER = "aie"
@@ -131,19 +141,35 @@ TVM_DLL int {name}(void* args, int* type_codes, int num_args,
 
 
 def _find_composite(func):
-    """The ``aie.qconv_fused`` composite function inside a partitioned function."""
+    """The AIE composite inside a partitioned function, as ``(composite, name)``.
+
+    Matches by MEMBERSHIP in ``_EMITTERS`` rather than against one constant, so a
+    second kernel is a ``pattern_table`` entry plus an emitter and nothing here.
+    """
     found = []
 
     def visit(e):
-        if isinstance(e, relay.Function) and e.attrs and "Composite" in e.attrs \
-                and str(e.attrs["Composite"]) == AIE_PATTERN_NAME:
-            found.append(e)
+        name = composite_name(e)
+        if name in _EMITTERS:
+            found.append((e, name))
 
     relay.analysis.post_order_visit(func.body, visit)
     if len(found) != 1:
-        raise ValueError(f"expected exactly one {AIE_PATTERN_NAME} composite, "
+        known = ", ".join(sorted(_EMITTERS)) or "(none registered)"
+        raise ValueError(f"expected exactly one AIE composite ({known}), "
                          f"found {len(found)}")
     return found[0]
+
+
+def _layer_label(comp, comp_name: str) -> str:
+    """``aie.qconv_fused (layer 06)`` -- with the number if step 2 attached one.
+
+    An error here is otherwise impossible to tie back to a ``--aie-layers``
+    argument, which is the only handle the user has.
+    """
+    if comp.attrs and ATTR_LAYER_ID in comp.attrs:
+        return f"{comp_name} (layer {int(comp.attrs[ATTR_LAYER_ID]):02d})"
+    return comp_name
 
 
 def fold_qparams(f) -> np.ndarray:
@@ -168,8 +194,19 @@ def _c_rows(values, per_line: int, indent: str = "    ") -> str:
 
 
 def emit_c_for_function(func, name: str) -> str:
-    """C source for one partitioned function. Raises if it is not the fused stem."""
-    comp = _find_composite(func)
+    """C source for one partitioned function, dispatched on the composite name."""
+    comp, comp_name = _find_composite(func)
+    return _EMITTERS[comp_name](func, comp, name, _layer_label(comp, comp_name))
+
+
+def emit_stem(func, comp, name: str, label: str) -> str:
+    """``aie.qconv_fused`` -> the ``conv2d_stem_prepadded`` wrapper.
+
+    Fail-closed on the signature: ``kernel_can_run`` already vetted this during
+    selection, but it may have run before ``InferType`` reached the composite's
+    params, so the authoritative dtype/shape check is here, on the partitioned
+    function, where types always exist.
+    """
     f = extract_fused(comp.body)
     in_t, out_t = func.params[0].checked_type, func.ret_type
     in_shape = [int(d) for d in in_t.shape]
@@ -177,7 +214,7 @@ def emit_c_for_function(func, name: str) -> str:
     oc, ic, kh, kw = (int(d) for d in f.weight.shape)
     if (str(in_t.dtype), str(out_t.dtype)) != ("uint8", "uint8") \
             or in_shape[1:] != [ic, *STEM_GEOMETRY["in_hw"]] or out_shape[1] != oc:
-        raise ValueError(f"{name}: {in_shape} {in_t.dtype} -> {out_shape} "
+        raise ValueError(f"{name}: {label}: {in_shape} {in_t.dtype} -> {out_shape} "
                          f"{out_t.dtype} is not the fused stem signature")
 
     qp = fold_qparams(f)
@@ -189,6 +226,13 @@ def emit_c_for_function(func, name: str) -> str:
         qp=",\n".join(f"        {b}, {z}, {m}, {s}" for b, z, m, s in qp),
         ic=ic, hp=in_shape[2], wp=in_shape[3],
         oc=oc, oh=out_shape[2], ow=out_shape[3])
+
+
+#: Composite name -> emitter ``(func, composite, symbol, label) -> C source``.
+#: The one dispatch point in step 4: ``_find_composite`` looks up by membership
+#: here, so adding a kernel means a ``pattern_table`` entry and an entry here.
+#: Defined after the emitters so the functions exist.
+_EMITTERS = {AIE_PATTERN_NAME: emit_stem}
 
 
 @tvm._ffi.register_func("relay.ext.aie")

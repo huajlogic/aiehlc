@@ -169,7 +169,16 @@ def _conv_geometry(graph: dict, idx: int) -> dict:
     Nothing here re-derives convolution arithmetic: the shapes are the result of
     TVM's type inference, so ``stride`` is read back out of the input/output
     ratio and ``K`` off the weight tensor.
+
+    The int8 default graph is **NCHWc** (5-D feature maps, 6-D weights) after
+    ``AlterOpLayout``; that case is handed to ``aie_offload._layer_geometry``,
+    which folds ``C = C_outer * c`` (skill: nchwclayoutfold). Without it every
+    conv -- the stem included -- came back ``non-4D shapes; not a conv2d``.
     """
+    if any(len(s) == 5 for s in _input_shapes(graph, idx) + [_shape(graph, idx)]):
+        from frontend.tvmrelay.aie_offload import _layer_geometry
+
+        return _layer_geometry(graph, idx)
     producers = _data_inputs(graph, idx)
     inputs = _input_shapes(graph, idx)
     if not producers and not inputs:
@@ -539,7 +548,18 @@ def _offload(backend, ir: str, owners: list, verdicts: list, layers_dir: Path,
 
 def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
                aie_dir: Path, out_dir: Path, mesh, verbose: bool) -> dict:
-    """Run ``run_aie_pipeline`` for one launch into *aie_dir*. Returns its record."""
+    """Run ``run_aie_pipeline`` for one launch into *aie_dir*. Returns its record.
+
+    A conv with exactly the ResNet stem geometry is built from
+    ``conv2dstem.cc`` by aiehlc instead -- the same logic ``test_conv2d.cc``
+    verifies bit-exact against this layer -- not from the generic placeholder
+    body (``aie_stem_lib``).
+    """
+    from frontend.tvmrelay import aie_stem_lib
+
+    if launch["op"].startswith("conv_") and aie_stem_lib.matches_stem(rec):
+        return _build_stem(aie_stem_lib, launch, rec, verdict, aie_dir,
+                           out_dir, verbose)
     aie_dir.mkdir(parents=True, exist_ok=True)
     specs = [(list(shape), int(bits), bool(is_in))
              for (shape, bits, is_in) in launch["tensor_specs"]]
@@ -564,6 +584,33 @@ def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
     if ok:
         entry.update(_archive_one(aie_dir, verdict, launch, specs, mesh,
                                   out_dir, verbose))
+    return entry
+
+
+def _build_stem(aie_stem_lib, launch: dict, rec: dict, verdict: dict,
+                aie_dir: Path, out_dir: Path, verbose: bool) -> dict:
+    """aiehlc-build ``conv2dstem.cc`` into *aie_dir*. Returns its record."""
+    res = aie_stem_lib.build_stem_layer(aie_dir, verbose=False)
+    if verbose:
+        print(f"  [aiegraph] layer {verdict['index']:02d} {verdict['kind']}"
+              f" -> {launch['op']} (stem) -> aiehlc "
+              f"{aie_stem_lib.STEM_SOURCE.name} -> "
+              f"{aie_dir.relative_to(out_dir)}/ ({len(res['files'])} files)")
+    entry = {"index": verdict["index"], "node": rec["node"],
+             "dir": str(aie_dir.relative_to(out_dir)), "ok": res["ok"],
+             "op": launch["op"], "func_name": launch["func_name"],
+             "files": res["files"], "backend": "aiehlc",
+             "source": str(aie_stem_lib.STEM_SOURCE.relative_to(_REPO))}
+    if res["archive"]:
+        entry["archive"] = str(Path(res["archive"]).relative_to(out_dir))
+        if verbose:
+            print(f"  [aiegraph]   -> {Path(res['archive']).name} "
+                  f"({Path(res['archive']).stat().st_size / 1024:,.0f} KB)")
+    else:
+        entry.update(archive=None,
+                     archive_reason=res.get("reason", "aiehlc built no archive"))
+        if verbose:
+            print(f"  [aiegraph]   no archive: {entry['archive_reason']}")
     return entry
 
 
@@ -615,6 +662,11 @@ def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
             "aiegraph": v["aiegraph"], "target": v["target"],
             "reason": v["verdict_reason"],
             "aie_dir": built["dir"] if built else None,
+            # How aie/ was produced: "aiehlc" from a hand-written source
+            # (the stem -> conv2dstem.cc), else the generic aiegraph pipeline.
+            "backend": (built.get("backend", "run_aie_pipeline")
+                        if built else None),
+            "source": built.get("source") if built else None,
             # The linkable product of that folder, or why there isn't one.
             # Null with a reason is the normal state on a box without the
             # Vitis cross toolchain; null without one means it was never tried.
