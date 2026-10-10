@@ -66,6 +66,7 @@
   <a href="#aiegraph">8. aiegraph path (what runs today)</a>
   <a href="#stem">9. conv2dstem.cc → layer aie/</a>
   <a href="#entry">10. The packed-call entry</a>
+  <a href="aietensorop_conv.html"><b>→ All 19 conv layers: basic ops vs per-op kernels</b></a>
   <h2>Into the ELF</h2>
   <a href="#driver">11. graph_driver.c</a>
   <a href="#make">12. Makefile, link, main.elf</a>
@@ -129,6 +130,10 @@ identical to the CPU-only <code>main_local.elf</code>: 258 Samoyed 12.0173, 279 
  apppaltest.py main.elf → console: [aie-offload] …, top-5               [7/7] cpu ref
 </pre>
 
+<div class="box"><b>Now: all 19 conv layers, not just layer 01</b>
+<code>--aie-layers all</code> is the default. Layer 01 is still built as described here
+(<code>conv2dstem.cc</code>). The other 18 use one shared AIE basic op plus TVM's own epilogue. How and why:
+<a href="aietensorop_conv.html">Many conv2d shapes on the AIE: one kernel per fused op, or basic ops?</a></div>
 <p>Two ideas hold the whole thing together:</p>
 <ol>
 <li><b>TVM owns the network, the AIE owns one operator.</b> TVM compiles all 41 kernel calls to
@@ -378,9 +383,10 @@ offloadable go <code>target: aie</code>; everything else <code>cpu</code>, each 
 <code>layers/partition.json</code>.</li>
 <li><b>Build</b> each AIE layer (<code>_build_one</code>). If its geometry is exactly the stem
 (<code>aie_stem_lib.matches_stem</code>, against <code>STEM_GEOMETRY</code>), it is built from the
-hand-written <code>conv2dstem.cc</code> (§9). Otherwise the generic
-<code>run_aie_pipeline</code> + <code>kernels.conv_bn_body</code> placeholder is used — int16 accumulator,
-dummy quant: right shape, <b>not</b> TVM's arithmetic.</li>
+hand-written <code>conv2dstem.cc</code> (§9). <b>Every other conv layer</b> (since 2026-10-10, with
+<code>--aie-layers all</code>, the default) goes through the shared <b>convgemm basic op</b> plus TVM's
+own epilogue transplanted into <code>aie/tail.c</code>, which is bit-exact on x86 for all 18. That has its own page:
+<a href="aietensorop_conv.html">Many conv2d shapes on the AIE</a>.</li>
 </ol>
 <p>The verdict for layer 01 in <code>partition.json</code>:</p>
 <pre><code>{ "index": 1, "target": "aie", "aiegraph": ["conv_bn"],

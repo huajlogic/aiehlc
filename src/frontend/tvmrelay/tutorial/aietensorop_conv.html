@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Many conv2d shapes on the AIE: one kernel per fused op, or basic ops?</title>
+<style>
+  :root { --fg:#1d2330; --muted:#5b6475; --line:#e2e6ee; --side:#f5f7fa; --code:#f6f8fa; --ok:#1a7f37; --bad:#b4161b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.6 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }
+  nav { position:fixed; top:0; left:0; bottom:0; width:280px; overflow-y:auto; background:var(--side);
+        border-right:1px solid var(--line); padding:18px 16px; font-size:14px; }
+  nav a { display:block; color:var(--fg); text-decoration:none; padding:3px 6px; border-radius:4px; }
+  nav a:hover { background:#e8ecf3; }
+  nav h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:14px 0 6px; }
+  main { margin-left:280px; max-width:1020px; padding:28px 44px 120px; }
+  h1 { font-size:29px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:22px; margin:44px 0 10px; padding-top:10px; border-top:1px solid var(--line); }
+  h3 { font-size:18px; margin:26px 0 8px; }
+  p.lead { color:var(--muted); font-size:17px; }
+  code { font:13.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--code); padding:1px 5px; border-radius:4px; }
+  pre { background:var(--code); border:1px solid var(--line); border-radius:6px; padding:12px 14px; overflow-x:auto;
+        font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  pre code { background:none; padding:0; }
+  table { border-collapse:collapse; width:100%; margin:12px 0; font-size:14px; }
+  th, td { border:1px solid var(--line); padding:5px 8px; text-align:left; vertical-align:top; }
+  th { background:var(--side); }
+  td.n { text-align:right; font-variant-numeric: tabular-nums; }
+  .box { border-left:4px solid #8aa4d6; background:#f3f6fc; padding:10px 14px; margin:14px 0; border-radius:0 6px 6px 0; }
+  .box.warn { border-color:#d4a72c; background:#fff8e6; } .box.ok { border-color:var(--ok); background:#eef8f0; }
+  .box b:first-child { display:block; margin-bottom:2px; }
+  @media (max-width: 900px) { nav { position:static; width:auto; } main { margin-left:0; padding:20px; } }
+</style>
+</head>
+<body>
+<nav>
+  <div style="font-weight:600">aietensorop: many conv shapes</div>
+  <div style="font-size:13px;color:var(--muted)"><a href="index.html" style="padding:0">← main TVM → AIE tutorial</a></div>
+  <h2>The question</h2>
+  <a href="#problem">1. 19 fused conv ops, 11 shapes, 6 tails</a>
+  <h2>Two answers</h2>
+  <a href="#perop">2. One hand kernel per fused op</a>
+  <a href="#basic">3. Basic ops: what every layer shares</a>
+  <a href="#convgemm">4. convgemm: the GEMM tile basic op</a>
+  <a href="#tail">5. The tail: TVM's own C, transplanted</a>
+  <a href="#isolate">6. Two AIE libraries in one ELF</a>
+  <h2>Using it</h2>
+  <a href="#flow">7. What the flow generates</a>
+  <a href="#verify">8. How it is verified</a>
+  <a href="#cost">9. Cost model and where to go next</a>
+  <a href="#extend">10. Adding a shape, an op, a kernel</a>
+  <a href="#compare">11. Side by side</a>
+</nav>
+<main>
+<h1>Many conv2d shapes on the AIE: one kernel per fused op, or basic ops?</h1>
+<p class="lead">ResNet-18 int8 has 19 distinct fused conv layers. This page explains how
+<code>src/aietensorop</code> covers all of them: a hand-tuned fused kernel for the hottest layer
+(<code>conv2dstem</code>), and for everything else <b>one basic op</b>
+(<code>convgemm</code>, an int8 GEMM tile) plus TVM's own epilogue. It also explains why the
+second approach scales and the first does not.</p>
+
+<div class="box ok"><b>State this page describes (2026-10-10, compile + x86 verified; not run on hardware)</b>
+<code>deploy_flow.py --aie-offload</code> (default <code>--aie-layers all</code>) offloads every fused op that
+contains a conv2d. That is 19 layer folders and 20 calls per inference. Each folder gets an <code>aie/</code>, and
+<code>main.elf</code> calls 19 <code>aie_tvmgen_*</code> entries. All 18 convgemm layers are proven
+<b>bit-exact on x86</b> against TVM's untouched function. The stem was proven on the board
+earlier. <code>run_test.sh --clean</code> passes.</div>
+
+<!-- ============================================================ -->
+<h2 id="problem">1. The problem: 19 fused conv ops, 11 shapes, 6 tails</h2>
+<p>After int8 legalization, the zero-point fold and TVM's operator fusion, every conv in the
+network is one C function that does <i>conv + a fused element-wise tail</i>. They differ in two
+independent ways.</p>
+<h3>Geometry</h3>
+<table>
+<tr><th>layer</th><th>conv</th><th>in → out</th><th>GEMM M×N×K</th><th>tile launches</th></tr>
+<tr><td>01</td><td>7×7/2</td><td>3 → 64, 230² → 112²</td><td class="n">12544×64×196</td><td>conv2dstem (1 launch)</td></tr>
+<tr><td>04 (×2), 06, 08</td><td>3×3/1</td><td>64 → 64, 58² → 56²</td><td class="n">3136×64×576</td><td class="n">39</td></tr>
+<tr><td>09</td><td>3×3/2</td><td>64 → 128, 58² → 28²</td><td class="n">784×128×576</td><td class="n">24</td></tr>
+<tr><td>11, 14, 15</td><td>3×3/1</td><td>128 → 128, 30² → 28²</td><td class="n">784×128×1152</td><td class="n">40</td></tr>
+<tr><td>12</td><td>1×1/2</td><td>64 → 128 (shortcut)</td><td class="n">784×128×64</td><td class="n">8</td></tr>
+<tr><td>16</td><td>3×3/2</td><td>128 → 256, 30² → 14²</td><td class="n">196×256×1152</td><td class="n">20</td></tr>
+<tr><td>18, 21, 22</td><td>3×3/1</td><td>256 → 256, 16² → 14²</td><td class="n">196×256×2304</td><td class="n">36</td></tr>
+<tr><td>19</td><td>1×1/2</td><td>128 → 256 (shortcut)</td><td class="n">196×256×128</td><td class="n">4</td></tr>
+<tr><td>23</td><td>3×3/2</td><td>256 → 512, 16² → 7²</td><td class="n">49×512×2304</td><td class="n">72</td></tr>
+<tr><td>25, 28, 29</td><td>3×3/1</td><td>512 → 512, 9² → 7²</td><td class="n">49×512×4608</td><td class="n">144</td></tr>
+<tr><td>26</td><td>1×1/2</td><td>256 → 512 (shortcut)</td><td class="n">49×512×256</td><td class="n">8</td></tr>
+</table>
+<h3>Fused tail (the part after the accumulator)</h3>
+<table>
+<tr><th>variant</th><th>layers</th><th>what TVM fused after the conv</th></tr>
+<tr><td>A requant → int8/uint8</td><td>01 04 09 14 16 21 23 28</td><td><code>fpm(acc + bias − zp − zp)</code>, clip, cast</td></tr>
+<tr><td>B requant → int32 for a residual</td><td>11 18 (25)</td><td>A without the clip, then <code>+zp_out</code>, ReLU, <code>− zp</code>, second fixed-point multiply (25: the requant alone, stored as int32)</td></tr>
+<tr><td>C shortcut + residual input</td><td>12 19</td><td>B, then <code>+ residual[i]</code> (an int32 activation input)</td></tr>
+<tr><td>D double requant</td><td>26</td><td>two chained requant/ReLU stages</td></tr>
+<tr><td>E residual prologue, uint8</td><td>06</td><td>requantize a uint8 skip input, add, clip, cast</td></tr>
+<tr><td>F residual prologue, int32</td><td>08 15 22 29</td><td>requantize an int32 skip input, add, clip (29: a further multiply)</td></tr>
+</table>
+<p>Every tail carries <b>literal constants</b> chosen by the quantizer, for example layer 11's <code>+ 92</code> and
+<code>* 1475238455 &gt;&gt; 31</code>. They are different in every layer.</p>
+
+<!-- ============================================================ -->
+<h2 id="perop">2. Answer A: one hand kernel per fused op (<code>conv2dstem</code>)</h2>
+<p><code>src/aietensorop/conv2dstem/conv2dstem.cc</code> is this approach, done well for one layer:</p>
+<ul>
+<li><b>The whole fused op runs on the core.</b> It does im2col, an int32 accumulate, <code>{bias, zp, mult, shift}</code>
+requantize and clip, then writes uint8. The quant params ride in the weights' padding channel, and one launch does the
+layer.</li>
+<li><b>The geometry is welded in.</b> Every number in the three <code>aie::GemmSpace</code> descriptors is a
+literal for 230×230×3 → 112×112×64: halo tile 61, stride 56, 4 rounds of 19 rows, and so on. A wall of
+<code>static_assert</code>s pins the tiling to the shape.</li>
+<li><b>Each column keeps its whole filter in core memory</b> (<code>B_local</code>): 16 channels × 196 bytes for the stem.</li>
+</ul>
+<p>Scaling this to the table above means 18 more such files. The shape alone forces a redesign, not a re-parameterization,
+in two places:</p>
+<ul>
+<li><b>Memory.</b> A column holding 64 output channels of a 3×3×256 filter needs 64 × 2304 = 147 KB, far over a
+core tile's 64 KB data memory. The 512-channel layers need 4× that. The kernel must then tile K across rounds and
+keep partial sums, which is a different kernel.</li>
+<li><b>Tiling.</b> 7×7 outputs do not split 4-ways the way 112×112 does, so the descriptors, round counts and halos
+change per layer.</li>
+</ul>
+<p>The tails then multiply the work: six variants, each needing a bit-exact transcription of TVM's arithmetic and
+constants into the kernel. One wrong rounding term gives plausible but wrong pixels.</p>
+<div class="box warn"><b>When answer A is still right</b>
+A layer that dominates runtime and has a shape you will keep shipping. Here that is the stem: 12544×64 outputs, the
+largest feature map. One launch with everything fused is the fastest possible form. That is why layer 01 stays on
+<code>conv2dstem</code>.</div>
+
+<!-- ============================================================ -->
+<h2 id="basic">3. Answer B: find what every layer shares</h2>
+<p>Read the 19 functions side by side and the shared core is obvious. Every one computes
+<code>acc[n][oc][y][x] = Σ x·w</code> in int32 first, and only then does its tail. So split there:</p>
+<pre><code>fused conv layer  =  conv accumulator         (heavy, same for all: int8·int8 → int32)
+                   + element-wise tail          (light, different everywhere)
+
+conv accumulator  =  im2col  ;  GEMM  ;  scatter     (im2col/scatter are index shuffles)
+GEMM              =  Σ over tiles of a FIXED-shape GEMM tile</code></pre>
+<ul>
+<li>The <b>AIE does one thing</b>: a fixed 256×64×256 int8 GEMM tile. That is the basic op. It is the same
+binary for every shape, built once.</li>
+<li>The <b>host</b> does what is shape-dependent but cheap: NCHWc im2col, splitting any M/N/K into tiles,
+accumulating K tiles in int32, and scattering back to NCHWc.</li>
+<li>The <b>tail</b> is not rewritten at all: TVM already generated it, so it is reused (§5).</li>
+</ul>
+<p>This is the same factoring a BLAS-backed framework uses (conv → im2col + GEMM). The point here is
+<b>granularity</b>. The thing implemented on the AIE is chosen to be shape-independent, so the number of
+AIE kernels is 1, not 19.</p>
+
+<!-- ============================================================ -->
+<h2 id="convgemm">4. <code>convgemm</code>: the GEMM tile basic op</h2>
+<p><code>src/aietensorop/convgemm/</code></p>
+<table>
+<tr><th>file</th><th>what</th></tr>
+<tr><td><code>convgemm.h</code></td><td>API: <code>conv2d_nchwc_i8(ifm, wts, acc, &amp;geom)</code>, <code>convgemm_i8i32(A, Bt, C, M, N, K)</code>, <code>convgemm_launch_count()</code>; <code>convgemm_geom</code> = the NCHWc shape</td></tr>
+<tr><td><code>convgemm.cc</code></td><td>the aiehlc source: kernel <code>gemm_i8i32</code> + the one launch site <code>cg_tile_run</code></td></tr>
+<tr><td><code>convgemm_host.h</code></td><td>plain C: im2col, tiling, K accumulation, scatter. Shared verbatim by the board build and the x86 harness</td></tr>
+</table>
+<h3>The kernel</h3>
+<p>It is the matmul from <code>example/tileprogram/ccode/simplematmul2.cc</code>, aiehlc's proven GEMM path, with two
+changes:</p>
+<pre><code>A  [256, 256]  RowBA    d1 = 16-row tiles across mesh ROWS,  d2 = K in 64-byte rounds
+Bt [ 64, 256]  ColBB    d1 = 16 channels per mesh COL,       d2 = K in 64-byte rounds
+C  [256, 64×4 bytes]    16 rows × 16 int32 per core tile, gathered left-to-right
+
+int32_t accum[tile_rows * tile_cols];          // int32: int16 wraps on real weights
+for k_round: acquire A chunk; acquire B chunk; accum += A·Bᵀ
+emit accum as 4 little-endian bytes per element through the int8 window</code></pre>
+<p>Emitting int32 as bytes keeps the proven int8 window/DMA machinery. The C port is just declared 4× wider in
+<code>d2</code>.</p>
+<h3>The host side</h3>
+<pre><code>m = oy*OW + ox          n = occ*ocb + ob          k = ((ky*KW + kx)*ICc + icc)*icb + ib
+A[m][k]  = ifm[icc][oy*S+ky][ox*S+kx][ib]      (NCHWc, already zero-point padded by TVM)
+Bt[n][k] = wts[occ][icc][ky][kx][ib][ob]       (OIHW{i}i{o}o)
+for m0, n0:  for k0:  pack zero-filled tiles → launch → C[m0.., n0..] (+)= tile
+acc[occ][oy][ox][ob] = C[m][n]</code></pre>
+<p>Zero-filled ragged tiles make any M/N/K exact. A zero row contributes nothing to a dot product. So the stem's
+K=196, layer 26's M=49 and layer 25's K=4608 all go through the same code.</p>
+
+<!-- ============================================================ -->
+<h2 id="tail">5. The tail: TVM's own C, transplanted</h2>
+<p>Hand-writing six tail variants with per-layer literals is where per-op kernels go wrong. So the tail is
+<b>not written</b>: <code>aie_conv_lib.transplant_tail</code> copies the layer's TVM function and makes
+two edits.</p>
+<ol>
+<li><b>Delete the MACs.</b> Every <code>conv2d_NCHWc*[i] = conv2d_NCHWc*[i] + (int32)x·(int32)w</code>
+becomes <code>;</code>. The activation and weight argument slots are read off these statements.</li>
+<li><b>Redirect the accumulator.</b> In each block ending in an output store <code>((T*)OUT_1)[IDX] = …</code>,
+every read of any <code>conv2d_NCHWc*</code> array becomes <code>aie_acc[(IDX)]</code>. The tail is
+element-wise and the accumulator has the output's NCHWc layout, so the stored element's index is exactly the
+accumulator element it needs.</li>
+</ol>
+<p>Layer 11, before and after (abridged):</p>
+<pre><code>// TVM:
+int32_t v_ = (int32_t)(((int64_t)((conv2d_NCHWc_global[(cse_var_29 + i4)] + bias[c]) - zp[c] - zp2[c])
+                         * (int64_t)mult[c] + (1 &lt;&lt; (sh[c]+30))) &gt;&gt; (sh[c]+31)) + 92;
+((int32_t*)compute_1)[(((i0_i1_fused_i2_fused * 112) + cse_var_29) + i4)] = … v_ … 1475238455 …;
+
+// aie/tail.c:
+int32_t v_ = (int32_t)(((int64_t)((aie_acc[((((i0_i1_fused_i2_fused * 112) + cse_var_29) + i4))] + bias[c]) …
+((int32_t*)compute_1)[(((i0_i1_fused_i2_fused * 112) + cse_var_29) + i4)] = … unchanged …;</code></pre>
+<p>Every constant, rounding rule and cast is TVM's by construction. The transplant <b>refuses</b> (raises
+<code>ValueError</code>) rather than guess: no MACs recognised, more than one activation or weight pointer, no
+store, or any int64 epilogue line still reading an accumulator after the rewrite.</p>
+<div class="box"><b>One subtlety found on the way</b>
+In layers 01, 04, 06 and 08, TVM stages the per-tile register array <code>conv2d_NCHWc_global</code> into a local
+or workspace <code>conv2d_NCHWc</code>, and the epilogue reads the <i>copy</i>. So "the accumulator" is
+every array named <code>conv2d_NCHWc*</code>, not only the MAC target. With only the MAC target, those four
+layers matched zero reads and were refused.</div>
+
+<!-- ============================================================ -->
+<h2 id="isolate">6. Two AIE libraries in one ELF</h2>
+<p>The stem (<code>libconv2dstem.a</code>) and the basic op (<code>libconvgemm.a</code>) are separate aiehlc
+builds. Each contains a copy of the AIE runtime plus generated <code>routing()</code>,
+<code>host_canonicalized()</code>, <code>dskernel_receiver()</code> and <code>g_*</code> globals, so linking both fails
+with duplicates. Renaming a few symbols is not enough, because <code>aie_runtime.o</code> calls
+<code>routing(dev)</code> by its fixed name (<code>__Runtime_routing_init</code>). A shared runtime would program one
+app's stream switches with the other app's routing.</p>
+<p><code>aiehlc_build.isolate_archive</code> gives each library a <b>private</b> runtime:</p>
+<pre><code>aarch64-none-elf-ld -r --whole-archive libconvgemm.a -o convgemm_isolated.o   # bind internals
+aarch64-none-elf-objcopy --keep-global-symbols=api.txt convgemm_isolated.o     # all else local
+ar rcs libconvgemm.a convgemm_isolated.o
+# api.txt = conv2d_nchwc_i8 convgemm_i8i32 convgemm_launch_count</code></pre>
+<p>Afterwards each library exports only its API. Its undefined symbols are only the XAie driver, libc and
+libstdc++, and the two partially link together with no duplicate globals.</p>
+
+<!-- ============================================================ -->
+<h2 id="flow">7. What the flow generates</h2>
+<pre><code>worklocal/tvmrelay_deploy/
+├── aie_ops/convgemm/                   shared basic op, built ONCE per run (aiehlc ~80 s)
+│   ├── host.cc kernel.cc gemm_i8i32.cc routing.cc …
+│   └── build/libconvgemm.a             isolated
+├── layers/01_contrib_conv2d_…/aie/     stem: aiehlc build of conv2dstem.cc (+ packed entry)
+├── layers/04_contrib_conv2d_…/aie/     every other conv layer:
+│   ├── entry.c    aie_tvmgen_…()  →  conv2d_nchwc_i8()  →  aie_tail_…()
+│   ├── tail.c     TVM's epilogue, MACs removed, acc → aie_acc[]
+│   └── README.md  geometry, GEMM M×N×K, launches, x86 verdict
+├── layers/partition.json               per layer: backend, source, entry, replaces, archive, verify
+└── arm_build/
+    ├── graph_driver.c   #ifdef GRAPH_AIE_OFFLOAD  aie_tvmgen_…(args…)  #else  tvmgen_…(args…)
+    ├── libaielayers.a   36 objects: every aie/entry.c + aie/tail.c (board build only)
+    └── main.elf         -Wl,--start-group libaielayers.a libconv2dstem.a libconvgemm.a -Wl,--end-group</code></pre>
+<p>The CPU layer <code>.c</code> files are untouched, which is why <code>layers/</code> still matches the default-flow
+golden. <code>make local</code> never compiles <code>aie/*.c</code> and never defines the macro, so
+<code>main_local.elf</code> stays the CPU reference built from the same driver.</p>
+<pre><code>entry.c (layer 04), abridged:
+int32_t aie_tvmgen_…_198efcab570a4ae4_(void* args, int32_t* codes, int32_t n, …) {
+    static const convgemm_geom g = {16, 4, 58, 58, 16, 4, 3, 3, 1, 1, 56, 56};
+    printf("[aie-offload] layer 04 …: ENTER convgemm conv2d_nchwc_i8 (M=3136 N=64 K=576) on the AIE mesh\n");
+    int32_t *acc = malloc(200704 * sizeof(int32_t));
+    int rc = conv2d_nchwc_i8(AIE_ARG_DATA(args, 0), AIE_ARG_DATA(args, 1), acc, &amp;g);
+    if (rc == 0) rc = aie_tail_…(args, codes, n, …, acc);
+    printf("[aie-offload] layer 04: EXIT rc=%d, %ld AIE launch(es)\n", rc, …);
+    …
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="verify">8. How it is verified (no board)</h2>
+<p>Hardware was deliberately not used for this step. <code>aie_conv_lib.verify_layer</code> runs on every flow
+run unless <code>AIE_CONV_VERIFY=0</code> is set:</p>
+<ol>
+<li>It builds one x86 program from the layer's untouched TVM <code>.c</code>, <code>aie/tail.c</code>,
+<code>aie/entry.c</code> and <code>convgemm_host.h</code>, with the AIE tile replaced by a scalar
+256×64×256 loop. Everything around the tile is the real code.</li>
+<li>It feeds both functions the same inputs: <b>real parameters</b> from <code>resnet18_params.bin</code>, plus
+random activations over each dtype's full range.</li>
+<li>It compares every output byte. The result is <b>18/18 layers identical</b>, e.g.
+<code>200704/200704 output bytes identical</code>, recorded in <code>partition.json</code> and checked by
+<code>run_test.sh</code>.</li>
+</ol>
+<p>That proves im2col, tiling, K accumulation, scatter and the transplanted tail. It does <b>not</b> prove the AIE
+tile on hardware, i.e. the int32-as-bytes C window and the DMA layout. That is the next board run:
+<code>apppaltest.py</code> on <code>main.elf</code> should print one ENTER/EXIT pair per layer and match
+<code>main_local.elf</code>'s top-5.</p>
+
+<!-- ============================================================ -->
+<h2 id="cost">9. Cost model and where to go next</h2>
+<p>Launches per inference: the stem's 1, plus Σ ⌈M/256⌉·⌈N/64⌉·⌈K/256⌉ over the 19 convgemm calls
+(layer 04 runs twice), which is <b>952 tile launches</b>. Each one currently does <code>aieSetDevice</code> +
+partition + routing + DMA BD setup. At ~372 ns per <code>XAie_Write32</code>
+(<code>doc/performance/register_write_cost.md</code>), the setup will outweigh the 4.2 M MACs a tile computes (256·64·256).
+The basic-op approach buys generality; these steps buy the speed back, roughly in order of payoff:</p>
+<ol>
+<li><b>Keep the partition and routing alive across launches.</b> Only re-arm BDs per tile (the same routing every
+time), or move to control-packet BD writes (~2.9 ns per write).</li>
+<li><b>Bigger tile, weight-stationary.</b> Load Bt once per (n0, k0) and stream all M tiles past it. This cuts
+launches by ⌈M/256⌉ for the early layers.</li>
+<li><b>A second basic op: the per-channel requantize epilogue on the core.</b> It returns int8 instead of int32, so
+4× less output DMA, for the tail variant A layers whose tail is only requant + clip. Keep the transplant for the
+rest.</li>
+<li><b>im2col on the DMA.</b> aiehlc already has <code>aie::Im2col::Dma</code> with halo descriptors (the stem uses
+it). Generating those descriptors from <code>convgemm_geom</code> removes the host im2col copy. That is the step
+from a "GEMM basic op" to a "parameterized conv basic op".</li>
+<li><b>Promote a hot layer to answer A</b> when profiling says so, as was done for the stem.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="extend">10. Adding a shape, an op, a kernel</h2>
+<table>
+<tr><th>you need</th><th>what to change</th></tr>
+<tr><td>a new conv shape (another network)</td><td><b>nothing</b>: geometry comes from the graph's shapes and the tile handles any M/N/K</td></tr>
+<tr><td>a new fused tail</td><td><b>nothing</b>, as long as TVM fuses it element-wise after the accumulator. If the transplant refuses, its message says why</td></tr>
+<tr><td>grouped / depthwise / dilated conv</td><td>extend the im2col and weight-pack loops in <code>conv2d_nchwc_i8</code> (one place), plus <code>conv_geometry</code></td></tr>
+<tr><td>another basic op (e.g. requant epilogue)</td><td>new <code>src/aietensorop/&lt;op&gt;/</code> library, built by <code>aiehlc_build</code>, isolated by <code>isolate_archive</code>, placed in <code>aie_ops/&lt;op&gt;/build/</code> (the Makefile's <code>AIE_SHARED_LIBS</code> picks it up)</td></tr>
+<tr><td>a hand kernel for one hot layer</td><td>the <code>aie_stem_lib</code> pattern: a geometry match, an aiehlc build into <code>aie/</code>, a packed entry appended to <code>host.cc</code>, isolation</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="compare">11. Side by side</h2>
+<table>
+<tr><th></th><th>A: per fused op (<code>conv2dstem</code>)</th><th>B: basic op (<code>convgemm</code> + TVM tail)</th></tr>
+<tr><td>AIE kernels for ResNet-18</td><td>19, each hand-tiled</td><td><b>1</b>, built once (plus the stem)</td></tr>
+<tr><td>new shape</td><td>new descriptors, tiling, asserts; often a new kernel (memory)</td><td>none</td></tr>
+<tr><td>fused tail</td><td>hand-transcribed per layer, bit-exact by care</td><td>TVM's own C, bit-exact by construction</td></tr>
+<tr><td>launches per layer</td><td>1</td><td>⌈M/256⌉·⌈N/64⌉·⌈K/256⌉ (4 … 144)</td></tr>
+<tr><td>data movement</td><td>on-core im2col, uint8 out</td><td>host im2col, int32 out (4×)</td></tr>
+<tr><td>speed</td><td>best possible for that layer</td><td>dominated by per-launch setup today (§9)</td></tr>
+<tr><td>correctness evidence</td><td>board <code>GOLDEN PASS 802816/802816</code></td><td>x86 bit-exact 18/18; board run pending</td></tr>
+</table>
+<p><b>Recommendation:</b> use B for coverage and A for the few layers that profiling shows dominate. Most of B's
+performance gap is per-launch overhead, which is fixable in the basic op once, for every layer at the same time.</p>
+</main>
+</body>
+</html>

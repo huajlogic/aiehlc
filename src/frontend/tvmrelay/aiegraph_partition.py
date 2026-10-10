@@ -75,6 +75,7 @@ block argument by index.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from frontend.tvmrelay.aie_offload import aie_backend
@@ -560,6 +561,11 @@ def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
     if launch["op"].startswith("conv_") and aie_stem_lib.matches_stem(rec):
         return _build_stem(aie_stem_lib, launch, rec, verdict, aie_dir,
                            out_dir, verbose)
+    # Every other conv: the convgemm basic op + TVM's own epilogue
+    # (aie_conv_lib). The generic run_aie_pipeline body below is a placeholder
+    # (int16 accumulator, dummy quant) and is no longer used for any conv.
+    if launch["op"].startswith("conv_"):
+        return _build_conv(launch, rec, verdict, aie_dir, out_dir, verbose)
     aie_dir.mkdir(parents=True, exist_ok=True)
     specs = [(list(shape), int(bits), bool(is_in))
              for (shape, bits, is_in) in launch["tensor_specs"]]
@@ -584,6 +590,64 @@ def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
     if ok:
         entry.update(_archive_one(aie_dir, verdict, launch, specs, mesh,
                                   out_dir, verbose))
+    return entry
+
+
+#: ``{out_dir: build_shared() result}`` -- libconvgemm.a is built once per run
+#: however many conv layers use it.
+_SHARED = {}
+
+
+def _build_conv(launch: dict, rec: dict, verdict: dict, aie_dir: Path,
+                out_dir: Path, verbose: bool) -> dict:
+    """Offload one conv layer through the convgemm basic op. Returns its record.
+
+    Writes ``aie/{entry.c, tail.c, README.md}`` (aie_conv_lib), proves them
+    bit-exact against TVM's function on x86 unless ``AIE_CONV_VERIFY=0``, and
+    points the record at the shared ``aie_ops/convgemm`` archive, which the
+    board Makefile links once for all layers.
+    """
+    import os
+
+    from frontend.tvmrelay import aie_conv_lib
+
+    key = str(out_dir)
+    if key not in _SHARED:
+        _SHARED[key] = aie_conv_lib.build_shared(out_dir, verbose=verbose)
+    shared = _SHARED[key]
+    if aie_dir.exists():
+        shutil.rmtree(aie_dir)          # no placeholder file may survive
+    graph = json.loads(next(Path(out_dir).glob("*_graph.json")).read_text())
+    res = aie_conv_lib.build_conv_layer(
+        aie_dir.parent, verdict["index"], rec["symbol"], graph, rec["node"],
+        verify=os.environ.get("AIE_CONV_VERIFY", "1") != "0")
+    ok = res["ok"] and shared.get("ok", False)
+    if verbose:
+        g = res.get("geometry") or {}
+        what = (f"conv {g.get('kh')}x{g.get('kw')}/s{g.get('stride_h')} "
+                f"{g.get('ic_chunk', 0) * g.get('ic_block', 0)}->"
+                f"{g.get('oc_chunk', 0) * g.get('oc_block', 0)}ch, "
+                f"{res.get('launches')} tile launch(es)") if g else res.get("reason")
+        ver = (res.get("verify") or {}).get("detail", "verify skipped")
+        print(f"  [aiegraph] layer {verdict['index']:02d} -> convgemm basic op + TVM "
+              f"tail: {what}; x86: {ver}")
+        if not shared.get("ok"):
+            print(f"  [aiegraph]   shared libconvgemm.a not built: {shared.get('reason')}")
+    archive = shared.get("archive")
+    entry = {"index": verdict["index"], "node": rec["node"],
+             "dir": str(aie_dir.relative_to(out_dir)), "ok": ok,
+             "op": launch["op"], "func_name": launch["func_name"],
+             "files": sorted(p.name for p in aie_dir.iterdir()) if aie_dir.is_dir() else [],
+             "backend": "convgemm",
+             "source": str(aie_conv_lib.CONVGEMM_SOURCE.relative_to(_REPO)),
+             "entry": res.get("entry") if ok else None, "replaces": rec["symbol"],
+             "entry_source": (str(Path(res["entry_source"]).resolve().relative_to(out_dir))
+                              if res.get("entry_source") else None),
+             "verify": (res.get("verify") or {}).get("detail")}
+    if archive and ok:
+        entry["archive"] = str(Path(archive).resolve().relative_to(out_dir))
+    else:
+        entry.update(archive=None, archive_reason=res.get("reason") or shared.get("reason"))
     return entry
 
 
@@ -675,6 +739,10 @@ def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
             # with -DGRAPH_AIE_OFFLOAD (arm_build.aie_entries).
             "entry": built.get("entry") if built else None,
             "replaces": built.get("replaces") if built else None,
+            # Which file defines `entry` (host.cc for the stem, entry.c for
+            # a convgemm layer) and its x86 bit-exactness verdict.
+            "entry_source": built.get("entry_source") if built else None,
+            "verify": built.get("verify") if built else None,
             # The linkable product of that folder, or why there isn't one.
             # Null with a reason is the normal state on a box without the
             # Vitis cross toolchain; null without one means it was never tried.

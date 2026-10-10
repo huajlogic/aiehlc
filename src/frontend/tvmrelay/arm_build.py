@@ -507,7 +507,9 @@ def aie_entries(layers_dir) -> dict:
                             layer.get("archive"))
         if layer.get("target") != "aie" or not (entry and sym and arch):
             continue
-        host = root / layer["aie_dir"] / "host.cc"
+        # The file that defines the entry: aie/host.cc for an aiehlc-built
+        # layer (the stem), aie/entry.c for a convgemm layer.
+        host = root / (layer.get("entry_source") or f"{layer['aie_dir']}/host.cc")
         if (root / arch).is_file() and host.is_file() \
                 and entry in host.read_text(errors="replace"):
             out[sym] = entry
@@ -1422,6 +1424,19 @@ LAYER_OBJS := $(LAYER_SRCS:.c=.o)
 AIE_LAYER_LIBS := $(sort $(wildcard $(LAYERS)/*/aie/build/*.a) \
                         $(wildcard $(LAYERS)/*/aie/*/build/*.a))
 
+# Per-layer AIE glue (aie_conv_lib): each offloaded conv layer's aie/entry.c
+# (TVM packed-call entry) + aie/tail.c (TVM's own epilogue, transplanted).
+# Board build only -- the local build never compiles them.
+AIE_GLUE_SRCS := $(sort $(wildcard $(LAYERS)/*/aie/*.c))
+AIE_GLUE_OBJS := $(AIE_GLUE_SRCS:.c=.o)
+AIE_GLUE_LIB  := $(if $(AIE_GLUE_OBJS),libaielayers.a,)
+
+# Shared AIE basic-op libraries, built ONCE per run for every layer that uses
+# them (aie_ops/convgemm/build/libconvgemm.a). Like each per-layer archive it
+# is isolated -- one relocatable object exporting only its API, with a private
+# AIE runtime and routing() -- so all of them link side by side.
+AIE_SHARED_LIBS := $(sort $(wildcard $(LAYERS)/../aie_ops/*/build/*.a))
+
 # Neither source of kernels resolved. Without this the build would cheerfully
 # archive zero objects and fail much later with a wall of undefined
 # tvmgen_default_* references, which says nothing about the real cause.
@@ -1482,10 +1497,19 @@ LAYER_LIB := $(if $(LAYER_OBJS),liblayers.a,)
 
 all: main.elf
 
-main.elf: $(OBJS) weights.o $(LAYER_LIB) $(AIE_LAYER_LIBS)
-\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(LAYER_LIB) $(AIE_LAYER_LIBS) $(AIE_LIB) $(LDFLAGS) $(LDLIBS)
-\t@echo "built $@$(if $(AIE_LAYER_LIBS), with $(words $(AIE_LAYER_LIBS)) per-layer AIE archive(s),)"
+# The AIE archives reference each other (glue -> shared basic op, entries ->
+# per-layer libs), so they are linked as one group.
+main.elf: $(OBJS) weights.o $(LAYER_LIB) $(AIE_GLUE_LIB) $(AIE_LAYER_LIBS) $(AIE_SHARED_LIBS)
+\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(LAYER_LIB) -Wl,--start-group $(AIE_GLUE_LIB) $(AIE_LAYER_LIBS) $(AIE_SHARED_LIBS) -Wl,--end-group $(AIE_LIB) $(LDFLAGS) $(LDLIBS)
+\t@echo "built $@$(if $(AIE_LAYER_LIBS)$(AIE_GLUE_OBJS), with $(words $(AIE_LAYER_LIBS)) per-layer AIE archive(s) + $(words $(AIE_GLUE_SRCS)) AIE glue source(s) + $(words $(AIE_SHARED_LIBS)) shared AIE op lib(s),)"
 \t@$(CROSS)size $@ 2>/dev/null || true
+
+libaielayers.a: $(AIE_GLUE_OBJS)
+\t@rm -f $@
+\t$(if $(V),,@)$(AR) rcs $@ $(AIE_GLUE_OBJS)
+\t@echo "archived $(words $(AIE_GLUE_OBJS)) AIE glue objects (layers/*/aie/*.c) into $@"
+
+$(AIE_GLUE_OBJS): $(LAYERS)/layers_common.h
 
 # One archive of per-operator objects. graph_driver.o pulls in the members it
 # calls, and a member may call another (the AIE packed-ABI shim calls the BYOC
@@ -1661,7 +1685,7 @@ clean-hex:
 \trm -rf layeriohex
 
 clean: clean-local
-\trm -f $(OBJS) $(KERNEL_OBJ) weights.o main.elf liblayers.a $(LAYER_OBJS)
+\trm -f $(OBJS) $(KERNEL_OBJ) weights.o main.elf liblayers.a $(LAYER_OBJS) libaielayers.a $(AIE_GLUE_OBJS)
 
 .PHONY: all clean clean-local clean-hex local run-local
 """

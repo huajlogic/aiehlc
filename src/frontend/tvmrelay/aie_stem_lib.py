@@ -46,6 +46,10 @@ _REPO = Path(__file__).resolve().parents[3]
 #: ``test_conv2d.cc`` ``#include``s.
 STEM_SOURCE = _REPO / "src" / "aietensorop" / "conv2dstem" / "conv2dstem.cc"
 
+#: Globals the isolated libconv2dstem.a keeps (plus the per-layer entry).
+STEM_API = ("conv2d_stem", "conv2d_stem_prepadded", "conv2d_stem_nchwc",
+            "conv2d_stem_verify", "conv2d_stem_release", "conv2d_stem_invalidate_weights")
+
 #: Not artifacts of the build: data headers aiehlc's ``*.h`` glob copies from
 #: the source directory. Nothing in the library includes them.
 _SKIP = ("conv2d_stem_in_weight.h", "conv2d_stem_out_golden.h")
@@ -165,8 +169,16 @@ def _install_entry(aie_dir: Path, index: int, func_name: str,
         stale.unlink()             # so an old archive cannot pass for this one
     built = aie_layer_lib.build_archive(aie_dir, STEM_SOURCE.stem, _REPO,
                                         verbose=verbose)
-    return {"ok": built.get("ok", False), "entry": entry,
-            "archive": built.get("archive"), "reason": built.get("reason")}
+    if not built.get("ok"):
+        return {"ok": False, "entry": entry, "archive": None,
+                "reason": built.get("reason")}
+    # Private runtime + routing, so this library can share main.elf with the
+    # convgemm basic op (aiehlc_build.isolate_archive explains why).
+    from frontend.tvmrelay.aiehlc_build import isolate_archive
+
+    iso = isolate_archive(Path(built["archive"]), STEM_API + (entry,))
+    return {"ok": iso["ok"], "entry": entry,
+            "archive": iso.get("archive"), "reason": iso.get("reason")}
 
 
 def build_stem_layer(aie_dir: Path, *, index: int = 1, func_name: str = "",

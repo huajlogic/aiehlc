@@ -2,6 +2,13 @@
 
 Targets **TVM 0.16**, the last release with a complete `tvm.relay`.
 
+> **New here? Start with the tutorial:** [`tutorial/index.html`](tutorial/index.html)
+> walks the whole flow end to end: ONNX → Relay → int8 → C → `layers/` → BYOC /
+> aiegraph → layer 01 built from `conv2dstem.cc` → `graph_driver.c` → `main.elf`.
+> It includes troubleshooting, optimization pointers and a hand-written recipe.
+> Serve it with `bash src/frontend/tvmrelay/tutorial/serve.sh` (port 8781), or
+> open the file directly.
+
 `src/frontend/tvm` targets the modern Relax-era TVM (0.25+). **The two are
 mutually exclusive** — one Python environment holds one TVM — so exactly one of
 them works at a time. Which one is live is whichever `setup_tvm016.py` left

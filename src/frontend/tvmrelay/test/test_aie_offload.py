@@ -62,6 +62,7 @@ import argparse
 import difflib
 import fnmatch
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -106,6 +107,14 @@ AIE_EXPECTED_FILES = ("host.cc", "kernel.cc", "routing.cc")
 #: source (the file test_conv2d.cc #includes) -- see ``_check_stem``.
 STEM_LAYER_PREFIX = "01_contrib_conv2d_NCHWc"
 STEM_SOURCE = "src/aietensorop/conv2dstem/conv2dstem.cc"
+
+#: Every OTHER conv layer goes through the convgemm basic op
+#: (src/frontend/tvmrelay/aie_conv_lib.py): its aie/ holds the generated
+#: packed-call entry and TVM's transplanted epilogue, and the shared
+#: libconvgemm.a sits once in aie_ops/.
+CONV_SOURCE = "src/aietensorop/convgemm/convgemm.cc"
+CONV_EXPECTED_FILES = ("entry.c", "tail.c")
+SHARED_CONVGEMM = OUT_DIR / "aie_ops" / "convgemm" / "build" / "libconvgemm.a"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -287,7 +296,7 @@ def _layer_dirs(layers_dir: Path) -> list:
     return sorted(p.name for p in layers_dir.iterdir() if p.is_dir())
 
 
-def check_aie_dir(layers_dir: Path, glob_pat: str) -> dict:
+def check_aie_dir(layers_dir: Path, glob_pat: str, require_all: bool = True) -> dict:
     """The conv layer folder must hold an ``aie/`` subdirectory with artifacts.
 
     Returns ``{"ok", "candidates", "with_aie", "files", "reason"}``.  Failing
@@ -326,10 +335,21 @@ def check_aie_dir(layers_dir: Path, glob_pat: str) -> dict:
                           f"folder(s) has a non-empty aie/ subdirectory"}
 
     problems = []
+    # "Offload every fused op that contains a conv2d": each candidate folder
+    # must carry an aie/, not just one of them.
+    missing = [n for n in candidates if n not in with_aie]
+    if require_all and missing:
+        problems.append(f"{len(missing)} conv layer folder(s) without aie/: "
+                        f"{', '.join(m[:2] for m in missing)}")
     for name in with_aie:
-        absent = [f for f in AIE_EXPECTED_FILES if f not in files[name]]
+        want = (AIE_EXPECTED_FILES if name.startswith(STEM_LAYER_PREFIX)
+                else CONV_EXPECTED_FILES)
+        absent = [f for f in want if f not in files[name]]
         if absent:
             problems.append(f"{name}/aie/ lacks {', '.join(absent)}")
+    if any(not n.startswith(STEM_LAYER_PREFIX) for n in with_aie) \
+            and not SHARED_CONVGEMM.is_file():
+        problems.append(f"shared basic op {SHARED_CONVGEMM} was not built")
     problems += _check_partition(layers_dir, with_aie)
     return {"ok": not problems, "candidates": candidates, "with_aie": with_aie,
             "files": files, "reason": "; ".join(problems)}
@@ -358,6 +378,29 @@ def _check_partition(layers_dir: Path, with_aie: list) -> list:
             problems.append(f"{name}: {v['aiegraph']} missing from aiegraph.mlir")
         elif name.startswith(STEM_LAYER_PREFIX):
             problems += _check_stem(layers_dir / name / "aie", v)
+        else:
+            problems += _check_convgemm(name, v)
+    return problems
+
+
+def _check_convgemm(name: str, verdict: dict) -> list:
+    """A non-stem conv layer: built by the convgemm basic op, x86 bit-exact.
+
+    ``verify`` is the x86 harness verdict aie_conv_lib recorded: TVM's untouched
+    function vs entry.c + tail.c with the AIE tile run as a scalar loop, on
+    real parameters. "N/N output bytes identical" or the layer fails.
+    """
+    problems = []
+    if verdict.get("backend") != "convgemm" or \
+            not str(verdict.get("source") or "").endswith(CONV_SOURCE):
+        problems.append(f"{name[:2]}: built by {verdict.get('backend')!r} from "
+                        f"{verdict.get('source')!r}, want convgemm ({CONV_SOURCE})")
+    ver = str(verdict.get("verify") or "")
+    m = re.match(r"(\d+)/(\d+) output bytes identical", ver)
+    if not m or m.group(1) != m.group(2):
+        problems.append(f"{name[:2]}: x86 bit-exactness not proven ({ver or 'not run'})")
+    if not verdict.get("entry"):
+        problems.append(f"{name[:2]}: no AIE entry recorded")
     return problems
 
 
@@ -394,7 +437,7 @@ def _check_stem(aie: Path, verdict: dict) -> list:
 ARM_BUILD = OUT_DIR / "arm_build"
 
 
-def check_elf(since=None) -> dict:
+def check_elf(since=None, expect_entries=None) -> dict:
     """``main.elf`` must exist (and be from this run) and must call layer 01 on
     the AIE: ``graph_driver.c`` swaps the stem kernel for its ``aie_*`` entry
     under ``GRAPH_AIE_OFFLOAD``, the Makefile defines that macro, and the ELF
@@ -422,9 +465,12 @@ def check_elf(since=None) -> dict:
     nm = shutil.which("aarch64-none-elf-nm") or shutil.which("nm")
     syms = subprocess.run([nm, str(elf)], capture_output=True,
                           text=True).stdout if nm else ""
-    for want in entries + ["conv2d_stem_nchwc"]:
+    for want in entries + ["conv2d_stem_nchwc", "conv2d_nchwc_i8"]:
         if f" {want}" not in syms:
             problems.append(f"main.elf does not define {want}")
+    if expect_entries is not None and len(entries) != expect_entries:
+        problems.append(f"graph_driver.c swaps {len(entries)} kernel(s) for AIE "
+                        f"entries, want {expect_entries} (one per conv layer folder)")
     return {"ok": not problems, "reason": "; ".join(problems),
             "elf": str(elf), "entries": entries,
             "bytes": elf.stat().st_size}
@@ -434,8 +480,9 @@ def report_elf(res: dict) -> None:
     if not res["ok"]:
         print(f"[elf ] FAIL -- {res['reason']}")
         return
-    print(f"[elf ] PASS -- {res['elf']} ({res['bytes']:,} B) runs layer 01 "
-          f"on the AIE via {', '.join(res['entries'])}")
+    print(f"[elf ] PASS -- {res['elf']} ({res['bytes']:,} B) calls "
+          f"{len(res['entries'])} AIE entr{'y' if len(res['entries']) == 1 else 'ies'} "
+          f"(aie_tvmgen_*) and links conv2d_stem_nchwc + conv2d_nchwc_i8")
 
 
 def report_aie(res: dict, show: int = 12) -> None:
@@ -446,13 +493,13 @@ def report_aie(res: dict, show: int = 12) -> None:
             print(f"       matching layer folder(s): "
                   f"{', '.join(res['candidates'][:6])}")
         return
+    print(f"[aie ] PASS -- {len(res['with_aie'])}/{len(res['candidates'])} conv "
+          f"layer folder(s) carry aie/")
     for name in res["with_aie"]:
         produced = res["files"][name]
-        print(f"[aie ] PASS -- {name}/aie/ holds {len(produced)} file(s)")
-        for rel in produced[:show]:
-            print(f"         aie/{rel}")
-        if len(produced) > show:
-            print(f"         ... and {len(produced) - show} more")
+        kind = "conv2dstem (aiehlc)" if name.startswith(STEM_LAYER_PREFIX) \
+            else "convgemm basic op + TVM tail"
+        print(f"         {name[:48]:48s} {kind:30s} {len(produced)} file(s)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -523,6 +570,9 @@ def main(argv=None) -> int:
     ap.add_argument("--no-aie-check", action="store_true",
                     help="skip check 3 (useful while the offload path is "
                          "being brought up)")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="check 3 accepts a subset of conv layers offloaded "
+                         "(e.g. with --deploy-args \"--aie-layers 1\")")
     ap.add_argument("--no-elf-check", action="store_true",
                     help="skip check 4 (no cross toolchain on this box)")
     ap.add_argument("--ignore", action="append", default=[],
@@ -599,7 +649,8 @@ def main(argv=None) -> int:
     if args.no_aie_check:
         print("[aie ] skipped (--no-aie-check)")
     else:
-        aie = check_aie_dir(args.layers, args.aie_layer_glob)
+        aie = check_aie_dir(args.layers, args.aie_layer_glob,
+                            require_all=not args.allow_partial)
         report_aie(aie)
 
     # ---- 4. main.elf -------------------------------------------------------
@@ -607,7 +658,8 @@ def main(argv=None) -> int:
     if args.no_elf_check:
         print("[elf ] skipped (--no-elf-check)")
     else:
-        elf = check_elf(None if args.skip_run else run_started)
+        elf = check_elf(None if args.skip_run else run_started,
+                        expect_entries=len(aie.get("with_aie") or []) or None)
         report_elf(elf)
 
     ok = tree["ok"] and aie["ok"] and elf["ok"]

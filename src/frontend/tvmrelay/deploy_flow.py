@@ -879,7 +879,7 @@ def _stage_quantize(raw_path, model_path, out_dir: Path, *,
 def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         global_scale: float = 8.0, fuse: bool = True, split: bool = True,
         flat: bool = False, arm: bool = True, image=None,
-        aie_offload: bool = False, aie_layers=(1,),   # keep in step with --aie-layers
+        aie_offload: bool = False, aie_layers=None,   # None = all; keep in step with --aie-layers
         aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
         aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
         relay_ptq: bool = False, local: bool = False, local_run: bool = True,
@@ -898,9 +898,10 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     ``aiegraph.func`` and partitions it: layers in ``aie_layers`` whose aiegraph
     ops are all in ``aiegraph_ops`` are offloaded to the aiehlc kernel backend,
     and the rest reuse the TVM-generated CPU C. Also additive. ``aie_layers`` is
-    the **same** selection ``aie_offload`` uses -- both default to layer 6, the
-    7x7/s2 conv stem under the int8-legalized graph -- so the two ways in target
-    the same conv instead of one offloading a layer and the other the graph.
+    the **same** selection ``aie_offload`` uses -- both default to ``None``
+    (every fused op containing a conv2d: layer 1 via conv2dstem.cc, the rest via
+    the convgemm basic op, ``aie_conv_lib``) -- so the two ways in target the
+    same convs instead of one offloading a layer and the other the graph.
 
     **Quantizer.** Stage 3 defaults to ONNX PTQ (``onnx_ptq.py``): the model is
     quantized *before* Relay sees it, giving symmetric per-channel int8 weights
@@ -1188,11 +1189,13 @@ def main(argv=None) -> int:
                          "the generated C calls the aiehlc AIE library "
                          "(aout/libconv2dstem.a) in place of TVM's kernel. "
                          "Only the ResNet-18 stem has an AIE kernel today")
-    ap.add_argument("--aie-layers", default="1",
+    ap.add_argument("--aie-layers", default="all",
                     help="which layers to offload, as numbered in layers/ by "
                          "the CPU build: an index, a comma list, or 'all'. "
                          "Applies to BOTH --aie-offload and --aiegraph "
-                         "(default: 1, the 7x7/s2 conv stem. It moved 1 -> 6 "
+                         "(default: all -- every fused op containing a conv2d; "
+                         "layer 1 is the 7x7/s2 stem (conv2dstem.cc), the rest "
+                         "use the convgemm basic op. The stem moved 1 -> 6 "
                          "when int8 legalization split each conv into a "
                          "zero-point chain, then back to 1 when --fold-qnn-zp "
                          "removed those chains again; with --no-fold-qnn-zp it "

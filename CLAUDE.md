@@ -239,13 +239,32 @@ runs `hostcompile.sh` in that directory to archive
 (`AIE_LAYER_LIBS`), and `partition.json` records `archive` / `archive_reason`.
 They coexist with `libconv2dstem.a` despite both carrying the AIE runtime,
 because `ld` pulls only members that resolve an undefined symbol. **Wired for
-the stem only:** a layer whose `partition.json` entry carries `entry` /
-`replaces` (today layer 01, built from `conv2dstem.cc`) is called through
+every conv layer (`--aie-layers all`, the default):** a layer whose
+`partition.json` entry carries `entry` / `replaces` / `entry_source` is called through
 `aie_<kernel>()` in `graph_driver.c` under `#ifdef GRAPH_AIE_OFFLOAD`. Only the
 board Makefile defines that macro (`arm_build.aie_entries` → `AIE_OFFLOAD_DEFS`),
 so `make local` builds the CPU kernel from the *same* driver and
-`main_local.elf` is the reference for `main.elf`. Every other layer's archive
-still links but contributes nothing.
+`main_local.elf` is the reference for `main.elf`.
+
+**All 19 fused conv ops offload; two backends.** Layer 01 (the stem) is the
+aiehlc build of `conv2dstem.cc` (`aie_stem_lib`). The other 18 use ONE shared
+basic op, `src/aietensorop/convgemm` (a fixed 256×64×256 int8 GEMM tile, built
+once per run into `aie_ops/convgemm/`; host im2col + tiling in
+`convgemm_host.h`), plus **TVM's own epilogue transplanted** into
+`layers/NN/aie/tail.c` (`aie_conv_lib.transplant_tail`: MAC statements deleted,
+every `conv2d_NCHWc*` read → `aie_acc[<stored element's index>]`), called from
+a generated `aie/entry.c`. `aie_conv_lib.verify_layer` proves each layer
+bit-exact on x86 against the untouched TVM function on every run (real params,
+the AIE tile as a scalar loop; `AIE_CONV_VERIFY=0` skips): 18/18 identical.
+Two aiehlc libraries cannot share a runtime because `aie_runtime.o` calls
+`routing()` by global name, so `aiehlc_build.isolate_archive` (`ld -r
+--whole-archive` + `objcopy --keep-global-symbols`) gives each a private one.
+The board Makefile compiles `layers/*/aie/*.c` into `libaielayers.a` and links
+it with the per-layer and `aie_ops` archives inside one `--start-group`.
+Compile-verified (19 entries, 20 call sites, 952 tile launches per inference);
+the convgemm tile has **not** run on hardware yet. Design:
+`src/frontend/tvmrelay/tutorial/aietensorop_conv.html`. Skill:
+**aieconvgemmoffload**.
 
 **qnn zero-point folding is the DEFAULT (`--no-fold-qnn-zp` opts out).** A
 quantized conv lowers to `term1 − term2 − term3 + term4`; `Conv2DCombineTerms`
@@ -471,6 +490,15 @@ untouched), so `src/frontend/tvmrelay/test/run_test.sh` holds `layers/` to
 the **default-flow** `layers-golden/` and checks `aie/` separately. aiegraph
 used to lift 0 convs under int8 because `_conv_geometry` read 4-D only; it now
 folds NCHWc through `aie_offload._layer_geometry`. Skill: **aieoffloadaiegraph**.
+Developer tutorial (HTML, `bash src/frontend/tvmrelay/tutorial/serve.sh` → :8781):
+`src/frontend/tvmrelay/tutorial/index.html`; keep it current with this flow.
+**Why BYOC fuses 0/20 today:** the default qnn zero-point fold turns the
+input-zp term into a constant `subtract(conv, C)`, while
+`aie_patterns.fused_qconv_pattern` requires `add(acc, C2)`. With
+`--no-fold-qnn-zp --aie-layers 6` the same pattern fuses 9 and partitions the
+stem (measured). Under that config the extra aiegraph lift fails verification;
+`deploy_flow` reports it rather than aborting, unless `--aiegraph` was asked
+for explicitly.
 
 **Four steps, one per file, and only the first is TVM's.** `partition_for_aie` is
 orchestration over **1 fuse** (`aie_fuse`: canonicalize → `MergeComposite` → tag
@@ -631,6 +659,7 @@ Read the matching skill when the task fits:
 | Live HW DMA stall debug | aiehwdmadebug |
 | Core register write succeeds on-core but host reads 0 / DMA never starts (`ST` vs `ST.TM`) | coretmregisterwrite |
 | Shim BD stuck on wrong/locked BD (index overflow into channel-control regs) | shimbdindexoverflow |
+| `Invalid column: N` / `Invalid Tile Type ... TileType:4` when the partition starts at col ≠ 0 — `XAie_TileLoc` cols are partition-relative | partitionrelativecol |
 | Sim PS.so load segfault | aiesimloaddebug |
 | aiesim live debug register socket | aiesim-debug-socket |
 | HW performance counters | aiehwprofile |
@@ -653,6 +682,7 @@ Read the matching skill when the task fits:
 | Drive conv2dstem from a real TVM layer's `layeriohex` dump (`conv2d_stem_nchwc`, OIHW3i4o/NCHW4c bridges); plausible-but-wrong pixels after a layout change; int32 quant params read as garbage or fault on the A78; mismatch coords name the wrong pixel | conv2dstemtvmlayer |
 | `--aie-offload` says `non-4D shapes; not a conv2d` for every layer, or a layer gets another layer's geometry (`K=0`); TVM 5-D NCHWc vs aiehlc's d1..d4 | nchwclayoutfold |
 | `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aiebackend` (two LLVMs) | aiebackendtvmllvm |
+| Offload all conv layers (convgemm basic op + transplanted TVM tail); "epilogue not found"; duplicate `routing`/`host_canonicalized` when linking two aiehlc libs; `libaielayers.a: entry.o: No such file` | aieconvgemmoffload |
 | `run_test.sh` check 3: no `aie/` under the offloaded layer; `--aiegraph` lifts 0 convs under int8 (`non-4D shapes`); may `--aie-offload` change `layers/` vs golden | aieoffloadaiegraph |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |

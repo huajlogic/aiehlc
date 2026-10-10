@@ -93,3 +93,18 @@ source `test_conv2d.cc` `#include`s and verifies bit-exact against this layer
 the `(sh + 31)` requant, and the generic `conv_bn_0.cc` must be absent. Other
 convs, if selected, still get the generic placeholder body (int16 accumulator,
 dummy quant).
+
+## All conv layers (default `--aie-layers all`)
+
+Check 3 now requires **every** `*conv2d*` layer folder to carry an `aie/`:
+
+- **layer 01:** the conv2dstem aiehlc build;
+- **every other conv folder:** the convgemm basic op, with `entry.c` + `tail.c`,
+  `partition.json` `backend: convgemm`, and an x86 verdict of
+  `N/N output bytes identical`;
+- **the shared basic op:** `aie_ops/convgemm/build/libconvgemm.a` must exist.
+
+Check 4 demands one `aie_tvmgen_*` entry per conv folder in `graph_driver.c`
+and `main.elf`, plus `conv2d_nchwc_i8` and `conv2d_stem_nchwc` defined. Pass
+`--allow-partial` when you select a subset with `--deploy-args "--aie-layers 1"`.
+Design: `../tutorial/aietensorop_conv.html`.
