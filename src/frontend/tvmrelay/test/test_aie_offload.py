@@ -391,6 +391,53 @@ def _check_stem(aie: Path, verdict: dict) -> list:
     return problems
 
 
+ARM_BUILD = OUT_DIR / "arm_build"
+
+
+def check_elf(since=None) -> dict:
+    """``main.elf`` must exist (and be from this run) and must call layer 01 on
+    the AIE: ``graph_driver.c`` swaps the stem kernel for its ``aie_*`` entry
+    under ``GRAPH_AIE_OFFLOAD``, the Makefile defines that macro, and the ELF
+    actually links the entry plus ``conv2d_stem_nchwc``.
+
+    deploy_flow.py exits 0 even when ``make`` fails (it reports and moves on),
+    so without this check a broken board link passes the whole test.
+    """
+    elf, drv, mk = ARM_BUILD / "main.elf", ARM_BUILD / "graph_driver.c", \
+        ARM_BUILD / "Makefile"
+    problems = []
+    if not elf.is_file():
+        return {"ok": False, "reason": f"{elf} was not built (see the [arm] "
+                                       f"lines in deploy_flow.log)"}
+    if since is not None and elf.stat().st_mtime < since:
+        problems.append("main.elf is older than this run -- the link failed "
+                        "and a stale ELF is on disk")
+    text = drv.read_text(errors="replace") if drv.is_file() else ""
+    entries = sorted({w.split("(")[0] for w in text.split()
+                      if w.startswith("aie_tvmgen_") and "(" in w})
+    if "#ifdef GRAPH_AIE_OFFLOAD" not in text or not entries:
+        problems.append("graph_driver.c does not call any aie_* entry")
+    if mk.is_file() and "-DGRAPH_AIE_OFFLOAD" not in mk.read_text():
+        problems.append("Makefile does not define GRAPH_AIE_OFFLOAD")
+    nm = shutil.which("aarch64-none-elf-nm") or shutil.which("nm")
+    syms = subprocess.run([nm, str(elf)], capture_output=True,
+                          text=True).stdout if nm else ""
+    for want in entries + ["conv2d_stem_nchwc"]:
+        if f" {want}" not in syms:
+            problems.append(f"main.elf does not define {want}")
+    return {"ok": not problems, "reason": "; ".join(problems),
+            "elf": str(elf), "entries": entries,
+            "bytes": elf.stat().st_size}
+
+
+def report_elf(res: dict) -> None:
+    if not res["ok"]:
+        print(f"[elf ] FAIL -- {res['reason']}")
+        return
+    print(f"[elf ] PASS -- {res['elf']} ({res['bytes']:,} B) runs layer 01 "
+          f"on the AIE via {', '.join(res['entries'])}")
+
+
 def report_aie(res: dict, show: int = 12) -> None:
     """Print the ``aie/`` check verdict, naming the artifacts it found."""
     if not res["ok"]:
@@ -476,6 +523,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-aie-check", action="store_true",
                     help="skip check 3 (useful while the offload path is "
                          "being brought up)")
+    ap.add_argument("--no-elf-check", action="store_true",
+                    help="skip check 4 (no cross toolchain on this box)")
     ap.add_argument("--ignore", action="append", default=[],
                     help="extra glob to exclude from the tree comparison "
                          "(repeatable); added to the built-in list")
@@ -515,6 +564,7 @@ def main(argv=None) -> int:
             shutil.rmtree(args.layers)
             print(f"[run ] removed {args.layers} (--clean)")
         TEST_DIR.mkdir(parents=True, exist_ok=True)
+        run_started = time.time()
         run = run_deploy_flow(args.deploy_args.split(),
                               TEST_DIR / "deploy_flow.log")
         if not run["ok"]:
@@ -552,10 +602,19 @@ def main(argv=None) -> int:
         aie = check_aie_dir(args.layers, args.aie_layer_glob)
         report_aie(aie)
 
-    ok = tree["ok"] and aie["ok"]
+    # ---- 4. main.elf -------------------------------------------------------
+    elf = {"ok": True}
+    if args.no_elf_check:
+        print("[elf ] skipped (--no-elf-check)")
+    else:
+        elf = check_elf(None if args.skip_run else run_started)
+        report_elf(elf)
+
+    ok = tree["ok"] and aie["ok"] and elf["ok"]
     print(f"\n=== {'PASS' if ok else 'FAIL'}: tree "
           f"{'ok' if tree['ok'] else 'differs'}, "
-          f"aie/ {'ok' if aie['ok'] else 'missing'}")
+          f"aie/ {'ok' if aie['ok'] else 'missing'}, "
+          f"main.elf {'ok' if elf['ok'] else 'bad'}")
     return 0 if ok else 1
 
 

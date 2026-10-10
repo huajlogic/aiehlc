@@ -484,6 +484,36 @@ def _driver_init(sids, shapes, dltypes, offsets, nodes, eid) -> list:
     return init, n_params
 
 
+def aie_entries(layers_dir) -> dict:
+    """``{TVM kernel symbol: AIE entry symbol}`` for layers the board ELF runs
+    on the AIE, from ``layers/partition.json``.
+
+    Only layers sent to AIE whose ``aie/`` archive is actually on disk and
+    whose ``host.cc`` defines the packed-call entry -- today the stem, built
+    from ``conv2dstem.cc`` (``aie_stem_lib``). Anything less and the swap would
+    be an undefined reference at link, so it is not made.
+    """
+    part = Path(layers_dir) / "partition.json"
+    if not part.is_file():
+        return {}
+    try:
+        doc = json.loads(part.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    out = {}
+    root = Path(layers_dir).parent
+    for layer in doc.get("layers", []):
+        entry, sym, arch = (layer.get("entry"), layer.get("replaces"),
+                            layer.get("archive"))
+        if layer.get("target") != "aie" or not (entry and sym and arch):
+            continue
+        host = root / layer["aie_dir"] / "host.cc"
+        if (root / arch).is_file() and host.is_file() \
+                and entry in host.read_text(errors="replace"):
+            out[sym] = entry
+    return out
+
+
 def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
                     c_source=None, verbose: bool = True) -> dict:
     """Emit ``graph_driver.c``, ``tvm_runtime_shim.c`` and ``main.c``.
@@ -573,6 +603,18 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         lines.append(f"int32_t {fn}(void* args, int32_t* arg_type_ids, "
                      "int32_t num_args, void* out_ret_value, "
                      "int32_t* out_ret_tcode, void* resource_handle);")
+    # AIE-offloaded kernels: same packed signature, defined in the layer's
+    # aie/host.cc (lib<...>.a). Only the board build defines
+    # GRAPH_AIE_OFFLOAD; `make local` compiles the CPU call from the SAME file,
+    # which is what makes main_local.elf the reference for main.elf.
+    offload = aie_entries(graph_path.parent / "layers")
+    if offload:
+        lines.append("#ifdef GRAPH_AIE_OFFLOAD")
+        for entry in sorted(set(offload.values())):
+            lines.append(f"int32_t {entry}(void* args, int32_t* arg_type_ids, "
+                         "int32_t num_args, void* out_ret_value, "
+                         "int32_t* out_ret_tcode, void* resource_handle);")
+        lines.append("#endif")
     lines.append("")
 
     for sid in sorted(sizes):
@@ -665,7 +707,14 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         tl = dict(param_of=param_of, roles=roles.get(fn, {}), nodes=nodes,
                   flow=flow)
         lines += _trace_lines(n_calls, fn, in_eids, out_eids, "in", **tl)
-        lines.append(f"    {fn}(args, codes, {len(arg_eids)}, 0, 0, 0);")
+        if fn in offload:
+            lines += ["#ifdef GRAPH_AIE_OFFLOAD",
+                      f"    {offload[fn]}(args, codes, {len(arg_eids)}, 0, 0, 0);",
+                      "#else",
+                      f"    {fn}(args, codes, {len(arg_eids)}, 0, 0, 0);",
+                      "#endif"]
+        else:
+            lines.append(f"    {fn}(args, codes, {len(arg_eids)}, 0, 0, 0);")
         lines += _trace_lines(n_calls, fn, in_eids, out_eids, "out", **tl)
         lines.append("")
         n_calls += 1
@@ -1397,6 +1446,13 @@ AIE_LIB  := {aie_lib}
 AIE_LDIRS := {aie_ldirs}
 AIE_EXTRA := {aie_extra}
 
+# Per-layer AIE offload (--aie-offload, aiegraph + aiehlc): graph_driver.c
+# calls the layer's aie_<kernel>() entry from its aie/build/lib*.a instead of
+# the CPU kernel. Board build only -- LOCAL_CFLAGS never gets it, so
+# main_local.elf runs the CPU kernel from the same driver and is the reference.
+AIE_OFFLOAD_DEFS := {aie_defs}
+CFLAGS += $(AIE_OFFLOAD_DEFS)
+
 # AIE_LDIRS comes FIRST, before $(BSP)/lib. The BSP's libxil.a bundles a stale
 # copy of the aienginev2 driver (62 xaie*.obj members); build_hw_lib in
 # aiehlc.sh strips those from its own libxil.a in thirdparty/alib/lib and
@@ -1549,11 +1605,14 @@ vpath %.c . $(sort $(dir $(LAYER_SRCS) $(KERNELS)))
 LOCAL_OBJS := $(addprefix $(LOCALOBJ)/,$(notdir $(SRCS:.c=.o)) \\
                                        $(notdir $(LAYER_SRCS:.c=.o)))
 
-# An AIE build cannot be run here: libconv2dstem.a and the per-layer archives
-# are aarch64 baremetal, and the kernels inside them execute on the AIE array.
-# Saying so beats a wall of undefined references to XAie_*.
+# A BYOC build cannot be run here: its wrapper is compiled INTO the kernel C
+# and calls libconv2dstem.a, which is aarch64 baremetal with kernels that run on
+# the array. Saying so beats a wall of undefined references to XAie_*.
+# Per-layer archives (AIE_LAYER_LIBS) are fine: the driver only calls them
+# under GRAPH_AIE_OFFLOAD, which LOCAL_CFLAGS never sets, so main_local.elf is
+# the CPU reference for the very same graph_driver.c.
 ifneq ($(filter local run-local,$(MAKECMDGOALS)),)
-ifneq ($(strip $(AIE_LIB)$(AIE_LAYER_LIBS)),)
+ifneq ($(strip $(AIE_LIB)),)
 $(error make local cannot link an AIE-offloaded build -- the archives are \\
 aarch64 and their kernels run on the array. Re-run deploy_flow.py without \\
 --aie-offload/--aiegraph for a local ELF, or use plain make for the board)
@@ -1614,7 +1673,8 @@ clean: clean-local
 AIE_ENTRY = "conv2d_stem_prepadded"
 
 
-def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
+def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path,
+                   layers_dir=None) -> dict:
     """Decide whether this ELF links against libconv2dstem.a, and stage its deps.
 
     Keyed off the generated C actually calling into it, not off a flag: if the
@@ -1639,18 +1699,22 @@ def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
         Deleting them here mirrors exactly what build_hw_lib does to its own
         copy, and leaves the rest of libxil.a (which the BSP needs) intact.
     """
-    empty = {"aie_lib": "", "aie_ldirs": "", "aie_extra": ""}
+    empty = {"aie_lib": "", "aie_ldirs": "", "aie_extra": "", "aie_defs": ""}
     try:
-        if AIE_ENTRY not in kernel_src.read_text():
-            return empty
+        byoc = AIE_ENTRY in kernel_src.read_text()
     except OSError:
+        byoc = False
+    # Per-layer offload needs the same driver libs as the BYOC archive (each
+    # aie/build/lib*.a carries the AIE runtime), just no AIE_LIB of its own.
+    offload = bool(aie_entries(layers_dir)) if layers_dir else False
+    if not (byoc or offload):
         return empty
 
     archive = repo_root / "aout" / "libconv2dstem.a"
     alib = repo_root / "thirdparty" / "alib" / "lib"
     hint = ("rebuild with `source script/aiehlc.sh --aie-version 5 "
             "--runtime-source-file src/aietensorop/conv2dstem/conv2dstem.cc`")
-    if not archive.is_file():
+    if byoc and not archive.is_file():
         print(f"  [arm] warning: the generated C calls {AIE_ENTRY} but "
               f"{archive} is missing -- {hint}")
         return empty
@@ -1687,10 +1751,11 @@ def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
     print(f"  [arm] staged {copied} AIE libs -> {staged}")
 
     return {
-        "aie_lib": str(archive),
+        "aie_lib": str(archive) if byoc else "",
         "aie_ldirs": f"-L{staged}",
         # Leading comma: this is spliced inside an existing --start-group list.
         "aie_extra": ",-lxaienginea78,-lstdc++",
+        "aie_defs": "-DGRAPH_AIE_OFFLOAD" if offload else "",
     }
 
 
@@ -1748,7 +1813,7 @@ def write_makefile(build: Path, repo_root: Path, kernel_src: Path,
         repo=repo_root, arch=arch, bsp=bsp,
         layers_dir=layers_dir, kernels=kernels, kernel_rule=rule,
         kernel_obj=f"{kernel_src.stem}.o",
-        **_aie_link_vars(repo_root, kernel_src, build),
+        **_aie_link_vars(repo_root, kernel_src, build, layers_dir),
     )
     path = build / "Makefile"
     path.write_text(text)

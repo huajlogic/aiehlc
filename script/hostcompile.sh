@@ -554,7 +554,11 @@ if [ "${HAS_ROUTING}" -eq 1 ]; then
     fi
     ROUTING_OBJ="routing.o"
 fi
-HOST_OBJS="host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o aie_runtime_control_plan.o aie_runtime_resource.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST}"
+# Must list every runtime object the ELF link below uses: aie_runtime.o calls
+# rt_seq_* (aie_runtime_xaie_seq.o) and the ctrl-pkt encoder, so an archive
+# without them links only until something reaches __Runtime_startio -- then
+# `undefined reference to rt_seq_start_queue` in the consumer's link.
+HOST_OBJS="host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o aie_runtime_control_plan.o aie_runtime_resource.o aie_ctrlpkt_encode.o aie_runtime_xaie_seq.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST}"
 
 if [ "${HOST_ENTRY_KIND}" = "library" ]; then
     # No main() => archive rather than link. The kernel ELF objects are included

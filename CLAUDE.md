@@ -238,9 +238,14 @@ runs `hostcompile.sh` in that directory to archive
 `layers/NN_op/aie/build/libNN_op.a`. `arm_build` links them by wildcard
 (`AIE_LAYER_LIBS`), and `partition.json` records `archive` / `archive_reason`.
 They coexist with `libconv2dstem.a` despite both carrying the AIE runtime,
-because `ld` pulls only members that resolve an undefined symbol. **Not yet
-wired:** `graph_driver.c` still calls the CPU kernel for those layers, so the
-archives link but contribute nothing.
+because `ld` pulls only members that resolve an undefined symbol. **Wired for
+the stem only:** a layer whose `partition.json` entry carries `entry` /
+`replaces` (today layer 01, built from `conv2dstem.cc`) is called through
+`aie_<kernel>()` in `graph_driver.c` under `#ifdef GRAPH_AIE_OFFLOAD`. Only the
+board Makefile defines that macro (`arm_build.aie_entries` → `AIE_OFFLOAD_DEFS`),
+so `make local` builds the CPU kernel from the *same* driver and
+`main_local.elf` is the reference for `main.elf`. Every other layer's archive
+still links but contributes nothing.
 
 **qnn zero-point folding is the DEFAULT (`--no-fold-qnn-zp` opts out).** A
 quantized conv lowers to `term1 − term2 − term3 + term4`; `Conv2DCombineTerms`
@@ -454,8 +459,15 @@ runs `aiehlc.sh` on `conv2dstem.cc` in a scratch cwd and installs
 `test_conv2d.cc` verifies bit-exact: `kernel.cc`/`routing.cc`/bcf/prx are
 byte-identical to its build, and `host.cc` is a strict subset (it lacks only
 `test_conv2d.cc`'s `main()` driver). `partition.json` records `backend: aiehlc`
-+ `source`. It adds ~80 s per run. It is additive (every `.c` is
-untouched), so `worklocal/tvmrelay_deploy/test/run_test.sh` holds `layers/` to
++ `source`. It adds ~80 s per run. Appended to that `host.cc`, then
+re-archived by `hostcompile.sh`: `aie_<kernel>()`, which has TVM's packed-call
+signature and performs `test_conv2d.cc`'s `fold_qparams` + `conv2d_stem_nchwc`.
+It prints `[aie-offload] layer 01 ... ENTER` / `EXIT rc=.. hash=..` on the
+console, which is the proof the board ran layer 01 on the array. Test:
+`src/frontend/tvmrelay/test/run_test.sh` (check 4 `[elf ]` demands main.elf
+is fresh and links the entry, because deploy_flow exits 0 even when `make`
+fails). It is additive (every `.c` is
+untouched), so `src/frontend/tvmrelay/test/run_test.sh` holds `layers/` to
 the **default-flow** `layers-golden/` and checks `aie/` separately. aiegraph
 used to lift 0 convs under int8 because `_conv_geometry` read 4-D only; it now
 folds NCHWc through `aie_offload._layer_geometry`. Skill: **aieoffloadaiegraph**.

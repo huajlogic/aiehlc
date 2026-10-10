@@ -2,7 +2,7 @@
 
 ```bash
 source script/setup.sh --path-set-only        # stage 6's cross toolchain
-bash worklocal/tvmrelay_deploy/test/run_test.sh
+bash src/frontend/tvmrelay/test/run_test.sh
 ```
 
 Three checks, reported separately so a failure names what broke:

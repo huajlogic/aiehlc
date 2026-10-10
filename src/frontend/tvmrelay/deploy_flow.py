@@ -1028,9 +1028,21 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
                        else ",".join(str(i) for i in aie_layers))
                 print(f"[6/7] aiegrph: lifting the whole graph, offloading "
                       f"layer(s) {sel} (AIE ops: {', '.join(aiegraph_ops)})")
-            graph_part = aiegraph_partition.run_aiegraph(
-                out_dir, aie_ops=tuple(aiegraph_ops), mesh=mesh,
-                layers=aie_layers, verbose=verbose)
+            try:
+                graph_part = aiegraph_partition.run_aiegraph(
+                    out_dir, aie_ops=tuple(aiegraph_ops), mesh=mesh,
+                    layers=aie_layers, verbose=verbose)
+            except RuntimeError as exc:
+                # Under --aiegraph this IS the stage, so fail loudly. Under
+                # --aie-offload alone it is an additive extra: before it ran
+                # here, `--aie-offload --no-fold-qnn-zp` worked, and that graph
+                # makes the whole-graph lift fail verification (its unfolded
+                # conv names carry two `add`s, read as a residual). Report and
+                # keep the CPU build instead of losing the whole run.
+                if aiegraph:
+                    raise
+                graph_part = {"ok": False, "reason": f"aiegraph lift failed, "
+                              f"no aie/ built: {exc}"}
             if verbose and not graph_part.get("ok"):
                 print(f"[6/7]          {graph_part.get('reason', 'partition failed')}")
 

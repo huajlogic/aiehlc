@@ -590,7 +590,10 @@ def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
 def _build_stem(aie_stem_lib, launch: dict, rec: dict, verdict: dict,
                 aie_dir: Path, out_dir: Path, verbose: bool) -> dict:
     """aiehlc-build ``conv2dstem.cc`` into *aie_dir*. Returns its record."""
-    res = aie_stem_lib.build_stem_layer(aie_dir, verbose=False)
+    # The TVM kernel symbol rides along so host.cc gets a packed-call entry
+    # graph_driver.c can call in its place (aie_stem_lib._ENTRY_TMPL).
+    res = aie_stem_lib.build_stem_layer(aie_dir, index=verdict["index"],
+                                        func_name=rec["symbol"], verbose=False)
     if verbose:
         print(f"  [aiegraph] layer {verdict['index']:02d} {verdict['kind']}"
               f" -> {launch['op']} (stem) -> aiehlc "
@@ -600,7 +603,8 @@ def _build_stem(aie_stem_lib, launch: dict, rec: dict, verdict: dict,
              "dir": str(aie_dir.relative_to(out_dir)), "ok": res["ok"],
              "op": launch["op"], "func_name": launch["func_name"],
              "files": res["files"], "backend": "aiehlc",
-             "source": str(aie_stem_lib.STEM_SOURCE.relative_to(_REPO))}
+             "source": str(aie_stem_lib.STEM_SOURCE.relative_to(_REPO)),
+             "entry": res.get("entry"), "replaces": rec["symbol"]}
     if res["archive"]:
         entry["archive"] = str(Path(res["archive"]).relative_to(out_dir))
         if verbose:
@@ -667,6 +671,10 @@ def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
             "backend": (built.get("backend", "run_aie_pipeline")
                         if built else None),
             "source": built.get("source") if built else None,
+            # graph_driver.c calls `entry` instead of `replaces` when built
+            # with -DGRAPH_AIE_OFFLOAD (arm_build.aie_entries).
+            "entry": built.get("entry") if built else None,
+            "replaces": built.get("replaces") if built else None,
             # The linkable product of that folder, or why there isn't one.
             # Null with a reason is the normal state on a box without the
             # Vitis cross toolchain; null without one means it was never tried.
