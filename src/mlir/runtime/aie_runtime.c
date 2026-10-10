@@ -2777,15 +2777,20 @@ static AieRC __Runtime_partition_initialize(XAie_DevInst *dev) {
  * XAie_CoreProcessorBusEnable mask-writes the ProcBusCtrl enable bit at the
  * tile address, letting the core write its own memory-module DMA/lock
  * registers. Iterate the partition's core tiles (AieTileRowStart .. +NumRows)
- * across its columns (StartCol .. +NumCols). Gen5 baremetal only.
+ * across its columns. Gen5 baremetal only.
+ *
+ * Columns are PARTITION-RELATIVE (0 .. NumCols-1), not StartCol-based: the
+ * partition's BaseAddr already includes StartCol, and aie-rt rejects any
+ * Loc.Col >= NumCols ("Invalid column"). Looping from StartCol skipped the
+ * first StartCol columns and failed the rest -- partition {3,6} hit relative
+ * col 3 (= absolute col 6) once and errored on cols 4..6.
  * ----------------------------------------------------------------------- */
 AieRC __Runtime_enable_core_proc_bus(XAie_DevInst *dev) {
 #if AIE_GEN == 5 && !defined(__AIESIM__)
     AieRC rc = XAIE_OK;
     u8 rowStart = dev->AieTileRowStart;
     u8 rowEnd = (u8)(dev->AieTileRowStart + dev->AieTileNumRows);
-    u8 colEnd = (u8)(dev->StartCol + dev->NumCols);
-    for (u8 col = dev->StartCol; col < colEnd; col++) {
+    for (u8 col = 0; col < dev->NumCols; col++) {
         for (u8 row = rowStart; row < rowEnd; row++) {
             AieRC r = XAie_CoreProcessorBusEnable(dev, XAie_TileLoc(col, row));
             if (r != XAIE_OK) {
