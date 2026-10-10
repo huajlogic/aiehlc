@@ -70,7 +70,7 @@ import time
 from pathlib import Path
 
 #: .../worklocal/tvmrelay_deploy/test/test_aie_offload.py -> up four.
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[4]
 OUT_DIR = REPO / "worklocal" / "tvmrelay_deploy"
 LAYERS_DIR = OUT_DIR / "layers"
 GOLDEN_DIR = OUT_DIR / "layers-golden"

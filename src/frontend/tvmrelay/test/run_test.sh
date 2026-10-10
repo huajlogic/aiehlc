@@ -25,7 +25,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "${HERE}/../../.." && pwd)"
+REPO="$(cd "${HERE}/../../../../" && pwd)"
 PYTHON="${PYTHON:-python3}"
 
 exec "${PYTHON}" "${HERE}/test_aie_offload.py" "$@"
