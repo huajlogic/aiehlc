@@ -33,32 +33,44 @@
 
 // Kernel-visible geometry: bare literals (the kernel TU sees only #defines
 // written in this file, never convgemm.h).
-#define TM 256    // A rows per launch
-#define TN 64     // output channels per launch
-#define TK 256    // reduction depth per launch
-#define C_BYTES 4 // bytes per int32 output element
+//
+// The DESCRIPTORS are byte-for-byte example/tileprogram/ccode/simplematmul2.cc
+// (M = N = K = 256, 16-row tiles, K in 64-byte rounds, int8 C tiles of 16x16
+// per core). That configuration is proven; the first convgemm (N = 64 with a
+// 4x-wide int32 C port) made aiehlc derive buffer sizes that disagreed with the
+// generated windows (buf_sz_b 4096 vs a 256-byte window) and the shim DMA hung
+// on the board (wait_io TIMEOUT). So int32 is carried INSIDE the proven int8
+// layout instead of widening it:
+//
+//   * the host replicates each real output channel r into 4 virtual B rows
+//     4r..4r+3 (TN_V = 4 * TN = 256 virtual rows);
+//   * for virtual column 4r+b the kernel stores BYTE b of acc(m, r);
+//   * so C row m, read as bytes 4r..4r+3, IS acc(m, r) little-endian, and the
+//     host reads C as int32[TM][TN] directly.
+// The dot product is computed once per group of 4 (j % 4 == 0).
+#define TM 256   // A rows per launch
+#define TN 64    // real output channels per launch
+#define TN_V 256 // virtual B rows = 4 bytes x TN
+#define TK 256   // reduction depth per launch
 #define HW_ROWS 4
 #define HW_COLS 4
 
-// A [TM, TK]: rows split across mesh ROWS (16-row tiles), K in 64-byte rounds.
 constexpr aie::GemmSpace RowBA = {.policy = {.map = {.act = aie::Pattern::Broadcast, .layout = aie::Layout::Row},
                                              .mat = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::None},
                                              .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
                                   .d1 = {.fullsize = TM, .tile_size = 16, .stride = 16},
                                   .d2 = {.fullsize = TK, .tile_size = 64, .stride = 64}};
-// Bt [TN, TK]: rows (output channels) split across mesh COLS.
 constexpr aie::GemmSpace ColBB = {.policy = {.map = {.wgt = aie::Pattern::Broadcast, .layout = aie::Layout::Col},
                                              .mat = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::None},
                                              .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
-                                  .d1 = {.fullsize = TN, .tile_size = 16, .stride = 16},
+                                  .d1 = {.fullsize = TN_V, .tile_size = 16, .stride = 16},
                                   .d2 = {.fullsize = TK, .tile_size = 64, .stride = 64}};
-// C [TM, TN*4 bytes]: 16 rows x 16 int32 (= 64 bytes) per core tile.
 constexpr aie::GemmSpace LtoR_Merge = {
     .policy = {.map = {.layout = aie::Layout::Row, .merge_order = aie::Flow::LeftToRight},
                .mat = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::None},
                .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
     .d1 = {.fullsize = TM, .tile_size = 16, .stride = 16},
-    .d2 = {.fullsize = TN * C_BYTES, .tile_size = 16 * C_BYTES, .stride = 16 * C_BYTES}};
+    .d2 = {.fullsize = TN_V, .tile_size = 16, .stride = 16}};
 
 constexpr aie::GlobalPolicy gemm_i8i32_policy = {.fullconnect_auto = 1};
 __global__(gemm_i8i32_policy) void gemm_i8i32(aie::port<input_window_int8 *, RowBA> win_a,
@@ -85,7 +97,8 @@ __global__(gemm_i8i32_policy) void gemm_i8i32(aie::port<input_window_int8 *, Row
         for (int i = 0; i < tile_rows * tile_cols; i++)
             accum[i] = 0;
 
-        // K rounds: accumulate partial products in int32.
+        // K rounds: accumulate partial products in int32. Virtual columns
+        // 4r+1..4r+3 repeat 4r, so only every 4th is computed.
         for (int kr = 0; kr < k_rounds; kr++) {
             for (int ra = 0; ra < num_a_rounds; ra++) {
                 int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
@@ -97,29 +110,28 @@ __global__(gemm_i8i32_policy) void gemm_i8i32(aie::port<input_window_int8 *, Row
                 int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
                 for (int i = 0; i < tile_rows; i++) {
                     for (int j = 0; j < cols_per_round; j++) {
+                        const int col = rb * cols_per_round + j;
+                        if (col & 3)
+                            continue;
                         int32_t sum = 0;
                         for (int k = 0; k < eff_k; k++)
                             sum += (int32_t)all_A[i * eff_k + k] * (int32_t)B_ptr[j * eff_k + k];
-                        accum[i * tile_cols + rb * cols_per_round + j] += sum;
+                        accum[i * tile_cols + col] += sum;
                     }
                 }
                 release_input_window(win_b);
             }
         }
 
-        // Emit int32 as little-endian bytes: row-major [tile_rows][tile_cols*4].
-        const int row_bytes = tile_cols * C_BYTES;
-        const int rows_per_c_round = buf_sz_c / row_bytes;
+        // Virtual column j carries byte (j & 3) of the int32 at column j & ~3.
+        const int rows_per_c_round = buf_sz_c / tile_cols;
         for (int rc = 0; rc < num_c_rounds; rc++) {
             int8_t *out = (int8_t *)acquire_output_window(win_c);
             for (int i = 0; i < rows_per_c_round; i++) {
+                const int row = rc * rows_per_c_round + i;
                 for (int j = 0; j < tile_cols; j++) {
-                    const uint32_t v = (uint32_t)accum[(rc * rows_per_c_round + i) * tile_cols + j];
-                    int8_t *o = &out[i * row_bytes + j * C_BYTES];
-                    o[0] = (int8_t)(v & 0xFF);
-                    o[1] = (int8_t)((v >> 8) & 0xFF);
-                    o[2] = (int8_t)((v >> 16) & 0xFF);
-                    o[3] = (int8_t)((v >> 24) & 0xFF);
+                    const uint32_t v = (uint32_t)accum[row * tile_cols + (j & ~3)];
+                    out[i * tile_cols + j] = (int8_t)((v >> (8 * (j & 3))) & 0xFF);
                 }
             }
             release_output_window(win_c);
@@ -145,10 +157,17 @@ static int cg_tile_run(const int8_t *a, const int8_t *b, int32_t *c) {
     aieSetDevice(0);
     aieArray device;
     aieMesh mesh = device.partition({3, 6, 0, 6}, HW_ROWS, HW_COLS);
-    gemm_i8i32<<<mesh>>>((int8_t *)a, (int8_t *)b, (int8_t *)c, TM, TN, TK);
+    gemm_i8i32<<<mesh>>>((int8_t *)a, (int8_t *)b, (int8_t *)c, TM, TN_V, TK);
+    // The generated launch flushes a/b/c BEFORE the DMA but does nothing after.
+    // c is reused by every launch, and lines the CPU speculatively refetched
+    // while the DMA ran would be read stale: measured on the board as ~4% wrong
+    // outputs once a GEMM needs more than one launch (one launch was exact).
+    // Invalidate c so the host reads what the S2MM DMA wrote.
+    device.synchronizecpu(c, (size_t)TM * TN_V);
     return 0;
 }
 
 #define CONVGEMM_TILE(a, b, c) cg_tile_run((a), (b), (c))
+#define CONVGEMM_BREP 4 /* B rows replicated per real channel (see the kernel) */
 #define CONVGEMM_DMA_ALLOC(n) __Runtime_Alloc(n)
 #include "convgemm_host.h"

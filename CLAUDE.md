@@ -261,8 +261,18 @@ Two aiehlc libraries cannot share a runtime because `aie_runtime.o` calls
 --whole-archive` + `objcopy --keep-global-symbols`) gives each a private one.
 The board Makefile compiles `layers/*/aie/*.c` into `libaielayers.a` and links
 it with the per-layer and `aie_ops` archives inside one `--start-group`.
-Compile-verified (19 entries, 20 call sites, 952 tile launches per inference);
-the convgemm tile has **not** run on hardware yet. Design:
+**Verified on the board (2026-10-10):** 20/20 conv calls return `rc=0`, and
+the top-5 equals `main_local.elf` down to the logits (inference 13.0 s,
+952 tile launches). Two hardware-only fixes live in `convgemm.cc`:
+
+- **Proven descriptors.** They match `simplematmul2` 256×256×256 exactly; int32
+  is carried by replicating B rows 4× and storing byte `b` of `acc(r)` at
+  virtual column `4r+b`. N = 64 with a 4×-wide C port derived inconsistent
+  `buf_sz`, and the DMA hung.
+- **Post-DMA cache invalidate.** `device.synchronizecpu(c, …)` after each
+  launch; the generated launch only flushes before the DMA.
+
+Standalone board test: `src/aietensorop/convgemm/test_convgemm.cc`. Design:
 `src/frontend/tvmrelay/tutorial/aietensorop_conv.html`. Skill:
 **aieconvgemmoffload**.
 

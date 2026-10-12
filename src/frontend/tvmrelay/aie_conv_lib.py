@@ -367,20 +367,26 @@ def _layer_readme(index, func_name, g, gm, gn, gk, launches, info, ver) -> str:
 _CPU_TILE_C = """\
 #include <stdint.h>
 #include <stdlib.h>
-/* The AIE tile, as a scalar loop: c[TM][TN] = a[TM][TK] . b[TN][TK]^T. Everything
- * around it -- im2col, tiling, K accumulation, scatter -- is the real
+/* The AIE tile, emulated exactly as convgemm.cc's kernel computes it: B arrives
+ * with every real row replicated into 4 virtual rows (CONVGEMM_BREP), virtual
+ * column j of C carries byte (j & 3) of the int32 dot product of A with virtual
+ * row (j & ~3). C is then read back as int32[256][64]. Everything around the
+ * tile -- im2col, tiling, K accumulation, scatter -- is the real
  * convgemm_host.h, the same code the board runs. */
 static int cpu_tile(const int8_t *a, const int8_t *b, int32_t *c) {
+    uint8_t *cb = (uint8_t *)c;
     for (int i = 0; i < 256; i++)
-        for (int j = 0; j < 64; j++) {
+        for (int j = 0; j < 256; j += 4) {
             int32_t s = 0;
             for (int k = 0; k < 256; k++)
                 s += (int32_t)a[i * 256 + k] * (int32_t)b[j * 256 + k];
-            c[i * 64 + j] = s;
+            for (int byte = 0; byte < 4; byte++)
+                cb[i * 256 + j + byte] = (uint8_t)(((uint32_t)s >> (8 * byte)) & 0xFF);
         }
     return 0;
 }
 #define CONVGEMM_TILE(a, b, c) cpu_tile((a), (b), (c))
+#define CONVGEMM_BREP 4
 #define CONVGEMM_DMA_ALLOC(n) malloc(n)
 #include "convgemm_host.h"
 """

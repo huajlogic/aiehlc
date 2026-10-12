@@ -14,6 +14,10 @@
  *   CONVGEMM_TILE(a, b, c)  run ONE tile: c[TM][TN] = a[TM][TK] . b[TN][TK]^T
  *                           (int32, overwritten); returns 0 on success
  *   CONVGEMM_DMA_ALLOC(n)   allocate n bytes the tile may DMA from/to
+ *   CONVGEMM_BREP           (optional, default 1) each real B row is written
+ *                           CONVGEMM_BREP times consecutively into the B tile;
+ *                           the tile then sees [TN*BREP][TK] and must return
+ *                           c[TM][TN] = a . b[r*BREP]  (convgemm.cc uses 4)
  ******************************************************************************/
 #ifndef AIETENSOROP_CONVGEMM_HOST_H
 #define AIETENSOROP_CONVGEMM_HOST_H
@@ -22,8 +26,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef CONVGEMM_BREP
+#define CONVGEMM_BREP 1
+#endif
+
 static int8_t *cg_a_tile = 0;  /* [TM][TK] */
-static int8_t *cg_b_tile = 0;  /* [TN][TK] */
+static int8_t *cg_b_tile = 0;  /* [TN*BREP][TK] */
 static int32_t *cg_c_tile = 0; /* [TM][TN] */
 static long cg_launches = 0;
 
@@ -31,7 +39,7 @@ static int cg_ensure_tiles(void) {
     if (cg_a_tile && cg_b_tile && cg_c_tile)
         return CONVGEMM_OK;
     cg_a_tile = (int8_t *)CONVGEMM_DMA_ALLOC((size_t)CONVGEMM_TM * CONVGEMM_TK);
-    cg_b_tile = (int8_t *)CONVGEMM_DMA_ALLOC((size_t)CONVGEMM_TN * CONVGEMM_TK);
+    cg_b_tile = (int8_t *)CONVGEMM_DMA_ALLOC((size_t)CONVGEMM_TN * CONVGEMM_BREP * CONVGEMM_TK);
     cg_c_tile = (int32_t *)CONVGEMM_DMA_ALLOC((size_t)CONVGEMM_TM * CONVGEMM_TN * 4);
     return (cg_a_tile && cg_b_tile && cg_c_tile) ? CONVGEMM_OK : CONVGEMM_ERR_ALLOC;
 }
@@ -43,6 +51,15 @@ static void cg_pack(int8_t *tile, int tr, int tk, const int8_t *src, int ld, int
     memset(tile, 0, (size_t)tr * tk);
     for (int r = 0; r < rows; r++)
         memcpy(tile + (size_t)r * tk, src + (size_t)(r0 + r) * ld + k0, (size_t)cols);
+}
+
+/* B tile: each real row r written CONVGEMM_BREP times (rows r*BREP ..). */
+static void cg_pack_rep(int8_t *tile, const int8_t *src, int ld, int r0, int rows, int k0, int cols) {
+    memset(tile, 0, (size_t)CONVGEMM_TN * CONVGEMM_BREP * CONVGEMM_TK);
+    for (int r = 0; r < rows; r++)
+        for (int v = 0; v < CONVGEMM_BREP; v++)
+            memcpy(tile + ((size_t)r * CONVGEMM_BREP + v) * CONVGEMM_TK, src + (size_t)(r0 + r) * ld + k0,
+                   (size_t)cols);
 }
 
 /* C[M,N] = A[M,K] . Bt[N,K]^T over the fixed AIE tile. K tiles accumulate in
@@ -62,7 +79,7 @@ int convgemm_i8i32(const int8_t *A, const int8_t *Bt, int32_t *C, int M, int N, 
             for (int k0 = 0; k0 < K; k0 += CONVGEMM_TK) {
                 const int kk = (K - k0 < CONVGEMM_TK) ? K - k0 : CONVGEMM_TK;
                 cg_pack(cg_a_tile, CONVGEMM_TM, CONVGEMM_TK, A, K, m0, mm, k0, kk);
-                cg_pack(cg_b_tile, CONVGEMM_TN, CONVGEMM_TK, Bt, K, n0, nn, k0, kk);
+                cg_pack_rep(cg_b_tile, Bt, K, n0, nn, k0, kk);
                 rc = CONVGEMM_TILE(cg_a_tile, cg_b_tile, cg_c_tile);
                 cg_launches++;
                 if (rc != 0)

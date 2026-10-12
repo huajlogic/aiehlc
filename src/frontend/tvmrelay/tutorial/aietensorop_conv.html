@@ -61,7 +61,11 @@
 (<code>convgemm</code>, an int8 GEMM tile) plus TVM's own epilogue. It also explains why the
 second approach scales and the first does not.</p>
 
-<div class="box ok"><b>State this page describes (2026-10-10, compile + x86 verified; not run on hardware)</b>
+<div class="box ok"><b>State this page describes (2026-10-10, verified on the board)</b>
+<code>apppaltest.py</code> on <code>main.elf</code>: all 20 conv calls run on the AIE and exit <code>rc=0</code>, with no
+AIE errors. The top-5 is <b>identical to the CPU-only <code>main_local.elf</code> down to the logits</b> (258 Samoyed
+12.0173, 279 8.5263, 259 8.1906, 257 7.9220, 270 7.4521). Inference took 13.0 s (952 tile launches; see §9).
+Log: <code>src/frontend/tvmrelay/test/applog_aie_offload_all.txt</code>.<br>
 <code>deploy_flow.py --aie-offload</code> (default <code>--aie-layers all</code>) offloads every fused op that
 contains a conv2d. That is 19 layer folders and 20 calls per inference. Each folder gets an <code>aie/</code>, and
 <code>main.elf</code> calls 19 <code>aie_tvmgen_*</code> entries. All 18 convgemm layers are proven
@@ -270,10 +274,24 @@ random activations over each dtype's full range.</li>
 <code>200704/200704 output bytes identical</code>, recorded in <code>partition.json</code> and checked by
 <code>run_test.sh</code>.</li>
 </ol>
-<p>That proves im2col, tiling, K accumulation, scatter and the transplanted tail. It does <b>not</b> prove the AIE
-tile on hardware, i.e. the int32-as-bytes C window and the DMA layout. That is the next board run:
-<code>apppaltest.py</code> on <code>main.elf</code> should print one ENTER/EXIT pair per layer and match
-<code>main_local.elf</code>'s top-5.</p>
+<p>That proves im2col, tiling, K accumulation, scatter and the transplanted tail. The AIE tile itself is proven on
+the board in two steps:</p>
+<ol>
+<li><code>src/aietensorop/convgemm/test_convgemm.cc</code>, a standalone aiehlc entry file, checks one tile
+(<code>PASS 16384/16384</code>) and a ragged 300×70×600 GEMM over 12 launches (<code>PASS 21000/21000</code>).</li>
+<li>The whole network on <code>main.elf</code>: 20/20 conv calls return <code>rc=0</code> and the top-5 equals
+<code>main_local.elf</code>.</li>
+</ol>
+<div class="box warn"><b>Two hardware-only bugs the x86 harness could not catch</b>
+<b>1. Descriptor derivation.</b> The first kernel declared N = 64 (one N-tile per mesh column) and a 4×-wide int32 C
+port. aiehlc then derived <code>buf_sz_b = 4096</code> against a 256-byte window, and the shim DMA hung
+(<code>wait_io TIMEOUT</code>). Fix: the descriptors are now byte-for-byte the proven
+<code>simplematmul2</code> 256×256×256 configuration. int32 rides inside its int8 C tiles: each real channel is
+replicated into 4 virtual B rows, and virtual column 4r+b stores byte b of acc(r). C row m <i>is</i>
+<code>int32[64]</code> in little-endian order.<br>
+<b>2. Cache coherency.</b> The generated launch flushes a/b/c <i>before</i> the DMA and does nothing after.
+With C reused across launches, ~4% of outputs were stale once a GEMM needed more than one launch. Fix:
+<code>device.synchronizecpu(c, …)</code> after every launch.</div>
 
 <!-- ============================================================ -->
 <h2 id="cost">9. Cost model and where to go next</h2>
@@ -287,6 +305,8 @@ The basic-op approach buys generality; these steps buy the speed back, roughly i
 time), or move to control-packet BD writes (~2.9 ns per write).</li>
 <li><b>Bigger tile, weight-stationary.</b> Load Bt once per (n0, k0) and stream all M tiles past it. This cuts
 launches by ⌈M/256⌉ for the early layers.</li>
+<li><b>Stop replicating B 4×.</b> The byte-plane trick (§8) multiplies B's DMA by 4. Once aiehlc derives
+consistent buffers for an int32 C port, drop it.</li>
 <li><b>A second basic op: the per-channel requantize epilogue on the core.</b> It returns int8 instead of int32, so
 4× less output DMA, for the tail variant A layers whose tail is only requant + clip. Keep the transplant for the
 rest.</li>
@@ -317,7 +337,8 @@ from a "GEMM basic op" to a "parameterized conv basic op".</li>
 <tr><td>launches per layer</td><td>1</td><td>⌈M/256⌉·⌈N/64⌉·⌈K/256⌉ (4 … 144)</td></tr>
 <tr><td>data movement</td><td>on-core im2col, uint8 out</td><td>host im2col, int32 out (4×)</td></tr>
 <tr><td>speed</td><td>best possible for that layer</td><td>dominated by per-launch setup today (§9)</td></tr>
-<tr><td>correctness evidence</td><td>board <code>GOLDEN PASS 802816/802816</code></td><td>x86 bit-exact 18/18; board run pending</td></tr>
+<tr><td>correctness evidence</td><td>board <code>GOLDEN PASS 802816/802816</code></td><td>x86 bit-exact 18/18; board: tile test PASS, whole-network top-5 = CPU reference</td></tr>
+<tr><td>measured inference (whole net)</td><td colspan="2">CPU-only 2.48 s; stem on AIE 2.48 s; all convs on AIE <b>13.0 s</b> (952 launches; §9)</td></tr>
 </table>
 <p><b>Recommendation:</b> use B for coverage and A for the few layers that profiling shows dominate. Most of B's
 performance gap is per-launch overhead, which is fixable in the basic op once, for every layer at the same time.</p>

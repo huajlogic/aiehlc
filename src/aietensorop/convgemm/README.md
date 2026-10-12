@@ -41,9 +41,29 @@ Traps, each one already hit:
 - **Never spell the kernel keyword or the launch syntax in a comment.**
 - **Include `convgemm.h` only after the kernel body** (skill aiesourcetextrewrite).
 
-Status: compiled, and every layer's host logic plus tail is bit-exact on x86.
-**Not yet run on hardware.** The int32-as-bytes C window and the DMA layout are
-unproven on the board.
+Status: **verified on the board.**
+
+- `test_convgemm.cc`: one tile `PASS 16384/16384`; a ragged 300×70×600 GEMM
+  over 12 launches `PASS 21000/21000`.
+- Full ResNet-18 with every conv offloaded: the top-5 equals `main_local.elf`
+  down to the logits.
+
+Two hardware-only fixes are in place:
+
+1. **Descriptors.** They are byte-for-byte `simplematmul2`'s proven
+   256×256×256. int32 is carried by replicating each B row 4× and storing byte
+   `b` of `acc(r)` at virtual column `4r+b`. N = 64 with a 4×-wide C port
+   made aiehlc derive inconsistent buffers, and the DMA hung.
+2. **Cache.** `device.synchronizecpu(c, …)` runs after every launch, because the
+   generated launch only flushes before the DMA, so stale C lines appeared from
+   the second launch on.
+
+```bash
+# standalone board test
+mkdir /tmp/cgt && cd /tmp/cgt
+source $REPO/script/aiehlc.sh --aie-version 5 --runtime-source-file $REPO/src/aietensorop/convgemm/test_convgemm.cc
+python3 $REPO/script/test/apppaltest.py -y -nonreboot aout/worklocal/build/host
+```
 
 Design and trade-offs:
 `src/frontend/tvmrelay/tutorial/aietensorop_conv.html`.
