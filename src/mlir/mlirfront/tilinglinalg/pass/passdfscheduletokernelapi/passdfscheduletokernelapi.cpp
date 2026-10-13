@@ -122,7 +122,10 @@ static void collectAggregatedOutTiles(KernelModuleOp kernelModuleOp, SmallVector
 /// Always matches and does full conversion so we do not depend on nested patterns
 /// firing first (conversion may try the parent before descending into regions).
 struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
-    using OpConversionPattern::OpConversionPattern;
+    KernelModuleToEmitCPattern(const TypeConverter &tc, MLIRContext *ctx, int partStartCol)
+        : OpConversionPattern(tc, ctx), partStartCol(partStartCol) {}
+
+    int partStartCol;
 
     LogicalResult matchAndRewrite(KernelModuleOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -633,7 +636,11 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 block += "  // packet_id and ooo_bd_id differ per tile, but one ELF runs on all of\n";
                 block += "  // them, so dispatch on the core's own id.\n";
                 block += "  unsigned _cid = get_coreid();\n";
-                block += "  int _col = (int)(_cid >> 16);\n";
+                // get_coreid() is the ABSOLUTE column; plan columns are partition-
+                // relative (host coordinates), so rebase or arms land on the wrong
+                // tiles -- and tiles past the partition origin offset arm nothing.
+                block +=
+                    "  int _col = (int)(_cid >> 16) - " + std::to_string(partStartCol) + "; // partition start col\n";
                 block += "  int _row = (int)(_cid & 0x1F);\n";
                 for (size_t i = 0; i < outTiles.size(); ++i) {
                     const CoreOffloadEntry &e = *outTiles[i];
@@ -789,7 +796,7 @@ void DfscheduleToKernelApiPass::runOnOperation() {
     typeConverter.addConversion([](Type type) { return type; });
 
     RewritePatternSet patterns(ctx);
-    patterns.add<KernelModuleToEmitCPattern>(typeConverter, ctx);
+    patterns.add<KernelModuleToEmitCPattern>(typeConverter, ctx, partStartCol);
 
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns))))
         signalPassFailure();

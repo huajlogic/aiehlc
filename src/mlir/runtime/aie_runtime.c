@@ -7448,6 +7448,17 @@ static void rt_wait_io_timeout_dump(XAie_DevInst *dev) {
     if (dumped)
         return;
     dumped = 1;
+    // Verbose per-tile core/DMA/lock dump: default OFF. On a hang it is tens of
+    // KB over the UART, which floods the console and can trip apppaltest's
+    // no-output/total watchdog before the one-line TIMEOUT above is even read.
+    // The single TIMEOUT line (printed by the caller) always says which tile/
+    // channel stalled; enable this full snapshot with the AIE_DEBUG_LOG flag,
+    // e.g. `#pragma aie_debug_level(AIE_DEBUG_LOG)` in the app source.
+    if (!AIEHLC_LOG_ENABLED()) {
+        printf("[aie_runtime] DMA status dump suppressed "
+               "(enable: #pragma aie_debug_level(AIE_DEBUG_LOG))\n");
+        return;
+    }
     uint64_t cols = 0U;
     for (int i = 0; i < s_kernel_ntiles; i++) {
         AieRt_PrintCoreStatus(dev, s_kernel_tiles[i]);

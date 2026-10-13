@@ -28,6 +28,11 @@ python3 script/test/apppaltest.py aout/worklocal/build/host    # run on hardware
 Expect, on the console:
 
 ```
+[conv2dstem] PERF first call: 148.512 ms  (includes partition init, staging
+             allocation and the weight transpose -- not the layer's cost)
+[conv2dstem] PERF iter 1/5: 31.204 ms
+...
+[conv2dstem] PERF SUMMARY iters 5  first 148.512  min 31.198  mean 31.240  max 31.301  host 2.914  (ms)
 [conv2dstem] GOLDEN PASS 802816/802816
 conv2dstem done (rc=0).
 ... device_teardown done
@@ -35,7 +40,8 @@ conv2dstem done (rc=0).
 
 `GOLDEN PASS 802816/802816` means every output byte matches what TVM's own
 kernel produced for the same layer. Anything else is a real failure — the
-comparison is bit-exact, not approximate.
+comparison is bit-exact, not approximate. (The `PERF` numbers above are
+illustrative formatting, not a reference measurement.)
 
 ---
 
@@ -77,6 +83,61 @@ graph's own tensors verbatim. It is a **separate entry on purpose**: it and
 reinterpret every weight and output byte for the offload path — which fails as
 wrong pixels, not as a link error.
 
+#### Control plane — host→array configuration off the config bus
+
+A 32-bit `XAie_Write32` is a non-posted Device-nGnRnE NoC round trip at **~372 ns**
+([doc/performance/register_write_cost.md](../../../doc/performance/register_write_cost.md)),
+and an N-word BD is N serial writes, so on this layer the host's register traffic
+is a first-class cost term, not an error bar. Five marker pragmas take it off the
+config bus, each gating one MLIR pipeline stage:
+
+| Pragma | What stops being MMIO | Proof in the generated code |
+|---|---|---|
+| `control_plan_op_control_packet` | the plan itself: reserves control-plane slots/arbiters/msel/pkt-ids, and lowers **kernel ELF load + core launch** onto the fabric | `__Runtime_ctrl_plan_init`, `__Runtime_load_kernel_group_16t_ctrl`, `__Runtime_launch_kernel_group_ctrl` in `host.cc` |
+| `CONTROL_PLAN_GROUP_REG_WRITE` | per-tile lock inits, folded into broadcast/row group writes | `__Runtime_ctrl_row_write_ack` |
+| `KERNELCONFIGOFFLOAD` | **all** core-tile DMA — BD chains, lock init/config, channel starts, both directions — the core self-programs it over the processor bus | `KERNELCONFIGOFFLOAD S2MM/MM2S` blocks in `kernel.cc`; **`grep -cE '\.TM' aout/worklocal/build/kernel.lst` must be non-zero** |
+| `control_plan_shim_bd_ctrl` | the shim BDs, out-of-order channel enable and start-queue writes, sent along row 0 as control packets | `__Runtime_ctrl_shim_bd_begin` / `_commit` |
+| `control_plan_dedicated_shim` | nothing — a **force flag** (see below) | build fails instead of warning |
+
+Two non-obvious things, each of which silently does nothing if you get it wrong:
+
+**The partition is `{2, 6}` — five columns for a four-column mesh.** The spare
+column is not slack. `planControlColumn` grants a dedicated control spine only
+when `partition cols >= mesh cols + 1`, and the spine is what
+`control_plan_shim_bd_ctrl` runs its row-0 packets along. The data plane does not
+move: the planner sets `dataStartCol = relStartCol + 1`, so the mesh still
+occupies absolute columns 3..6 exactly as it did under the old `{3, 6}`. Narrow it
+back and shim BDs silently return to MMIO — which is why
+`control_plan_dedicated_shim` is there: alone, `control_plan_shim_bd_ctrl` only
+prints a WARNING and falls back. Confirm in the build log:
+
+```
+[TilingLinalg] control plane: dedicated shim col 0 (MM2S ch0 / S2MM ch0;
+    shim-row BD control on MM2S ch1 / S2MM ch1); data plane uses cols [1,4]
+```
+
+**`__Runtime_ctrl_high_throughput_enable(1)` is required, not a tuning knob.** On
+AIE2PS it disables CTRL TLAST errors at partition init and packs all
+self-delimiting accesses into one shim MM2S BD with a single final TLAST.
+`control_plan_shim_bd_ctrl` does not work without it, and the ELF load degrades to
+one BD and one TLAST per access. It must run *before* device init, so
+`conv2dstem_control_plane_init()` is called at the top of both launch sites, ahead
+of their `aieSetDevice`/`partition` pair. It also pins the provenance map off —
+that defaults to reading the `AIE_CTRL_PMAP` env var, so a stray export in the
+operator's shell would print a line per packet and wreck the `PERF` numbers.
+
+**`control_plan_shim_bd_ctrl` needs a current `aiehlc`.** It postdates
+`release/prebuild/aiehlc` and older `build/aiehlc` trees; an unknown pragma is a
+warning, not an error, so a stale tool accepts the file and silently omits the
+feature. Check `[aiehlc] Detected #pragma ...` — all **four** control-plane pragmas must appear (`KERNELCONFIGOFFLOAD` is commented out: it deadlocks on `{2,6}`, see `doc/debug/troubleshoot_aie_offload_timeout.md`) — or
+`strings build/aiehlc | grep control_plan_shim_bd_ctrl`. Rebuild with
+`make -C build CMAKE_COMMAND=/scratch/staff/huaj/aiehlc/.venv/bin/cmake aiehlc -j16`
+(skill: **mlirbuildsandbox**).
+
+Not enabled here: `#pragma control_packet_mode(aot)`, which precomputes the
+compile-time part of every control packet at build time (skill:
+**ctrlpkt-aot-elf**).
+
 ### `conv2dstem.h` — the library contract
 
 Geometry macros, the `conv2dstem_qparam` struct, the entry declarations and the
@@ -100,10 +161,43 @@ on the AIE and compares against that layer's own output. So this is not a model
 of the operator — it is the operator, on the real data the network carries.
 
 What it does: decode the layer's six int32 parameter arrays into
-`conv2dstem_qparam[64]` (`fold_qparams`), call `conv2d_stem_nchwc()`, then
-compare all 802,816 output bytes and print one machine-readable verdict line
-(`data/groundtruth.py --applog` parses it back off the console, which is the
-only channel a baremetal board under xsdb has).
+`conv2dstem_qparam[64]` (`fold_qparams`), call `conv2d_stem_nchwc()`, **measure**
+(`run_perf`), then compare all 802,816 output bytes and print one
+machine-readable verdict line (`data/groundtruth.py --applog` parses it back off
+the console, which is the only channel a baremetal board under xsdb has).
+
+#### What `run_perf()` measures
+
+Three numbers, because quoting the wrong one is the usual way an AIE layer gets
+misreported:
+
+| Number | What is inside it |
+|---|---|
+| **first call** | partition init over the config bus, the staging allocations, the 12544-element weight transpose. A bring-up number, never the layer's cost. |
+| **steady state** (`CONV2DSTEM_PERF_ITERS`, default 5) | input staging, the *full* DMA/BD + kernel-ELF configuration, the launch, the wait, the output repack. aiehlc re-programs the mesh on **every** launch, so repeating amortizes none of that away — this is the per-inference latency of calling `conv2d_stem_nchwc()`, not an array throughput. |
+| **host share** | `stage_ifm_prepadded()` + `collect_ofm_nchwc()` timed alone. The remainder is reported as `config+launch`, *not* as "AIE compute": at ~372 ns per 32-bit `XAie_Write32` ([doc/performance/register_write_cost.md](../../../doc/performance/register_write_cost.md)) the register traffic is a first-class term, not an error bar. |
+
+Wall clock is the Arm generic timer (`XTime` / `COUNTS_PER_SECOND`, reached via
+`conv2dstem.cc`'s `xiltimer.h` — deliberately **not** `aie_timer.h`, which
+branches on `AIE_GEN`, a macro the host compile defines but the aiehlc frontend
+parse does not).
+
+The perf loop runs **before** the golden check, so the check validates the last
+launch rather than only the first; the inputs never change, so `ofm` holds the
+same bytes either way. A failing iteration aborts the loop and poisons `rc` —
+perf numbers for a failed launch would be worse than none.
+
+A second block — per-launch `kload` / `bdcfg` / `coreen` / `startio` / `wait_io`
+PMU cycles — prints only when the host was built with
+`source script/aiehlc.sh --profiling ...` (`-DAIEHLC_PROFILING=1`). The
+accessors always link; without the flag every counter reads 0, which the report
+says in words instead of printing as a row of zeros. Those are PMU cycles and
+the wall clock is the generic timer, so they are shown as a share of the
+accounted total and never mixed into one ratio.
+
+Set `-DCONV2DSTEM_PERF_ITERS=0` to time only the first call. Raising it
+multiplies board time, and `apppaltest.py` watchdogs a run at 300 s without
+console output / 600 s total.
 
 ### `buildtest.sh` — build the app, regenerating its data first
 
@@ -202,7 +296,9 @@ The older fixture headers — `conv2dstem_image.h`, `conv2dstem_weights.h`,
 python3 script/test/apppaltest.py aout/worklocal/build/host
 ```
 
-Pass is `GOLDEN PASS 802816/802816` **and** `device_teardown done`. Mismatch
+Pass is `GOLDEN PASS 802816/802816` **and** `device_teardown done`. The run also
+prints a `PERF SUMMARY ... (ms)` line; for the per-launch cost breakdown rebuild
+with `./buildtest.sh --profiling`. Mismatch
 coordinates are printed as NCHW4c (`occ, oh, ow, ocb`, with `oc = occ*4 + ocb`),
 capped at 16 lines — the cap is not cosmetic, since 802,816 lines over a UART
 would blow through apppaltest's watchdog.

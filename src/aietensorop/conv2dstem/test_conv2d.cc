@@ -106,11 +106,28 @@
 #define CONV2DSTEM_MAX_REPORTED_MISMATCHES 16
 #endif
 
+// Timed repeats AFTER the first call. The first call is always timed; this
+// governs only the steady-state loop, and 0 disables it. Every iteration re-runs
+// the whole layer on the array, so raising it multiplies board time --
+// apppaltest.py watchdogs the run at 300 s without console output / 600 s total.
+#ifndef CONV2DSTEM_PERF_ITERS
+#define CONV2DSTEM_PERF_ITERS 5
+#endif
+
 // Declared, not included: the runtime header (src/mlir/runtime/aie_runtime.h)
 // pulls in the XAie driver headers, which this plain host TU does not need.
 // These are C++-mangled in the archive (_Z15__Runtime_Allocm), NOT extern "C",
 // so declare them as plain C++ or the link fails with an undefined reference.
 void *__Runtime_Alloc(size_t bytes);
+
+// The runtime's own PMU phase counters, used by the optional second half of the
+// perf report. They are always LINKED -- the accessors exist unconditionally in
+// aie_runtime.c -- but they only COUNT when the host was built with
+// `script/aiehlc.sh --profiling` (-DAIEHLC_PROFILING=1). Without it every
+// counter reads 0, which the report states rather than printing as data.
+// Same C++-linkage note as above: declare plainly, not extern "C".
+void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
+void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
 
 // The generated arrays are uint8_t — a hex initializer for int8_t would lean on
 // an implementation-defined out-of-range conversion — so they are cast at the
@@ -202,6 +219,178 @@ static int check_against_golden(const uint8_t *ofm) {
 }
 #endif
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Performance measurement
+//
+// Three numbers, because they answer three different questions and quoting the
+// wrong one is the usual way an AIE layer gets misreported:
+//
+//   first call    everything that happens once is inside it -- the partition
+//                 init over the config bus, the staging allocations, and the
+//                 12544-element weight transpose (stage_weights_nchwc, which
+//                 later calls skip because g_wts_src still matches). This is a
+//                 bring-up number, never the layer's cost.
+//   steady state  every later call: input staging, the FULL DMA/BD plus
+//                 kernel-ELF configuration, the launch, the wait, and the
+//                 output repack. aiehlc re-programs the mesh on every launch,
+//                 so none of that configuration is amortized away by repeating
+//                 -- this is the honest per-inference latency of calling
+//                 conv2d_stem_nchwc(), not a steady-state array throughput.
+//   host share    stage_ifm_prepadded() and collect_ofm_nchwc() timed on their
+//                 own, so "how much of that was just the A78 shuffling bytes"
+//                 has a measurement instead of an assumption. Both are pure
+//                 index shuffles over the already-allocated staging buffers, so
+//                 re-running them outside a launch is side-effect free and
+//                 leaves `ofm` holding exactly what the last launch produced.
+//
+// Wall clock is the Arm generic timer (XTime / COUNTS_PER_SECOND, reached via
+// conv2dstem.cc's xiltimer.h -- the same counter conv2d_stem_verify uses). It is
+// deliberately NOT aie_timer.h: that header picks its branch on AIE_GEN, which
+// the host compile defines but the aiehlc frontend parse does not, so including
+// it here would send the frontend down the xtime_l.h branch.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// MACs per inference. The kernel's K dim is channel-ALIGNED, so the array issues
+// 7*7*4 = 196 taps per output point where the convolution only needs 7*7*3 =
+// 147; the pad channel multiplies by a zero that physically exists in DDR
+// (conv2dstem.cc's "the DMA cannot synthesize zeros"). Report both -- "useful"
+// is the operator's arithmetic, "issued" is what the hardware actually spent.
+#define PERF_OUT_POINTS ((double)OUTPUT_H * (double)OUTPUT_W * (double)NUM_FILTERS)
+#define PERF_USEFUL_MACS (PERF_OUT_POINTS * (double)(KERNEL_H * KERNEL_W * INPUT_C))
+#define PERF_ISSUED_MACS (PERF_OUT_POINTS * (double)(KERNEL_H * KERNEL_W * INPUT_C_ALIGN))
+
+static double perf_ms(XTime t0, XTime t1) {
+    // Unsigned subtraction, so an out-of-order pair would wrap to an enormous
+    // positive number rather than a negative one. Order is checked instead.
+    if (t1 <= t0)
+        return 0.0;
+    return 1000.0 * (double)(t1 - t0) / (double)COUNTS_PER_SECOND;
+}
+
+// Runtime phase cycles consumed by ONE steady-state call.
+//
+// The counters are cumulative over the process, so the caller passes the
+// snapshot taken before the loop and the number of iterations it covered, and
+// this prints per-iteration deltas. Percentages are of the accounted total, not
+// of wall time: these are PMU cycles and the wall clock above is the generic
+// timer, so the two run at different rates and must not be mixed into one ratio.
+static void perf_report_phases(const unsigned long long *ph0, unsigned long long wio0, int iters) {
+    unsigned long long ph1[4] = {0, 0, 0, 0}, wio1 = 0ULL;
+    unsigned int phc[4] = {0, 0, 0, 0}, wioc = 0U;
+    __Runtime_phase_cycles(ph1, phc);
+    __Runtime_wait_io_cycles(&wio1, &wioc);
+
+    unsigned long long d[5];
+    for (int i = 0; i < 4; i++)
+        d[i] = (ph1[i] >= ph0[i]) ? (ph1[i] - ph0[i]) : 0ULL;
+    d[4] = (wio1 >= wio0) ? (wio1 - wio0) : 0ULL;
+
+    unsigned long long total = 0ULL;
+    for (int i = 0; i < 5; i++)
+        total += d[i];
+    if (total == 0ULL) {
+        printf("[conv2dstem] PERF runtime phase counters not built in -- rebuild with\n"
+               "             `source script/aiehlc.sh --profiling ...` for the kload/bdcfg/\n"
+               "             coreen/startio/wait_io split of each launch.\n");
+        return;
+    }
+
+    const char *name[5] = {"kload  ", "bdcfg  ", "coreen ", "startio", "wait_io"};
+    printf("[conv2dstem] PERF launch breakdown (PMU cycles per call, %% of accounted):\n");
+    for (int i = 0; i < 5; i++)
+        printf("             %s %12.0f  (%5.1f%%)\n", name[i], (double)d[i] / (double)iters,
+               100.0 * (double)d[i] / (double)total);
+    printf("             %s %12.0f  (100.0%%)\n", "TOTAL  ", (double)total / (double)iters);
+}
+
+/*
+ * Time CONV2DSTEM_PERF_ITERS further calls and print the report.
+ *
+ * `first_ms` is the already-measured cost of the call main() made, passed in so
+ * the one-time costs are reported next to the steady-state ones rather than in a
+ * separate place in the log.
+ *
+ * Returns CONV2DSTEM_OK, or the rc of the first failing iteration -- a perf run
+ * that silently measured a failing launch would be worse than no measurement.
+ */
+static int run_perf(const conv2dstem_qparam *qp, uint8_t *ofm, double first_ms) {
+    printf("[conv2dstem] PERF first call: %.3f ms  (includes partition init, staging\n"
+           "             allocation and the weight transpose -- not the layer's cost)\n",
+           first_ms);
+
+    if (CONV2DSTEM_PERF_ITERS <= 0) {
+        printf("[conv2dstem] PERF steady-state loop disabled (CONV2DSTEM_PERF_ITERS=0).\n");
+        return CONV2DSTEM_OK;
+    }
+
+    unsigned long long ph0[4] = {0, 0, 0, 0}, wio0 = 0ULL;
+    unsigned int phc0[4] = {0, 0, 0, 0}, wioc0 = 0U;
+    __Runtime_phase_cycles(ph0, phc0);
+    __Runtime_wait_io_cycles(&wio0, &wioc0);
+
+    double sum_ms = 0.0, min_ms = 0.0, max_ms = 0.0;
+    for (int it = 0; it < CONV2DSTEM_PERF_ITERS; it++) {
+        XTime t0, t1;
+        XTime_GetTime(&t0);
+        const int rc = conv2d_stem_nchwc(tvm_ifm(), tvm_wts(), qp, ofm);
+        XTime_GetTime(&t1);
+        if (rc != CONV2DSTEM_OK) {
+            printf("ERROR: conv2d_stem_nchwc failed on perf iteration %d (rc=%d); perf numbers\n"
+                   "       for this run are meaningless.\n",
+                   it, rc);
+            return rc;
+        }
+        const double ms = perf_ms(t0, t1);
+        printf("[conv2dstem] PERF iter %d/%d: %.3f ms\n", it + 1, CONV2DSTEM_PERF_ITERS, ms);
+        sum_ms += ms;
+        if (it == 0 || ms < min_ms)
+            min_ms = ms;
+        if (it == 0 || ms > max_ms)
+            max_ms = ms;
+    }
+    const double mean_ms = sum_ms / (double)CONV2DSTEM_PERF_ITERS;
+
+    perf_report_phases(ph0, wio0, CONV2DSTEM_PERF_ITERS);
+
+    // Host-side share, measured the same way the loop was. Timed AFTER the loop
+    // so neither measurement perturbs the other, and in the same order the real
+    // call makes them.
+    XTime hs0, hs1, hc0, hc1;
+    XTime_GetTime(&hs0);
+    stage_ifm_prepadded(tvm_ifm());
+    XTime_GetTime(&hs1);
+    XTime_GetTime(&hc0);
+    collect_ofm_nchwc(ofm);
+    XTime_GetTime(&hc1);
+    const double stage_ms = perf_ms(hs0, hs1);
+    const double collect_ms = perf_ms(hc0, hc1);
+    const double host_ms = stage_ms + collect_ms;
+
+    printf("[conv2dstem] PERF host share: stage_ifm_prepadded %.3f ms + collect_ofm_nchwc\n"
+           "             %.3f ms = %.3f ms  (%.1f%% of the %.3f ms mean call)\n",
+           stage_ms, collect_ms, host_ms, mean_ms > 0.0 ? 100.0 * host_ms / mean_ms : 0.0, mean_ms);
+    // Everything the mean call is NOT host staging: the config writes, the
+    // launch and the wait. Named "config+launch" and not "AIE compute" on
+    // purpose -- doc/performance/register_write_cost.md measures ~372 ns per
+    // 32-bit XAie_Write32, so on this path the register traffic is a first-class
+    // term and not an error bar around the array's own time.
+    printf("[conv2dstem] PERF config+launch (mean - host): %.3f ms\n", mean_ms > host_ms ? mean_ms - host_ms : 0.0);
+
+    if (mean_ms > 0.0) {
+        const double sec = mean_ms / 1000.0;
+        printf("[conv2dstem] PERF throughput: %.2f MMAC useful / %.2f MMAC issued per call\n"
+               "             -> %.2f GMAC/s useful, %.2f GOP/s (2 ops/MAC), %.1f inferences/s\n",
+               PERF_USEFUL_MACS / 1e6, PERF_ISSUED_MACS / 1e6, PERF_USEFUL_MACS / sec / 1e9,
+               2.0 * PERF_USEFUL_MACS / sec / 1e9, 1.0 / sec);
+    }
+
+    // One machine-readable line, mirroring the GOLDEN verdict line so a console
+    // log is enough to recover the measurement without the surrounding prose.
+    printf("[conv2dstem] PERF SUMMARY iters %d  first %.3f  min %.3f  mean %.3f  max %.3f  host %.3f  (ms)\n",
+           CONV2DSTEM_PERF_ITERS, first_ms, min_ms, mean_ms, max_ms, host_ms);
+    return CONV2DSTEM_OK;
+}
+
 int main() {
     printf("=== ResNet-18 stem conv2d on AIE (TVM layer 01) ===\n");
     printf("    Op:     01_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi\n");
@@ -233,7 +422,13 @@ int main() {
         return rc;
     }
 
+    // Timed: this call carries the one-time costs (partition init, staging
+    // allocation, weight transpose), so run_perf() reports it apart from the
+    // steady-state repeats rather than folding it into their mean.
+    XTime t_first0, t_first1;
+    XTime_GetTime(&t_first0);
     rc = conv2d_stem_nchwc(tvm_ifm(), tvm_wts(), qp, ofm);
+    XTime_GetTime(&t_first1);
     if (rc != CONV2DSTEM_OK)
         printf("ERROR: conv2d_stem_nchwc failed (rc=%d).\n", rc);
 
@@ -242,6 +437,16 @@ int main() {
         printf("%02x ", ofm[i]);
     }
     printf("\n");
+
+    // Perf before correctness: the loop leaves `ofm` holding the result of its
+    // last launch -- the same bytes every time, since the inputs never change --
+    // so the golden check below still validates real output, and it validates
+    // the LAST launch rather than only the first.
+    if (rc == CONV2DSTEM_OK) {
+        const int perf_rc = run_perf(qp, ofm, perf_ms(t_first0, t_first1));
+        if (perf_rc != CONV2DSTEM_OK)
+            rc = perf_rc;
+    }
 
 #if CONV2DSTEM_HAVE_GOLDEN
     if (rc == CONV2DSTEM_OK)

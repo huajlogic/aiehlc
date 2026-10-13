@@ -1070,8 +1070,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         computeKernelName = userKernelFuncName;
     }
 
-    if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::DfscheduleToKernelApiPass>(), irDir, stage,
-                       "DfscheduleToKernelApiPass"))
+    if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::DfscheduleToKernelApiPass>(partStartCol),
+                               irDir, stage, "DfscheduleToKernelApiPass"))
         return false;
 
     // Create output directory

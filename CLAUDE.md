@@ -104,6 +104,51 @@ header's `_data[]` is `unsigned char[]`, so reading the int32 params via a
 the bytes (`rd_i32`). Mismatch coordinates decode as NCHW4c (`occ,oh,ow,ocb`),
 not HWC. Skill: **conv2dstemtvmlayer**.
 
+It also **measures** (`run_perf`, before the golden check so the check validates
+the last launch): the **first** call separately — it carries partition init,
+staging allocation and the weight transpose — then `CONV2DSTEM_PERF_ITERS`
+(default 5) steady-state calls, then `stage_ifm_prepadded`/`collect_ofm_nchwc`
+alone so the host share is measured rather than assumed. **Repeating amortizes
+nothing**: aiehlc re-programs the mesh on every launch, so the steady-state
+number is the per-call latency of `conv2d_stem_nchwc()`, and the non-host
+remainder is labelled `config+launch`, not "AIE compute" —
+`doc/performance/register_write_cost.md` puts a 32-bit `XAie_Write32` at ~372 ns.
+Repeat calls are safe because `__Runtime_init_mesh_partition` is init-once per
+`meshId` and the function-local `aieArray` restarts at `meshId` 0. Wall clock is
+`xiltimer.h`'s `XTime`, deliberately **not** `aie_timer.h` (it branches on
+`AIE_GEN`, which the host compile defines but the frontend parse does not). The
+per-launch `kload/bdcfg/coreen/startio/wait_io` PMU split needs
+`./buildtest.sh --profiling`; without it the counters read 0 and the report says
+so instead of printing zeros. Machine-readable line: `PERF SUMMARY ... (ms)`.
+
+**conv2dstem configures the array over the control plane, not the config bus.**
+`conv2dstem.cc` carries four active marker pragmas — `control_plan_op_control_packet`
+(the plan; also moves **kernel ELF load + core launch** onto the fabric →
+`__Runtime_load_kernel_group_16t_ctrl` / `_launch_kernel_group_ctrl`),
+`CONTROL_PLAN_GROUP_REG_WRITE` (lock inits → `__Runtime_ctrl_row_write_ack`),
+`control_plan_shim_bd_ctrl` (shim BDs + channel enable + start queue along row 0 →
+`__Runtime_ctrl_shim_bd_begin`/`_commit`), and `control_plan_dedicated_shim`.
+Justified by `doc/performance/register_write_cost.md`: ~372 ns per `XAie_Write32`,
+N words = N serial writes. Three traps. The partition is **`{2, 6}` — five columns
+for a four-column mesh**: `planControlColumn` grants the control spine only when
+`partition cols >= mesh cols + 1`, and *the data plane does not move*
+(`dataStartCol = relStartCol + 1`, so still absolute cols 3..6, as under the old
+`{3,6}`). `control_plan_dedicated_shim` is a **force flag**, not a feature — alone,
+`control_plan_shim_bd_ctrl` only WARNs and falls back to MMIO.
+`__Runtime_ctrl_high_throughput_enable(1)` is **required** (AIE2PS: disables CTRL
+TLAST errors, packs self-delimiting accesses into one shim MM2S BD) and must run
+*before* device init — hence `conv2dstem_control_plane_init()` at the top of both
+launch sites. **`KERNELCONFIGOFFLOAD` is commented out**: on `{2,6}` it deadlocks
+the mesh (`wait_io TIMEOUT`). One cause is fixed (KCO's `get_coreid()` dispatch
+compared absolute columns against partition-relative arms; skill
+**kcocoreidpartition**), and a second is open — see
+`doc/debug/troubleshoot_aie_offload_timeout.md`. Verify, don't assume: **four**
+control-plane `[aiehlc] Detected #pragma` lines and
+`control plane: dedicated shim col 0 (... shim-row BD control ...)`. An unknown
+pragma is a *warning*, so `control_plan_shim_bd_ctrl` is silently dropped by
+`release/prebuild/aiehlc` and by `build/aiehlc` trees older than it — rebuild the
+tool (skill: **mlirbuildsandbox**). Not enabled: `control_packet_mode(aot)`.
+
 **conv2dstem runs on real data.** `src/aietensorop/conv2dstem/data/` generates
 three committed-or-derived headers from a photo and the int8-quantized
 ResNet-18: `conv2dstem_image.h` (`int8[230,230,4]`, already preprocessed,
@@ -603,11 +648,14 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/controlplane.md](doc/controlplane.md)** — Control-packet plane: encoding, `CtrlInstance` send/recv, row/broadcast fabric, transaction capture, resource reservation, provenance
 - **[doc/performance/register_write_cost.md](doc/performance/register_write_cost.md)** — **Measured** host↔AIE register access cost: ~372 ns per 32-bit `XAie_Write32` (non-posted Device-nGnRnE NoC round trip; an N-word BD is N serial writes) vs ~2.9 ns via control packets. Cite this instead of deriving ns/write from a timeline span.
 - **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
+- **[doc/modelsupportevaluate.md](doc/modelsupportevaluate.md)** — Gap analysis for Gemma / ResNet-50 / YOLO / MobileNet / BERT / ViT (none run on AIE today); proposed `aiephase` + `aiecfg` dialects (phase-based control-plane reconfiguration, overlay kernels), new Depthwise/Eltwise/Reduce/Attention/Pipeline/Move spaces, milestones M0–M8
 - **[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** — `#pragma KERNELCONFIGOFFLOAD`: core self-configured DMA, lock asymmetry, BD-id reservation
 - **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)** — `--aie-offload`: TVM BYOC → `libconv2dstem.a`, fused boundary, uint8 shift, weight-fingerprint layer mapping
 - **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
 - **[doc/debug/tutorial_aiehlc.md](doc/debug/tutorial_aiehlc.md)** — aiehlc simulator + debug UI (`--platform sim`, `--sim-only`)
 - **[doc/debug/tutorial_baremetal.md](doc/debug/tutorial_baremetal.md)** — naiebaremetal VEK385 boot + debug UI
+- **[doc/resnetlaye1timeoutdebug.md](doc/resnetlaye1timeoutdebug.md)** — Step-by-step summary of the ResNet-18 layer-01 `--aie-offload` timeout debug: symptom, allconv review, source/pragma bisection, KCO absolute-column root cause + fix, `-O3` (2232 → 1282 ms), lessons
+- **[doc/debug/troubleshoot_aie_offload_timeout.md](doc/debug/troubleshoot_aie_offload_timeout.md)** — `--aie-offload` main.elf hangs (`ENTER` without `EXIT`, `wait_io TIMEOUT`): reading the deadlock, allconv review, HW bisection (committed stem passes, control-plane WIP hangs standalone too), `AIE_DEBUG_LOG`-gated timeout dump
 - **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` for `aie::SpatialPolicy`
 - **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based spatial op spaces (GemmSpace, Conv2dSpace)
 - **[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md)** — Live debug framework design (static view + daemon)
@@ -631,12 +679,14 @@ Read the matching skill when the task fits:
 | Live HW DMA stall debug | aiehwdmadebug |
 | Core register write succeeds on-core but host reads 0 / DMA never starts (`ST` vs `ST.TM`) | coretmregisterwrite |
 | Shim BD stuck on wrong/locked BD (index overflow into channel-control regs) | shimbdindexoverflow |
+| `KERNELCONFIGOFFLOAD` + partition start col ≠ 0 hangs; high core columns' MM2S never armed (`get_coreid()` absolute vs plan relative) | kcocoreidpartition |
 | Sim PS.so load segfault | aiesimloaddebug |
 | aiesim live debug register socket | aiesim-debug-socket |
 | HW performance counters | aiehwprofile |
 | Raw-XAie sim debug bundle | raw-xaie-sim-debug-bundle |
 | Sim build/run separation | sim-build-run-separation |
 | Build fails on missing snap cmake / libz.so / ZLIB::ZLIB; fast single-file compile check | mlirbuildsandbox |
+| A `#pragma` you added is never `Detected` in the aiehlc log and its feature silently does nothing (build still rc=0) — stale `aiehlc` binary | stalepragmabinary |
 | Gen2-only build break: missing `xpseudo_asm_armclang.h`, or `XPAR_CPU_TIMESTAMP_CLK_FREQ` undeclared | bspheadergen2 |
 | hostcompile / missing compile_kernel.sh | hostcompile-entrypoint |
 | App source with no `main()` → static lib; "return-statement with a value, in function returning 'void'" | hostlibrarymode |

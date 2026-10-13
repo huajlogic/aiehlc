@@ -24,6 +24,9 @@
 #   ./buildtest.sh                 # all four steps
 #   ./buildtest.sh --skip-trace    # reuse the layeriohex already on disk (1+2 are slow)
 #   ./buildtest.sh --no-aiehlc     # stop after the headers are in place
+#   ./buildtest.sh --profiling     # pass --profiling through to aiehlc.sh, which
+#                                  # makes test_conv2d.cc's PERF report print the
+#                                  # per-launch kload/bdcfg/coreen/startio split
 #   ./buildtest.sh -h
 #
 # Env overrides:
@@ -55,10 +58,14 @@ TRACE_HEX_PARAMS="${TRACE_HEX_PARAMS:-0}"
 
 SKIP_TRACE=0
 RUN_AIEHLC=1
+# Extra flags forwarded verbatim to script/aiehlc.sh at step 4. An array, not a
+# string, so an argument carrying a space survives the expansion below.
+AIEHLC_EXTRA=()
 for arg in "$@"; do
     case "$arg" in
     --skip-trace) SKIP_TRACE=1 ;;
     --no-aiehlc) RUN_AIEHLC=0 ;;
+    --profiling) AIEHLC_EXTRA+=("--profiling") ;;
     -h | --help)
         sed -n '7,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         exit 0
@@ -155,7 +162,10 @@ trap 'rm -f "${MARKER}"' EXIT
 cd "${REPO}" || die "cannot cd to ${REPO}"
 
 # shellcheck source=/dev/null
-source "${REPO}/script/aiehlc.sh" --aie-version "${AIE_VERSION}" --runtime-source-file "${ENTRY}"
+# "${AIEHLC_EXTRA[@]+...}" rather than a bare "${AIEHLC_EXTRA[@]}": `set -u` is
+# on, and bash < 4.4 treats an empty array as unset and would abort here.
+source "${REPO}/script/aiehlc.sh" --aie-version "${AIE_VERSION}" --runtime-source-file "${ENTRY}" \
+    ${AIEHLC_EXTRA[@]+"${AIEHLC_EXTRA[@]}"}
 rc=$?
 
 ELF="${REPO}/aout/worklocal/build/host"

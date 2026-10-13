@@ -52,6 +52,85 @@
 #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_DMA_ISSUE_COUNT)
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Control plane — move host->array configuration off the config bus
+//
+// Four opt-ins, each a bare marker pragma that aiehlc publishes as a module attr
+// gating one MLIR pipeline stage. They are independent features but they compose
+// into one story: a 32-bit XAie_Write32 is a non-posted Device-nGnRnE NoC round
+// trip at ~372 ns (doc/performance/register_write_cost.md), and an N-word BD is
+// N serial writes, so on this layer the host's register traffic is a first-class
+// cost term. Every pragma below replaces some of it.
+//
+//   control_plan_op_control_packet   THE plan. Reserves control-plane
+//       stream-switch resources (slots, arbiters, msel, pkt-ids) so the fabric
+//       can share the array with the data plane, and lowers KERNEL ELF LOADING
+//       plus core launch onto it -- load_kernel_group_16t_ctrl streams the ELF's
+//       PT_LOAD bytes as 4-word broadcast writes and launch_kernel_group_ctrl
+//       enables the cores through the same path, instead of per-tile
+//       XAie_LoadElfMem / XAie_CoreEnable. Every other pragma here requires it.
+//   CONTROL_PLAN_GROUP_REG_WRITE     Runs GroupRegWritePass, which folds the
+//       per-tile lock inits -- identical across all 16 tiles of this mesh --
+//       into broadcast/row group writes (__Runtime_ctrl_row_write_ack) instead
+//       of one XAie_LockSetValue per tile per lock.
+//   KERNELCONFIGOFFLOAD              Core self-configures ALL of its own
+//       core-tile DMA (BD chains, lock init/config, channel starts, both
+//       directions) from kernel.cc over the processor bus, so the host stops
+//       programming it over the config bus entirely. Gen5 only -- this app is.
+//   control_plan_shim_bd_ctrl        The remaining host-side writes are the SHIM
+//       BDs; this sends those, the out-of-order channel enable and the
+//       start-queue writes along row 0 as control packets instead of MMIO.
+//
+// control_plan_dedicated_shim is a FORCE flag, not a feature: shim_bd_ctrl needs
+// a spare column west of the mesh for the control spine, and on its own it only
+// WARNS and silently falls back to MMIO when there isn't one. With this pragma
+// the build fails instead. That matters here because the spare column is exactly
+// what the partition change below buys -- see the launch sites.
+//
+// Verify in the build log, not by assumption:
+//   [aiehlc] Detected #pragma ...                      (x4; KERNELCONFIGOFFLOAD is off, see below)
+//   [TilingLinalg] control plane: dedicated shim col 0
+//       (MM2S ch0 / S2MM ch0; shim-row BD control on MM2S ch1 / S2MM ch1);
+//       data plane uses cols [1,4]                     (spare column found)
+// A "WARNING: #pragma control_plan_shim_bd_ctrl needs ..." line means the shim
+// BDs stayed on MMIO. Skills: shim-row-ctrl-bd-config, ctrlpkt-aot-elf.
+// ═══════════════════════════════════════════════════════════════════════════
+#pragma control_plan_op_control_packet
+#pragma CONTROL_PLAN_GROUP_REG_WRITE
+#pragma control_plan_dedicated_shim
+#pragma control_plan_shim_bd_ctrl
+// KERNELCONFIGOFFLOAD is deliberately OFF. On this {2,6} partition it deadlocks
+// the mesh on the board (wait_io TIMEOUT; doc/debug/troubleshoot_aie_offload_timeout.md).
+// It is a core-MMIO feature, not a control-packet one, so the control plane above
+// is unaffected. Re-enable only after that doc's open KCO item is closed.
+// #pragma KERNELCONFIGOFFLOAD
+
+// Runtime-side opt-ins for the above. Declared, not included: aie_runtime.h
+// pulls in the XAie driver headers, which this file does not otherwise need and
+// which must not reach the kernel translation unit. Same C++-linkage rule as the
+// rest of the runtime -- plain declarations, NOT extern "C".
+//
+// high_throughput_enable(1) is REQUIRED, not a tuning knob: on AIE2PS it
+// disables CTRL TLAST errors at partition init and packs all self-delimiting
+// accesses into one shim MM2S BD with a single final TLAST. control_plan_shim_bd_ctrl
+// does not work without it, and the ELF load falls back to one BD and one TLAST
+// per access. It must run BEFORE device init, so both launch sites call it ahead
+// of their aieSetDevice/partition pair; it only sets a flag, so repeating is free.
+//
+// pmap_enable(0) pins the control-packet provenance map OFF. It defaults to
+// "resolve from the AIE_CTRL_PMAP env var", so without this an exported
+// AIE_CTRL_PMAP in the operator's shell would start printing a line per packet
+// and quietly wreck test_conv2d.cc's PERF numbers.
+void __Runtime_ctrl_high_throughput_enable(int on);
+void __Runtime_ctrl_pmap_enable(int on);
+
+// Turn the control-plane runtime opt-ins on. Called at the top of every launch
+// site, before the device exists.
+static inline void conv2dstem_control_plane_init(void) {
+    __Runtime_ctrl_high_throughput_enable(1);
+    __Runtime_ctrl_pmap_enable(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Geometry
 //
 // Written as bare literals, NOT as aliases of the CONV2DSTEM_* macros in
@@ -703,9 +782,21 @@ static int stem_run(const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm
     // --- Device + mesh ---
     // Must stay function-local and constant-foldable: the Clang frontend
     // pattern-matches this VarDecl to recover the mesh dims and partition.
+    //
+    // Partition is {2,6}, FIVE columns for a 4-column mesh. The spare column is
+    // not slack: planControlColumn only grants a dedicated control spine when
+    // partition cols >= mesh cols + 1, and the spine is what
+    // control_plan_shim_bd_ctrl runs its row-0 packets along. The data plane is
+    // unmoved by it -- the planner sets dataStartCol = relStartCol + 1, so the
+    // mesh still occupies absolute columns 3..6 exactly as it did when the
+    // partition was {3,6}. Narrow this back and the shim BDs silently return to
+    // MMIO (control_plan_dedicated_shim turns that silence into a build error).
+    // Written as a bare literal, per this file's rule for geometry: the frontend
+    // recovers the mesh from this VarDecl.
+    conv2dstem_control_plane_init();
     aieSetDevice(0);
     aieArray device;
-    aieMesh mesh = device.partition({3, 6, 0, 6}, HW_ROWS, HW_COLS);
+    aieMesh mesh = device.partition({2, 6, 0, 6}, HW_ROWS, HW_COLS);
 
     conv2d_spatial<<<mesh>>>(g_ifm_pad, g_wts_bt, g_ofm, M, N, K);
 
@@ -787,9 +878,13 @@ int conv2d_stem_nchwc(const int8_t *ifm_pad, const int8_t *wts, const conv2dstem
         g_wts_src = wts;
     }
 
+    // Same five-column partition and the same control-plane opt-ins as
+    // stem_run(); see the comment there for why the spare column exists. The two
+    // launch sites must agree -- they describe the same physical mesh.
+    conv2dstem_control_plane_init();
     aieSetDevice(0);
     aieArray device;
-    aieMesh mesh = device.partition({3, 6, 0, 6}, HW_ROWS, HW_COLS);
+    aieMesh mesh = device.partition({2, 6, 0, 6}, HW_ROWS, HW_COLS);
 
     conv2d_spatial<<<mesh>>>(g_ifm_pad, g_wts_bt, g_ofm, M, N, K);
 

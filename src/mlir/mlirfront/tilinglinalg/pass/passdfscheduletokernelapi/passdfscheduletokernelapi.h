@@ -18,6 +18,9 @@ namespace mlir {
 class DfscheduleToKernelApiPass : public PassWrapper<DfscheduleToKernelApiPass, OperationPass<ModuleOp>> {
   public:
     DfscheduleToKernelApiPass() = default;
+    // Absolute column of the partition origin. Plan columns are partition-relative,
+    // but get_coreid() reports the absolute hardware column.
+    explicit DfscheduleToKernelApiPass(int partStartCol) : partStartCol(partStartCol < 0 ? 0 : partStartCol) {}
 
     StringRef getArgument() const final { return "dfschedule-to-kernel-api"; }
     StringRef getDescription() const final { return "Convert dfschedule.module kernel logic to emitc (line-by-line)"; }
@@ -28,6 +31,9 @@ class DfscheduleToKernelApiPass : public PassWrapper<DfscheduleToKernelApiPass, 
         registry.insert<dfschedule::dfscheduledialect, emitc::EmitCDialect, func::FuncDialect, arith::ArithDialect,
                         memref::MemRefDialect>();
     }
+
+  private:
+    int partStartCol = 0;
 };
 
 } // namespace mlir
