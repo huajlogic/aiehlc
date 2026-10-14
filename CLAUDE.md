@@ -138,12 +138,12 @@ for a four-column mesh**: `planControlColumn` grants the control spine only when
 `__Runtime_ctrl_high_throughput_enable(1)` is **required** (AIE2PS: disables CTRL
 TLAST errors, packs self-delimiting accesses into one shim MM2S BD) and must run
 *before* device init — hence `conv2dstem_control_plane_init()` at the top of both
-launch sites. **`KERNELCONFIGOFFLOAD` is commented out**: on `{2,6}` it deadlocks
-the mesh (`wait_io TIMEOUT`). One cause is fixed (KCO's `get_coreid()` dispatch
-compared absolute columns against partition-relative arms; skill
-**kcocoreidpartition**), and a second is open — see
-`doc/debug/troubleshoot_aie_offload_timeout.md`. Verify, don't assume: **four**
-control-plane `[aiehlc] Detected #pragma` lines and
+launch sites. **`KERNELCONFIGOFFLOAD` is on** and needed two compiler fixes to
+work on `{2,6}` (otherwise `wait_io TIMEOUT`): KCO's `get_coreid()` dispatch is
+rebased by the partition start column, and its MM2S BD length comes from the host
+plan (3136 B), not `sizeof(buf_out_ping_0)` (784 B). Skill **kcocoreidpartition**;
+`doc/debug/troubleshoot_aie_offload_timeout.md`. Verify, don't assume: **five**
+`[aiehlc] Detected #pragma` lines, non-zero `grep -cE '\.TM' aout/worklocal/build/kernel.lst`, and
 `control plane: dedicated shim col 0 (... shim-row BD control ...)`. An unknown
 pragma is a *warning*, so `control_plan_shim_bd_ctrl` is silently dropped by
 `release/prebuild/aiehlc` and by `build/aiehlc` trees older than it — rebuild the
@@ -654,6 +654,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
 - **[doc/debug/tutorial_aiehlc.md](doc/debug/tutorial_aiehlc.md)** — aiehlc simulator + debug UI (`--platform sim`, `--sim-only`)
 - **[doc/debug/tutorial_baremetal.md](doc/debug/tutorial_baremetal.md)** — naiebaremetal VEK385 boot + debug UI
+- **[doc/design/lwip_elf_bootloader.md](doc/design/lwip_elf_bootloader.md)** — Design (not implemented): resident lwIP TCP loader on the baremetal A78 in `DDR_LOW1`, receives the ELF from `PALIP`, places `PT_LOAD` into `DDR_LOW0`, quiesces GEM/GIC/MMU and jumps; replaces per-run JTAG `dow`. Recommended mode D: supervisor stays on core 0, app runs on core 1 via xilpm wake/force-off = watchdog + kill/rerun without JTAG (app `boot.S` set/way invalidate up to LoC is the hazard to test). Phase 0 gate: GEM0 cabling/IP
 - **[doc/resnetlaye1timeoutdebug.md](doc/resnetlaye1timeoutdebug.md)** — Step-by-step summary of the ResNet-18 layer-01 `--aie-offload` timeout debug: symptom, allconv review, source/pragma bisection, KCO absolute-column root cause + fix, `-O3` (2232 → 1282 ms), lessons
 - **[doc/debug/troubleshoot_aie_offload_timeout.md](doc/debug/troubleshoot_aie_offload_timeout.md)** — `--aie-offload` main.elf hangs (`ENTER` without `EXIT`, `wait_io TIMEOUT`): reading the deadlock, allconv review, HW bisection (committed stem passes, control-plane WIP hangs standalone too), `AIE_DEBUG_LOG`-gated timeout dump
 - **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` for `aie::SpatialPolicy`

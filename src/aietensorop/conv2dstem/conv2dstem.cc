@@ -87,7 +87,7 @@
 // what the partition change below buys -- see the launch sites.
 //
 // Verify in the build log, not by assumption:
-//   [aiehlc] Detected #pragma ...                      (x4; KERNELCONFIGOFFLOAD is off, see below)
+//   [aiehlc] Detected #pragma ...                      (x5, all parsed)
 //   [TilingLinalg] control plane: dedicated shim col 0
 //       (MM2S ch0 / S2MM ch0; shim-row BD control on MM2S ch1 / S2MM ch1);
 //       data plane uses cols [1,4]                     (spare column found)
@@ -98,11 +98,11 @@
 #pragma CONTROL_PLAN_GROUP_REG_WRITE
 #pragma control_plan_dedicated_shim
 #pragma control_plan_shim_bd_ctrl
-// KERNELCONFIGOFFLOAD is deliberately OFF. On this {2,6} partition it deadlocks
-// the mesh on the board (wait_io TIMEOUT; doc/debug/troubleshoot_aie_offload_timeout.md).
-// It is a core-MMIO feature, not a control-packet one, so the control plane above
-// is unaffected. Re-enable only after that doc's open KCO item is closed.
-// #pragma KERNELCONFIGOFFLOAD
+// KERNELCONFIGOFFLOAD on {2,6} needed two compiler fixes, or the mesh deadlocks
+// (wait_io TIMEOUT; doc/debug/troubleshoot_aie_offload_timeout.md): the get_coreid()
+// dispatch rebased by the partition start column, and MM2S BD length taken from the
+// host plan (3136 B), not sizeof(buf_out_ping_0) (784 B). Skill: kcocoreidpartition.
+#pragma KERNELCONFIGOFFLOAD
 
 // Runtime-side opt-ins for the above. Declared, not included: aie_runtime.h
 // pulls in the XAie driver headers, which this file does not otherwise need and

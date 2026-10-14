@@ -1434,10 +1434,11 @@ endif
 # -I$(REPO)/include reaches aie_timer.h (main.c times each phase with it).
 # -DAIE_GEN=5 picks its xiltimer.h branch, which is what this cortexa78 BSP
 # ships -- the default branch wants xtime_l.h, which the BSP does not have.
-# -O3, not -Os: on int8 ResNet-18 with the stem on the AIE, graph_run() measured
-# 2232 ms at -Os and 1282 ms at -O3 on the board, with bit-identical logits.
-# .text grows from ~0.4 MB to ~1.3 MB, small next to the 11.9 MB weight blob.
-CFLAGS  ?= -O3 -mcpu=$(CPU) -std=c11 -DAIE_GEN=5 \\
+# -O3 -funroll-loops, not -Os: on int8 ResNet-18 with the stem on the AIE,
+# graph_run() measured 2232 ms at -Os, 1282 ms at -O3, 1270 ms adding
+# -funroll-loops (-flto: no gain), all with bit-identical logits. .text grows
+# from ~0.4 MB to ~1.3 MB, small next to the 11.9 MB weight blob.
+CFLAGS  ?= -O3 -funroll-loops -mcpu=$(CPU) -std=c11 -DAIE_GEN=5 \\
            -I. -I$(REPO)/include -I$(BSP)/include \\
            -I$(REPO)/src/aietensorop/conv2dstem
 
