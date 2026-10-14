@@ -4115,8 +4115,15 @@ function wireFolds(box, onChange){
 }
 
 const g = DATA.grid;
+// Occupied column span. A control-plane partition ({2,6} for a 4-col mesh)
+// reserves partition-relative col 0 as the control spine, so the data plane
+// starts at col 1; drawing from 0 would leave a blank 1fr column on the left.
+const gColMin = (g.col_list && g.col_list.length) ? Math.min(...g.col_list) : 0;
+const gNCols = Math.max(0, g.cols - gColMin);
 document.getElementById('meta').textContent =
-  'AIE Debug  ' + g.cols + '\u00d7' + g.rows + ' grid';
+  'AIE Debug  ' + gNCols + '\u00d7' + g.rows + ' grid' +
+  (gColMin ? '  (cols ' + gColMin + '..' + (g.cols - 1) +
+             '; lower cols have no data tiles, e.g. control spine)' : '');
 
 // build a loc->tile map
 const byLoc = {};
@@ -4170,10 +4177,10 @@ function highlightFlow(fi, loc, badgeEl){
 
 // grid: columns left->right, rows top (highest) -> bottom (0)
 const grid = document.getElementById('grid');
-grid.style.gridTemplateColumns = 'repeat(' + g.cols + ', 1fr)';
+grid.style.gridTemplateColumns = 'repeat(' + gNCols + ', 1fr)';
 const rowsDesc = g.row_list.slice().sort((a,b)=>b-a);
 rowsDesc.forEach(r => {
-  for (let c=0; c<g.cols; c++){
+  for (let c=gColMin; c<g.cols; c++){
     const t = byLoc[c+','+r];
     const cell = document.createElement('div');
     if (!t){ cell.style.visibility='hidden'; cell.className='tile'; grid.appendChild(cell); continue; }
