@@ -102,8 +102,24 @@ Data path, no scp of the target ELF:
 dev box: netload.py --via huaj@PALIP ==ssh stdin/stdout==> PALIP: netboot_proxy.py ==TCP==> board 10.10.70.50:5155
 ```
 
-Measured: 15.4 MB ResNet ELF dev box -> board in 1.22 s (ssh setup included); a
-whole `apppaltest --netload` run, reusing the parked core, 9 s.
+**Run time.** `apppaltest.py -y -nonreboot --netload <ResNet main.elf>` takes
+**~2.35 s end to end** (measured 2.35-2.37 s, three consecutive runs). About
+1.4 s of that is the app itself (`inference 1270 ms` + boot). How:
+- **one multiplexed ssh connection** (`ControlMaster`, `ControlPersist=4h`,
+  `ControlPath=/tmp/apppal-$USER-%C`) for every ssh/scp. A fresh connection to
+  PALIP costs 0.55-0.85 s; a multiplexed one 0.05 s;
+- **console via `ssh -tt host systest-client`**, so there is no login-shell prompt to wait for;
+- **optimistic `load`**: no `status` round trip first. A refusal ("busy" / no answer)
+  falls back to the bootstrap;
+- **console attach overlaps the transfer**: `netload.send_gate` holds back the
+  last 4 KB until com0 is attached. The supervisor cannot start the app before
+  the last byte, so nothing is missed (`resnet18: init` is captured);
+- netload runs in-process (no second Python); poll interval 0.05 s, console read
+  0.1 s, trailing drain 0.05 s.
+
+The first run after the shared ssh connection expires (4 h idle) pays one
+handshake: measured **3.29 s**. The bootstrap path (no supervisor, or core 1 busy)
+still takes ~50 s.
 
 From the dev box by hand:
 

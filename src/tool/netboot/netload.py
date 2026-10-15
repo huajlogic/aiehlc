@@ -46,6 +46,9 @@ class TcpLink:
         self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.s.settimeout(reply_timeout)
 
+    def send_part(self, data):
+        self.s.sendall(data)
+
     def send(self, data):
         self.s.sendall(data)
 
@@ -65,16 +68,19 @@ class TcpLink:
 class SshProxyLink:
     """ssh <via> python3 <proxy>: the bytes ride ssh stdin/stdout through netboot_proxy.py."""
 
-    def __init__(self, via, proxy, host, connect_timeout, reply_timeout):
+    def __init__(self, via, proxy, host, connect_timeout, reply_timeout, ssh_opts=()):
         self.reply_timeout = reply_timeout
         self.p = subprocess.Popen(
-            ["ssh", "-o", "BatchMode=yes", via, "python3", proxy, "--host", host, "--port", str(PORT),
+            ["ssh", "-o", "BatchMode=yes", *ssh_opts, via, "python3", proxy, "--host", host, "--port", str(PORT),
              "--connect-timeout", str(connect_timeout)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    def send(self, data):
+    def send_part(self, data):
         self.p.stdin.write(data)
         self.p.stdin.flush()
+
+    def send(self, data):
+        self.send_part(data)
         self.p.stdin.close()  # one request per connection: EOF = TCP half-close at the proxy
 
     def recv_exact(self, n):
@@ -97,14 +103,29 @@ class SshProxyLink:
             self.p.kill()
 
 
-def request(host, cmd, payload=b"", timeout_ms=0, connect_timeout=5.0, reply_timeout=60.0, via=None, proxy=None):
+# Optional callable run before the LAST bytes of a request go out. The supervisor
+# cannot start the app before it has every byte, so a caller can overlap its own
+# setup (apppaltest: attaching the console) with the transfer and still be ready
+# before the app prints anything.
+send_gate = None
+GATE_TAIL = 4096
+
+
+def request(host, cmd, payload=b"", timeout_ms=0, connect_timeout=5.0, reply_timeout=60.0, via=None, proxy=None,
+            ssh_opts=()):
     digest = hashlib.sha256(payload).digest() if payload else bytes(32)
     hdr = struct.pack(REQ_FMT, REQ_MAGIC, VERSION, CMDS[cmd], 0, len(payload), timeout_ms, 0, digest)
     t0 = time.monotonic()
-    link = (SshProxyLink(via, proxy, host, connect_timeout, reply_timeout) if via
+    link = (SshProxyLink(via, proxy, host, connect_timeout, reply_timeout, ssh_opts) if via
             else TcpLink(host, connect_timeout, reply_timeout))
     try:
-        link.send(hdr + payload)
+        body = hdr + payload
+        if send_gate and len(body) > GATE_TAIL:
+            link.send_part(body[:-GATE_TAIL])
+            send_gate()
+            link.send(body[-GATE_TAIL:])
+        else:
+            link.send(body)
         t_sent = time.monotonic()
         rep = struct.unpack(REP_FMT, link.recv_exact(48))
         magic, rc, bytes_rx, rx_ms, place_ms, entry, state, run_ms, runs, msg_len = rep
@@ -130,6 +151,8 @@ def main(argv=None):
     ap.add_argument("--connect-timeout", type=float, default=5.0)
     ap.add_argument("--via", metavar="USER@HOST", help="reach the board through netboot_proxy.py on this host")
     ap.add_argument("--proxy", default="~/aiehlc/netboot/netboot_proxy.py", help="proxy path on the --via host")
+    ap.add_argument("--ssh-opt", action="append", default=[], metavar="OPT",
+                    help="extra `ssh -o` option for --via (repeatable), e.g. ControlPath=... to reuse a connection")
     a = ap.parse_args(argv)
 
     payload = b""
@@ -139,7 +162,9 @@ def main(argv=None):
         with open(a.elf, "rb") as f:
             payload = f.read()
     try:
-        r = request(a.host, a.cmd, payload, a.timeout_ms, a.connect_timeout, via=a.via, proxy=a.proxy)
+        ssh_opts = [x for o in a.ssh_opt for x in ("-o", o)]
+        r = request(a.host, a.cmd, payload, a.timeout_ms, a.connect_timeout, via=a.via, proxy=a.proxy,
+                    ssh_opts=ssh_opts)
     except (OSError, ConnectionError) as e:
         print(f"[netload] {a.cmd}: no answer from {a.host}:{PORT}: {e}")
         return 2

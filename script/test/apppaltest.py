@@ -218,7 +218,7 @@ def console_reader(child, output_queue, stop_event):
     while not stop_event.is_set():
         try:
             # Read any available output without blocking for long
-            output = child.read_nonblocking(size=4096, timeout=1)
+            output = child.read_nonblocking(size=4096, timeout=0.1)
             if output:
                 buffer += output
                 output_queue.put(output)
@@ -664,6 +664,9 @@ def copy_elf_to_remote(local_elf):
 NETBOOT_LOCAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "tool", "netboot")
 NETBOOT_REMOTE_DIR = f"/home/{username}/aiehlc/netboot"
 NETBOOT_READY_TIMEOUT_S = 120
+# One persistent ssh connection to the lab host, reused by every netload ssh/scp:
+# a fresh connection costs 0.55-0.85 s here, a multiplexed one a few tens of ms.
+SSH_MUX = ["-o", "ControlMaster=auto", "-o", "ControlPersist=4h", "-o", f"ControlPath=/tmp/apppal-{username}-%C"]
 
 
 def stage_if_changed(local_paths):
@@ -673,12 +676,13 @@ def stage_if_changed(local_paths):
     names = [os.path.basename(p) for p in local_paths]
     probe = (f"mkdir -p {NETBOOT_REMOTE_DIR} && cd {NETBOOT_REMOTE_DIR} && "
              f"(sha256sum {' '.join(shlex.quote(n) for n in names)} 2>/dev/null; true)")
-    r = subprocess.run(["ssh", host, f"bash -c {shlex.quote(probe)}"], capture_output=True, text=True, timeout=30)
+    r = subprocess.run(["ssh", *SSH_MUX, host, f"bash -c {shlex.quote(probe)}"], capture_output=True, text=True,
+                       timeout=30)
     remote = {ln.split()[1]: ln.split()[0] for ln in r.stdout.splitlines() if len(ln.split()) == 2}
     stale = [p for p, n in zip(local_paths, names)
              if remote.get(n) != hashlib.sha256(open(p, "rb").read()).hexdigest()]
     if stale:
-        subprocess.run(["scp", "-q", *stale, f"{host}:{NETBOOT_REMOTE_DIR}/"], check=True,
+        subprocess.run(["scp", "-q", *SSH_MUX, *stale, f"{host}:{NETBOOT_REMOTE_DIR}/"], check=True,
                        capture_output=True, timeout=120)
     print(f"[netload] staged on {palip}: {', '.join(os.path.basename(p) for p in stale) or 'nothing (up to date)'}")
 
@@ -697,13 +701,57 @@ def netboot_stage_supervisor():
     return f"{NETBOOT_REMOTE_DIR}/netboot.elf"
 
 
-def netload_remote(argv, timeout=600):
-    """Run netload.py HERE and reach the board through netboot_proxy.py on the lab
-    host over ssh: the ELF streams through the ssh pipe, nothing is scp'd."""
-    cmd = [sys.executable, os.path.join(NETBOOT_LOCAL_DIR, "netload.py"), *argv,
-           "--via", host, "--proxy", f"{NETBOOT_REMOTE_DIR}/netboot_proxy.py"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    return r.returncode, (r.stdout + r.stderr).strip()
+_netload_mod = []
+
+
+def netload_remote(argv, timeout=600, gate=None):
+    """Run netload.py's main() in this process and reach the board through
+    netboot_proxy.py on the lab host over the multiplexed ssh: the ELF streams
+    through the ssh pipe, nothing is scp'd. Returns (exit status, printed text)."""
+    import contextlib
+    import importlib.util
+    import io
+    if not _netload_mod:
+        spec = importlib.util.spec_from_file_location("netload", os.path.join(NETBOOT_LOCAL_DIR, "netload.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _netload_mod.append(mod)
+    out = io.StringIO()
+    extra = ["--via", host, "--proxy", f"{NETBOOT_REMOTE_DIR}/netboot_proxy.py"]
+    extra += [x for i in range(1, len(SSH_MUX), 2) for x in ("--ssh-opt", SSH_MUX[i])]
+    mod = _netload_mod[0]
+    mod.send_gate = gate
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = mod.main(argv + extra)
+    finally:
+        mod.send_gate = None
+    return rc, out.getvalue().strip()
+
+
+def open_console_fast():
+    """com0 through `ssh -tt host systest-client` on the multiplexed connection:
+    no login shell to wait for (that alone was ~0.8 s of setup_second_connection)."""
+    child = pexpect.spawn("ssh", [*SSH_MUX, "-tt", host, "/opt/systest/common/bin/systest-client"],
+                          encoding='utf-8', codec_errors='replace', timeout=60)
+    child.expect(r'Systest[#>]', timeout=60)
+    child.sendline("connect com0")
+    child.expect(r'Connecting to device com0.*escape', timeout=60)
+    return child
+
+
+def start_console(fast):
+    conn2 = open_console_fast() if fast else setup_second_connection()
+    stop_console_thread.clear()
+    th = threading.Thread(target=console_reader, args=(conn2, console_output_queue, stop_console_thread))
+    th.start()
+    return conn2, th
+
+
+def stop_console(conn2, th):
+    stop_console_thread.set()
+    th.join(timeout=5)
+    conn2.close(force=True)
 
 
 def drain_until(marker, timeout_s, collected):
@@ -723,58 +771,60 @@ def drain_until(marker, timeout_s, collected):
 
 
 def netload_start(args, local_elf, collected):
-    """Make sure the supervisor is resident, open the console, send the ELF.
+    """Fast path first: console up, then `load` straight to a resident supervisor.
 
-    Returns (conn1, conn2, console_thread, ok). conn1 is only opened when the
-    supervisor had to be bootstrapped over JTAG (first use after power-up).
-    Order matters: the bootstrap's `device program` resets the board, which
-    drops a com0 session opened before it -- so the console comes up after."""
+    Only if that is refused -- nothing answers, or core 1 is busy (running/hung;
+    this PDI cannot stop it) -- or --netload-bootstrap is given, fall back to a
+    JTAG bootstrap of the supervisor. Order on that path matters: `device program`
+    resets the board and drops a com0 session opened before it, so the console is
+    reopened after programming. Returns (conn1, conn2, console_thread, ok)."""
     ip = args.netload_ip
-    netboot_stage_proxy()
-    conn1 = None
-    rc, out = netload_remote(["status", "--host", ip, "--connect-timeout", "3"], timeout=60)
-    print(out)
-    # Reuse a supervisor that answers: "free" (never ran) and "parked" (previous app
-    # returned through the patched _exit) both take the ELF directly. Only "busy"
-    # (running or hung, and this PDI gives no way to stop it) needs a bootstrap.
-    core_busy = rc != 2 and "app core busy" in out
-    bootstrap = rc == 2 or args.netload_bootstrap or core_busy
-    if bootstrap:
-        why = ("--netload-bootstrap" if args.netload_bootstrap else
-               f"supervisor not answering at {ip}" if rc == 2 else "app core still busy from the previous run")
-        print(f"\n>>> {why}: loading the netboot supervisor over JTAG (one-time)...")
-        # Bootstrap = the one place netload touches power: `device program` on a live
-        # system (supervisor + app core running) aborts at ~18%, so the PDI reload
-        # needs the power cycle first. Use the non-owning systest-client session
-        # (no `become`), so closing it cannot release/power off the board; the app
-        # finishing never powers anything off (main), and a reusable supervisor
-        # ("free"/"parked") skips this whole path.
-        conn1 = setup_first_connection(nonreboot=True)
+    load_argv = ["load", local_elf, "--host", ip, "--timeout-ms", str(args.netload_timeout_ms)]
+    if not args.netload_bootstrap:
+        # The console attaches while the ELF streams; netload holds back the last
+        # 4 KB until it is attached, so the app cannot print before we listen.
+        box = {}
+        opener = threading.Thread(target=lambda: box.setdefault("c", start_console(fast=True)))
+        opener.start()
+        netboot_stage_proxy()
 
-    print("\n>>> Setting up console connection (com0)...")
-    conn2 = setup_second_connection()
-    console_thread = threading.Thread(target=console_reader, args=(conn2, console_output_queue, stop_console_thread))
-    console_thread.start()
+        def console_attached():
+            opener.join(timeout=60)
+            if "c" not in box:
+                raise ConnectionError("com0 console did not attach")
 
-    if bootstrap:
-        if not download_elf_and_continue(conn1, netboot_stage_supervisor()):
-            return conn1, conn2, console_thread, False
-        if not drain_until("[netboot] ready", NETBOOT_READY_TIMEOUT_S, collected):
-            print(f"\n[ERROR] supervisor did not print '[netboot] ready' within {NETBOOT_READY_TIMEOUT_S}s")
-            return conn1, conn2, console_thread, False
-        rc, out = netload_remote(["status", "--host", ip, "--connect-timeout", "5"], timeout=60)
+        t0 = time.time()
+        rc, out = netload_remote(load_argv, gate=console_attached)
+        opener.join(timeout=60)
+        if "c" not in box:
+            print("\n[ERROR] com0 console did not attach")
+            return None, None, None, False
+        conn2, th = box["c"]
         print(out)
-        if rc == 2:
-            print(f"\n[ERROR] supervisor booted but {ip}:5155 is unreachable from {host} "
-                  "(GEM0 cabling / IP plan, see doc/design/lwip_elf_bootloader.md phase 0)")
-            return conn1, conn2, console_thread, False
-
-    print(f"\n>>> netload: streaming {local_elf} to {ip} through the proxy on {palip} (no scp)...")
-    t0 = time.time()
-    rc, out = netload_remote(["load", local_elf, "--host", ip, "--timeout-ms", str(args.netload_timeout_ms)])
+        if rc == 0:
+            print(f"[netload] streamed {local_elf} through the proxy on {palip} in {time.time() - t0:.2f}s (no scp)")
+            return None, conn2, th, True
+        if rc != 2 and "re-bootstrap" not in out:
+            return None, conn2, th, False  # a real refusal (bad ELF etc.), not "no supervisor"
+        stop_console(conn2, th)
+        why = f"supervisor not answering at {ip}" if rc == 2 else "app core still busy from the previous run"
+    else:
+        why = "--netload-bootstrap"
+    print(f"\n>>> {why}: loading the netboot supervisor over JTAG (one-time)...")
+    netboot_stage_proxy()
+    # `device program` on a live system aborts at ~18%, so the bootstrap power-cycles
+    # first, through the non-owning systest-client session. The app finishing never
+    # powers anything off, and the fast path above never reaches this.
+    conn1 = setup_first_connection(nonreboot=True)
+    conn2, th = start_console(fast=False)
+    if not download_elf_and_continue(conn1, netboot_stage_supervisor()):
+        return conn1, conn2, th, False
+    if not drain_until("[netboot] ready", NETBOOT_READY_TIMEOUT_S, collected):
+        print(f"\n[ERROR] supervisor did not print '[netboot] ready' within {NETBOOT_READY_TIMEOUT_S}s")
+        return conn1, conn2, th, False
+    rc, out = netload_remote(load_argv)
     print(out)
-    print(f"[netload] round trip {time.time() - t0:.2f}s (includes ssh to {palip})")
-    return conn1, conn2, console_thread, rc == 0
+    return conn1, conn2, th, rc == 0
 
 
 def main():
@@ -1007,7 +1057,7 @@ def wait_console(collected_output, finished=None):
     """
     MAX_WAIT = 600        # absolute maximum wait (seconds)
     NO_OUTPUT_TIMEOUT = 300  # abort if no output for this long (debug snapshot reads many regs)
-    POLL_INTERVAL = 1     # check queue every N seconds
+    POLL_INTERVAL = 0.05  # check queue every N seconds
 
     print(f"\n>>> Waiting for console output (max {MAX_WAIT}s, no-output timeout {NO_OUTPUT_TIMEOUT}s)...")
     output_detected = bool(collected_output)
@@ -1039,7 +1089,7 @@ def wait_console(collected_output, finished=None):
 
         if program_done:
             log.debug("main: program_done detected, draining trailing output...")
-            time.sleep(2)
+            time.sleep(0.05)  # "device_teardown done" is the app's last line
             while not console_output_queue.empty():
                 chunk = console_output_queue.get()
                 collected_output.append(chunk)
@@ -1071,7 +1121,7 @@ def _close_all(console_thread, conn1, conn2):
     for name, conn in (("conn1", conn1), ("conn2", conn2)):
         if conn:
             try:
-                conn.close()
+                conn.close(force=True)
             except Exception as e:
                 log.debug("main finally: %s.close() error: %s", name, e)
     log.debug("main finally: all cleanup done")
