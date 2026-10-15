@@ -27,6 +27,7 @@ import queue
 import argparse
 import glob
 import logging
+import re
 import shlex
 
 # Configure logging with timestamps so we can see where things get stuck
@@ -346,6 +347,31 @@ def exit_xsdb_and_poweroff(child):
     print("[Connection 1] Power off complete")
 
 
+_xsdb_seq = [0]
+
+
+def xsdb_run(child, cmd, timeout=60, what=None):
+    """Run one xsdb command and wait for ITS completion, not for "a prompt".
+
+    rlwrap echoes the xsdb prompt twice, so a plain expect('xsdb%') matches the
+    previous command's prompt: the log showed "Device programmed" printed while
+    `device program` was still at 0%, and every later command typed ahead. Here
+    the command reports through a unique token. The token is printed via
+    [expr], so the echoed command line ("@@OK_[expr {..}]@@") can never match the
+    real output ("@@OK_7@@"). Raises RuntimeError on a Tcl error or PLM stall.
+    """
+    _xsdb_seq[0] += 1
+    n = _xsdb_seq[0]
+    ok, err = f"@@OK_{n}@@", f"@@ERR_{n}@@"
+    child.sendline(f'if {{[catch {{{cmd}}} e]}} {{puts "@@ERR_[expr {{{n - 1}+1}}]@@ $e"}} '
+                   f'else {{puts "@@OK_[expr {{{n - 1}+1}}]@@"}}')
+    index = child.expect([re.escape(ok), re.escape(err) + r"([^\r\n]*)", r"PLM stalled"], timeout=timeout)
+    if index == 0:
+        return
+    detail = child.match.group(1).strip() if index == 1 else "PLM stalled"
+    raise RuntimeError(f"xsdb `{what or cmd}` failed: {detail}")
+
+
 def setup_first_connection(nonreboot=False):
     """
     First SSH connection: Setup xsdb and program device.
@@ -416,52 +442,22 @@ def setup_first_connection(nonreboot=False):
     
     print("[Connection 1] In xsdb, connecting...")
     
-    # Step 7: Connect
-    if nonreboot:
-        #child.sendline("hw_server -stcp:0.0.0.0:3121 &")
-        #child.expect(r'xsdb%', timeout=60)
-        child.sendline("connect -url TCP:10.23.224.213:3121")
-    else:
-        child.sendline("conn")
-    child.expect(r'xsdb%', timeout=60)
+    # Steps 7-11, each waited on by its own completion token (xsdb_run).
+    xsdb_run(child, "connect -url TCP:10.23.224.213:3121" if nonreboot else "conn", 60, "connect")
     print("[Connection 1] Connected, targeting device 1...")
-    
-    # Step 8: Target 1
-    child.sendline("tar 1")
-    child.expect(r'xsdb%', timeout=60)
+    xsdb_run(child, "tar 1", 60)
     print("[Connection 1] Programming Palboard.BIN...")
-    
-    # Step 9: Program device – detect PLM stall and abort early
-    child.sendline(f"device program {PALBOARD_BIN}")
-    index = child.expect([r'xsdb%', r'PLM stalled'], timeout=120)
-    if index == 1:
-        # Consume the rest of the error output up to the prompt
-        child.expect(r'xsdb%', timeout=60)
-        raise RuntimeError(
-            "PLM stalled during BOOT.BIN programming. "
-            "The board may need a power cycle. Run 'plm log' for details."
-        )
-    time.sleep(5)  # allow PLM to fully initialise before continuing
-    print("[Connection 1] Device programmed, targeting device 20...")
-    
-    # Step 10: Target 20
-    child.sendline("tar 20")
-    child.expect(r'xsdb%', timeout=60)
-    print("[Connection 1] Resetting processor...")
-    
-    # Step 11: Reset processor
-    child.sendline("rst -proc")
-    child.expect(r'xsdb%', timeout=60)
-
-    # Drain any stale xsdb% prompts left in the buffer.
-    # xsdb sometimes emits double prompts after rst -proc; if the second
-    # one isn't consumed here it will be falsely matched by the next expect.
-    time.sleep(0.5)
     try:
-        child.read_nonblocking(size=4096, timeout=1)
-    except pexpect.TIMEOUT:
-        pass
-
+        xsdb_run(child, f"device program {PALBOARD_BIN}", 120, "device program")
+    except RuntimeError as e:
+        raise RuntimeError(f"BOOT.BIN programming failed ({e}). The board may need a power cycle; "
+                           "run 'plm log' for details.") from e
+    print("[Connection 1] Device programmed (100%), letting the PLM settle...")
+    time.sleep(5)  # now measured from the END of programming
+    print("[Connection 1] Targeting device 20...")
+    xsdb_run(child, "tar 20", 60)
+    print("[Connection 1] Resetting processor...")
+    xsdb_run(child, "rst -proc", 60)
     print("[Connection 1] Setup complete!")
     
     return child
@@ -557,15 +553,13 @@ def download_elf_and_continue(child, elf_path):
         print("The board needs a full power cycle and re-programming of BOOT.BIN.")
         print("Run 'plm log' in xsdb for details.")
         return False
-    child.expect(r'xsdb%', timeout=60)
     log.debug("download_elf_and_continue: download complete")
     print("[Connection 1] ELF download complete!")
 
     # Step 13: Continue execution
     print("[Connection 1] Continuing execution...")
     log.debug("download_elf_and_continue: sending 'con'...")
-    child.sendline("con")
-    child.expect(r'xsdb%', timeout=60)
+    xsdb_run(child, "con", 60)
     log.debug("download_elf_and_continue: 'con' completed, execution started")
     print("[Connection 1] Execution started!")
     return True
@@ -657,6 +651,99 @@ def copy_elf_to_remote(local_elf):
         return False, None
 
 
+# --------------------------------------------------------------------------
+# --netload: run the ELF through the resident netboot supervisor instead of a
+# JTAG `dow` (doc/design/lwip_elf_bootloader.md). The console is still com0,
+# read by the same console_reader, so the log is collected exactly as before.
+# --------------------------------------------------------------------------
+NETBOOT_LOCAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "tool", "netboot")
+NETBOOT_REMOTE_DIR = f"/home/{username}/aiehlc/netboot"
+NETBOOT_READY_TIMEOUT_S = 120
+
+
+def netboot_stage_remote():
+    """Copy netload.py and netboot.elf to the lab host; return the remote ELF path."""
+    local_py = os.path.join(NETBOOT_LOCAL_DIR, "netload.py")
+    local_elf = os.path.join(NETBOOT_LOCAL_DIR, "build", "netboot.elf")
+    if not os.path.isfile(local_elf):
+        raise RuntimeError(f"{local_elf} missing: run src/tool/netboot/build.sh first")
+    subprocess.run(["ssh", host, f"mkdir -p {NETBOOT_REMOTE_DIR}"], check=True, capture_output=True, timeout=30)
+    subprocess.run(["scp", "-q", local_py, local_elf, f"{host}:{NETBOOT_REMOTE_DIR}/"], check=True,
+                   capture_output=True, timeout=120)
+    return f"{NETBOOT_REMOTE_DIR}/netboot.elf"
+
+
+def netload_remote(argv, timeout=600):
+    """Run netload.py on the lab host (it shares the board's network segment)."""
+    cmd = "python3 " + shlex.quote(f"{NETBOOT_REMOTE_DIR}/netload.py") + " " + " ".join(shlex.quote(a) for a in argv)
+    r = subprocess.run(["ssh", host, cmd], capture_output=True, text=True, timeout=timeout)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def drain_until(marker, timeout_s, collected):
+    """Echo console output until `marker` appears; True if it did."""
+    deadline = time.time() + timeout_s
+    seen = ""
+    while time.time() < deadline:
+        while not console_output_queue.empty():
+            chunk = console_output_queue.get()
+            collected.append(chunk)
+            print(chunk, end='', flush=True)
+            seen = (seen + chunk)[-4096:]
+            if marker in seen:
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def netload_start(args, remote_elf_path, collected):
+    """Make sure the supervisor is resident, open the console, send the ELF.
+
+    Returns (conn1, conn2, console_thread, ok). conn1 is only opened when the
+    supervisor had to be bootstrapped over JTAG (first use after power-up).
+    Order matters: the bootstrap's `device program` resets the board, which
+    drops a com0 session opened before it -- so the console comes up after."""
+    ip = args.netload_ip
+    remote_netboot = netboot_stage_remote()
+    conn1 = None
+    rc, out = netload_remote(["status", "--host", ip, "--connect-timeout", "3"], timeout=60)
+    print(out)
+    # "app core busy": the previous app still owns core 1 and this PDI gives the
+    # supervisor no way to stop it, so the only reset is a fresh bootstrap.
+    core_busy = rc != 2 and "app core busy" in out
+    bootstrap = rc == 2 or args.netload_bootstrap or core_busy
+    if bootstrap:
+        why = ("--netload-bootstrap" if args.netload_bootstrap else
+               f"supervisor not answering at {ip}" if rc == 2 else "app core still busy from the previous run")
+        print(f"\n>>> {why}: loading the netboot supervisor over JTAG (one-time)...")
+        conn1 = setup_first_connection(nonreboot=args.nonreboot)
+
+    print("\n>>> Setting up console connection (com0)...")
+    conn2 = setup_second_connection()
+    console_thread = threading.Thread(target=console_reader, args=(conn2, console_output_queue, stop_console_thread))
+    console_thread.start()
+
+    if bootstrap:
+        if not download_elf_and_continue(conn1, remote_netboot):
+            return conn1, conn2, console_thread, False
+        if not drain_until("[netboot] ready", NETBOOT_READY_TIMEOUT_S, collected):
+            print(f"\n[ERROR] supervisor did not print '[netboot] ready' within {NETBOOT_READY_TIMEOUT_S}s")
+            return conn1, conn2, console_thread, False
+        rc, out = netload_remote(["status", "--host", ip, "--connect-timeout", "5"], timeout=60)
+        print(out)
+        if rc == 2:
+            print(f"\n[ERROR] supervisor booted but {ip}:5155 is unreachable from {host} "
+                  "(GEM0 cabling / IP plan, see doc/design/lwip_elf_bootloader.md phase 0)")
+            return conn1, conn2, console_thread, False
+
+    print(f"\n>>> netload: sending {remote_elf_path} to {ip}...")
+    t0 = time.time()
+    rc, out = netload_remote(["load", remote_elf_path, "--host", ip, "--timeout-ms", str(args.netload_timeout_ms)])
+    print(out)
+    print(f"[netload] round trip {time.time() - t0:.2f}s (includes ssh to {palip})")
+    return conn1, conn2, console_thread, rc == 0
+
+
 def main():
     """Main test function."""
     # Parse command-line arguments
@@ -692,6 +779,31 @@ Examples:
         default=False,
         help="Keep board powered on after test (no xsdb exit, no power off) for manual debug"
     )
+    parser.add_argument(
+        "--netload",
+        action="store_true",
+        default=False,
+        help="Run via the resident netboot supervisor instead of JTAG dow; bootstraps the "
+             "supervisor over JTAG only if it does not answer. The board is left powered on "
+             "with the supervisor resident (src/tool/netboot/README.md)."
+    )
+    parser.add_argument(
+        "--netload-ip",
+        default="10.10.70.50",
+        help="Supervisor IP (netboot build.sh NETBOOT_IP)"
+    )
+    parser.add_argument(
+        "--netload-bootstrap",
+        action="store_true",
+        default=False,
+        help="Reload the supervisor over JTAG even if one answers (supervisor upgrade)"
+    )
+    parser.add_argument(
+        "--netload-timeout-ms",
+        type=int,
+        default=600000,
+        help="Board-side watchdog for the run (--netload only)"
+    )
     args = parser.parse_args()
 
     # Step 0: Find ELF file using smart selection
@@ -715,116 +827,30 @@ Examples:
     conn2 = None
     console_thread = None
 
+    collected_output = []
     try:
-        # Step 2-3: Setup first connection and program device
-        log.debug("main: setting up first connection...")
-        print("\n>>> Setting up first connection...")
-        conn1 = setup_first_connection(nonreboot=args.nonreboot)
-        log.debug("main: first connection ready")
+        if args.netload:
+            conn1, conn2, console_thread, elf_ok = netload_start(args, remote_elf_path, collected_output)
+            if not elf_ok:
+                print("\n" + "=" * 60)
+                print("Test FAILED (netload)")
+                print("=" * 60)
+                sys.exit(1)
+        else:
+            conn1, conn2, elf_ok = jtag_start(args, remote_elf_path)
+            if elf_ok is None:
+                sys.exit(1)
 
-        # Step 4: Setup second connection for console output
-        log.debug("main: setting up second connection...")
-        print("\n>>> Setting up second connection...")
-        conn2 = setup_second_connection()
-        log.debug("main: second connection ready")
+        if console_thread is None:
+            log.debug("main: starting console_reader thread...")
+            console_thread = threading.Thread(
+                target=console_reader,
+                args=(conn2, console_output_queue, stop_console_thread)
+            )
+            console_thread.start()
+            log.debug("main: console_reader thread started")
 
-        # Step 5: Download ELF file
-        log.debug("main: downloading ELF file...")
-        print("\n>>> Downloading ELF file...")
-        elf_ok = download_elf_and_continue(conn1, remote_elf_path)
-        log.debug("main: download_elf_and_continue returned %s", elf_ok)
-
-        if not elf_ok:
-            # PLM stalled — skip console wait, go straight to cleanup
-            print("\n[Skipping console wait due to PLM failure]")
-            if not args.nonreboot:
-                print("\n>>> Cleaning up Connection 1...")
-                exit_xsdb_and_poweroff(conn1)
-            else:
-                print("\n>>> --nonreboot: skipping cleanup, board left as-is for manual debug")
-            print("\n" + "=" * 60)
-            print("Test FAILED (PLM stall)")
-            print("=" * 60)
-            sys.exit(1)
-
-        # Start console reader thread after ELF is running
-        log.debug("main: starting console_reader thread...")
-        console_thread = threading.Thread(
-            target=console_reader,
-            args=(conn2, console_output_queue, stop_console_thread)
-        )
-        console_thread.start()
-        log.debug("main: console_reader thread started")
-
-        # Poll console output instead of fixed sleep:
-        #   - Finish early when "device_teardown done" is seen (program completed)
-        #   - Abort early if no output arrives within NO_OUTPUT_TIMEOUT seconds
-        #   - Hard cap at MAX_WAIT seconds as safety bound
-        MAX_WAIT = 600        # absolute maximum wait (seconds)
-        NO_OUTPUT_TIMEOUT = 300  # abort if no output for this long (debug snapshot reads many regs)
-        POLL_INTERVAL = 1     # check queue every N seconds
-
-        print(f"\n>>> Waiting for console output (max {MAX_WAIT}s, no-output timeout {NO_OUTPUT_TIMEOUT}s)...")
-
-        collected_output = []
-        output_detected = False
-        program_done = False
-        start_time = time.time()
-        last_output_time = start_time
-
-        while True:
-            #print("\ndebug: polling console output queue...\n")
-            elapsed = time.time() - start_time
-            since_last_output = time.time() - last_output_time
-
-            # Check for new output in the queue
-            got_new = False
-            while not console_output_queue.empty():
-                #print("\ndebug: new console output detected\n")
-                chunk = console_output_queue.get()
-                collected_output.append(chunk)
-                print(chunk, end='', flush=True)
-                output_detected = True
-                got_new = True
-                # Check for completion marker
-                if "device_teardown done" in chunk or "Not tearing down partition" in chunk:
-                    program_done = True
-
-            #print(f"\ndebug: elapsed={elapsed:.1f}s, since_last_output={since_last_output:.1f}s, "
-            #      f"output_detected={output_detected}, program_done={program_done}\n")
-            if got_new:
-                last_output_time = time.time()
-
-            # Exit conditions (in priority order)
-            if program_done:
-                # Give a short grace period for any trailing output
-                log.debug("main: program_done detected, draining trailing output...")
-                time.sleep(2)
-                while not console_output_queue.empty():
-                    chunk = console_output_queue.get()
-                    collected_output.append(chunk)
-                    print(chunk, end='', flush=True)
-                print(f"\n[Program completed after {elapsed:.0f}s]")
-                log.debug("main: exiting poll loop (program_done)")
-                break
-
-            if elapsed >= MAX_WAIT:
-                log.debug("main: exiting poll loop (MAX_WAIT reached)")
-                print(f"\n[Max wait {MAX_WAIT}s reached]")
-                break
-
-            if output_detected and since_last_output >= NO_OUTPUT_TIMEOUT:
-                log.debug("main: exiting poll loop (no new output for %ds)", NO_OUTPUT_TIMEOUT)
-                print(f"\n[No new output for {NO_OUTPUT_TIMEOUT}s — program may be hung]")
-                break
-
-            if not output_detected and since_last_output >= NO_OUTPUT_TIMEOUT:
-                log.debug("main: exiting poll loop (no output ever received, %ds)", NO_OUTPUT_TIMEOUT)
-                print(f"\n[ERROR: No output received for {NO_OUTPUT_TIMEOUT}s — "
-                      "UART/PS may not be initialized (PLM issue or board problem)]")
-                break
-
-            time.sleep(POLL_INTERVAL)
+        program_done, output_detected = wait_console(collected_output)
 
         # Stop console reader
         log.debug("\nmain: signaling console_reader thread to stop...")
@@ -844,9 +870,11 @@ Examples:
 
         if not output_detected:
             print("[No output received from com0 serial console]")
-        
+
         # Step 6: Go back to conn1, exit xsdb and power off
-        if not args.nonreboot:
+        if args.netload:
+            print("\n>>> --netload: board left powered on, netboot supervisor stays resident")
+        elif not args.nonreboot:
             log.debug("main: cleaning up Connection 1 (exit_xsdb_and_poweroff)...")
             print("\n>>> Cleaning up Connection 1...")
             exit_xsdb_and_poweroff(conn1)
@@ -858,17 +886,19 @@ Examples:
         print("\n" + "=" * 60)
         print("Test complete!")
         print("=" * 60)
+        if args.netload and not program_done:
+            sys.exit(1)
 
     except pexpect.TIMEOUT as e:
         log.error("main: pexpect.TIMEOUT: %s", e)
         print(f"\nError: Command timed out - {e}")
-        if conn1 and not args.nonreboot:
+        if conn1 and not args.nonreboot and not args.netload:
             try:
                 exit_xsdb_and_poweroff(conn1)
             except Exception:
                 pass
-        elif conn1 and args.nonreboot:
-            print("[--nonreboot] Skipping cleanup, board left as-is")
+        elif conn1:
+            print("[--nonreboot/--netload] Skipping cleanup, board left as-is")
         sys.exit(1)
     except pexpect.EOF as e:
         log.error("main: pexpect.EOF: %s", e)
@@ -877,45 +907,127 @@ Examples:
     except Exception as e:
         log.error("main: exception: %s", e, exc_info=True)
         print(f"\nError: {e}")
-        if conn1 and not args.nonreboot:
+        if conn1 and not args.nonreboot and not args.netload:
             try:
                 exit_xsdb_and_poweroff(conn1)
             except Exception:
                 pass
-        elif conn1 and args.nonreboot:
-            print("[--nonreboot] Skipping cleanup, board left as-is")
+        elif conn1:
+            print("[--nonreboot/--netload] Skipping cleanup, board left as-is")
         sys.exit(1)
     finally:
-        # Cleanup - ensure thread is stopped and connections closed
-        log.debug("main finally: stopping console thread...")
-        stop_console_thread.set()
+        _close_all(console_thread, conn1, conn2)
 
-        if console_thread and console_thread.is_alive():
-            log.debug("main finally: joining console_reader thread (timeout=5)...")
-            console_thread.join(timeout=5)
-            if console_thread.is_alive():
-                log.warning("main finally: console_reader thread still alive after join!")
-            else:
-                log.debug("main finally: console_reader thread joined")
 
-        if conn1:
-            log.debug("main finally: closing conn1...")
+def jtag_start(args, remote_elf_path):
+    """The JTAG flow: program BOOT.BIN, open com0, dow -force, con.
+
+    Returns (conn1, conn2, elf_ok); elf_ok None means the run already failed."""
+    log.debug("main: setting up first connection...")
+    print("\n>>> Setting up first connection...")
+    conn1 = setup_first_connection(nonreboot=args.nonreboot)
+    log.debug("main: first connection ready")
+
+    log.debug("main: setting up second connection...")
+    print("\n>>> Setting up second connection...")
+    conn2 = setup_second_connection()
+    log.debug("main: second connection ready")
+
+    log.debug("main: downloading ELF file...")
+    print("\n>>> Downloading ELF file...")
+    elf_ok = download_elf_and_continue(conn1, remote_elf_path)
+    log.debug("main: download_elf_and_continue returned %s", elf_ok)
+    if elf_ok:
+        return conn1, conn2, True
+
+    # PLM stalled -- skip console wait, go straight to cleanup
+    print("\n[Skipping console wait due to PLM failure]")
+    if not args.nonreboot:
+        print("\n>>> Cleaning up Connection 1...")
+        exit_xsdb_and_poweroff(conn1)
+    else:
+        print("\n>>> --nonreboot: skipping cleanup, board left as-is for manual debug")
+    print("\n" + "=" * 60)
+    print("Test FAILED (PLM stall)")
+    print("=" * 60)
+    return conn1, conn2, None
+
+
+def wait_console(collected_output):
+    """Echo com0 output until the program completes, goes quiet, or MAX_WAIT.
+
+    Returns (program_done, output_detected).
+      - Finish early when "device_teardown done" is seen (program completed)
+      - Abort early if no output arrives within NO_OUTPUT_TIMEOUT seconds
+      - Hard cap at MAX_WAIT seconds as safety bound
+    """
+    MAX_WAIT = 600        # absolute maximum wait (seconds)
+    NO_OUTPUT_TIMEOUT = 300  # abort if no output for this long (debug snapshot reads many regs)
+    POLL_INTERVAL = 1     # check queue every N seconds
+
+    print(f"\n>>> Waiting for console output (max {MAX_WAIT}s, no-output timeout {NO_OUTPUT_TIMEOUT}s)...")
+    output_detected = bool(collected_output)
+    program_done = False
+    tail = ""  # markers can straddle two console chunks
+    start_time = time.time()
+    last_output_time = start_time
+
+    while True:
+        elapsed = time.time() - start_time
+        since_last_output = time.time() - last_output_time
+
+        got_new = False
+        while not console_output_queue.empty():
+            chunk = console_output_queue.get()
+            collected_output.append(chunk)
+            print(chunk, end='', flush=True)
+            output_detected = True
+            got_new = True
+            tail = (tail + chunk)[-512:]
+            if "device_teardown done" in tail or "Not tearing down partition" in tail:
+                program_done = True
+        if got_new:
+            last_output_time = time.time()
+
+        if program_done:
+            log.debug("main: program_done detected, draining trailing output...")
+            time.sleep(2)
+            while not console_output_queue.empty():
+                chunk = console_output_queue.get()
+                collected_output.append(chunk)
+                print(chunk, end='', flush=True)
+            print(f"\n[Program completed after {elapsed:.0f}s]")
+            break
+        if elapsed >= MAX_WAIT:
+            print(f"\n[Max wait {MAX_WAIT}s reached]")
+            break
+        if output_detected and since_last_output >= NO_OUTPUT_TIMEOUT:
+            print(f"\n[No new output for {NO_OUTPUT_TIMEOUT}s — program may be hung]")
+            break
+        if not output_detected and since_last_output >= NO_OUTPUT_TIMEOUT:
+            print(f"\n[ERROR: No output received for {NO_OUTPUT_TIMEOUT}s — "
+                  "UART/PS may not be initialized (PLM issue or board problem)]")
+            break
+        time.sleep(POLL_INTERVAL)
+    return program_done, output_detected
+
+
+def _close_all(console_thread, conn1, conn2):
+    """Stop the console reader and close both ssh sessions."""
+    log.debug("main finally: stopping console thread...")
+    stop_console_thread.set()
+    if console_thread and console_thread.is_alive():
+        console_thread.join(timeout=5)
+        if console_thread.is_alive():
+            log.warning("main finally: console_reader thread still alive after join!")
+    for name, conn in (("conn1", conn1), ("conn2", conn2)):
+        if conn:
             try:
-                conn1.close()
-                log.debug("main finally: conn1 closed")
+                conn.close()
             except Exception as e:
-                log.debug("main finally: conn1.close() error: %s", e)
-
-        if conn2:
-            log.debug("main finally: closing conn2...")
-            try:
-                conn2.close()
-                log.debug("main finally: conn2 closed")
-            except Exception as e:
-                log.debug("main finally: conn2.close() error: %s", e)
-
-        log.debug("main finally: all cleanup done")
-        print("\nConnections closed.")
+                log.debug("main finally: %s.close() error: %s", name, e)
+    log.debug("main finally: all cleanup done")
+    print("\nConnections closed.")
 
 
 if __name__ == "__main__":

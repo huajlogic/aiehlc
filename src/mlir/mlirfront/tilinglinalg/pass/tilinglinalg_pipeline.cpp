@@ -1874,9 +1874,22 @@ after_host_emit:
             TilingBcf bcf;
             constexpr uint32_t kStackBase = 0x70000;
             bcf.setStack(kStackBase, allocator.getBaseAddr() - kStackBase);
+            // Keep the linker's own .data/.bss (libme's control_rnd/control_sat,
+            // main()'s sync_buffer, any kernel global) inside THIS tile's memory,
+            // after the buffers. Unreserved, bridge placed them at DMb 0x0, which
+            // is not this tile's data memory -- aie_api restores crRnd from
+            // control_rnd after every window acquire, so a vector kernel's SRS
+            // rounding mode became whatever byte lived there (conv2dstem_vec:
+            // 726,699/802,816 outputs off by +1). Skill: bcfglobalplacement.
+            bcf.addReservedDMB(0x00000, 0x40000);
             bcf.addReservedDMB(0x40000, 0x10000);
+            bcf.addReservedDMB(0x50000, 0x20000); // remaining neighbour windows below own 0x70000
+            bcf.addReservedDMB(0x80000, 0x80000); // TM register window, not memory
             // This crashes the simulator, commenting out for now
             // bcf.addReservedDMB(0x7F800, 0x800);
+            // Buffer ranges are NOT reserved: bridge rejects a pinned _symbol inside a
+            // _reserved range. They are covered instead by declaring every buffer at its
+            // full allocated size (DfscheduleToKernelApiPass, CoreMemAllocator::getSize).
             for (const auto &slot : allocations) {
                 bcf.addSymbol(slot.symbolName, slot.address);
             }

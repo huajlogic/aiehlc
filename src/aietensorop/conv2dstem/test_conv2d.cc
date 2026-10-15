@@ -124,7 +124,10 @@ void *__Runtime_Alloc(size_t bytes);
 // perf report. They are always LINKED -- the accessors exist unconditionally in
 // aie_runtime.c -- but they only COUNT when the host was built with
 // `script/aiehlc.sh --profiling` (-DAIEHLC_PROFILING=1). Without it every
-// counter reads 0, which the report states rather than printing as data.
+// counter reads 0, which the report states rather than printing as data. They
+// read pmccntr_el0, which the runtime's __Runtime_init constructor starts under
+// that flag -- this file deliberately avoids aie_timer.h, so it cannot call
+// __ps_pmccntr_enable() itself the way simplematmul2_prof.cc does.
 // Same C++-linkage note as above: declare plainly, not extern "C".
 void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
 void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
@@ -289,9 +292,18 @@ static void perf_report_phases(const unsigned long long *ph0, unsigned long long
     for (int i = 0; i < 5; i++)
         total += d[i];
     if (total == 0ULL) {
+#if defined(AIEHLC_PROFILING) && AIEHLC_PROFILING
+        // Built in, yet nothing counted: pmccntr_el0 is not running. The runtime
+        // starts it in its __Runtime_init constructor; zeros here mean that did
+        // not happen (a runtime object older than that fix, or a Linux build,
+        // where the enable is skipped because EL0 cannot write PMCR_EL0).
+        printf("[conv2dstem] PERF runtime phase counters built in (-DAIEHLC_PROFILING=1) but\n"
+               "             all read 0 -- the PMU cycle counter (pmccntr_el0) is not running.\n");
+#else
         printf("[conv2dstem] PERF runtime phase counters not built in -- rebuild with\n"
                "             `source script/aiehlc.sh --profiling ...` for the kload/bdcfg/\n"
                "             coreen/startio/wait_io split of each launch.\n");
+#endif
         return;
     }
 

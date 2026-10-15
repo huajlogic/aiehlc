@@ -74,6 +74,27 @@ static inline unsigned long long __rt_pmccntr(void) {
 static inline unsigned long long __rt_pmccntr(void) { return 0ULL; }
 #endif
 
+// Start the cycle counter the RT_PROF_* phases read. Nothing else does: the
+// standalone BSP boot.S never touches PMCR_EL0, whose E bit resets to 0, so
+// without this pmccntr_el0 stays frozen and every phase delta is 0 -- a
+// --profiling build that reports "not built in". Apps used to call aie_timer.h's
+// __ps_pmccntr_enable() themselves; one that did not (conv2dstem test_conv2d.cc)
+// silently got zeros. Same bits as that helper (E=1, D=0 so it counts every
+// cycle, PMCNTENSET.C) minus the C reset: only deltas are used, and resetting
+// would invalidate a snapshot the app already took. Baremetal only -- under
+// Linux PMCR_EL0 is EL1-owned and an EL0 write traps.
+static inline void __rt_pmccntr_enable(void) {
+#if AIEHLC_PROFILING && defined(__aarch64__) && !defined(__AIESIM__) && !defined(__linux__)
+    unsigned long long v;
+    __asm__ volatile("mrs %0, pmcr_el0" : "=r"(v));
+    v |= (1ULL << 0);
+    v &= ~(1ULL << 3);
+    __asm__ volatile("msr pmcr_el0, %0" : : "r"(v));
+    __asm__ volatile("msr pmcntenset_el0, %0" : : "r"(1ULL << 31));
+    __asm__ volatile("isb");
+#endif
+}
+
 static unsigned long long g_prof_excl_cyc = 0ULL;
 static inline unsigned long long __rt_prof_now(void) { return __rt_pmccntr() - g_prof_excl_cyc; }
 
@@ -2726,6 +2747,7 @@ void __Runtime_platform_init(void) {
 void __Runtime_init(void) {
     AIEHLC_LOG(printf("[aie_runtime] __Runtime_init--\n"););
     __Runtime_platform_init();
+    __rt_pmccntr_enable();
 
     AIEHLC_LOG(printf("[aie_runtime] _init OK\n"));
 }
