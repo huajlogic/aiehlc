@@ -92,6 +92,16 @@ echoes twice. When a resident supervisor is **reused** (it answers with
 `app core free`), nothing is reprogrammed and PL/AIE state carries over from the
 previous run. Pass `--netload-bootstrap` to force a fresh PDI program.
 
+**Build on demand.** `apppaltest.py --netload` checks that `netboot_proxy.py`
+exists and that `build/netboot.elf` exists and is newer than every supervisor and
+lwIP source (`ensure_netboot_built`). Otherwise it runs `build.sh` first, which
+needs the A78 cross compiler on `PATH`. With lwIP cached a rebuild takes ~2 s; a
+first build ~1 min.
+
+**Debug web UI.** The debug server's Run button for the pal board probes the
+supervisor and passes `--netload` when it acks. See `src/tool/debug/README.md`,
+"Run deploys through netboot when a supervisor answers".
+
 Flags: `--netload-bootstrap` forces a supervisor reload (use it after rebuilding
 `netboot.elf`); `--netload-ip IP`; `--netload-timeout-ms N` sets the board-side
 watchdog.

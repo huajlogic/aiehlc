@@ -669,6 +669,32 @@ NETBOOT_READY_TIMEOUT_S = 120
 SSH_MUX = ["-o", "ControlMaster=auto", "-o", "ControlPersist=4h", "-o", f"ControlPath=/tmp/apppal-{username}-%C"]
 
 
+def ensure_netboot_built():
+    """Netload needs two local artifacts: netboot_proxy.py (in the repo) and
+    build/netboot.elf (built by src/tool/netboot/build.sh). Build the ELF when it is
+    missing or older than any of its sources, so a fresh checkout or an edited
+    supervisor never bootstraps a stale image. The mtime check is free when
+    nothing changed."""
+    proxy = os.path.join(NETBOOT_LOCAL_DIR, "netboot_proxy.py")
+    if not os.path.isfile(proxy):
+        raise RuntimeError(f"{proxy} missing (it is part of the repo; check the checkout)")
+    elf = os.path.join(NETBOOT_LOCAL_DIR, "build", "netboot.elf")
+    srcs = [p for pat in ("supervisor/*.c", "supervisor/*.S", "supervisor/*.h", "lwip/*", "netboot_proto.h",
+                          "build.sh") for p in glob.glob(os.path.join(NETBOOT_LOCAL_DIR, pat))]
+    newest = max((os.path.getmtime(p) for p in srcs), default=0)
+    if os.path.isfile(elf) and os.path.getmtime(elf) >= newest:
+        return
+    why = "missing" if not os.path.isfile(elf) else "older than its sources"
+    print(f"[netload] netboot.elf {why}: building it (src/tool/netboot/build.sh)...")
+    r = subprocess.run(["bash", os.path.join(NETBOOT_LOCAL_DIR, "build.sh")], capture_output=True, text=True,
+                       timeout=1800)
+    if r.returncode != 0 or not os.path.isfile(elf):
+        tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-15:])
+        raise RuntimeError(f"building netboot.elf failed (exit {r.returncode}):\n{tail}\n"
+                           "The A78 cross compiler must be on PATH (source Vitis settings64.sh).")
+    print(f"[netload] built {elf}")
+
+
 def stage_if_changed(local_paths):
     """Copy files to NETBOOT_REMOTE_DIR on the lab host, skipping any whose remote
     copy already has the same SHA-256 (one ssh round trip to check)."""
@@ -779,6 +805,7 @@ def netload_start(args, local_elf, collected):
     resets the board and drops a com0 session opened before it, so the console is
     reopened after programming. Returns (conn1, conn2, console_thread, ok)."""
     ip = args.netload_ip
+    ensure_netboot_built()
     load_argv = ["load", local_elf, "--host", ip, "--timeout-ms", str(args.netload_timeout_ms)]
     if not args.netload_bootstrap:
         # The console attaches while the ELF streams; netload holds back the last
@@ -1049,7 +1076,7 @@ def wait_console(collected_output, finished=None):
 
     Returns (program_done, output_detected).
       - Finish early when "device_teardown done" is seen (program completed), or
-        when `finished()` (polled every 5 s; --netload passes "supervisor reports
+        when `finished()` (polled every 0.5 s; --netload passes "supervisor reports
         the app exited") says so -- apps that print neither marker then end on
         their real exit instead of the 300 s no-output timeout
       - Abort early if no output arrives within NO_OUTPUT_TIMEOUT seconds
@@ -1083,7 +1110,9 @@ def wait_console(collected_output, finished=None):
                 program_done = True
         if got_new:
             last_output_time = time.time()
-        if finished and not program_done and time.time() - last_probe >= 5:
+        # 0.5 s: one STATUS over the multiplexed ssh costs ~0.1 s, and for apps that
+        # print no teardown line this probe IS the completion signal.
+        if finished and not program_done and time.time() - last_probe >= 0.5:
             last_probe = time.time()
             program_done = finished()
 

@@ -404,7 +404,7 @@ static int run_perf(const conv2dstem_qparam *qp, uint8_t *ofm, double first_ms) 
 }
 
 int main() {
-    printf("=== ResNet-18 stem conv2d on AIE (TVM layer 01) ===\n");
+    printf("1014=== ResNet-18 stem conv2d on AIE (TVM layer 01) ===\n");
     printf("    Op:     01_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi\n");
     printf("    Input:  int8  [%d, %d, %d]  (zero-point padded, %d-channel)\n", INPUT_H_PAD, INPUT_W_PAD,
            CONV2DSTEM_INPUT_C, CONV2DSTEM_INPUT_C);
