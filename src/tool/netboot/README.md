@@ -11,7 +11,9 @@ console output stays on the board UART (com0) and is collected by
 src/tool/netboot/
   build.sh              builds lwIP 2.2 + Xilinx GEM port for the A78 SDT BSP, then netboot.elf
   netboot_proto.h       wire protocol (64 B request, 48 B reply + text)
-  netload.py            host client: load | rerun | kill | status (stdlib only, runs on PALIP)
+  netload.py            host client: load | rerun | kill | status (stdlib only); direct TCP on PALIP,
+                        or --via user@PALIP from the dev box through netboot_proxy.py
+  netboot_proxy.py      stdio<->TCP relay that lives on PALIP; netload.py streams through it over ssh
   lwip/                 lwipopts.h, xlwipconfig.h, xtopology_g.c (what the Vitis BSP flow would generate)
   supervisor/
     main.c              lwIP init (static IP), poll loop, timers, watchdog, launch/kill
@@ -47,12 +49,16 @@ supervisor image outside `0x7800_0000..0x7A20_0000`.
 python3 script/test/apppaltest.py -y -nonreboot --netload aout/main.elf
 ```
 
-1. stages `netload.py` and `netboot.elf` on `PALIP`, opens com0;
-2. `netload.py status`. If nothing answers, loads the supervisor once over JTAG
-   and waits for `[netboot] ready` on the console;
-3. `netload.py load <elf>`: transfer, SHA-256 check, place, start on core 1;
+1. stages `netboot_proxy.py` on `PALIP`, only if its SHA-256 changed. The
+   **target ELF is never copied**;
+2. `netload.py status --via`: from the dev box, through ssh, into the proxy, to the
+   supervisor. If it answers with core 1 `free` or `parked`, there is no JTAG and no power command;
+   otherwise it stages `netboot.elf` (if changed), loads it over JTAG and waits for `[netboot] ready`;
+3. opens com0, then `netload.py load <local elf> --via`: the ELF **streams from the
+   dev box through the ssh pipe** into the proxy and on to the supervisor (SHA-256
+   check, place, start or release core 1);
 4. collects the console until `device_teardown done` / `Not tearing down partition`,
-   exactly like the JTAG flow;
+   or until the supervisor reports the app exited;
 5. leaves the board up with the supervisor resident.
 
 **Reuse without re-bootstrap (park).** The palmyra PDI does not let the supervisor
@@ -90,11 +96,27 @@ Flags: `--netload-bootstrap` forces a supervisor reload (use it after rebuilding
 `netboot.elf`); `--netload-ip IP`; `--netload-timeout-ms N` sets the board-side
 watchdog.
 
-By hand, on `PALIP`:
+Data path, no scp of the target ELF:
+
+```
+dev box: netload.py --via huaj@PALIP ==ssh stdin/stdout==> PALIP: netboot_proxy.py ==TCP==> board 10.10.70.50:5155
+```
+
+Measured: 15.4 MB ResNet ELF dev box -> board in 1.22 s (ssh setup included); a
+whole `apppaltest --netload` run, reusing the parked core, 9 s.
+
+From the dev box by hand:
 
 ```bash
-python3 ~/aiehlc/netboot/netload.py status
-python3 ~/aiehlc/netboot/netload.py load ~/aiehlc/main.elf --timeout-ms 600000
+python3 src/tool/netboot/netload.py status --via huaj@10.23.224.213 --proxy /home/huaj/aiehlc/netboot/netboot_proxy.py
+python3 src/tool/netboot/netload.py load aout/main.elf --via huaj@10.23.224.213 --proxy /home/huaj/aiehlc/netboot/netboot_proxy.py
+```
+
+Or on `PALIP` itself (direct TCP):
+
+```bash
+python3 netload.py status
+python3 netload.py load main.elf --timeout-ms 600000
 python3 ~/aiehlc/netboot/netload.py rerun     # same image again, no transfer   (needs a free app core)
 python3 ~/aiehlc/netboot/netload.py kill      # stop the app core               (refused by the palmyra PDI)
 ```

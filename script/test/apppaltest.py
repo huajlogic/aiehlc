@@ -666,22 +666,43 @@ NETBOOT_REMOTE_DIR = f"/home/{username}/aiehlc/netboot"
 NETBOOT_READY_TIMEOUT_S = 120
 
 
-def netboot_stage_remote():
-    """Copy netload.py and netboot.elf to the lab host; return the remote ELF path."""
-    local_py = os.path.join(NETBOOT_LOCAL_DIR, "netload.py")
+def stage_if_changed(local_paths):
+    """Copy files to NETBOOT_REMOTE_DIR on the lab host, skipping any whose remote
+    copy already has the same SHA-256 (one ssh round trip to check)."""
+    import hashlib
+    names = [os.path.basename(p) for p in local_paths]
+    probe = (f"mkdir -p {NETBOOT_REMOTE_DIR} && cd {NETBOOT_REMOTE_DIR} && "
+             f"(sha256sum {' '.join(shlex.quote(n) for n in names)} 2>/dev/null; true)")
+    r = subprocess.run(["ssh", host, f"bash -c {shlex.quote(probe)}"], capture_output=True, text=True, timeout=30)
+    remote = {ln.split()[1]: ln.split()[0] for ln in r.stdout.splitlines() if len(ln.split()) == 2}
+    stale = [p for p, n in zip(local_paths, names)
+             if remote.get(n) != hashlib.sha256(open(p, "rb").read()).hexdigest()]
+    if stale:
+        subprocess.run(["scp", "-q", *stale, f"{host}:{NETBOOT_REMOTE_DIR}/"], check=True,
+                       capture_output=True, timeout=120)
+    print(f"[netload] staged on {palip}: {', '.join(os.path.basename(p) for p in stale) or 'nothing (up to date)'}")
+
+
+def netboot_stage_proxy():
+    """The relay netload.py talks through; the target ELF itself is never copied."""
+    stage_if_changed([os.path.join(NETBOOT_LOCAL_DIR, "netboot_proxy.py")])
+
+
+def netboot_stage_supervisor():
+    """netboot.elf for a JTAG bootstrap (xsdb on the lab host `dow`s it from there)."""
     local_elf = os.path.join(NETBOOT_LOCAL_DIR, "build", "netboot.elf")
     if not os.path.isfile(local_elf):
         raise RuntimeError(f"{local_elf} missing: run src/tool/netboot/build.sh first")
-    subprocess.run(["ssh", host, f"mkdir -p {NETBOOT_REMOTE_DIR}"], check=True, capture_output=True, timeout=30)
-    subprocess.run(["scp", "-q", local_py, local_elf, f"{host}:{NETBOOT_REMOTE_DIR}/"], check=True,
-                   capture_output=True, timeout=120)
+    stage_if_changed([local_elf])
     return f"{NETBOOT_REMOTE_DIR}/netboot.elf"
 
 
 def netload_remote(argv, timeout=600):
-    """Run netload.py on the lab host (it shares the board's network segment)."""
-    cmd = "python3 " + shlex.quote(f"{NETBOOT_REMOTE_DIR}/netload.py") + " " + " ".join(shlex.quote(a) for a in argv)
-    r = subprocess.run(["ssh", host, cmd], capture_output=True, text=True, timeout=timeout)
+    """Run netload.py HERE and reach the board through netboot_proxy.py on the lab
+    host over ssh: the ELF streams through the ssh pipe, nothing is scp'd."""
+    cmd = [sys.executable, os.path.join(NETBOOT_LOCAL_DIR, "netload.py"), *argv,
+           "--via", host, "--proxy", f"{NETBOOT_REMOTE_DIR}/netboot_proxy.py"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
@@ -701,7 +722,7 @@ def drain_until(marker, timeout_s, collected):
     return False
 
 
-def netload_start(args, remote_elf_path, collected):
+def netload_start(args, local_elf, collected):
     """Make sure the supervisor is resident, open the console, send the ELF.
 
     Returns (conn1, conn2, console_thread, ok). conn1 is only opened when the
@@ -709,7 +730,7 @@ def netload_start(args, remote_elf_path, collected):
     Order matters: the bootstrap's `device program` resets the board, which
     drops a com0 session opened before it -- so the console comes up after."""
     ip = args.netload_ip
-    remote_netboot = netboot_stage_remote()
+    netboot_stage_proxy()
     conn1 = None
     rc, out = netload_remote(["status", "--host", ip, "--connect-timeout", "3"], timeout=60)
     print(out)
@@ -736,7 +757,7 @@ def netload_start(args, remote_elf_path, collected):
     console_thread.start()
 
     if bootstrap:
-        if not download_elf_and_continue(conn1, remote_netboot):
+        if not download_elf_and_continue(conn1, netboot_stage_supervisor()):
             return conn1, conn2, console_thread, False
         if not drain_until("[netboot] ready", NETBOOT_READY_TIMEOUT_S, collected):
             print(f"\n[ERROR] supervisor did not print '[netboot] ready' within {NETBOOT_READY_TIMEOUT_S}s")
@@ -748,9 +769,9 @@ def netload_start(args, remote_elf_path, collected):
                   "(GEM0 cabling / IP plan, see doc/design/lwip_elf_bootloader.md phase 0)")
             return conn1, conn2, console_thread, False
 
-    print(f"\n>>> netload: sending {remote_elf_path} to {ip}...")
+    print(f"\n>>> netload: streaming {local_elf} to {ip} through the proxy on {palip} (no scp)...")
     t0 = time.time()
-    rc, out = netload_remote(["load", remote_elf_path, "--host", ip, "--timeout-ms", str(args.netload_timeout_ms)])
+    rc, out = netload_remote(["load", local_elf, "--host", ip, "--timeout-ms", str(args.netload_timeout_ms)])
     print(out)
     print(f"[netload] round trip {time.time() - t0:.2f}s (includes ssh to {palip})")
     return conn1, conn2, console_thread, rc == 0
@@ -830,10 +851,13 @@ Examples:
     print("=" * 60)
     
     # Step 1: Copy ELF file to remote server
-    success, remote_elf_path = copy_elf_to_remote(local_elf)
-    if not success:
-        print("Failed to copy ELF file, exiting...")
-        sys.exit(1)
+    # --netload streams the ELF through the proxy: no copy of the target ELF.
+    remote_elf_path = None
+    if not args.netload:
+        success, remote_elf_path = copy_elf_to_remote(local_elf)
+        if not success:
+            print("Failed to copy ELF file, exiting...")
+            sys.exit(1)
     
     conn1 = None
     conn2 = None
@@ -842,7 +866,7 @@ Examples:
     collected_output = []
     try:
         if args.netload:
-            conn1, conn2, console_thread, elf_ok = netload_start(args, remote_elf_path, collected_output)
+            conn1, conn2, console_thread, elf_ok = netload_start(args, local_elf, collected_output)
             if not elf_ok:
                 print("\n" + "=" * 60)
                 print("Test FAILED (netload)")
