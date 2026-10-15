@@ -27,9 +27,14 @@ int apu_start(uint64_t entry);
 int apu_kill(void);
 int apu_available(void);
 int apu_busy(void); /* app core woken and not stopped since */
+int apu_parked(int32_t *rc); /* finished app sits in park.S, reusable without the PLM */
+
+/* park.S: the patched _exit lands here */
+void nb_park(void);
 
 /* elfload.c */
 int elf_place(const uint8_t *img, uint64_t size, uint64_t *entry, char *msg, size_t msglen);
+int elf_patch_exit(const uint8_t *img, uint64_t size, uint64_t park_addr);
 
 /* sha256.c */
 void nb_sha256(const uint8_t *data, uint64_t len, uint8_t out[32]);

@@ -365,10 +365,16 @@ def xsdb_run(child, cmd, timeout=60, what=None):
     ok, err = f"@@OK_{n}@@", f"@@ERR_{n}@@"
     child.sendline(f'if {{[catch {{{cmd}}} e]}} {{puts "@@ERR_[expr {{{n - 1}+1}}]@@ $e"}} '
                    f'else {{puts "@@OK_[expr {{{n - 1}+1}}]@@"}}')
-    index = child.expect([re.escape(ok), re.escape(err) + r"([^\r\n]*)", r"PLM stalled"], timeout=timeout)
+    index = child.expect([re.escape(ok), re.escape(err), r"PLM stalled"], timeout=timeout)
     if index == 0:
         return
-    detail = child.match.group(1).strip() if index == 1 else "PLM stalled"
+    detail = "PLM stalled"
+    if index == 1:  # xsdb's message may span lines: take everything up to the prompt
+        try:
+            child.expect(r"xsdb%", timeout=10)
+            detail = " ".join(child.before.split()) or "(no message)"
+        except pexpect.TIMEOUT:
+            detail = "(no message)"
     raise RuntimeError(f"xsdb `{what or cmd}` failed: {detail}")
 
 
@@ -415,13 +421,12 @@ def setup_first_connection(nonreboot=False):
     else:
         print("[Connection 1] nonreboot mode: skipping 'become' (board already up)")
     
-    # Step 4a: Power off first to ensure clean state
+    # Step 4: Power cycle for a clean state. Required before `device program`:
+    # programming a live system aborts part-way (measured: ~18%).
     child.sendline("power 0")
     child.expect(r'Systest[#>]', timeout=60)
     time.sleep(2)  # Wait for power off to complete
     print("[Connection 1] Power off complete, powering on...")
-    
-    # Step 4b: Power on
     child.sendline("power 1")
     child.expect(r'Systest[#>]', timeout=60)  # Wait for power cycle to complete
     time.sleep(3)  # Extra wait for board to initialize
@@ -708,15 +713,22 @@ def netload_start(args, remote_elf_path, collected):
     conn1 = None
     rc, out = netload_remote(["status", "--host", ip, "--connect-timeout", "3"], timeout=60)
     print(out)
-    # "app core busy": the previous app still owns core 1 and this PDI gives the
-    # supervisor no way to stop it, so the only reset is a fresh bootstrap.
+    # Reuse a supervisor that answers: "free" (never ran) and "parked" (previous app
+    # returned through the patched _exit) both take the ELF directly. Only "busy"
+    # (running or hung, and this PDI gives no way to stop it) needs a bootstrap.
     core_busy = rc != 2 and "app core busy" in out
     bootstrap = rc == 2 or args.netload_bootstrap or core_busy
     if bootstrap:
         why = ("--netload-bootstrap" if args.netload_bootstrap else
                f"supervisor not answering at {ip}" if rc == 2 else "app core still busy from the previous run")
         print(f"\n>>> {why}: loading the netboot supervisor over JTAG (one-time)...")
-        conn1 = setup_first_connection(nonreboot=args.nonreboot)
+        # Bootstrap = the one place netload touches power: `device program` on a live
+        # system (supervisor + app core running) aborts at ~18%, so the PDI reload
+        # needs the power cycle first. Use the non-owning systest-client session
+        # (no `become`), so closing it cannot release/power off the board; the app
+        # finishing never powers anything off (main), and a reusable supervisor
+        # ("free"/"parked") skips this whole path.
+        conn1 = setup_first_connection(nonreboot=True)
 
     print("\n>>> Setting up console connection (com0)...")
     conn2 = setup_second_connection()
@@ -850,7 +862,12 @@ Examples:
             console_thread.start()
             log.debug("main: console_reader thread started")
 
-        program_done, output_detected = wait_console(collected_output)
+        finished = None
+        if args.netload:
+            def finished():  # the supervisor saw the app return through its patched _exit
+                rc, out = netload_remote(["status", "--host", args.netload_ip, "--connect-timeout", "3"], timeout=30)
+                return rc == 0 and "state=exited" in out
+        program_done, output_detected = wait_console(collected_output, finished)
 
         # Stop console reader
         log.debug("\nmain: signaling console_reader thread to stop...")
@@ -953,11 +970,14 @@ def jtag_start(args, remote_elf_path):
     return conn1, conn2, None
 
 
-def wait_console(collected_output):
+def wait_console(collected_output, finished=None):
     """Echo com0 output until the program completes, goes quiet, or MAX_WAIT.
 
     Returns (program_done, output_detected).
-      - Finish early when "device_teardown done" is seen (program completed)
+      - Finish early when "device_teardown done" is seen (program completed), or
+        when `finished()` (polled every 5 s; --netload passes "supervisor reports
+        the app exited") says so -- apps that print neither marker then end on
+        their real exit instead of the 300 s no-output timeout
       - Abort early if no output arrives within NO_OUTPUT_TIMEOUT seconds
       - Hard cap at MAX_WAIT seconds as safety bound
     """
@@ -969,6 +989,7 @@ def wait_console(collected_output):
     output_detected = bool(collected_output)
     program_done = False
     tail = ""  # markers can straddle two console chunks
+    last_probe = time.time()
     start_time = time.time()
     last_output_time = start_time
 
@@ -988,6 +1009,9 @@ def wait_console(collected_output):
                 program_done = True
         if got_new:
             last_output_time = time.time()
+        if finished and not program_done and time.time() - last_probe >= 5:
+            last_probe = time.time()
+            program_done = finished()
 
         if program_done:
             log.debug("main: program_done detected, draining trailing output...")

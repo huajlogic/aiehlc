@@ -45,6 +45,33 @@ int apu_init(void) {
 
 int apu_available(void) { return s_ready; }
 
+/* Shared with park.S (offsets 0/4/8/16 are hard-coded there). */
+struct nb_mbox {
+    volatile uint32_t state; /* 1 = parked */
+    volatile int32_t rc;
+    volatile uint32_t seq; /* written only by the supervisor */
+    uint32_t pad;
+    volatile uint64_t entry;
+} __attribute__((aligned(64)));
+struct nb_mbox nb_mbox;
+
+int apu_parked(int32_t *rc) {
+    if (!s_powered || nb_mbox.state != 1U)
+        return 0;
+    if (rc)
+        *rc = nb_mbox.rc;
+    return 1;
+}
+
+/* Send a parked app core to `entry`. No PLM involved: the core is already ours. */
+static void apu_release(uint64_t entry) {
+    nb_mbox.state = 0;
+    nb_mbox.entry = entry;
+    __asm__ volatile("dmb ish" ::: "memory");
+    nb_mbox.seq = nb_mbox.seq + 1U;
+    __asm__ volatile("dsb sy\n\tsev" ::: "memory");
+}
+
 int apu_busy(void) { return s_powered; }
 
 /* Stop the app core whatever it is doing. Each PLM path is tried in turn and
@@ -80,6 +107,11 @@ int apu_kill(void) {
 int apu_start(uint64_t entry) {
     if (!s_ready)
         return -1;
+    if (apu_parked(NULL)) {
+        apu_release(entry);
+        xil_printf("[netboot] app core was parked: released to 0x%llx (no PLM call)\r\n", (unsigned long long)entry);
+        return 0;
+    }
     if (s_powered && apu_kill() != 0)
         return -2;
     XStatus st = XPm_RequestWakeUp(NETBOOT_APP_CORE, 1, entry, REQUEST_ACK_BLOCKING);

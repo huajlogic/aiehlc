@@ -87,12 +87,12 @@ PYEOF
 grep -q '> noc_ddr4_C0_DDR_LOW0' "${LDS}" && die "linker script still places sections in the app's DDR"
 grep -q 'netboot_bd_ram' "${LDS}" || die "could not add the BD-ring region to ${LDS}"
 
-APP_SRCS=("${HERE}"/supervisor/*.c)
+APP_SRCS=("${HERE}"/supervisor/*.c "${HERE}"/supervisor/*.S)
 DEFS=(-DNETBOOT_IP="$(ipdef "${NETBOOT_IP}")" -DNETBOOT_MASK="$(ipdef "${NETBOOT_MASK}")"
     -DNETBOOT_GW="$(ipdef "${NETBOOT_GW}")")
 OBJS=()
 for s in "${APP_SRCS[@]}"; do
-    o="${OUT}/obj/$(basename "${s%.c}").o"
+    b="$(basename "$s")"; o="${OUT}/obj/${b%.*}.o"
     # -fno-delete-null-pointer-checks: the app's first PT_LOAD is at address 0.
     "${CC}" "${CFLAGS[@]}" -Wall -Wextra -Wno-unused-parameter -fno-delete-null-pointer-checks \
         "${DEFS[@]}" -c "$s" -o "$o" || die "compile failed: $s"

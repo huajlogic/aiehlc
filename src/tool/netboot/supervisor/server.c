@@ -177,9 +177,19 @@ void server_poll(void) {
     case NETBOOT_CMD_KILL:
         reply(nb_kill("KILL command"), 0, 0, "app core powered down");
         break;
-    case NETBOOT_CMD_STATUS:
+    case NETBOOT_CMD_STATUS: {
+        int32_t xrc = 0;
+        int parked = apu_parked(&xrc);
         snprintf(msg, sizeof(msg), "pm %s, staged %llu B, app core %s", apu_available() ? "ok" : "UNAVAILABLE",
-                 (unsigned long long)g_nb.staged_size, apu_busy() ? "busy" : "free");
+                 (unsigned long long)g_nb.staged_size,
+                 parked       ? "parked"
+                 : apu_busy() ? "busy"
+                              : "free");
+        if (parked) {
+            size_t n = strlen(msg);
+            snprintf(msg + n, sizeof(msg) - n, " (exit rc %d)", (int)xrc);
+        }
+    }
         reply(0, 0, 0, msg);
         break;
     default:

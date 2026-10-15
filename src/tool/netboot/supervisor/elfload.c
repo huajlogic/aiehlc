@@ -104,3 +104,41 @@ int elf_place(const uint8_t *img, uint64_t size, uint64_t *entry, char *msg, siz
              (unsigned long long)zeroed, (unsigned long long)eh->e_entry);
     return 0;
 }
+
+/* Redirect the placed app's _exit to the supervisor's park routine so a finished
+ * app core can be reused without the PLM (park.S). Patched only when _exit is the
+ * BSP's `b .` followed by 12 bytes of padding, room for
+ *   ldr x16, #8 ; br x16 ; .quad park_addr
+ * Returns 1 if patched, 0 if the image does not match (core then stays busy). */
+int elf_patch_exit(const uint8_t *img, uint64_t size, uint64_t park_addr) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+    if (eh->e_shoff == 0 || eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > size)
+        return 0;
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(img + eh->e_shoff);
+    for (unsigned i = 0; i < eh->e_shnum; i++) {
+        if (sh[i].sh_type != SHT_SYMTAB || sh[i].sh_link >= eh->e_shnum)
+            continue;
+        const Elf64_Shdr *st = &sh[sh[i].sh_link];
+        if (sh[i].sh_offset + sh[i].sh_size > size || st->sh_offset + st->sh_size > size)
+            return 0;
+        const Elf64_Sym *sym = (const Elf64_Sym *)(img + sh[i].sh_offset);
+        for (uint64_t k = 0; k < sh[i].sh_size / sizeof(Elf64_Sym); k++) {
+            if (sym[k].st_name >= st->sh_size ||
+                strcmp((const char *)img + st->sh_offset + sym[k].st_name, "_exit") != 0)
+                continue;
+            uint64_t a = sym[k].st_value;
+            if (a + 16 > NB_APP_LIMIT || (a & 3))
+                return 0;
+            volatile uint32_t *w = (volatile uint32_t *)(uintptr_t)a;
+            if (w[0] != 0x14000000U || w[1] || w[2] || w[3])
+                return 0;       /* not the expected `b .` + padding: leave it alone */
+            w[0] = 0x58000050U; /* ldr x16, #8 */
+            w[1] = 0xD61F0200U; /* br  x16     */
+            w[2] = (uint32_t)park_addr;
+            w[3] = (uint32_t)(park_addr >> 32);
+            Xil_DCacheFlushRange((INTPTR)a, 16);
+            return 1;
+        }
+    }
+    return 0;
+}

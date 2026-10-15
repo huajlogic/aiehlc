@@ -25,7 +25,7 @@ REQ_MAGIC = 0x3154424E  # 'NBT1'
 REP_MAGIC = 0x3152424E  # 'NBR1'
 VERSION = 1
 CMDS = {"load": 1, "rerun": 2, "kill": 3, "status": 4}
-STATES = {0: "idle", 1: "running", 2: "killed", 3: "watchdog-timeout"}
+STATES = {0: "idle", 1: "running", 2: "killed", 3: "watchdog-timeout", 4: "exited"}
 REQ_FMT = "<IIIIQII32s"            # struct netboot_req, 64 B
 REP_FMT = "<IiQIIQIIII"            # struct netboot_rep, 48 B
 assert struct.calcsize(REQ_FMT) == 64 and struct.calcsize(REP_FMT) == 48

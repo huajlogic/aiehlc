@@ -22,6 +22,7 @@ enum netboot_state {
     NETBOOT_ST_RUNNING = 1,
     NETBOOT_ST_KILLED = 2,  /* by KILL or replaced by a new LOAD_RUN */
     NETBOOT_ST_TIMEOUT = 3, /* watchdog fired */
+    NETBOOT_ST_EXITED = 4,  /* app returned from main; core parked and reusable */
 };
 
 struct netboot_req { /* 64 bytes */

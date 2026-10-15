@@ -44,11 +44,13 @@ int nb_launch(uint32_t timeout_ms, uint32_t *place_ms, char *msg, size_t msglen)
         snprintf(msg, msglen, "PLM/IPI unavailable: cannot drive the app core");
         return -10;
     }
-    nb_kill("replaced by a new run");
-    if (apu_busy()) {
+    if (!apu_parked(NULL))
+        nb_kill("replaced by a new run");
+    if (apu_busy() && !apu_parked(NULL)) {
         snprintf(msg, msglen,
                  "app core still running and this PDI does not let the supervisor stop it "
-                 "(ForcePowerDown refused, core reset NO_ACCESS): re-bootstrap the supervisor");
+                 "(ForcePowerDown refused, core reset NO_ACCESS) and it is not parked "
+                 "(still running or hung): re-bootstrap the supervisor");
         return -5;
     }
     uint64_t t0 = nb_now_ms();
@@ -57,7 +59,11 @@ int nb_launch(uint32_t timeout_ms, uint32_t *place_ms, char *msg, size_t msglen)
         g_nb.staged_size = 0;
         return -3;
     }
+    int patched =
+        elf_patch_exit((const uint8_t *)(uintptr_t)NB_STAGING_BASE, g_nb.staged_size, (uint64_t)(uintptr_t)nb_park);
     *place_ms = (uint32_t)(nb_now_ms() - t0);
+    size_t n0 = strlen(msg);
+    snprintf(msg + n0, msglen - n0, patched ? ", _exit -> park" : ", _exit NOT patched (core stays busy after exit)");
     g_nb.entry = entry;
     g_nb.runs++;
     g_nb.timeout_ms = timeout_ms ? timeout_ms : NB_DEFAULT_TIMEOUT_MS;
@@ -157,6 +163,11 @@ static void timers(uint64_t now) {
  * a run, and `now - run_start_ms` on that stale value underflowed and fired the
  * watchdog a few ms into every run. */
 static void watchdog(void) {
+    int32_t rc;
+    if (g_nb.state == NETBOOT_ST_RUNNING && apu_parked(&rc)) {
+        g_nb.state = NETBOOT_ST_EXITED; /* app returned from main and parked */
+        return;
+    }
     uint64_t now = nb_now_ms();
     if (g_nb.state != NETBOOT_ST_RUNNING || now < g_nb.run_start_ms || now - g_nb.run_start_ms <= g_nb.timeout_ms)
         return;

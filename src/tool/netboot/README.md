@@ -55,12 +55,28 @@ python3 script/test/apppaltest.py -y -nonreboot --netload aout/main.elf
    exactly like the JTAG flow;
 5. leaves the board up with the supervisor resident.
 
-**On the palmyra BOOT.BIN every run re-bootstraps.** The PDI does not let the
-supervisor stop core 1 once an app has run on it (design section 12, item 4), so
-`status` reports `app core busy` and `apppaltest` reloads the 200 KB supervisor
-over JTAG first. That reset frees core 1. It costs ~40 s per run, against ~150 s
-to `dow` the 15 MB ResNet ELF. With a PDI that grants core-1 reset permission,
-the `apu.c` kill chain takes over and runs skip JTAG entirely.
+**Reuse without re-bootstrap (park).** The palmyra PDI does not let the supervisor
+power down or reset core 1 (design section 12, item 4). To reuse it anyway, the
+supervisor patches each app's `_exit` (the BSP's `b .`, padded to 16 bytes) into
+`ldr x16,#8; br x16; .quad nb_park`. When the app returns from `main`, core 1
+lands in `supervisor/park.S`: it records the exit code, parks in WFE, and on
+release turns MMU/caches off and jumps to the next entry. `status` reports
+`app core parked (exit rc N)`, and `apppaltest --netload` then sends the next
+ELF directly, with no JTAG and no power commands. It still re-bootstraps when
+nothing answers, when core 1 is `busy` (app running or hung, or `_exit` not
+patchable), or with `--netload-bootstrap`.
+Verified on palmyra: after one bootstrap, a ResNet run and a conv2dstem run were
+each sent directly (`released to 0x0 (no PLM call)`). They took **11 s** and
+**15 s** wall, against ~50 s with a bootstrap. `--netload` also ends the console
+wait when the supervisor reports `state=exited`, so apps that print no
+`device_teardown done` finish on their real exit instead of the 300 s timeout.
+The reported exit rc is whatever `x0` held at `_exit`; treat it as informational.
+
+**Power.** Netload never powers the board off when an app finishes. The only power
+commands are the `power 0`/`power 1` before a bootstrap's `device program`,
+because programming a live system aborts part-way (measured: ~18%). The bootstrap
+uses the non-owning `systest-client` session (no `become`), so closing it cannot
+release the board either.
 
 **When `device program` happens.** A bootstrap is the full JTAG sequence:
 `device program BOOT.BIN` (waited on until it reports success, then a 5 s PLM
