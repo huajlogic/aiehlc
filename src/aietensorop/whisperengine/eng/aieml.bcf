@@ -1,0 +1,11 @@
+_entry_point _main_init
+_symbol _main _after  _main_init
+_symbol _main_init 0
+_symbol we_arena 0x70c00
+_symbol we_gelu_ab 0x7c000
+_symbol we_gelu_cd 0x7e000
+_stack DM_stack 0x70000 0xc00
+_reserved DMb 0x0 0x40000
+_reserved DMb 0x40000 0x10000
+_reserved DMb 0x50000 0x20000
+_reserved DMb 0x80000 0x80000
