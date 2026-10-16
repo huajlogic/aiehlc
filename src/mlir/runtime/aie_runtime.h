@@ -962,6 +962,26 @@ void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size);
 // Invalidate cache lines for the buffer from DDR (after DMA wrote it).
 void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, size_t size);
 
+// Deferred variant used by the emitted __aie_launch for kernel arguments: queues
+// the range; the runtime performs it inside its poll loops and completes every
+// CPU-written range before any data-plane DMA starts (see aie_runtime.c).
+void __Runtime_sync_for_dev_deferred(XAie_DevInst *dev, void *ptr, size_t size);
+// Complete all deferred maintenance (emitted after host_canonicalized).
+void __Runtime_dsync_drain(void);
+// Contract: the array writes [ptr, ptr+size) and the CPU does not write it
+// between launches (it only reads it after a launch returns). Flushes it once;
+// afterwards its deferred maintenance is invalidate-only and may overlap the
+// launch's own DMA.
+void __Runtime_buffer_device_written(void *ptr, size_t size);
+// Drop a __Runtime_buffer_device_written registration (call before freeing it).
+void __Runtime_buffer_forget(void *ptr);
+// Allocate a CPU-written DMA buffer (<= 2 MB) mapped Normal Non-cacheable: the
+// CPU's stores reach DDR directly and launches skip its cache maintenance. Falls
+// back to a normal cached __Runtime_Alloc where that is not possible (Linux,
+// simulator, above 4 GB). Free with __Runtime_free_uncached.
+void *__Runtime_alloc_uncached(size_t bytes);
+void __Runtime_free_uncached(void *ptr);
+
 // Data movement wrappers (wraps XAie routing APIs)
 void __Runtime_move_data_to_tile(XAie_RoutingInstance *routing, XAie_LocType shim_tile, XAie_LocType dest_tile,
                                  XAie_MemInst *mem, uint32_t size, uint32_t tile_offset);

@@ -2382,6 +2382,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     filter:brightness(1.12);
   }
   #stopbtn { background:#2a1516; color:#f8b0b0; border-color:#5c2828; }
+  .force-reset { display:inline-flex; align-items:center; gap:3px; font-size:11px; color:#c9a0a0;
+                 cursor:pointer; user-select:none; }
+  .force-reset input { margin:0; cursor:pointer; }
   #stopbtn:hover { background:#3a1e1e; border-color:#7a3535; }
 
   /* ── unified input ───────────────────────────────────────────── */
@@ -3443,6 +3446,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button id="attachbtn" disabled
           title="Attach to a run you started outside this UI (CLI / already-programmed board)">Attach existing run</button>
         <button id="stopbtn" disabled title="Terminate the run owned by this UI">Stop run</button>
+        <label id="forceresetlbl" class="force-reset"
+          title="Unchecked (default): Stop only ends the run here; the board and its netboot supervisor are left as they are, so the next Run is fast. Checked: the next Run starts from a clean board (power cycle, BOOT.BIN, supervisor reload). Use it when the app hangs."><input type="checkbox" id="forcereset"> force reset</label>
       </div>
       <span id="connstatus" data-state="idle">Not connected</span>
     </div>
@@ -4115,8 +4120,15 @@ function wireFolds(box, onChange){
 }
 
 const g = DATA.grid;
+// Occupied column span. A control-plane partition ({2,6} for a 4-col mesh)
+// reserves partition-relative col 0 as the control spine, so the data plane
+// starts at col 1; drawing from 0 would leave a blank 1fr column on the left.
+const gColMin = (g.col_list && g.col_list.length) ? Math.min(...g.col_list) : 0;
+const gNCols = Math.max(0, g.cols - gColMin);
 document.getElementById('meta').textContent =
-  'AIE Debug  ' + g.cols + '\u00d7' + g.rows + ' grid';
+  'AIE Debug  ' + gNCols + '\u00d7' + g.rows + ' grid' +
+  (gColMin ? '  (cols ' + gColMin + '..' + (g.cols - 1) +
+             '; lower cols have no data tiles, e.g. control spine)' : '');
 
 // build a loc->tile map
 const byLoc = {};
@@ -4170,10 +4182,10 @@ function highlightFlow(fi, loc, badgeEl){
 
 // grid: columns left->right, rows top (highest) -> bottom (0)
 const grid = document.getElementById('grid');
-grid.style.gridTemplateColumns = 'repeat(' + g.cols + ', 1fr)';
+grid.style.gridTemplateColumns = 'repeat(' + gNCols + ', 1fr)';
 const rowsDesc = g.row_list.slice().sort((a,b)=>b-a);
 rowsDesc.forEach(r => {
-  for (let c=0; c<g.cols; c++){
+  for (let c=gColMin; c<g.cols; c++){
     const t = byLoc[c+','+r];
     const cell = document.createElement('div');
     if (!t){ cell.style.visibility='hidden'; cell.className='tile'; grid.appendChild(cell); continue; }
@@ -10690,8 +10702,13 @@ document.getElementById('stopbtn').onclick = () => {
       .catch(() => { setStatus('daemon offline: cannot stop simulator.'); });
     return;
   }
-  api('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+  const frBox = document.getElementById('forcereset');
+  const forceReset = !!(frBox && frBox.checked);
+  api('/stop', {method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({force_reset: forceReset})})
     .then(r => {
+      // One-shot: the reset is armed for the next run, so the box clears.
+      if (frBox && forceReset) frBox.checked = false;
       // Re-enable debug features immediately — don't wait for the next pollLog
       // tick, which may never fire if the run was in a bad state.
       if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
@@ -10709,14 +10726,16 @@ document.getElementById('stopbtn').onclick = () => {
       triggerTimeline(true);   // gated by tsSeen; forced fresh render on Stop.
       if (r.run) applyRunState(r.run);
       updateRunButtons();
-      if (r.error){ setStatus('stop: ' + r.error); }
+      if (r.note){ setStatus('stop: ' + r.note); }
+      else if (r.error){ setStatus('stop: ' + r.error); }
       else if (r.abandoned){
         // #livestatus is hidden in Device Map view, so use the banner too.
         const msg = 'run ' + r.run_id + ' (pid ' + r.pid + ') survived SIGKILL; '
                   + 'the daemon released it but it may still hold the board';
         setStatus(msg); setRunStatus(msg);
       } else {
-        setStatus('run: stopped (pid ' + r.pid + ')');
+        setStatus('run: stopped (pid ' + r.pid + ')'
+                  + (r.force_reset_next ? '; next Run resets the board' : '; board left as is (soft stop)'));
       }
     })
     .catch(() => { setStatus('daemon offline: cannot stop a run.'); setDebugEnabled(true); });
