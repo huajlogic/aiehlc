@@ -162,11 +162,14 @@ LogicalResult emitCoreTileParams(FlowLoweringCtx &c, CoreTileCtx &t, const CoreT
             // When tile_m < tileRows, each k-round only needs
             // tile_m rows (not partRows). Divide by mRounds
             // so pingPongBufferSize = tile_m * effectiveK.
-            int64_t tileM = d.passState->tileM;
-            int64_t tileRows = d.passState->tileRows;
-            if (tileM > 0 && tileM < tileRows) {
-                int64_t mRounds = tileRows / tileM;
-                t.perCorePerKRound = t.perCorePerKRound / mRounds;
+            // Port 1 (B) walks N sub-tiles; A walks M sub-tiles (see the matching
+            // fix in BlueprintToScheduleKernelPass -- the two must agree).
+            bool isB = c.funcArgIdx == 1;
+            int64_t tileS = isB ? d.passState->tileN : d.passState->tileM;
+            int64_t tileExt = isB ? d.passState->tileCols : d.passState->tileRows;
+            if (tileS > 0 && tileS < tileExt) {
+                int64_t subRounds = tileExt / tileS;
+                t.perCorePerKRound = t.perCorePerKRound / subRounds;
             }
         }
     } else {

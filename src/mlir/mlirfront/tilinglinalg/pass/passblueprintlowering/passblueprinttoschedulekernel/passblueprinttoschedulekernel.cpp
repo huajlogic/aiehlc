@@ -990,11 +990,16 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                         // When tile_m < tileRows, each k-round only needs
                         // tile_m rows (not partRows). Divide by mRounds
                         // so pingPongBufSize = tile_m * effectiveK.
-                        int64_t tileM = tiling.tileM;
-                        int64_t tileRows = tiling.tileRows;
-                        if (tileM > 0 && tileM < tileRows) {
-                            int64_t mRounds = tileRows / tileM;
-                            perCoreSizeForBuf = perCoreSizeForBuf / mRounds;
+                        // B (port 1) walks N sub-tiles, A walks M sub-tiles. Dividing B by
+                        // the M rounds -- what this did for every input -- is only right
+                        // when M and N split alike (square GEMMs); a 1536x384 dense sized
+                        // the B window at 4*k_chunk while the kernel walks 16*k_chunk.
+                        bool isB = paramInfo.funcArgIndex == 1;
+                        int64_t tileS = isB ? tiling.tileN : tiling.tileM;
+                        int64_t tileExt = isB ? tiling.tileCols : tiling.tileRows;
+                        if (tileS > 0 && tileS < tileExt) {
+                            int64_t subRounds = tileExt / tileS;
+                            perCoreSizeForBuf = perCoreSizeForBuf / subRounds;
                         }
                     }
                 }

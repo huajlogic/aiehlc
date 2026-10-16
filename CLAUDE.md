@@ -548,6 +548,38 @@ accumulator must be **int32**; per-channel quant params hide in the filter
 window's **pad channel**; kernel-visible helpers must be **macros**; and the link
 needs the BSP's `libxil.a` de-duplicated against `libxaienginea78.a`.
 
+### Whisper → TVM → aiehlc: every layer on the AIE (`src/frontend/tvmrelay/example/whisper/`)
+
+`PYTHONPATH=src python src/frontend/tvmrelay/example/whisper/whisper_flow.py` takes
+OpenAI Whisper-tiny (official `tiny.pt`, fp32) through ONNX → Relay and offloads
+**all** of it: an **AIE-first partition** (`aie_partition.py`) cuts the graph into
+147 `Compiler="aie_whisper"` layers (encoder 56, decoder step 91) and fails if any
+Relay op is left for the CPU; layout ops (reshape/transpose, head split/merge) are
+absorbed into neighbours as strided `PortView`s. The layers map onto **24 aiehlc
+libraries** generated from two templates: GEMMs on `GemmSpace` (bias as an extra K
+column, GELU epilogue, one launch per attention head) and row ops on the new
+**`aie::RowSpace`** (layer norm, softmax, masked softmax, add). Compile level only:
+every library builds and is checked (resolved `aie::get_*` == plan, core window ==
+kernel window); an x86 run of the *resolved* kernels through emulated windows
+reproduces the PyTorch JFK transcript token for token; `board/whisper_aie.elf`
+links (not run). Gaps/proposals/lessons: `GAP_ANALYSIS.md`; skill
+**whisperaieoffload**.
+
+**`aie::RowSpace {policy, rows, cols}`** (new spatial type, `aiehlc.cc`
+`deriveRowSpaceTiling`): every port names its own `[rows, cols]` — GemmSpace infers
+shapes from the launch's `(M,N,K)` by role and cannot describe a non-GEMM operand.
+Row-layout ports are split one tile per array column on a **1×N mesh**, a Col-layout
+input is broadcast; windows follow the pipeline's own `fullconnect_auto=0` stream
+rule and the build fails on a short or row-splitting window. Skill **rowspacenongemm**.
+
+Three aiehlc bugs this exposed, all invisible on the square 4×4 meshes / square GEMMs
+every example uses (skill **nonsquaremeshgemmwindow**): `RoutingToDmapPass` /
+`routinglower.cpp` took the tiles of a mesh *row* from the *row* count; K-rounded
+GEMMs sized the B core window with A's M sub-tile count (fixed for port 1 in
+`BlueprintToScheduleKernelPass` + `flowtransfer_kernel.cpp`); and the frontend
+compared `l1_budget` *bytes* with *element* counts. Generated code for
+`simplematmul2`/`conv2dstem` is byte-identical before/after (kernel/routing/bcf).
+
 ### Pass Pipeline
 
 **Shared stages** (produces dfscheblueprint IR, then module is cloned):
@@ -706,6 +738,10 @@ Read the matching skill when the task fits:
 | `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aiebackend` (two LLVMs) | aiebackendtvmllvm |
 | `run_test.sh` check 3: no `aie/` under the offloaded layer; `--aiegraph` lifts 0 convs under int8 (`non-4D shapes`); may `--aie-offload` change `layers/` vs golden | aieoffloadaiegraph |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |
+| Non-GEMM kernel (layer norm, softmax, add): GemmSpace port gets a GEMM-role shape (`win_b [WxW]`), `aie::RowSpace` | rowspacenongemm |
+| Compiles rc=0 but core window != kernel window on a non-square mesh / non-square GEMM (`BUF_SZ_IN_1` vs `buf_sz_b`) | nonsquaremeshgemmwindow |
+| Whisper → TVM → aiehlc all-layer offload: op left on CPU, library check fails, emulated transcript differs, ELF link fails | whisperaieoffload |
+| Iterate on an app in seconds (`aiehlc.sh --fast`); a `--fast` build that unexpectedly rebuilds; why xchesscc/xchessmk is slow | aiehlcfastbuild |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
 | Kernel codegen | kernelcodegen |
@@ -739,6 +775,8 @@ to reload the MCP server.
 
 - **[script/verify_env.sh](script/verify_env.sh)** — validate Vitis, LLVM, toolchain, board vars before build
 - **[script/hostcompile.sh](script/hostcompile.sh)** — kernel build via `compile_one_kernel()` → `kc.sh`; do not restore deleted `compile_kernel.sh` (skill: hostcompile-entrypoint). Picks `HOST_ENTRY_KIND` from the generated `host.cc`: `int main()` / `void main()` link an ELF, **no main() archives `lib<app>.a`** instead (skill: hostlibrarymode). The `return;`→`return 0;` fixup is main-only — it rewrites the *first* `return;` in the file and corrupts `host_canonicalized` if applied without a main.
+- **`source script/aiehlc.sh ... --fast`** — incremental build for iteration: skips the aie-rt/libxil rebuild when its fingerprint stamp matches, reuses aiehlc's generated code when nothing it reads changed (else runs it with `AIEHLC_NO_IR_DUMP=1`, log in `aout/aiehlc.log`), restores the chess kernel build from `.aiehlc/kernelcache/` (chess itself is ~65 s for conv2dstem and not tunable: xchesscc has a 3.2 s floor, xchessmk is one TU), compiles host objects through ccache, skips debug views. conv2dstem `test_conv2d.cc`: 100 s → **1.6 s** warm, ELF byte-identical. Without `--fast` nothing changes. Skill **aiehlcfastbuild**.
+- **`AIEHLC_SKIP_AIELIB=1 source script/aiehlc.sh ...`** reuses the built aie-rt driver library instead of wiping `thirdparty/alib/lib/*.a` — required to run several aiehlc builds in parallel (the Whisper flow builds it once, then 8 apps at a time).
 - **[script/aiehlc.sh](script/aiehlc.sh)** — `--platform sim` is build-only; launch sim separately via `runsim.sh` or debug UI **Run** (skills: sim-build-run-separation, raw-xaie-sim-debug-bundle)
 - **`include/bspcompat/`** — shims for standalone-BSP headers present only on the armclang branch (`thirdparty/alib/include/` is a flattened copy of *one* BSP, picked by `--aie-version`, wiped every run, gitignored). `aiehlc.sh` appends `-I${AIEHLC_DIR}/include/bspcompat` **last** in `AIEHLC_ARGS` so the real Gen5 header still wins — add it to the **front-end only**, never to the host/kernel compiles. Details and the related `AIE_GEN > 2` XTime gate: skill **bspheadergen2**.
 - **[script/kc.sh](script/kc.sh)** — after linking the kernel ELF, `strip_kernel_debug_loc` drops `.debug_loc` + the `.debug_info` group via `llvm-objcopy` (13.7 MB → 82 KB on matmul; this is JTAG download time, since the kernel ELF is embedded into the host ELF and `dow -force`d). `.debug_line` is kept, so `kernel.linemap.json` / aiediag pc are unaffected; the full-DWARF original is parked at `<out>/kernel_debug`. `--keep-debug-loc` opts out. Must be `llvm-objcopy` — GNU binutils rejects the chess `e_machine 0x108`.

@@ -1008,7 +1008,11 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         llvm::outs() << "replicate_on=" << replicate_on << " single_tile_owner=" << single_tile_owner << "\n";
 
         std::vector<Point> tileList;
-        int tileNum = (split_axis == "row") ? row : col;
+        // A mesh ROW holds `col` tiles and a mesh COLUMN holds `row` tiles. This
+        // used to read `row ? row : col` -- invisible on the square 4x4 meshes every
+        // example uses, wrong on any other: a 4x1 mesh got 4 tiles per mesh row
+        // (16 in all) and its gather divided each row block by 4.
+        int tileNum = (split_axis == "row") ? col : row;
         int core_start_row = (int) router_.getRM()->getrsc()->absTileRow(TileType::Core, 0);
         for(int i = 0; i < tileNum; i++) {
             if (split_axis == "row") {

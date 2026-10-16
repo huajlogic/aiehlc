@@ -105,6 +105,8 @@ struct ParsedTensorInfo {
                                      // channel coverage for the filter K). Used by the
                                      // structured-dim coalescing path.
     bool perPort2D = false;          // true when d1/d2 were set on this port
+    bool rowSpace = false;           // port declared with aie::RowSpace: tdD1 = rows,
+                                     // tdD2 = cols, shape = [rows, cols]; no GEMM role
     int layoutTransform = 0;         // 0=None, 1=DmaShuffle, 2=CoreShuffle
     int tileMode = 0;                // 0=Partition, 1=Overlap
     bool requireFullCoverage = true; // validation: tiles must cover the dim
@@ -303,6 +305,137 @@ static void populateGemmTiling(SplitModel &splitModel, const std::vector<TensorP
             continue; // unknown role: leave flat
         }
         split.gemmTiling = std::move(dims);
+    }
+}
+
+// Bytes per element of a parsed port (>= 1).
+static int64_t elemBytesOf(const ParsedTensorInfo &pt) {
+    return pt.elementBitWidth / 8 > 0 ? pt.elementBitWidth / 8 : 1;
+}
+
+// True when every port of the launch was declared with aie::RowSpace. Mixing a
+// RowSpace port with GEMM-role ports has no meaning (the GEMM derivation would
+// assign the RowSpace port a role it does not have), so a mix is reported and
+// treated as not-RowSpace -- the GEMM path then fails loudly on its own terms.
+static bool isRowSpaceKernel(const std::vector<ParsedTensorInfo> &pts) {
+    size_t n = 0;
+    for (const auto &pt : pts)
+        n += pt.rowSpace ? 1 : 0;
+    if (n != 0 && n != pts.size())
+        llvm::errs() << "[TilingLinalg] ERROR: RowSpace ports mixed with GEMM-role ports (" << n << " of " << pts.size()
+                     << "); a RowSpace kernel must declare every port as RowSpace\n";
+    return n != 0 && n == pts.size();
+}
+
+// Derive the window protocol of a RowSpace (row-parallel map) kernel.
+//
+// Physical mapping: rows are distributed over the tiles of a 1 x N mesh, one
+// tile per array COLUMN. A mesh ROW split cannot do it: the router expands a
+// mesh row to every physical column of the partition (a 4x1 mesh on a 4-wide
+// partition still owns 16 tiles and the output gather divides each row block
+// by 4), and a 1-column partition has one shim -- 2 MM2S + 2 S2MM channels,
+// which a 4-tile row split exhausts ("No free shim DMA slot"). Across columns
+// every tile gets its own shim. So a Row-layout port becomes a COLUMN split
+// (hwAxisOwner=col) and a broadcast operand a ROW split of the single mesh
+// row (replicated across the columns) -- see flipRowSpaceDistribution.
+//
+// The pipeline streams every flow of a fullconnect_auto=0 kernel the same way
+// (flowtransfer_kernel.cpp, emitCoreTileParams): a core's share of the tensor
+// is cut into windows of min(perCore, maxPingPongBytes / elemBytes) elements,
+// numIterations = perCore / window. So the kernel-side numbers are not a second
+// design -- they are that rule, evaluated per port, with:
+//   Row-layout port (input or output): split evenly over the mesh ROWS,
+//                                      perCore = (rows / meshRows) * cols
+//   Col-layout input (broadcast):      every tile receives it whole,
+//                                      perCore = rows * cols
+// and maxPingPongBytes = the minimum l1_budget over the ports (the same value
+// MeshKernelDesc::maxPPBytes carries to runPipeline). Anything the stream rule
+// would deliver as a short last window, or a window that splits a row, is an
+// error here: the kernel walks whole rows, and a silent remainder is exactly the
+// acquire-count mismatch that deadlocks on hardware.
+static bool deriveRowSpaceTiling(const std::vector<ParsedTensorInfo> &pts, int meshRows, int meshCols,
+                                 DerivedTilingParams &dp) {
+    auto fail = [](const std::string &msg) {
+        llvm::errs() << "[TilingLinalg] ERROR: RowSpace: " << msg << "\n";
+        return false;
+    };
+    if (meshRows != 1 || meshCols <= 0)
+        return fail("needs a 1 x N mesh (HW_ROWS=1), got " + std::to_string(meshRows) + "x" + std::to_string(meshCols) +
+                    " -- rows are distributed one tile per array column");
+    const int tiles = meshCols;
+    int64_t maxPP = 0;
+    int64_t rows = -1;
+    for (const auto &pt : pts) {
+        if (pt.maxBufferBytes > 0 && (maxPP == 0 || pt.maxBufferBytes < maxPP))
+            maxPP = pt.maxBufferBytes;
+        if (pt.shape.size() != 2 || pt.shape[0] <= 0 || pt.shape[1] <= 0)
+            return fail(pt.varName + " needs rows.fullsize and cols.fullsize");
+        bool isRow = pt.distribution == 0 || !pt.isInput;
+        if (!isRow)
+            continue;
+        if (rows >= 0 && pt.shape[0] != rows)
+            return fail("Row ports disagree on rows (" + std::to_string(rows) + " vs " + pt.varName + "=" +
+                        std::to_string(pt.shape[0]) + ")");
+        rows = pt.shape[0];
+    }
+    if (rows <= 0)
+        return fail("no Row-layout port");
+    if (rows % tiles != 0)
+        return fail("rows=" + std::to_string(rows) + " not divisible by " + std::to_string(tiles) + " tiles");
+    if (maxPP <= 0)
+        maxPP = 4096;
+
+    dp.tileRows = rows / tiles;
+    dp.tileCols = 1;
+    dp.kDim = 1;
+    dp.tileM = dp.tileRows;
+    dp.tileN = 1;
+    dp.effectiveK = 1;
+    dp.kRounds = 1;
+    dp.spatialMRounds = 1;
+    dp.spatialNRounds = 1;
+    uint32_t totalBufBytes = 0;
+    for (const auto &pt : pts) {
+        bool isRow = pt.distribution == 0 || !pt.isInput;
+        int64_t eb = pt.elementBitWidth / 8 > 0 ? pt.elementBitWidth / 8 : 1;
+        int64_t cols = pt.shape[1];
+        int64_t perCore = isRow ? dp.tileRows * cols : pt.shape[0] * cols;
+        int64_t window = std::min<int64_t>(perCore, maxPP / eb);
+        if (window <= 0 || perCore % window != 0)
+            return fail(pt.varName + ": per-tile " + std::to_string(perCore) + " elements do not divide into " +
+                        std::to_string(window) + "-element windows (l1_budget " + std::to_string(maxPP) + " B)");
+        if (isRow && window % cols != 0)
+            return fail(pt.varName + ": a " + std::to_string(window) + "-element window splits a " +
+                        std::to_string(cols) + "-element row; pick l1_budget as a multiple of the row bytes");
+        DerivedTilingParams::PortParams pp;
+        pp.bufferSize = window;
+        pp.numRounds = perCore / window;
+        pp.spatialRounds = 1;
+        dp.portParams.push_back(pp);
+        int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
+        totalBufBytes += (uint32_t)(ppDepth * window * eb);
+        llvm::outs() << "[TilingLinalg] RowSpace port " << pt.varName << (isRow ? " row" : " bcast") << " ["
+                     << pt.shape[0] << "x" << cols << "]: perTile=" << perCore << " window=" << window
+                     << " numRounds=" << pp.numRounds << "\n";
+    }
+    std::string errMsg;
+    if (!makeResource("Gen2")->checkDataMemoryFits(totalBufBytes, &errMsg))
+        return fail(errMsg);
+    dp.valid = true;
+    llvm::outs() << "[TilingLinalg] RowSpace tiling: rows=" << rows << " tiles=" << tiles
+                 << " rowsPerTile=" << dp.tileRows << " maxPPBytes=" << maxPP << " buffers=" << totalBufBytes << " B\n";
+    return true;
+}
+
+// RowSpace ports are declared in row-parallel terms (Row = row-split operand,
+// Col = broadcast operand) and realized on a 1 x N mesh (deriveRowSpaceTiling):
+// the row split runs along the mesh COLUMNS, the broadcast along the single
+// mesh ROW. Called once the tiling is derived, before the SplitModel is built
+// from pattern/distribution.
+static void flipRowSpaceDistribution(std::vector<ParsedTensorInfo> &pts) {
+    for (auto &pt : pts) {
+        bool isRow = pt.distribution == 0 || !pt.isInput;
+        pt.distribution = isRow ? 1 : 0;
     }
 }
 
@@ -1477,7 +1610,8 @@ public:
                                                 // SpatialPolicy -> not. Fallback: a bare Policy has
                                                 // exactly 3 fields (map/mat/sched), so nf>=4 ==> composed.
                                                 bool composed;
-                                                if (spaceTypeName == "GemmSpace" || spaceTypeName == "Conv2dSpace")
+                                                if (spaceTypeName == "GemmSpace" || spaceTypeName == "Conv2dSpace" ||
+                                                    spaceTypeName == "RowSpace")
                                                     composed = true;
                                                 else if (spaceTypeName == "SpatialPolicy")
                                                     composed = false;
@@ -1574,6 +1708,19 @@ public:
                                                             << " raw_h=" << pti.shimDma.raw_h
                                                             << " raw_wc=" << pti.shimDma.raw_wc << "\n";
                                                     }
+                                                } else if (spaceTypeName == "RowSpace") {
+                                                    // RowSpace: 0 policy, 1 rows, 2 cols. The port's
+                                                    // shape is its own [rows, cols]; tiling is derived
+                                                    // by deriveRowSpaceTiling, never by the GEMM roles,
+                                                    // so tdM/tdN/tdK and perPort2D stay untouched.
+                                                    readPolicy(apval->getStructField(0));
+                                                    int nf = apval->getStructNumFields();
+                                                    if (nf >= 2)
+                                                        readTileDim(apval->getStructField(1), pti.tdD1);
+                                                    if (nf >= 3)
+                                                        readTileDim(apval->getStructField(2), pti.tdD2);
+                                                    pti.rowSpace = true;
+                                                    pti.tileMode = 0;
                                                 } else if (composed) {
                                                     readPolicy(apval->getStructField(0));
                                                     bool isConv;
@@ -2039,6 +2186,10 @@ public:
                                     else // Gather/Scatter -> C
                                         pti.shape = {macroDimM, macroDimN};
                                 }
+                                // RowSpace: the port names its own matrix, whatever the
+                                // launch's M/N/K say (they are GEMM roles it does not have).
+                                if (pti.rowSpace && pti.tdD1.base > 0 && pti.tdD2.base > 0)
+                                    pti.shape = {(int64_t)pti.tdD1.base, (int64_t)pti.tdD2.base};
 
                                 // 3D conv OUTPUT shape: when the output port's GemmSpace
                                 // declares a full 3D iteration space (d1=H, d2=W, d3=C, each
@@ -2212,8 +2363,17 @@ public:
                     // ---- Compute derived tiling parameters from M/K/N + per-port policy ----
                     int effectiveMeshRows = localMeshRows > 0 ? localMeshRows : tilingMeshRows;
                     int effectiveMeshCols = localMeshCols > 0 ? localMeshCols : tilingMeshCols;
-                    if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && effectiveMeshRows > 0 &&
-                        effectiveMeshCols > 0 && !parsedTensors.empty()) {
+                    const bool rowSpaceKernel = isRowSpaceKernel(parsedTensors);
+                    if (rowSpaceKernel) {
+                        // Row-parallel map: no GEMM roles, so none of the M/N/K
+                        // derivation below applies. The stream protocol forbids the
+                        // M x N cartesian re-send, hence fullconnect_auto is forced off.
+                        derivedTilingParams = {};
+                        deriveRowSpaceTiling(parsedTensors, effectiveMeshRows, effectiveMeshCols, derivedTilingParams);
+                        flipRowSpaceDistribution(parsedTensors);
+                        kernelFullConnectAuto[currentLaunchKernel] = false;
+                    } else if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && effectiveMeshRows > 0 &&
+                               effectiveMeshCols > 0 && !parsedTensors.empty()) {
                         derivedTilingParams.tileRows = macroDimM / effectiveMeshRows;
                         derivedTilingParams.tileCols = macroDimN / effectiveMeshCols;
                         derivedTilingParams.kDim = macroDimK;
@@ -2647,12 +2807,17 @@ public:
                                         // Input A: Broadcast+Row — tileM rows × effectiveK per k-round
                                         // pp_depth only controls physical ping-pong buffer count,
                                         // NOT data splitting. Only split when data exceeds maxBuf.
+                                        // maxBuf is BYTES (l1_budget) and the pipeline clamps
+                                        // windows to maxBuf / elemBytes elements, so compare
+                                        // like with like -- an element count against bytes made
+                                        // every >8-bit window 2-4x its budget.
                                         int64_t perKRoundData = tileM_eff * dmaK;
-                                        if (perKRoundData <= maxBuf) {
+                                        int64_t maxElems = maxBuf / elemBytesOf(pt);
+                                        if (perKRoundData <= maxElems) {
                                             pp.bufferSize = perKRoundData;
                                             pp.numRounds = 1;
                                         } else {
-                                            int64_t rowsPerRound = maxBuf / dmaK;
+                                            int64_t rowsPerRound = maxElems / dmaK;
                                             if (rowsPerRound <= 0)
                                                 rowsPerRound = 1;
                                             pp.bufferSize = rowsPerRound * dmaK;
@@ -2665,11 +2830,12 @@ public:
                                     } else if (pt.pattern == 0 && pt.distribution == 1) {
                                         // Input B: Broadcast+Col — tileN cols × effectiveK per k-round
                                         int64_t perKRoundData = tileN_eff * dmaK;
-                                        if (perKRoundData <= maxBuf) {
+                                        int64_t maxElems = maxBuf / elemBytesOf(pt);
+                                        if (perKRoundData <= maxElems) {
                                             pp.bufferSize = perKRoundData;
                                             pp.numRounds = 1;
                                         } else {
-                                            int64_t colsPerRound = maxBuf / dmaK;
+                                            int64_t colsPerRound = maxElems / dmaK;
                                             if (colsPerRound <= 0)
                                                 colsPerRound = 1;
                                             pp.bufferSize = colsPerRound * dmaK;
@@ -4230,6 +4396,19 @@ public:
                     ret += "  tile_dim d3;\n";
                     ret += "  tile_dim d4;\n";
                     ret += "};\n";
+                    // RowSpace — row-parallel map space for the non-GEMM operators of
+                    // a network (layernorm, softmax, element-wise). Unlike GemmSpace
+                    // there are no M/N/K roles: every port declares its OWN matrix
+                    // [rows.fullsize, cols.fullsize]. A Row-layout port is split
+                    // evenly across mesh ROWS (HW_COLS must be 1) and streamed in
+                    // whole-row windows; a Col-layout INPUT is a broadcast operand
+                    // that every tile receives whole (e.g. layernorm gamma/beta).
+                    // Field order is contractual: 0 policy, 1 rows, 2 cols.
+                    ret += "struct RowSpace {\n";
+                    ret += "  SpatialPolicy policy;\n";
+                    ret += "  tile_dim rows;\n";
+                    ret += "  tile_dim cols;\n";
+                    ret += "};\n";
                     // Conv2dSpace — composes a SpatialPolicy with the conv iteration
                     // space. Field order is contractual: 0 policy, 1 ih, 2 iw,
                     // 3 ic, 4 oc, 5 kh, 6 kw, 7 stride, 8 pad, 9 m. ih/iw carry the
@@ -5044,6 +5223,13 @@ public:
                     stream << "  tile_dim d2;\n";
                     stream << "  tile_dim d3;\n";
                     stream << "  tile_dim d4;\n";
+                    stream << "};\n";
+                    // RowSpace — row-parallel map space (0 policy, 1 rows, 2 cols); see the
+                    // definition in aiehlc.cc's parse preamble for the semantics.
+                    stream << "struct RowSpace {\n";
+                    stream << "  SpatialPolicy policy;\n";
+                    stream << "  tile_dim rows;\n";
+                    stream << "  tile_dim cols;\n";
                     stream << "};\n";
                     // Conv2dSpace — policy + conv iteration space; ih/iw carry the
                     // EXACT input spatial dims (OH/OW derived via forward conv).

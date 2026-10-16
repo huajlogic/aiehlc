@@ -213,6 +213,27 @@ else
     exit 1
 fi
 
+# --fast (AIEHLC_FAST=1, from `aiehlc.sh --fast`): compile the host objects
+# through ccache. The runtime sources and a regenerated-but-identical host.cc then
+# cost a hash lookup instead of a cross compile (~7 s -> ~0.2 s). ccache keys on the
+# preprocessed source and the flags, so a changed header still recompiles. The
+# default flow keeps the plain compiler.
+HOST_CXX="${TOOL_PREFIX}g++"
+if [ "${AIEHLC_FAST:-0}" = "1" ] && command -v ccache >/dev/null 2>&1; then
+    export CCACHE_DIR="${CCACHE_DIR:-${AIEHLC_ROOT}/.aiehlc/ccache}"
+    # Absolute paths (the per-build aout/worklocal -I dir, the source path) are
+    # rewritten relative to the build dir, so the same app hits from any cwd.
+    export CCACHE_BASEDIR="${CCACHE_BASEDIR:-/}"
+    export CCACHE_NOHASHDIR=true
+    # host_fixed.cc and the copied app headers are rewritten just before the
+    # compile; without this ccache sees "file too new" and preprocesses every
+    # time instead of using its direct (no-preprocessor) mode. Content is still
+    # hashed, so a real change still misses.
+    export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-include_file_mtime,include_file_ctime,time_macros}"
+    HOST_CXX="ccache ${TOOL_PREFIX}g++"
+    echo "[fast] host objects through ccache (${CCACHE_DIR})"
+fi
+
 if [[ "$platform" == "sim" ]]; then
     SIM_DIR="${AIEHLC_ROOT}/script/sim"
     RUNSIM="${AIEHLC_ROOT}/script/runsim.sh"
@@ -435,7 +456,7 @@ HOST_SRC="${HOST_FIXED}"
 if [ "${REBUILD}" -eq 1 ] || [ ! -f host.o ]; then
     set -x
     echo "Compiling host..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++20 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++20 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile host.cc"
         exit 1
@@ -448,7 +469,7 @@ fi
 # Compile aie_runtime.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime.o ]; then
     echo "Compiling aie_runtime.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime.c" -o aie_runtime.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime.c" -o aie_runtime.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime.c"
         exit 1
@@ -460,7 +481,7 @@ fi
 # Compile aie_runtime_debug.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_debug.o ]; then
     echo "Compiling aie_runtime_debug.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_debug.c" -o aie_runtime_debug.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_debug.c" -o aie_runtime_debug.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_debug.c"
         exit 1
@@ -472,7 +493,7 @@ fi
 # Compile aie_runtime_stream_debug.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_stream_debug.o ]; then
     echo "Compiling aie_runtime_stream_debug.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_stream_debug.c" -o aie_runtime_stream_debug.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_stream_debug.c" -o aie_runtime_stream_debug.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_stream_debug.c"
         exit 1
@@ -484,7 +505,7 @@ fi
 # Compile aie_runtime_common.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_common.o ]; then
     echo "Compiling aie_runtime_common.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_common.c" -o aie_runtime_common.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_common.c" -o aie_runtime_common.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_common.c"
         exit 1
@@ -496,7 +517,7 @@ fi
 # Compile aie_runtime_control_plan.c (pure row-control planner)
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_control_plan.o ]; then
     echo "Compiling aie_runtime_control_plan.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_control_plan.c" -o aie_runtime_control_plan.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_control_plan.c" -o aie_runtime_control_plan.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_control_plan.c"
         exit 1
@@ -508,7 +529,7 @@ fi
 # Compile aie_runtime_resource.c (control-plane resource reservation table)
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_resource.o ]; then
     echo "Compiling aie_runtime_resource.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_resource.c" -o aie_runtime_resource.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_resource.c" -o aie_runtime_resource.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_resource.c"
         exit 1
@@ -519,7 +540,7 @@ fi
 
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_ctrlpkt_encode.o ]; then
     echo "Compiling aie_ctrlpkt_encode.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_ctrlpkt_encode.c" -o aie_ctrlpkt_encode.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_ctrlpkt_encode.c" -o aie_ctrlpkt_encode.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_ctrlpkt_encode.c"
         exit 1
@@ -530,7 +551,7 @@ fi
 
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_xaie_seq.o ]; then
     echo "Compiling aie_runtime_xaie_seq.c..."
-    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_xaie_seq.c" -o aie_runtime_xaie_seq.o
+    ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_xaie_seq.c" -o aie_runtime_xaie_seq.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_xaie_seq.c"
         exit 1
@@ -544,7 +565,7 @@ ROUTING_OBJ=""
 if [ "${HAS_ROUTING}" -eq 1 ]; then
     if [ "${REBUILD}" -eq 1 ] || [ ! -f routing.o ]; then
         echo "Compiling routing.cc..."
-        ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${WORKLOCAL_DIR}/routing.cc" -o routing.o
+        ${HOST_CXX} ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${WORKLOCAL_DIR}/routing.cc" -o routing.o
         if [ $? -ne 0 ]; then
             echo "Error: failed to compile routing.cc"
             exit 1

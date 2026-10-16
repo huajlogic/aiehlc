@@ -217,6 +217,11 @@ static bool resolveTraceParameterSpecs(mlir::ModuleOp hostModule, const std::vec
 }
 
 static std::string setupPipelineIRDir(const std::string &subdir) {
+    // AIEHLC_NO_IR_DUMP=1 (set by `aiehlc.sh --fast`): no per-pass IR files. An
+    // empty dir makes dumpPipelineIRToFile a no-op; printing the whole module
+    // after every pass is the bulk of the pipeline's wall time on a small app.
+    if (const char *v = std::getenv("AIEHLC_NO_IR_DUMP"); v && *v && std::string(v) != "0")
+        return "";
     llvm::SmallString<256> cwdPath;
     if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
         llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
@@ -1306,6 +1311,13 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "  tile_dim d2;\n";
             stream << "  tile_dim d3;\n";
             stream << "  tile_dim d4;\n";
+            stream << "};\n";
+            // RowSpace — row-parallel map space (0 policy, 1 rows, 2 cols); see the
+            // definition in aiehlc.cc's parse preamble for the semantics.
+            stream << "struct RowSpace {\n";
+            stream << "  SpatialPolicy policy;\n";
+            stream << "  tile_dim rows;\n";
+            stream << "  tile_dim cols;\n";
             stream << "};\n";
             // Conv2dSpace — policy + conv iteration space; ih/iw carry the
             // EXACT input spatial dims (OH/OW derived via forward conv).

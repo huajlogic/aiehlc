@@ -370,3 +370,46 @@ step=13}`.
    `tileM=64 tileN=64 effectiveK=256`, "Host built successfully". ✔
 5. No-regression re-check after the flat-DmaTransform guard: `simplematmul2.cc`
    and `simplematmul.cc` both still resolve identically and build the host. ✔
+
+## RowSpace — row-parallel maps (no GEMM roles)
+
+**Status:** implemented on branch `whisper` (2026-10-14), used by every
+non-GEMM layer of the Whisper offload
+(`src/frontend/tvmrelay/example/whisper/`).
+
+```cpp
+struct RowSpace { SpatialPolicy policy; tile_dim rows; tile_dim cols; };  // 0 policy, 1 rows, 2 cols
+
+constexpr aie::RowSpace X = {.policy = {.map = {.act = aie::Pattern::Broadcast, .layout = aie::Layout::Row},
+                                        .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{6144}}},
+                             .rows = {.fullsize = 1504, .tile_size = 4}, .cols = {.fullsize = 384}};
+constexpr aie::RowSpace P = {.policy = {.map = {.wgt = aie::Pattern::Broadcast, .layout = aie::Layout::Col}, ...},
+                             .rows = {.fullsize = 2}, .cols = {.fullsize = 384}};   // gamma | beta
+constexpr aie::GlobalPolicy ln_policy = {.fullconnect_auto = 0};
+__global__(ln_policy) void ln(aie::port<input_window_int32 *, X> win_a,
+                              aie::port<input_window_int32 *, P> win_b,
+                              aie::port<output_window_int32 *, Y> win_c);
+// launched on a 1 x 4 mesh: device.partition({0, 3, 0, 6}, 1, 4)
+```
+
+Why it exists: `GemmSpace` infers every port's shape from the launch's
+`(M, N, K)` by role (Row input `[M,K]`, Col input `[K,N]`, output `[M,N]`), so
+an operand that is not a GEMM operand cannot be described — a layer norm's
+`gamma/beta [2,384]` became `[384,384]`.
+
+Semantics (all in `aiehlc.cc`):
+
+* **shape** — `[rows.fullsize, cols.fullsize]` per port, whatever the launch's
+  M/N/K say. All ports of a kernel must be RowSpace (`isRowSpaceKernel`).
+* **placement** — rows are split over the tiles of a **1 × N mesh**, one tile
+  per array column (each with its own shim). A Row-layout port becomes a column
+  split, a Col-layout *input* a broadcast along the single mesh row
+  (`flipRowSpaceDistribution`). A mesh-row split is unusable: a single
+  partition column has one shim (2+2 channels), and before the `tileNum` fix in
+  `RoutingToDmapPass` an R×1 mesh expanded every mesh row to the partition width.
+* **windows** — `deriveRowSpaceTiling` evaluates the pipeline's own stream
+  rule for `fullconnect_auto=0` flows (`window = min(perTile,
+  maxPPBytes/elemBytes)`, `numRounds = perTile/window`) per port and fails the
+  build on a short last window or a window that splits a row. The kernel sees
+  them as `aie::get_num_rounds/get_buffer_size(win)`.
+* `fullconnect_auto` is forced to 0 (there is no M×N re-send).

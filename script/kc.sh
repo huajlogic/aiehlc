@@ -460,7 +460,57 @@ mkdir -p "$output_dir"
 
 obj_file="${output_dir}/kernel.o"
 
-if [[ "$use_llvm_aie" != "true" ]]; then
+# --- --fast: content-addressed cache of the chess build (steps 1-4 below) ---
+#
+# Measured on conv2dstem: xchesscc 16.5 s (3.2 s of it fixed start-up, even for
+# an empty file), xchessmk 48-51 s for ONE translation unit -- neither `-g` nor
+# `+P 16` changes it. So the only way to make an unchanged kernel cheap is not to
+# recompile it. Enabled by `aiehlc.sh --fast` (AIEHLC_FAST=1); the default flow
+# never reads or writes the cache.
+#
+# The key is a superset of everything the chess steps read: the kernel TU and
+# every .cc/.h beside it (the compute kernel is #included from there), the .prx
+# and .bcf, the runtime/include headers the TU pulls in, every flag, the Vitis
+# install and this script. The generated sources carry no absolute paths, so the
+# same kernel hits from any working directory. chesswork/ (45 MB of intermediates
+# no later step reads) is not cached.
+kernel_cache_key() {
+    local src_dir prx_dir
+    src_dir="$(cd "$(dirname "$kernel_cc")" && pwd)"
+    prx_dir="$(cd "$(dirname "$prx_file")" && pwd)"
+    {
+        # The flags carry -I<kernel dir> (an absolute, per-build path); the
+        # directory's contents are hashed below, so its location must not count.
+        printf '%s\n' "kc-cache-v1" "${compiler_flags_chess//$src_dir/@KDIR@}" "$chess_elf_compiler" \
+            "KEEP_DEBUG_LOC=$KEEP_DEBUG_LOC" "$XILINX_VITIS" "$aie_version" "$platform"
+        sha256sum "${BASH_SOURCE[0]}" "$kernel_cc" "$prx_file" | cut -d' ' -f1
+        find "$src_dir" "$prx_dir" -maxdepth 1 -type f \
+            \( -name '*.cc' -o -name '*.h' -o -name '*.bcf' -o -name '*.prx' \) \
+            ! -name 'host*.cc' ! -name 'routing*.cc' ! -name 'newfile*' -print0 |
+            sort -z -u | xargs -0 sha256sum | sed "s#  .*/#  #"
+        sha256sum "${AIEHLC_ROOT_DIR}"/src/mlir/runtime/*.h "${AIEHLC_ROOT_DIR}"/include/*.h |
+            cut -d' ' -f1
+    } | sha256sum | cut -c1-24
+}
+
+KERNEL_CACHE_HIT=0
+if [[ "$use_llvm_aie" != "true" ]] && [ "${AIEHLC_FAST:-0}" = "1" ]; then
+    _kc_cache_root="${AIEHLC_KERNEL_CACHE:-${AIEHLC_ROOT_DIR}/.aiehlc/kernelcache}"
+    _kc_key="$(kernel_cache_key)"
+    _kc_entry="${_kc_cache_root}/${_kc_key}"
+    if [ -f "${_kc_entry}/.complete" ]; then
+        cp -a "${_kc_entry}/." "$output_dir/"
+        rm -f "$output_dir/.complete"
+        KERNEL_CACHE_HIT=1
+        echo "[fast] kernel cache hit ${_kc_key}: chess skipped ($(basename "$kernel_cc"))"
+    else
+        echo "[fast] kernel cache miss ${_kc_key}: running chess"
+    fi
+fi
+
+if [[ "$use_llvm_aie" != "true" ]] && [ "$KERNEL_CACHE_HIT" = "1" ]; then
+    : # chess outputs restored from the cache
+elif [[ "$use_llvm_aie" != "true" ]]; then
     echo "Compiling kernel (using chess): $(basename "$kernel_cc")"
 
     # Step 1: xchesscc -> LLVM IR
@@ -507,6 +557,23 @@ if [[ "$use_llvm_aie" != "true" ]]; then
     # .debug_line parsing is architecture-agnostic, so a host/aarch64 readelf
     # works on the AIE ELF. Non-fatal: a missing/empty table only warns.
     emit_linemap_artifacts "$output_dir"
+
+    # --fast: publish the chess outputs (everything but chesswork/ and the
+    # per-app embedding, which is redone below). Staged then renamed, so a
+    # concurrent build never sees a half-written entry.
+    if [ "${AIEHLC_FAST:-0}" = "1" ] && [ -n "${_kc_entry:-}" ]; then
+        _kc_tmp="${_kc_entry}.tmp.$$"
+        rm -rf "$_kc_tmp"
+        mkdir -p "$_kc_tmp"
+        find "$output_dir" -maxdepth 1 -type f -name 'kernel*' ! -name 'kernel.o' \
+            -exec cp -a {} "$_kc_tmp/" \;
+        touch "$_kc_tmp/.complete"
+        if mv -T "$_kc_tmp" "$_kc_entry" 2>/dev/null; then
+            echo "[fast] kernel cached as ${_kc_key}"
+        else
+            rm -rf "$_kc_tmp"
+        fi
+    fi
 else
     echo "Compiling kernel (using llvm-aie): $(basename "$kernel_cc")"
 

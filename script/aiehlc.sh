@@ -20,12 +20,15 @@ run_cmd() {
 }
 
 usage() {
-    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb] [--profiling] [--skip-bss]"
+    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb] [--profiling] [--skip-bss] [--fast]"
     echo "  --platform    baremetal (default) | sim | linux | baremetal_debug"
     echo "                'baremetal_debug' builds a baremetal ELF and writes sim_config.sh so the debug"
     echo "                UI can run either a hardware test or a simulator run from one build."
     echo "  --profiling   build the host with the PMU profiling layer (-DAIEHLC_PROFILING=1)"
     echo "  --skip-bss    skip .bss zero-init on kernel load (-DAIEHLC_SKIP_BSS_DEFAULT=1)"
+    echo "  --fast        incremental build: skip the aie-rt/libxil rebuild when its inputs are"
+    echo "                unchanged, no per-pass MLIR IR dumps, aiehlc/host logs to aout/*.log,"
+    echo "                chess kernel + host objects from caches (.aiehlc/), no debug views"
     return 1
 }
 
@@ -177,6 +180,42 @@ build_hw_lib() {
     }
 
 
+# Fingerprint of what build_hw_lib consumes: the aie-rt driver sources, the BSP
+# libraries/headers it copies, the toolchain prefix and flags. aie-rt is hashed by
+# CONTENT: its own Makefile re-copies driver/internal/*.h on every build, so their
+# mtimes change each run (0.08 s for the whole tree). The BSP, which the build
+# only reads, is keyed on name/size/mtime. Never fails the build.
+hw_lib_fingerprint() {
+    {
+        echo "hwlib-v1 $1 $2 ${TOOL_PREFIX} ${hw_lib_flag} ${AIELIB_APU_NAME} ${ARCH_APU_LD}"
+        # Sources only: build_hw_lib leaves objects/archives inside aie-rt itself.
+        find "${AIE_DRIVER_PARENT_DIR}/aie-rt/driver/src" "${AIE_DRIVER_PARENT_DIR}/aie-rt/driver/internal" \
+             -type f \( -name '*.c' -o -name '*.h' -o -name 'Makefile*' \) -print0 2>/dev/null |
+            sort -z | xargs -0 -r sha256sum
+        find "${ARCH_APU_ALIB}" -maxdepth 1 -type f -name '*.a' -printf '%p %s %T@\n' 2>/dev/null | sort
+        find "${ARCH_APU_AINC}" -type f -name '*.h' -printf '%p %s %T@\n' 2>/dev/null | sort
+    } | sha256sum | cut -c1-24
+}
+
+# --fast quick check for the aiehlc code-generation step: a key over everything
+# it reads -- its own binary (path/size/mtime), every argument, the app source
+# directory (the entry file and what it #includes; the 6 MB conv2dstem data
+# headers included, ~20 ms to hash), the repo headers it parses, and the system
+# library fingerprint (the aie-rt headers it parses come from there). A changed
+# byte anywhere re-runs aiehlc; nothing is inferred from timestamps of inputs.
+frontend_cache_key() {
+    {
+        echo "fe-v1 ${aie_version} ${platform} ${use_llvm_aie} ${runtime_source_file}"
+        printf '%s\n' "${AIEHLC_ARGS[@]}"
+        stat -c '%n %s %Y' "${AIEHLC}"
+        find "${SOURCE_DIR}" -maxdepth 1 -type f \( -name '*.cc' -o -name '*.cpp' -o -name '*.c' \
+             -o -name '*.h' -o -name '*.hpp' \) -print0 | sort -z | xargs -0 -r sha256sum
+        find "${AIEHLC_DIR}/include" "${AIEHLC_DIR}/src/mlir/runtime" -type f -name '*.h' -print0 |
+            sort -z | xargs -0 -r sha256sum
+        echo "${_hwlib_fp:-}"
+    } 2>/dev/null | sha256sum | cut -c1-24
+}
+
 main() {
 set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -202,6 +241,7 @@ GDB_MODE=0
 # in the same shell would otherwise persist.
 PROFILING=0
 SKIP_BSS=0
+FAST=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -help)
@@ -254,6 +294,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --profiling)
             PROFILING=1
+            shift
+            ;;
+        --fast)
+            FAST=1
             shift
             ;;
         --skip-bss)
@@ -386,6 +430,23 @@ fi
 # compile aie-rt, if the local aie-rt exist
 if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt/driver/" ] && [[ "$platform" != "sim" ]]; then
     USE_LOCAL_AIERT_BSP=1
+    # Fingerprint of build_hw_lib's inputs, recorded after every build so that
+    # --fast can tell "unchanged" from "never built / changed" without building.
+    _hwlib_stamp="${AIE_DRIVER_PARENT_DIR}/lib/.aiehlc_hwlib.stamp"
+    _hwlib_fp="$(hw_lib_fingerprint "$aie_version" "$platform")"
+    # AIEHLC_SKIP_AIELIB=1 reuses an already-built libxaiengine instead of wiping
+    # and rebuilding it. build_hw_lib starts with `rm -rf lib/*.a`, so two
+    # aiehlc.sh runs sharing one thirdparty/alib race each other; a driver that
+    # builds many apps (src/frontend/tvmrelay/example/whisper) builds the library
+    # once and then runs the apps in parallel with this set.
+    if [ "${AIEHLC_SKIP_AIELIB:-0}" = "1" ] && [ -f "${AIE_DRIVER_PARENT_DIR}/lib/${AIELIB_APU_NAME}" ]; then
+        echo "[aiehlc] AIEHLC_SKIP_AIELIB=1: reusing ${AIE_DRIVER_PARENT_DIR}/lib/${AIELIB_APU_NAME}"
+    elif [ "$FAST" -eq 1 ] && [ -f "${AIE_DRIVER_PARENT_DIR}/lib/${AIELIB_APU_NAME}" ] \
+            && [ "$(cat "$_hwlib_stamp" 2>/dev/null)" = "$_hwlib_fp" ]; then
+        # (build_hw_lib renames its libxil.a to ${AIELIB_APU_NAME}; -lxil itself
+        # links from the BSP's own lib dir, so that archive is the one to check.)
+        echo "[fast] system libraries up to date (${_hwlib_fp}): skipping aie-rt/libxil rebuild"
+    else
     build_hw_lib \
         "${ARCH_APU_AINC}" \
         ${TOOL_PREFIX}gcc \
@@ -397,6 +458,8 @@ if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt/driver/" ] && [[ "$platform" != "sim" ]
         "$ARCH_APU_ALIB" \
         "$ARCH_APU_LD" \
                 "$platform"
+    hw_lib_fingerprint "$aie_version" "$platform" > "$_hwlib_stamp"
+    fi
 
     if [[ $aie_version == "1" || $aie_version == "2" ]]; then
         EXTRA_LIBS=""
@@ -474,6 +537,34 @@ if [ "$GDB_MODE" -eq 1 ]; then
         "${AIEHLC_ARGS[@]}" \
         ${runtime_source_file} --
     AIEHLC_RC=$?
+elif [ "$FAST" -eq 1 ]; then
+    # --fast: (1) quick check -- if nothing aiehlc reads changed, restore its
+    # previous output instead of re-running it (frontend_cache_key); (2) else run
+    # it with no per-pass IR dumps (AIEHLC_NO_IR_DUMP) and the pipeline log in a
+    # file instead of the terminal. On failure the stderr part is printed below
+    # exactly as in the normal flow.
+    mkdir -p "$KERNEL_DIR"
+    AIEHLC_RC=0
+    _fe_key="$(frontend_cache_key)"
+    _fe_entry="${AIEHLC_FAST_CACHE:-${AIEHLC_DIR}/.aiehlc}/frontend/${_fe_key}"
+    if [ -f "${_fe_entry}/.complete" ]; then
+        cp -a "${_fe_entry}/aout/." "$KERNEL_DIR"
+        echo "[fast] aiehlc inputs unchanged (${_fe_key}): reused its generated code"
+    else
+        AIEHLC_NO_IR_DUMP=1 "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" \
+            "${AIEHLC_ARGS[@]}" \
+            ${runtime_source_file} -- > "${KERNEL_DIR}aiehlc.log" 2> "$AIEHLC_ERRLOG" || AIEHLC_RC=$?
+        cat "$AIEHLC_ERRLOG" >> "${KERNEL_DIR}aiehlc.log"
+        echo "[fast] aiehlc: per-pass IR dumps off, log in ${KERNEL_DIR}aiehlc.log"
+        if [ $AIEHLC_RC -eq 0 ]; then
+            _fe_tmp="${_fe_entry}.tmp.$$"
+            rm -rf "$_fe_tmp"
+            mkdir -p "$_fe_tmp"
+            cp -a "$KERNEL_DIR" "$_fe_tmp/aout"
+            touch "$_fe_tmp/.complete"
+            mv -T "$_fe_tmp" "$_fe_entry" 2>/dev/null || rm -rf "$_fe_tmp"
+        fi
+    fi
 else
     dbg_echo "+ $LD_SO --library-path ${LIB_PATH}:${LIB_BASE_PATH} ${AIEHLC} ${AIEHLC_ARGS[*]} ${runtime_source_file} --"
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" \
@@ -555,11 +646,26 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     if [ "${SKIP_BSS}" -eq 1 ]; then
         hc_extra_defs="${hc_extra_defs} -DAIEHLC_SKIP_BSS_DEFAULT=1"
     fi
+    if [ "$FAST" -eq 1 ]; then
+        # --fast: kernel/host caches (AIEHLC_FAST), build log to a file; its tail
+        # is printed if the build fails.
+        TILING_RC=0
+        WORKLOCAL_DIR="${WORKLOCAL_DIR}" AIE_VERSION="${aie_version}" PLATFORM="${platform}" \
+            SIM_TILES="${SIM_TILES:-}" DEBUG_SYMS="${DEBUG_SYMS}" \
+            AIEHLC_PROFILING="${PROFILING}" EXTRA_DEFS="${hc_extra_defs}" AIEHLC_FAST=1 \
+            bash "${AIEHLC_DIR}/script/hostcompile.sh" > "${HOST_BUILD_DIR}hostcompile.log" 2>&1 || TILING_RC=$?
+        grep -h '^\[fast\]' "${HOST_BUILD_DIR}hostcompile.log" || true
+        echo "[fast] hostcompile log in ${HOST_BUILD_DIR}hostcompile.log"
+        if [ $TILING_RC -ne 0 ]; then
+            tail -40 "${HOST_BUILD_DIR}hostcompile.log"
+        fi
+    else
     WORKLOCAL_DIR="${WORKLOCAL_DIR}" AIE_VERSION="${aie_version}" PLATFORM="${platform}" \
         SIM_TILES="${SIM_TILES:-}" DEBUG_SYMS="${DEBUG_SYMS}" \
         AIEHLC_PROFILING="${PROFILING}" EXTRA_DEFS="${hc_extra_defs}" \
         bash "${AIEHLC_DIR}/script/hostcompile.sh"
     TILING_RC=$?
+    fi
     if [ $TILING_RC -ne 0 ]; then
         echo "Error: tiling mode compilation failed."
         return $TILING_RC
@@ -584,7 +690,9 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
 
     # Generate the readable schedule view (schedule_view.json + host_schedule.html).
     # Non-fatal: view generation must never break the build (set -e is active).
-    if [ -f "${WORKLOCAL_DIR}/dfscheduleprovenancemap.json" ] && [ -f "${WORKLOCAL_DIR}/host.cc" ]; then
+    if [ "$FAST" -eq 1 ]; then
+        echo "[fast] skipping the readable schedule view (debug artefact)"
+    elif [ -f "${WORKLOCAL_DIR}/dfscheduleprovenancemap.json" ] && [ -f "${WORKLOCAL_DIR}/host.cc" ]; then
         echo "Generating readable schedule view..."
         if python3 "${AIEHLC_DIR}/src/tool/debug/schedule_view.py" "${WORKLOCAL_DIR}"; then
             echo "    ${WORKLOCAL_DIR}/host_schedule.html"
@@ -827,7 +935,7 @@ if [[ "$platform" == "baremetal_debug" ]]; then
     write_sim_config "$HOST_BUILD_DIR" "$host_file" "${sim_obj_files[*]}" "${kernel_names[*]}" "$aie_version" "$SIM_TILES"
 fi
 
-if [ -f "$host_file" ]; then
+if [ -f "$host_file" ] && [ "$FAST" -eq 0 ]; then
     prepare_raw_xaie_debug_view \
         "$host_file" "${HOST_BUILD_DIR}/worklocal" "$runtime_source_file" \
         "$aie_version" "baremetal" "${HOST_BUILD_DIR}/main.elf"
