@@ -493,6 +493,21 @@ carries mid-file material (a BYOC prelude) and a synthesized prototype for any
 function defined but not pre-declared — so **BYOC codegen must keep weights as
 function-scope statics**, or they duplicate into all 65 TUs and collide at link.
 
+**Whole ResNet-18 on the AIE: the persistent conv engine** (`src/aietensorop/resnetengine/`).
+**2.81 ms per image** on the board, float image → logits **bit-identical to TVM**
+(baseline 1270 ms): stem 7×7 + fused maxpool + all 19 other convs on the AIE as 17
+engine layers, only quantize and avgpool+fc on the A78 (NEON). One fabric (conv2dstem's
+routing), **one kernel ELF loaded once**; each layer's 256 B header arrives on the
+weight stream and the core programs its own DMAs, so the host only re-arms 24 shim BDs
+per layer over the control-packet plane. `gen_engine.py` extracts weights and every
+epilogue constant from TVM's graph/params/generated C and **proves the fused design
+bit-exact in numpy before any board run**: downsamples are a 10th tap of the 3×3 s2
+conv, residuals stay in core memory (GRAB/COMB), every inter-layer tensor is 8-bit.
+Measured limits: AIE clock 998 MHz, ~2.3 GB/s per shim MM2S channel (burst/AxCACHE
+don't move it), compute only ~6 % of engine time. Design + step-by-step optimization
+log: **[doc/design/resnet_aie_engine.md](doc/design/resnet_aie_engine.md)**; skill
+**resnetengine**.
+
 ### TVM `--aie-offload` → AIE via BYOC
 
 `deploy_flow.py --aie-offload --aie-layers N` (default 1, the stem) puts layer N
@@ -739,6 +754,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/performance/conv2dstem_perf_review.md](doc/performance/conv2dstem_perf_review.md)** — Why conv2dstem takes 31 ms: kernel.lst cycle model (scalar `MAC r`, 68 cycles / 21 MACs, 108-cycle per-output epilogue, 7 cycles/byte copies) closes to the measurement; 7.5 GOPS = 0.09 % of 4×4 int8 peak; **no vector instructions**; kernel/compiler/programming-model fixes
 - **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
 - **[doc/modelsupportevaluate.md](doc/modelsupportevaluate.md)** — Gap analysis for Gemma / ResNet-50 / YOLO / MobileNet / BERT / ViT (none run on AIE today); proposed `aiephase` + `aiecfg` dialects (phase-based control-plane reconfiguration, overlay kernels), new Depthwise/Eltwise/Reduce/Attention/Pipeline/Move spaces, milestones M0–M8
+- **[doc/design/resnet_aie_engine.md](doc/design/resnet_aie_engine.md)** — whole int8 ResNet-18 on the AIE in 2.81 ms, bit-exact: persistent engine architecture, exactness proofs (fusions, 8-bit tensors, on-core residuals), measured optimization steps 1270 → 2.81 ms, what did not help, remaining limits
 - **[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** — `#pragma KERNELCONFIGOFFLOAD`: core self-configured DMA, lock asymmetry, BD-id reservation
 - **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)** — `--aie-offload`: TVM BYOC → `libconv2dstem.a`, fused boundary, uint8 shift, weight-fingerprint layer mapping
 - **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
@@ -807,6 +823,9 @@ Read the matching skill when the task fits:
 | `pip install -e .` / `import aiegraph`: TVM 0.16 not found or provisioning unexpectedly, `no aiehlc checkout`, `exists and was not written by aiegraph`, stale results after changing model/calib, packaging `frontend` namespace | aiegraphinstall |
 | `aiegraph` region API: `no region matches 'layer1.0.conv1'`, a region offloads its sibling too (`move together` / *dragged*), `region="layer1"` vs `offload_check("layer1")` mean different things, `partition` undid an earlier offload, `register_kernel` "contract contradicts" | aiegraphregion |
 | Plug a user-written kernel into a TVM layer (`AIEK_ENTRY`/`AIEK_SPEC`, `--aie-kernel`, `aiekernel check/offload`); an L0xx lint code, calibrate MISMATCH, emulate FAIL, or `rejected at link -- ... routing()` | aieuserkernel |
+| Run/extend the persistent ResNet-18 engine (`resnetengine`: gen_engine.py model mismatch, core memory overflow, ENG FAIL, new layer kind) | resnetengine |
+| AIE kernel: +1 errors / constant garbage right after ADDING a code path; statics above `DM_stack` overwritten | aiecorestackoverflow |
+| Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
 | Kernel codegen | kernelcodegen |

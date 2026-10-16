@@ -48,7 +48,7 @@ AieRC rt_seq_bd_desc(XAie_DevInst *dev, XAie_LocType tile, uint64_t dma_addr, co
     {
         uint8_t tt = dev->DevOps->GetTTypefromLoc(dev, tile);
         if (tt == XAIEGBL_TILE_TYPE_SHIMNOC)
-            (void)XAie_DmaSetAxi(desc, 0U, RT_SEQ_SHIM_AXI_BURST, 0U, 0U, 0U);
+            (void)XAie_DmaSetAxi(desc, 0U, RT_SEQ_SHIM_AXI_BURST, RT_SEQ_SHIM_AXI_QOS, RT_SEQ_SHIM_AXI_CACHE, 0U);
     }
     XAie_DmaEnableBd(desc);
     return XAIE_OK;
