@@ -65,7 +65,9 @@ class EngineModel:
         sd = {k: v.detach().float() for k, v in model.state_dict().items()}
         self.n_head = model.dims.n_audio_head
         dh = model.dims.n_audio_state // self.n_head
-        self.qscale = dh ** -0.5  # (dh^-0.25)^2 folded into q only; power of two -> exact
+        # (dh^-0.25)^2 = 1/8 and log2(e) folded into q: scores come out in log2
+        # units and the engine's softmax is exp2 (eng/kernel.cc att_softmax)
+        self.qscale = dh ** -0.5 * math.log2(math.e)
         self.w = {}
         for k, v in sd.items():
             if k.endswith(("query.weight", "query.bias")):
@@ -77,12 +79,15 @@ class EngineModel:
         self.n_dec = model.dims.n_text_layer
 
     # -- ops -----------------------------------------------------------------
-    def gemm(self, a, w, b=None, gelu=False):
+    def gemm(self, a, w, b=None, gelu=False, res=None):
+        """The engine GEMM epilogue: + bias, GELU (bf16 out), + residual, ONE rounding."""
         y = bf(a) @ w.t()
         if b is not None:
             y = y + b
         if gelu:
-            y = self.gelu(y)
+            y = bf(self.gelu(y))
+        if res is not None:
+            y = y + res
         return self.act(y)
 
     def gelu(self, y):
@@ -119,14 +124,14 @@ class EngineModel:
         qh = q.view(Tq, H, -1).transpose(0, 1)
         kh = k.view(Tk, H, -1).transpose(0, 1)
         vh = v.view(Tk, H, -1).transpose(0, 1)
-        s = qh @ kh.transpose(1, 2)
+        s = qh @ kh.transpose(1, 2)  # log2 units
         if mask is not None:
             s = s + mask
-        p = bf(torch.softmax(s, dim=-1))
-        o = p @ vh
+        e = torch.exp2(s - s.max(dim=-1, keepdim=True).values)
+        o = (bf(e) @ vh) / e.sum(dim=-1, keepdim=True)  # P rounded unnormalized, divide after P V
         return self.act(o.transpose(0, 1).reshape(Tq, -1))
 
-    def mha(self, x, p, kv=None, cache=None, mask=None):
+    def mha(self, x, p, kv=None, cache=None, mask=None, res=None):
         w = self.w
         q = self.gemm(x, w[p + ".query.weight"], w[p + ".query.bias"])
         if kv is None:
@@ -138,15 +143,15 @@ class EngineModel:
         else:
             k, v = kv
         o = self.attention(q, k, v, mask)
-        return self.gemm(o, w[p + ".out.weight"], w[p + ".out.bias"])
+        return self.gemm(o, w[p + ".out.weight"], w[p + ".out.bias"], res=res)
 
-    def mlp(self, x, p):
+    def mlp(self, x, p, res=None):
         w = self.w
         h = self.gemm(x, w[p + ".mlp.0.weight"], w[p + ".mlp.0.bias"], gelu=True)
-        return self.gemm(h, w[p + ".mlp.2.weight"], w[p + ".mlp.2.bias"])
+        return self.gemm(h, w[p + ".mlp.2.weight"], w[p + ".mlp.2.bias"], res=res)
 
     # -- network -------------------------------------------------------------
-    def conv(self, x, name, stride):
+    def conv(self, x, name, stride, res=None):
         """conv1d k=3 pad=1 as a GEMM over im2col: x [T, Cin] -> [T/stride, Cout]."""
         w = self.w[name + ".weight"]  # [Cout, Cin, 3]
         T = x.shape[0]
@@ -154,17 +159,16 @@ class EngineModel:
         To = (T + stride - 1) // stride
         cols = torch.cat([xp[t:t + stride * (To - 1) + 1:stride] for t in range(3)], dim=1)  # [To, 3*Cin]
         wm = w.permute(0, 2, 1).reshape(w.shape[0], -1)  # [Cout, 3*Cin] tap-major
-        return self.gemm(cols, wm, self.w[name + ".bias"], gelu=True)
+        return self.gemm(cols, wm, self.w[name + ".bias"], gelu=True, res=res)
 
     def encode(self, mel):
         """mel [80, 3000] -> audio features [1500, 384] (bf16 values)."""
         x = self.conv(bf(mel.t()), "encoder.conv1", 1)
-        x = self.conv(x, "encoder.conv2", 2)
-        x = self.act(x + self.enc_pos)
+        x = self.conv(x, "encoder.conv2", 2, res=bf(self.enc_pos))  # pos = conv2's bf16 residual
         for i in range(self.n_enc):
             p = f"encoder.blocks.{i}"
-            x = self.res(x, self.mha(self.ln(x, p + ".attn_ln"), p + ".attn"))
-            x = self.res(x, self.mlp(self.ln(x, p + ".mlp_ln"), p))
+            x = self.mha(self.ln(x, p + ".attn_ln"), p + ".attn", res=x)
+            x = self.mlp(self.ln(x, p + ".mlp_ln"), p, res=x)
         return self.ln(x, "encoder.ln_post")
 
     def cross_kv(self, xa):
@@ -186,12 +190,11 @@ class EngineModel:
         mask = torch.full((n, T), float("-inf")).triu_(pos0 + 1)
         for i in range(self.n_dec):
             p = f"decoder.blocks.{i}"
-            x = self.res(x, self.mha(self.ln(x, p + ".attn_ln"), p + ".attn", cache=cache, mask=mask))
-            x = self.res(x, self.mha(self.ln(x, p + ".cross_attn_ln"), p + ".cross_attn",
-                                     kv=xkv[p + ".cross_attn"]))
-            x = self.res(x, self.mlp(self.ln(x, p + ".mlp_ln"), p))
+            x = self.mha(self.ln(x, p + ".attn_ln"), p + ".attn", cache=cache, mask=mask, res=x)
+            x = self.mha(self.ln(x, p + ".cross_attn_ln"), p + ".cross_attn", kv=xkv[p + ".cross_attn"], res=x)
+            x = self.mlp(self.ln(x, p + ".mlp_ln"), p, res=x)
         x = self.ln(x[-1:], "decoder.ln")
-        return (bf(x) @ w["decoder.token_embedding.weight"].t())[0]
+        return (bf(x) @ w["decoder.token_embedding.weight"].t())[0]  # fp32 logits (engine WE_F_F32)
 
     def transcribe(self, mel, sot=(50258, 50259, 50359, 50363), eot=50257, max_tokens=48):
         with torch.no_grad():

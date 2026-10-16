@@ -25,6 +25,9 @@ if [ ! -f "$REPO/thirdparty/alib/lib/libxaienginea78.a" ]; then
         || { echo "aielib staging failed (log $OUT/aielib.log)"; exit 1; }
 fi
 cd "$OUT"
+# The persistent kernel runs every op from one 16 KB program memory: size-optimize
+# the LLVM front end (hot MAC loops keep their chess schedule, checked in kernel.lst).
+export KC_OPT_LEVEL="${KC_OPT_LEVEL:--Os}"
 WORKLOCAL_DIR="$W" AIE_VERSION=5 PLATFORM=baremetal AIEHLC_PROFILING="${PROFILING:-0}" \
     bash "$REPO/script/hostcompile.sh" > "$OUT/build.log" 2>&1
 rc=$?

@@ -348,6 +348,8 @@ arch_model_dir_aie2ps="${XILINX_VITIS}/aietools/data/aie2ps/lib"
 # Force-include kernel_log.h so klog() is available in all kernel builds
 KERNEL_LOG_INCLUDE="+Wllvm,-include,${AIEHLC_ROOT_DIR}/src/mlir/runtime/kernel_log.h"
 
+# KC_OPT_LEVEL (aie2ps only) overrides the LLVM front-end -O2, e.g. KC_OPT_LEVEL=-Os for
+# a kernel near the 16 KB program-memory limit (whisperengine/build.sh sets it).
 # xchesscc compiler flags per AIE version
 # DWARF debug info is always-on (-g) so the kernel ELF carries a .debug_line
 # table (DICompileUnit/DILocation referencing kernel.cc). This enables PC->source
@@ -364,7 +366,7 @@ KERNEL_LOG_INCLUDE="+Wllvm,-include,${AIEHLC_ROOT_DIR}/src/mlir/runtime/kernel_l
 # has variable locations and types to work with. Use --keep-debug-loc to opt out.
 compiler_flags_aie="$silent_flag +f -p me -P $arch_model_dir_aie +P 4 +Wllvm,-O2,-g,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=10 -D__AIEARCH=10 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR $KERNEL_LOG_INCLUDE $INCLUDE_PATH"
 compiler_flags_aieml="-aiearch aie-ml $silent_flag +f -p me -P $arch_model_dir_aieml +P 4 +Wllvm,-O2,-g,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=20 -D__AIEARCH=20 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $KERNEL_LOG_INCLUDE $INCLUDE_PATH"
-compiler_flags_aie2ps="-aiearch aie2ps $silent_flag +f -p me -P $arch_model_dir_aie2ps +P 4 +Wllvm,-O2,-g,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $KERNEL_LOG_INCLUDE $INCLUDE_PATH"
+compiler_flags_aie2ps="-aiearch aie2ps $silent_flag +f -p me -P $arch_model_dir_aie2ps +P 4 +Wllvm,${KC_OPT_LEVEL:--O2},-g,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $KERNEL_LOG_INCLUDE $INCLUDE_PATH"
 
 # llvm-aie compiler flags per AIE version
 LLVM_AIE_INCLUDE_PATH="-I$XILINX_VITIS_AIETOOLS/include \

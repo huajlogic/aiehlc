@@ -21,8 +21,17 @@
  *       the 4 mesh columns (4 chunks; chunk c is column c's).
  *       WE_F_KT: blocks with cb in [kt_lo, kt_hi) are written transposed,
  *       [dt 6][kp 8][8 dims][8 keys] (the B tile of S = Q K^T).
+ *       Epilogue order: + bias, GELU (if set), + residual (if set), one rounding.
  *       WE_F_GELU: exact erf-GELU of the bf16-rounded value (table, see
  *       gen_gelu_lut.py / we_model.gelu_aie).
+ *       WE_F_VT: blocks with cb in [vt_lo, vt_hi) are written as key-pair tiles
+ *       [kp 8][nt 6][8 keys][8 dims] (the B tile of O = P V).
+ * ATTN  flash attention, heads on mesh columns (round = up to 4 heads), q rows on
+ *       mesh rows; q-blocks of 48 rows, key chunks of 32. Per q-block, A carries
+ *       4 Q chunks [rg 12][kd 8][4][8] (chunk c = column c's head) and B carries
+ *       NKC x (K^T chunk [kd 8][kp 4][8 dims][8 keys], V chunk [kp 4][dt 8][8][8]).
+ *       Scores are in log2 units (log2(e)/sqrt(dh) folded into Wq): P = exp2(S - m).
+ *       Out per q-block: O [rg 12][dt 8][4][8] bf16 (6 KB).
  * LN    y = LayerNorm(x) * gamma + beta (C = 384); A carries the row block one
  *       4-row group at a time (3 KB: [cb 8][kt 6][4][8]); core c of the mesh row
  *       handles groups [c*RGC, (c+1)*RGC) and emits one 3 KB packet each.
@@ -47,6 +56,14 @@ enum { WE_OP_GEMM = 1, WE_OP_LN = 2, WE_OP_ATTN = 3 };
 #define WE_F_GELU 2
 #define WE_F_RES 4
 #define WE_F_KT 8
+#define WE_F_VT 16
+#define WE_F_ROWMAJOR 32 /* out block row-major [64][48] (conv1 -> conv2 window reads) */
+#define WE_F_LOGIT 64    /* out = fp32, one row group (WH_LRG) only: [nt 6][4][8] fp32 (768 B) */
+#define WE_A_CAUSAL 1
+#define WE_QB 48                      /* attention q-block rows */
+#define WE_KCH 32                     /* attention key chunk */
+#define WE_Q_CHUNK (WE_QB * 64 * 2)   /* 6144 */
+#define WE_KV_CHUNK (WE_KCH * 64 * 2) /* 4096 */
 
 enum {
     WH_MAGIC = 0,
@@ -61,10 +78,20 @@ enum {
     WH_N,
     WH_KT_LO,
     WH_KT_HI,
+    WH_VT_LO,
+    WH_VT_HI,
+    WH_LRG, /* WE_F_LOGIT: row group to emit */
+    /* ATTN */
+    WH_T = 4,      /* valid keys */
+    WH_NKC,        /* key chunks */
+    WH_AFLAGS,     /* WE_A_* */
+    WH_NQB = 8,    /* [4]: q-blocks of mesh column c (0: idle in this op) */
+    WH_Q0 = 12,    /* [4]: first query index of column c's q-blocks (causal mask) */
+    WH_STEPS = 16, /* A steps (max NQB) */
     /* LN */
     WH_RGC = 4, /* row groups per core */
     WH_EPS,     /* float bits */
-    WH_NWORDS = 16
+    WH_NWORDS = 32
 };
 
 #endif
