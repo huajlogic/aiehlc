@@ -127,6 +127,14 @@ Machine-readable line: `PERF SUMMARY ... (ms)`.
 
 **`conv2dstem_vec.cc` is the vectorized kernel** (`./buildtest.sh --vec`): same host/DMA/pragmas, kernel on `aie::mmul<4,8,8,int8,int8>` + a bit-exact two-stage vector requantize; 1.77 ms vs 31.47 ms, GOLDEN PASS on the board. Host transforms (1.09 ms) now dominate. `conv2dstem.cc` stays the `--aie-offload` source. Details: `doc/performance/conv2dstem_perf_review.md` §6.
 
+**conv2d launch is 185 µs** (`test_conv2d.cc`, GOLDEN PASS): vector kernel now in
+`conv2dstem.cc` (`mmul<8,8,8>`, filter pre-packed in mmul order by the host,
+2×32-bit-split exact requantize), `#pragma output_tile_major` (fixes a shim-BD
+re-programming race; `g_ofm` is tile-major, host de-tiles), `control_packet_mode(aot)`,
+`TILE_W` 64 with a 232-px staging pitch, non-cacheable input staging. Runtime:
+deferred launch-arg cache sync, warm ELF reload, plan cache, shim AXI burst 16.
+Details `doc/performance/conv2dstem_perf_review.md` §7; skill **outputtilemajorrace**.
+
 **conv2dstem configures the array over the control plane, not the config bus.**
 `conv2dstem.cc` carries four active marker pragmas — `control_plan_op_control_packet`
 (the plan; also moves **kernel ELF load + core launch** onto the fabric →
@@ -772,6 +780,7 @@ Read the matching skill when the task fits:
 | Sim PS.so load segfault | aiesimloaddebug |
 | aiesim live debug register socket | aiesim-debug-socket |
 | HW performance counters | aiehwprofile |
+| GOLDEN FAIL only once the kernel is fast; whole output tiles at stale addresses; per-slab host loop re-programming shim S2MM BDs; KCYC cycle stamps | outputtilemajorrace |
 | `--profiling` build, yet every runtime phase (kload/bdcfg/coreen/startio/wait_io) reads 0 / "counters not built in" (`pmccntr_el0` never started) | pmccntrnotenabled |
 | Raw-XAie sim debug bundle | raw-xaie-sim-debug-bundle |
 | Sim build/run separation | sim-build-run-separation |

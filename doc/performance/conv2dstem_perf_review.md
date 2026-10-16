@@ -217,3 +217,46 @@ generated `aieml.bcf` left DMb 0x0..0x3FFFF unreserved, so libme's
 window acquire) were linked at DMb 0x0 — not this tile's memory. First vec run:
 726,699 outputs off by +1. Fix: reserve the non-local address space like ADF does
 and declare each buffer at its full allocated size.
+
+## 7. conv2d launch under 200 µs (hardware-verified 2026-10-14)
+
+`conv2dstem.cc` now carries the vector kernel (the `_vec` file is the older
+snapshot). `test_conv2d.cc` on the board via `apppaltest.py --netload`:
+**GOLDEN PASS 802816/802816, conv2d launch 185 µs mean / 182 µs min** (the
+`conv2d_spatial` call: cache sync + ELF load + config + array + drain), whole
+`conv2d_stem_nchwc()` 0.51 ms (was 1.80 ms; scalar 35.9 ms).
+
+Starting point: the scalar `conv2dstem.cc` (GOLDEN PASS, conv2d launch ~34.9 ms,
+whole call 35.9 ms). Each row is the board-measured mean conv2d launch over 5 calls
+after that change (tuning took ~3 h 10 min, ~25 build + board cycles):
+
+| # | Change | Launch after | Gain |
+|---|---|---|---|
+| 0 | Starting point: scalar kernel | ~34,900 µs | – |
+| 1 | Vectorized kernel (`aie::mmul<4,8,8>`, from `conv2dstem_vec.cc`) | 590 µs | −34.3 ms |
+| 2 | `ctrl_plan_init` snapshot cache (runtime) \* | 509 µs | −81 µs |
+| 3 | `#pragma output_tile_major` (one S2MM BD per core, no per-slab host loop) + sinks before sources -- also fixes the race below | 341 µs | −168 µs |
+| 4 | Kernel: `mmul<8,8,8>` pairs, aligned A loads, branchless epilogue, host-packed filters (compute 167k → 82k cycles) | 300 µs | −41 µs |
+| 5 | AOT control packets + plain shim BD as 1-D AOT site (window batched into one call) | 288 → 270 µs | −30 µs |
+| 6 | Deferred launch-arg cache sync (802 KB output invalidate overlaps the array) | 228 µs | −42 µs |
+| 7 | Warm kernel-ELF reload (program memory not resent) | 221 µs | −7 µs |
+| 8 | `TILE_W` 64 / 232-px staging pitch: kernel reads the DMA window, no slab copy | 214 µs | −7 µs |
+| 9 | Shim AXI burst 16 | 210 µs | −4 µs |
+| 10 | Non-cacheable input staging + 32-bit word stores | **185 µs** | −25 µs |
+
+\* Step 2 was measured on an intermediate build that still had the output race,
+so its gain is approximate; every build from step 3 on is correct, and the final
+one is GOLDEN PASS. Step 10 also halved host staging (0.168 → 0.079 ms), so the
+whole call went 1.80 ms (vector kernel) → **0.51 ms**.
+
+**The race.** With the dense HWC output the compiler re-programmed the shim
+S2MM OOO BDs between 4 height slabs in a host loop. Once the kernel was fast,
+cores emitted the next slab before the BDs were re-armed and whole 3136 B tiles
+landed at stale addresses (deterministic for a given timing; a 20k-cycle spin per
+round made it pass). `#pragma output_tile_major` lays `g_ofm` out
+`[mesh row][mesh col][round][7x28x16]` so each core is one linear BD (iter wrap 16),
+configured once; the host `collect_ofm_*` de-tiles. Skill **outputtilemajorrace**.
+
+Remaining (measured with `CONV2DSTEM_KCYC 1`): kernel ~157k cycles = compute 82k,
+output wait ~23–42k (daisy-chained per-row output merge gives cols 0–1 1/8 of the
+link each), core wait for first data ~30k.

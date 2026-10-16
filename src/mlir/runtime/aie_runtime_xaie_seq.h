@@ -19,6 +19,9 @@ typedef struct {
     int ooo;
 } rt_seq_bd_args;
 
+/* AXI burst length (beats) for every shim BD built by rt_seq_bd_desc. */
+#define RT_SEQ_SHIM_AXI_BURST 16U
+
 AieRC rt_seq_bd_desc(XAie_DevInst *dev, XAie_LocType tile, uint64_t dma_addr, const rt_seq_bd_args *a,
                      XAie_DmaDesc *desc);
 
