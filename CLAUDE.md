@@ -609,6 +609,24 @@ GEMMs sized the B core window with A's M sub-tile count (fixed for port 1 in
 compared `l1_budget` *bytes* with *element* counts. Generated code for
 `simplematmul2`/`conv2dstem` is byte-identical before/after (kernel/routing/bcf).
 
+**Whisper-tiny on the board: the persistent engine** (`src/aietensorop/whisperengine/`).
+The compiler route above is compile-only; what runs on VEK385 is a hand-written
+engine. It uses the resnetengine fabric with memory tiles spliced in, two kernel
+programs (GEMM, attention) swapped over control packets, and the host re-arming only
+memtile/shim BDs. The encoder takes **27.8 ms (17.8 % of 4×4 bf16 peak)**, the decoder
+~27 ms/token, and the JFK transcript matches PyTorch. Build and run it with
+`build.sh eng` + `apppaltest.py --netload`. Profile it with `HDEFS=WE_TL` (host
+timeline), `KDEFS=WE_PROF_G HDEFS=WE_PROF_GOP` (per-op core split) and
+`KDEFS=WE_PROF_A` (attention). Probes m0–m10 cover mmul blocking, DDR, epilogue,
+LayerNorm apply and attention matmuls.
+
+Traps:
+- **DDR is ~10.5 GB/s read / 10 write / 8 mixed for the whole array, whatever the shim count** (m4). The ~150 MB encoder traffic is the floor, so 30 % of peak is out of reach without on-chip fusion, and the fusions do not fit the 512 KB memory tiles.
+- The host BD shadow writes only changed BD words; `XAie_DmaUpdateBdAddr` read-modify-writes, and each read costs ~400 ns.
+- The attention program's 0x540 stack overflows silently when an extra register-blocked loop is added (m10 4x2 pv was bit-exact standalone, NaN in the engine).
+
+Tutorial: `doc/web/whisper_aie/index.html`. Skills: **memtilebdlockchannel**, **hosttimelinedistortion**, **aie2psprogrammemory**, **dmaoutputdirtycache**.
+
 ### `aiegraph` — the Python front door (`pip install -e .`)
 
 `src/aiegraph/` (+ root `pyproject.toml`): `ag.load("resnet18" | "x.onnx" | nn.Module)` →

@@ -48,15 +48,15 @@
 <p class="sub">What this branch built to run OpenAI Whisper-tiny on the AIE array, how each layer of the encoder and the decoder is handled, and which parts came from aiehlc versus which were written by hand.</p>
 
 <div class="tiles">
-  <div class="tile"><div class="v">33.7 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
-  <div class="tile"><div class="v">14.7 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
-  <div class="tile"><div class="v">~29 ms</div><div class="k">per decoder step (24 steps for the JFK clip)</div></div>
-  <div class="tile"><div class="v">~0.74 s</div><div class="k">audio features in → tokens out</div></div>
+  <div class="tile"><div class="v">27.8 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
+  <div class="tile"><div class="v">17.8 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
+  <div class="tile"><div class="v">~27 ms</div><div class="k">per decoder step (24 steps for the JFK clip)</div></div>
+  <div class="tile"><div class="v">~0.67 s</div><div class="k">audio features in → tokens out</div></div>
   <div class="tile"><div class="v">match</div><div class="k">transcript identical to PyTorch, token for token</div></div>
   <div class="tile"><div class="v">16 cores</div><div class="k">4×4 mesh + 8 memory tiles, 5-column partition</div></div>
 </div>
 
-<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at 14.7 % and the work continues; this page is updated as it moves. Numbers come from board runs on VEK385, booted over netboot.</div>
+<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at <b>17.8 % (27.8 ms)</b>. Measured DDR bandwidth puts 30 % below the floor of this dataflow: see <a href="#floor">the DDR floor</a>. Numbers come from board runs on VEK385, booted over netboot.</div>
 
 <nav class="toc"><b>Contents</b>
 <ol>
@@ -244,15 +244,32 @@
 <tr><td>LayerNorm folded into GEMMs; 4×2 attention, in-place exp2 (5332 → ~2350 cycles per chunk)</td><td class="num">42.4 ms</td><td class="num">11.6</td></tr>
 <tr><td>Two programs + program swap, bank-aware core memory, 4×2 GEMM inner loop, BD shadow cache</td><td class="num">34.9 ms</td><td class="num">14.2</td></tr>
 <tr><td>Streaming fills (memory-tile locks), sub-ops queued ahead, next op prepared during the current one</td><td class="num">33.7 ms</td><td class="num">14.7</td></tr>
+<tr><td>Attention round 2 reuses the q tiles already in MT_A and stays pending; next GEMM prepared before the program swap</td><td class="num">32.6 ms</td><td class="num">15.1</td></tr>
+<tr><td>BD shadow at word level: only changed BD words written, no read-modify-write (a read costs ~400 ns)</td><td class="num">30.6 ms</td><td class="num">16.2</td></tr>
+<tr><td>LayerNorm row statistics once per pass instead of once per sub-op</td><td class="num">28.8 ms</td><td class="num">17.2</td></tr>
+<tr><td>GELU epilogue split into a bias pass and a pipelined GELU pass (probe m8: 9462 → 4408 cycles per block)</td><td class="num">28.1 ms</td><td class="num">17.6</td></tr>
+<tr><td>Round-2 heads share K/V through the neighbour memory tile; convs on the streaming path</td><td class="num">27.8 ms</td><td class="num">17.8</td></tr>
 </table>
 
 <h3>Measured limits</h3>
 <ul>
-<li><b>Host register writes</b> cost ~350 ns each on this board, and re-typing the aperture as Device-nGnRE does not change it (probe <code>m7</code>). Per-op set-up is hidden only by overlapping it with the running op.</li>
-<li><b>DDR</b> delivers ~10–12 GB/s for the whole array; the encoder moves ~150 MB, so DDR alone needs ~13 ms unless traffic is cut (e.g. keeping FC1's 4.7 MB output on chip).</li>
+<li><b>Host register writes</b> cost ~350 ns each on this board, a read ~400 ns, and re-typing the aperture as Device-nGnRE does not change it (probe <code>m7</code>). The host writes only the BD words that changed and prepares each op while the previous one runs, so host time is now hidden almost completely.</li>
+<li><b>DDR</b> delivers ~10.5 GB/s read, ~10 GB/s write, ~8 GB/s mixed for the whole array (probe <code>m4</code>); see the floor above.</li>
 <li><b>GEMM inner loop</b>: 1251 cycles per 64×48×48 chunk on the board (576 ideal); epilogues add ~18 % of core time.</li>
-<li><b>Attention</b>: ~2.2 ms per layer, of which ~0.65 ms is filling Q and K/V before compute starts.</li>
+<li><b>Attention</b>: ~2.1 ms per layer, of which ~0.5 ms is filling Q and K/V before compute starts; in situ 2800 cycles per 32×64 chunk (qk + exp 1577, pv 1170).</li>
 </ul>
+
+<h3 id="floor">The DDR floor: why 30 % is out of reach for this dataflow</h3>
+<p>Probe <code>m4</code> measures the board's DDR as seen from the array: one shim channel reads ~6 GB/s, but any combination of channels and shims saturates at <b>~10.5 GB/s read</b>, <b>~10 GB/s write</b> and <b>~8 GB/s</b> mixed. More shim columns do not add bandwidth.</p>
+<table>
+<tr><th>Op (per encoder layer)</th><th class="num">DDR traffic</th><th class="num">floor at ~9 GB/s</th><th class="num">measured</th><th>bound by</th></tr>
+<tr><td>Q/K/V GEMM</td><td class="num">5.6 MB</td><td class="num">0.62 ms</td><td class="num">0.62 ms</td><td>DDR + LayerNorm on the core</td></tr>
+<tr><td>attention (2 rounds)</td><td class="num">4.6 MB</td><td class="num">0.5 ms</td><td class="num">~2.1 ms</td><td>core (37 % of mmul peak in situ)</td></tr>
+<tr><td>out-projection + residual</td><td class="num">3.8 MB</td><td class="num">0.42 ms</td><td class="num">0.43 ms</td><td>DDR</td></tr>
+<tr><td>FC1 + GELU</td><td class="num">7.1 MB</td><td class="num">0.79 ms</td><td class="num">1.05 ms</td><td>core (GELU, LayerNorm)</td></tr>
+<tr><td>FC2 + residual</td><td class="num">8.3 MB</td><td class="num">0.92 ms</td><td class="num">~1.0 ms</td><td>DDR</td></tr>
+</table>
+<p>The whole encoder moves ~150 MB, a floor of ~16–18 ms on its own — at or below the 16.5 ms target, before any compute that does not overlap with it. Reaching 30 % needs the traffic cut, mainly by keeping FC1's 4.7 MB hidden activation on chip. Each such fusion has been checked against the memory tiles and does not fit: FC1 + FC2 weights are 2.36 MB, more than all eight memory tiles together (4 MB, half of which hold activations), and the Q/K/V → attention fusion needs 523 KB of a 512 KB memory tile. The remaining gains inside this dataflow are kernel work on the compute-bound ops: attention, FC1's GELU and the LayerNorm apply.</p>
 
 <h3>Comparison: the ORT/VitisAI all-AIE decoder</h3>
 <p>The internal <a href="http://xsjpmteamserver50/md/decoder-option/layer-reuse/">layer-reuse report</a> runs Whisper tiny.en (same architecture, FP16) as seven ONNX graphs through VitisAI, one session per graph call. It measures 43.8 ms for one encoder call and 60.5 s for the JFK decode, of which 53.7 s is session construction. This engine keeps the kernel resident and does the same transcript in about 0.74 s.</p>
