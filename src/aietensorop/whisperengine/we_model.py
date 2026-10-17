@@ -15,7 +15,12 @@ Rounding points (``bf()`` = round-to-nearest-even to bf16):
   * every activation tensor written by an op: bf16 (residual stream included
     unless ``fp32_residual``);
   * GEMM: fp32 sum of bf16 products, + bias, [GELU], then bf16;
-  * LayerNorm: fp32 stats of the bf16 input, output bf16;
+  * LayerNorm: folded into the GEMM that consumes it (``fused_ln``, the default;
+    we_desc.h WE_F_LN): W' = bf16(gamma W) (hi/lo pair for the decoder), fp32
+    stats of the bf16 input, y = rstd (x W'^T - mu c) + d with c = sum W' (as
+    the hi+lo bf16 pair the engine holds) and d = b + beta W^T in fp32 -- the
+    normalised x is never rounded (``fused_ln=False``: the old LayerNorm op,
+    output bf16);
   * attention: S = q k^T in fp32, softmax in fp32, P rounded to bf16, O = P v
     in fp32, output bf16 (flash form is the same math up to fp32 rounding);
   * decoder: self-attention K/V cache in bf16; cross-attention K/V computed
@@ -55,11 +60,41 @@ def gelu_aie(y: torch.Tensor) -> torch.Tensor:
 
 
 GELU_SQ = float(torch.tensor(0.3989422804).to(torch.bfloat16))
+LN_EPS = 1e-5
+
+
+def fold(w: torch.Tensor, g: torch.Tensor, hilo: bool):
+    """gamma folded into a GEMM weight: (hi, lo) bf16 parts of gamma (.) W (lo None if not hilo)."""
+    wf = w.float() * g.float()[None, :]
+    hi = bf(wf)
+    return (hi, bf(wf - hi)) if hilo else (hi, None)
+
+
+def ln_consts(w: torch.Tensor, weff: torch.Tensor, b, beta: torch.Tensor):
+    """c = row sums of the folded weight as the hi/lo bf16 pair the engine holds,
+    d = b + beta W^T (fp32)."""
+    c = weff.double().sum(1).float()
+    ch = bf(c)
+    d = beta.double() @ w.double().t()
+    if b is not None:
+        d = d + b.double()
+    return ch, bf(c - ch), d.float()
+
+
+class LNx:
+    """LayerNorm(x) not yet materialised: the next GEMM folds it in."""
+
+    def __init__(self, x, g, b):
+        self.x, self.g, self.b = x, g, b
 
 
 class EngineModel:
-    def __init__(self, model, fp32_residual: bool = False, bf16_act: bool = True, gelu: str = "lut"):
+    def __init__(self, model, fp32_residual: bool = False, bf16_act: bool = True, gelu: str = "lut",
+                 fused_ln: bool = True):
         self.fp32_residual = fp32_residual
+        self.fused_ln = fused_ln
+        self.hilo_dec = False   # decoder weights as hi+lo pairs (set by gen_engine)
+        self.emb_lookup = None  # token embedding rows as the engine reads them (gen_engine)
         self.gelu_mode = gelu
         self.act = bf if bf16_act else (lambda t: t)
         sd = {k: v.detach().float() for k, v in model.state_dict().items()}
@@ -79,11 +114,25 @@ class EngineModel:
         self.n_dec = model.dims.n_text_layer
 
     # -- ops -----------------------------------------------------------------
-    def gemm(self, a, w, b=None, gelu=False, res=None):
-        """The engine GEMM epilogue: + bias, GELU (bf16 out), + residual, ONE rounding."""
-        y = bf(a) @ w.t()
-        if b is not None:
-            y = y + b
+    def gemm(self, a, w, b=None, gelu=False, res=None, hilo=False, raw=False):
+        """The engine GEMM epilogue: + bias, GELU (bf16 out), + residual, ONE rounding
+        (raw: fp32 out, no rounding). a may be an LNx (LayerNorm folded in)."""
+        if isinstance(a, LNx):
+            hi, lo = fold(w, a.g, hilo)
+            weff = hi if lo is None else hi + lo
+            ch, cl, d = ln_consts(w, weff, b, a.b)
+            x = a.x
+            k = x.shape[1]
+            mu = x.sum(1, keepdim=True) * (1.0 / k)
+            var = (x * x).sum(1, keepdim=True) * (1.0 / k) - mu * mu
+            rstd = 1.0 / torch.sqrt(var + LN_EPS)
+            y = rstd * (x @ weff.t() - mu * (ch + cl)) + d
+        else:
+            y = bf(a) @ w.t()
+            if b is not None:
+                y = y + b
+        if raw:
+            return y
         if gelu:
             y = bf(self.gelu(y))
         if res is not None:
@@ -112,6 +161,8 @@ class EngineModel:
         return h + h * t
 
     def ln(self, x, p):
+        if self.fused_ln:
+            return LNx(x, self.w[p + ".weight"], self.w[p + ".bias"])
         y = F.layer_norm(x, (x.shape[-1],), self.w[p + ".weight"], self.w[p + ".bias"], 1e-5)
         return self.act(y)
 
@@ -150,10 +201,11 @@ class EngineModel:
 
     def mha(self, x, p, kv=None, cache=None, mask=None, res=None):
         w = self.w
-        q = self.gemm(x, w[p + ".query.weight"], w[p + ".query.bias"])
+        hl = self.hilo_dec and p.startswith("decoder")
+        q = self.gemm(x, w[p + ".query.weight"], w[p + ".query.bias"], hilo=hl)
         if kv is None:
-            k = self.gemm(x, w[p + ".key.weight"])
-            v = self.gemm(x, w[p + ".value.weight"], w[p + ".value.bias"])
+            k = self.gemm(x, w[p + ".key.weight"], hilo=hl)
+            v = self.gemm(x, w[p + ".value.weight"], w[p + ".value.bias"], hilo=hl)
             if cache is not None:
                 cache[p] = (torch.cat([cache[p][0], k]), torch.cat([cache[p][1], v])) if p in cache else (k, v)
                 k, v = cache[p]
@@ -164,7 +216,8 @@ class EngineModel:
 
     def mlp(self, x, p, res=None):
         w = self.w
-        h = self.gemm(x, w[p + ".mlp.0.weight"], w[p + ".mlp.0.bias"], gelu=True)
+        hl = self.hilo_dec and p.startswith("decoder")
+        h = self.gemm(x, w[p + ".mlp.0.weight"], w[p + ".mlp.0.bias"], gelu=True, hilo=hl)
         return self.gemm(h, w[p + ".mlp.2.weight"], w[p + ".mlp.2.bias"], res=res)
 
     # -- network -------------------------------------------------------------
@@ -193,8 +246,8 @@ class EngineModel:
         out = {}
         for i in range(self.n_dec):
             p = f"decoder.blocks.{i}.cross_attn"
-            out[p] = (self.gemm(xa, w[p + ".key.weight"]),
-                      self.gemm(xa, w[p + ".value.weight"], w[p + ".value.bias"]))
+            out[p] = (self.gemm(xa, w[p + ".key.weight"], hilo=self.hilo_dec),
+                      self.gemm(xa, w[p + ".value.weight"], w[p + ".value.bias"], hilo=self.hilo_dec))
         return out
 
     def decode_tokens(self, toks, pos0, xkv, cache):
@@ -202,7 +255,8 @@ class EngineModel:
         cache, return logits of the last token."""
         w = self.w
         n = len(toks)
-        x = self.act(w["decoder.token_embedding.weight"][toks] + self.dec_pos[pos0:pos0 + n])
+        emb = self.emb_lookup if self.emb_lookup is not None else w["decoder.token_embedding.weight"]
+        x = self.act(emb[toks] + self.dec_pos[pos0:pos0 + n])
         T = pos0 + n
         mask = torch.full((n, T), float("-inf")).triu_(pos0 + 1)
         for i in range(self.n_dec):
@@ -211,7 +265,9 @@ class EngineModel:
             x = self.mha(self.ln(x, p + ".cross_attn_ln"), p + ".cross_attn", kv=xkv[p + ".cross_attn"], res=x)
             x = self.mlp(self.ln(x, p + ".mlp_ln"), p, res=x)
         x = self.ln(x[-1:], "decoder.ln")
-        return (bf(x) @ w["decoder.token_embedding.weight"].t())[0]  # fp32 logits (engine WE_F_F32)
+        if isinstance(x, LNx):
+            return self.gemm(x, w["decoder.token_embedding.weight"], hilo=self.hilo_dec, raw=True)[0]
+        return (bf(x) @ w["decoder.token_embedding.weight"].t())[0]  # fp32 logits (engine WE_F_LOGIT)
 
     def transcribe(self, mel, sot=(50258, 50259, 50359, 50363), eot=50257, max_tokens=48):
         with torch.no_grad():

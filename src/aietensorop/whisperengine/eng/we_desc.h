@@ -3,8 +3,10 @@
  * Full picture: doc/design/whisper_aie_engine.md.
  *
  * Every op starts with a WE_HDR_BYTES header on the A channel (core S2MM ch0,
- * row broadcast from MT_A): int32 words WH_*, then a parameter area at
- * WE_PRM_OFF (bias / gamma,beta as bf16).
+ * row broadcast from MT_A; it lands over the A ping+pong buffers): int32 words
+ * WH_*, then a parameter area at WE_PRM_OFF. GEMM parameters, for the NSB*48
+ * columns of the sub-op: d fp32 [NSB*48] (bias), and with WE_F_LN also c_hi,
+ * c_lo bf16 [NSB*48] each.
  *
  * Activation layout in DDR and memtiles ("BLK"): a [M x C] bf16 tensor with
  * M = 4 * RB rows (RB = rows per mesh-row block, multiple of 64) is
@@ -26,6 +28,14 @@
  *       gen_gelu_lut.py / we_model.gelu_aie).
  *       WE_F_VT: blocks with cb in [vt_lo, vt_hi) are written as key-pair tiles
  *       [kp 8][nt 6][8 keys][8 dims] (the B tile of O = P V).
+ *       WE_F_LN: A is the raw residual stream x and the op computes
+ *       LayerNorm(x) W^T + b without materialising LayerNorm(x): W' = gamma (.) W
+ *       (folded host-side), c = sum_k W'[n][k], d = b + beta W^T, so
+ *         y = rstd * (x W'^T - mu c) + d   (mu, rstd per row of x).
+ *       The core takes mu / rstd from the first WH_KST A chunks of every block of
+ *       its first column tile (nb == 0) -- fp32 sums of x and x^2 -- and keeps
+ *       them for the other tiles; mu c goes on the multiplier as a hi/lo bf16
+ *       outer product. (The LayerNorm op it replaces cost a DDR round trip.)
  * ATTN  flash attention, heads on mesh columns (round = up to 4 heads), q rows on
  *       mesh rows; q-blocks of 32 rows, key chunks of 64. Per q-block, A carries
  *       4 Q chunks [rg 8][kd 8][4][8] (chunk c = column c's head) and B carries
@@ -34,15 +44,12 @@
  *       m a per-row reference raised only when a score passes m + WE_SM_LAZY (softmax
  *       is invariant to it); the denominator is kept per lane, reduced at the end.
  *       Out per q-block: O [rg 8][dt 8][4][8] bf16 (4 KB).
- * LN    y = LayerNorm(x) * gamma + beta (C = 384); A carries the row block one
- *       4-row group at a time (3 KB: [cb 8][kt 6][4][8]); core c of the mesh row
- *       handles groups [c*RGC, (c+1)*RGC) and emits one 3 KB packet each.
  */
 #ifndef WE_DESC_H
 #define WE_DESC_H
 
 #define WE_MAGIC 0x31455745 /* "EWE1" */
-#define WE_HDR_BYTES 4096
+#define WE_HDR_BYTES 8192
 #define WE_PRM_OFF 256
 #define WE_TM 64
 #define WE_TN 48
@@ -50,9 +57,8 @@
 #define WE_A_CHUNK (WE_TM * WE_KC * 2) /* 6144 */
 #define WE_B_CHUNK (WE_TN * WE_KC * 2) /* 4608 */
 #define WE_BLK (WE_TM * WE_TN * 2)     /* 6144: one GEMM output block */
-#define WE_RG_ROW (4 * 384 * 2)        /* 3072: one 4-row group of a 384-wide row */
 
-enum { WE_OP_GEMM = 1, WE_OP_LN = 2, WE_OP_ATTN = 3 };
+enum { WE_OP_GEMM = 1, WE_OP_ATTN = 3 }; /* 2 was the LayerNorm op, now folded (WE_F_LN) */
 
 #define WE_F_BIAS 1
 #define WE_F_GELU 2
@@ -61,6 +67,7 @@ enum { WE_OP_GEMM = 1, WE_OP_LN = 2, WE_OP_ATTN = 3 };
 #define WE_F_VT 16
 #define WE_F_ROWMAJOR 32 /* out block row-major [64][48] (conv1 -> conv2 window reads) */
 #define WE_F_LOGIT 64    /* out = fp32, one row group (WH_LRG) only: [nt 6][4][8] fp32 (768 B) */
+#define WE_F_LN 128      /* LayerNorm folded in (above) */
 #define WE_A_CAUSAL 1
 #define WE_QB 32                      /* attention q-block rows */
 #define WE_KCH 64                     /* attention key chunk */
@@ -83,7 +90,10 @@ enum {
     WH_KT_HI,
     WH_VT_LO,
     WH_VT_HI,
-    WH_LRG, /* WE_F_LOGIT: row group to emit */
+    WH_LRG,    /* WE_F_LOGIT: row group to emit */
+    WH_KST,    /* WE_F_LN: A chunks per block that carry x (K / 48; the rest replay it) */
+    WH_LNEPS,  /* WE_F_LN: epsilon, float bits */
+    WH_LNINVK, /* WE_F_LN: 1 / K, float bits (the core has no scalar FPU) */
     /* ATTN */
     WH_T = 4,      /* valid keys */
     WH_NKC,        /* key chunks */
@@ -91,9 +101,6 @@ enum {
     WH_NQB = 8,    /* [4]: q-blocks of mesh column c (0: idle in this op) */
     WH_Q0 = 12,    /* [4]: first query index of column c's q-blocks (causal mask) */
     WH_STEPS = 16, /* A steps (max NQB) */
-    /* LN */
-    WH_RGC = 4, /* row groups per core */
-    WH_EPS,     /* float bits */
     WH_NWORDS = 32
 };
 

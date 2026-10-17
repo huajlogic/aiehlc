@@ -32,4 +32,14 @@ export KC_OPT_LEVEL="${KC_OPT_LEVEL:--Os}"
 WORKLOCAL_DIR="$W" AIE_VERSION=5 PLATFORM=baremetal AIEHLC_PROFILING="${PROFILING:-0}" \
     bash "$REPO/script/hostcompile.sh" > "$OUT/build.log" 2>&1
 rc=$?
-if [ -f "$W/build/host" ]; then echo "built $W/build/host"; else echo "BUILD FAILED rc=$rc (log $OUT/build.log)"; grep -n 'error' "$OUT/build.log" | head; exit 1; fi
+# AIE2PS program memory is 16 KB and an overflow only shows at load time
+# ("Overflow of program memory", the tail silently dropped). The map's "Used" omits
+# alignment padding: check the end address of the last PM item instead.
+MAP="$W/build/kernel.map"
+if [ -f "$MAP" ]; then
+    pm_end=$(awk '/Memory map for memory .PM./{f=1} /Memory map for memory .DM/{f=0} f && /items\) :/{split($1,a,"\\.\\."); e=a[2]} END{print e}' "$MAP")
+    if [ -n "$pm_end" ] && [ $((pm_end)) -ge $((0x4000)) ]; then
+        echo "BUILD FAILED: kernel program memory ends at $pm_end, past 16 KB (0x4000)"; exit 1
+    fi
+fi
+if [ -f "$W/build/host" ]; then echo "built $W/build/host (kernel PM end ${pm_end:-?})"; else echo "BUILD FAILED rc=$rc (log $OUT/build.log)"; grep -n 'error' "$OUT/build.log" | head; exit 1; fi

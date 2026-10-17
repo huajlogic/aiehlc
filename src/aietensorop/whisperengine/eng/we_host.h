@@ -243,6 +243,11 @@ typedef struct {
     float *logits;  /* WE_F_LOGIT: fp32 [tile][6][4][8] of row group lrg */
     int lrg;
     int wsplit; /* weights as hi+lo bf16 pairs: W' = [Wh | Wl] (K' = 2K), A replayed twice */
+    /* WE_F_LN (we_desc.h): LayerNorm of A folded in. w is gamma (.) W, lnd = b + beta W^T
+     * (fp32, replaces bias), lnc = c_hi | c_lo bf16 [n each]: c = row sums of w */
+    const float *lnd;
+    const bf16_t *lnc;
+    int lnn; /* full N of lnd / lnc (a column chunk of a wider GEMM indexes into them) */
 } WeGemm;
 
 /* Column tiles per mesh column per sub-op: <= 4 (memtile task queue), 1 when
@@ -299,9 +304,10 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
         hbuf = (int32_t *)__Runtime_Alloc(hdrs);
         hcap = hdrs;
     }
+    const int ln = g->lnd != 0;
     for (int s = 0; s < NSUB; s++) {
         int32_t *h = (int32_t *)((int8_t *)hbuf + (size_t)s * WE_HDR_BYTES);
-        memset(h, 0, WE_HDR_BYTES);
+        memset(h, 0, WE_PRM_OFF);
         h[WH_MAGIC] = WE_MAGIC;
         h[WH_OP] = WE_OP_GEMM;
         h[WH_SEQ] = (int32_t)e->seq++;
@@ -309,15 +315,26 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
         h[WH_MB] = MBP;
         h[WH_NB] = NBS;
         h[WH_KCN] = KCN;
-        h[WH_FLAGS] = g->flags | (g->bias ? WE_F_BIAS : 0) | (res ? WE_F_RES : 0);
+        h[WH_FLAGS] = g->flags | (g->bias || ln ? WE_F_BIAS : 0) | (res ? WE_F_RES : 0) | (ln ? WE_F_LN : 0);
         h[WH_N] = NSB * 48;
         h[WH_KT_LO] = g->kt_lo - s * NSB;
         h[WH_KT_HI] = g->kt_hi - s * NSB;
         h[WH_VT_LO] = g->vt_lo - s * NSB;
         h[WH_VT_HI] = g->vt_hi - s * NSB;
         h[WH_LRG] = g->lrg;
-        if (g->bias)
-            memcpy((int8_t *)h + WE_PRM_OFF, g->bias + (size_t)s * NSB * 48, (size_t)NSB * 48 * 2);
+        h[WH_KST] = K / 48;
+        const float eps = 1e-5f, invk = 1.0f / (float)K;
+        memcpy(&h[WH_LNEPS], &eps, 4);
+        memcpy(&h[WH_LNINVK], &invk, 4);
+        // parameters of this sub-op's NSB*48 columns: d fp32, then (LN) c_hi, c_lo bf16
+        float *d = (float *)((int8_t *)h + WE_PRM_OFF);
+        const size_t c0 = (size_t)s * NSB * 48;
+        for (int i = 0; i < NSB * 48; i++)
+            d[i] = ln ? g->lnd[c0 + i] : g->bias ? bf2f(g->bias[c0 + i]) : 0.0f;
+        if (ln) {
+            memcpy(d + NSB * 48, g->lnc + c0, (size_t)NSB * 48 * 2);
+            memcpy((bf16_t *)(d + NSB * 48) + NSB * 48, g->lnc + g->lnn + c0, (size_t)NSB * 48 * 2);
+        }
     }
     __Runtime_sync_for_dev(e->dev, hbuf, hdrs);
     // B: the column's whole weight slice, once per op
@@ -586,56 +603,6 @@ static int we_attn(WeEng *e, const WeAttn *a) {
     }
     const int h2[4] = {4, 5, 4, 5}, n2[4] = {QB, QB, 0, 0};
     return we_attn_round(e, a, h2, n2, z);
-}
-
-/* ---- LayerNorm ----------------------------------------------------------- */
-static int we_ln(WeEng *e, const WeAct *x, const bf16_t *gamma, const bf16_t *beta, float eps, const WeAct *y,
-                 int ract) {
-    const int RB = x->rb, RG = RB / 4, RGC = RG / 4;
-    const size_t tileb = (size_t)RB * 48 * 2;
-    XTime p0, p1, p2, p3;
-    XTime_GetTime(&p0);
-    we_hdr_begin(e, WE_OP_LN, ract);
-    e->hdr[WH_RGC] = RGC;
-    memcpy(&e->hdr[WH_EPS], &eps, 4);
-    memcpy((int8_t *)e->hdr + WE_PRM_OFF, gamma, 384 * 2);
-    memcpy((int8_t *)e->hdr + WE_PRM_OFF + 768, beta, 384 * 2);
-    __Runtime_sync_for_dev(e->dev, e->hdr, WE_HDR_BYTES);
-    struct_ioevent ev[4];
-    bf16_t *dst[4][4];
-    for (int r = 0; r < 4; r++)
-        for (int c = 0; c < 4; c++)
-            dst[r][c] = we_tile(y, r, 0) + (size_t)c * 4 * 48; /* group g -> core g % 4 */
-    we_arm_out(e, ract, dst, WE_RG_ROW, RGC, 4 * 384, 384, 8, (int)tileb, ev);
-    for (int k = 1; k <= ract; k++) {
-        XAie_LocType t = we_mt(k, EF_MT_A_ROW);
-        we_mt_bd(e, t, 0, EF_MT_BASE, (uint32_t)(WE_HDR_BYTES + 8 * tileb), 0, 0, 0, 0, 0, -1);
-        we_mt_queue(e, t, DMA_S2MM, 0, 1);
-        we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, 13, 0, 0, 0);
-        we_sh_bd(e, k, 13, we_tile(x, k - 1, 0), (int)(8 * tileb), -1, 0, 0, 0);
-        we_sh_start(e, k, 1, 12);
-    }
-    int rc = 0;
-    for (int k = 1; k <= ract && !rc; k++)
-        rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 0, DMA_S2MM);
-    XTime_GetTime(&p1);
-    for (int k = 1; k <= ract; k++) {
-        XAie_LocType t = we_mt(k, EF_MT_A_ROW);
-        we_mt_bd(e, t, 1, EF_MT_BASE, WE_HDR_BYTES, 0, 0, 0, 0, 0, -1);
-        const uint32_t s[3] = {1, (uint32_t)(tileb / 4), 96}, w[3] = {96, 8, 0};
-        we_mt_bd(e, t, 2, EF_MT_BASE + WE_HDR_BYTES, (uint32_t)(8 * tileb), 3, s, w, 0, 0, -1);
-        we_mt_queue(e, t, DMA_MM2S, 1, 1);
-        we_mt_queue(e, t, DMA_MM2S, 2, 1);
-    }
-    XTime_GetTime(&p2);
-    for (int r = 0; r < ract; r++)
-        if (we_wait_out(e, ev[r]))
-            return -1;
-    XTime_GetTime(&p3);
-    e->t_fill += we_us(p0, p1);
-    e->t_arm += we_us(p1, p2);
-    e->t_run += we_us(p2, p3);
-    return rc;
 }
 
 /* Header to the idle mesh rows too (cores of rows >= ract only read it). */

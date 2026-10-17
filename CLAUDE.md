@@ -861,6 +861,8 @@ Read the matching skill when the task fits:
 | Plug a user-written kernel into a TVM layer (`AIEK_ENTRY`/`AIEK_SPEC`, `--aie-kernel`, `aiekernel check/offload`); an L0xx lint code, calibrate MISMATCH, emulate FAIL, or `rejected at link -- ... routing()` | aieuserkernel |
 | Run/extend the persistent ResNet-18 engine (`resnetengine`: gen_engine.py model mismatch, core memory overflow, ENG FAIL, new layer kind) | resnetengine |
 | AIE kernel: +1 errors / constant garbage right after ADDING a code path; statics above `DM_stack` overwritten | aiecorestackoverflow |
+| `[AIE ERROR] Overflow of program memory` at load though the build passed (kernel.map "Used" < 16 KB); shrinking a persistent AIE2PS kernel; chess "no Basic_block found" | aie2psprogrammemory |
+| AIE output correct except one/two 64-byte lines (stale / zero, different each run): dirty host cache lines evicted over DMA output | dmaoutputdirtycache |
 | Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |

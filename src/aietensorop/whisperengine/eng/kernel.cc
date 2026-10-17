@@ -25,8 +25,10 @@
 #define AR_B1 0x4200  /* B pong 4.5 KB            */
 #define AR_C 0x5400   /* GEMM accumulators 12 KB  */
 #define AR_OUT 0x8400 /* output block 6 KB        */
-#define AR_PRM 0x9C00 /* per-op params 3 KB       */
-#define AR_BYTES 0xB400
+#define AR_PRM 0x9C00 /* own tiles' params 1.5 KB: d fp32 [NB*48], c_hi, c_lo bf16 [NB*48] */
+#define AR_TMP 0xA200 /* LN: per-row-group partial sums of x, x^2 (2 KB) */
+#define AR_ST 0xAA00  /* LN: mu, rstd per row of the op's blocks [MB*64][2] (3 KB) */
+#define AR_BYTES 0xB600
 /* ATTN carve-up */
 #define AT_A0 0x0000 /* Q chunk ping 4 KB (header too) */
 #define AT_A1 0x1000 /* Q chunk pong 4 KB */
@@ -41,7 +43,7 @@ alignas(64) int8_t we_arena[AR_BYTES];
 alignas(64) uint16_t we_gelu_ab[2 * WE_GELU_LUT_N] = WE_GELU_LUT_INIT;
 alignas(64) uint16_t we_gelu_cd[2 * WE_GELU_LUT_N] = WE_GELU_LUT_INIT;
 alignas(64) volatile int32_t we_dbg[16]; /* progress for host-side hang dumps (aieml.bcf: 0x7f400) */
-alignas(64) float we_att_ml[2][8][32];   /* [0] reference max per row (x8 lanes), [1] per-lane denominator */
+alignas(64) float we_att_ml[3][8][32]; /* [0] reference per row (x8 lanes), [1] per-lane denominator, [2] l snapshot */
 
 static const int k_pkt[EF_MESH_ROWS][EF_MESH_COLS] = EF_PKT_ID_TABLE;
 static const int k_ooo[EF_MESH_ROWS][EF_MESH_COLS] = EF_OOO_BD_TABLE;
@@ -55,39 +57,51 @@ typedef aie::vector<float, 32> V32;
 static int g_mr, g_mc, g_pkt, g_ooo;
 
 // ---- tile DMA programming ---------------------------------------------------
+// one BD (lock acquire / release, optional packet header) and one channel start,
+// each encoded in exactly one place (program memory)
+__attribute__((noinline)) static void bd_write(int bd, unsigned off, unsigned len, int next, int lk_acq, int lk_rel,
+                                               int pkt) {
+    AieKcReg kc[8];
+    core_reg_write_block(kc, aie_kc_encode_bd(kc, (uint8_t)bd, (uintptr_t)(we_arena + off), len, next, lk_acq, -1,
+                                              lk_rel, 1, pkt, pkt ? g_pkt : 0, 0, pkt ? g_ooo : -1));
+}
+__attribute__((noinline)) static void ch_start(int ch, int mm2s, int bd, unsigned rounds) {
+    AieKcReg kc[2];
+    if (mm2s)
+        aie_kc_encode_mm2s_start(kc, ch, bd, rounds, 0);
+    else
+        aie_kc_encode_s2mm_start(kc, ch, bd, rounds, 0);
+    core_reg_write(kc[0].off, kc[0].val);
+}
 __attribute__((noinline)) static void cfg_s2mm(int ch, int bd0, int bd1, unsigned o0, unsigned o1, unsigned len,
                                                int lk_e, int lk_f, unsigned rounds) {
-    AieKcReg kc[8];
-    if (rounds == 1) {
-        core_reg_write_block(
-            kc, aie_kc_encode_bd(kc, bd0, (uintptr_t)(we_arena + o0), len, -1, lk_e, -1, lk_f, 1, 0, 0, 0, -1));
-        aie_kc_encode_s2mm_start(kc, ch, bd0, 1, 0);
-    } else {
-        core_reg_write_block(
-            kc, aie_kc_encode_bd(kc, bd1, (uintptr_t)(we_arena + o1), len, -1, lk_e, -1, lk_f, 1, 0, 0, 0, -1));
-        core_reg_write_block(
-            kc, aie_kc_encode_bd(kc, bd0, (uintptr_t)(we_arena + o0), len, bd1, lk_e, -1, lk_f, 1, 0, 0, 0, -1));
-        aie_kc_encode_s2mm_start(kc, ch, bd0, rounds / 2, 0);
-    }
-    core_reg_write(kc[0].off, kc[0].val);
+    const int pp = rounds != 1; /* ping-pong pair, else a single BD */
+    if (pp)
+        bd_write(bd1, o1, len, -1, lk_e, lk_f, 0);
+    bd_write(bd0, o0, len, pp ? bd1 : -1, lk_e, lk_f, 0);
+    ch_start(ch, 0, bd0, pp ? rounds / 2 : 1);
 }
 __attribute__((noinline)) static void cfg_a(unsigned len, unsigned rounds) {
     cfg_s2mm(0, EF_BD_IN_PING, EF_BD_IN_PONG, AR_A0, AR_A1, len, EF_LK_IN_EMPTY, EF_LK_IN_FULL, rounds);
 }
-__attribute__((noinline)) static void cfg_b(unsigned len, unsigned rounds) {
-    cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AR_B0, AR_B1, len, EF_LK_W_EMPTY, EF_LK_W_FULL, rounds);
-}
 __attribute__((noinline)) static void cfg_out_at(unsigned off, unsigned len, unsigned rounds) {
-    AieKcReg kc[8];
-    core_reg_write_block(kc, aie_kc_encode_bd(kc, EF_BD_OUT_PING, (uintptr_t)(we_arena + off), len, -1, EF_LK_OUT_FULL,
-                                              -1, EF_LK_OUT_EMPTY, 1, 1, g_pkt, 0, g_ooo));
-    aie_kc_encode_mm2s_start(kc, 0, EF_BD_OUT_PING, rounds, 0);
-    core_reg_write(kc[0].off, kc[0].val);
+    bd_write(EF_BD_OUT_PING, off, len, -1, EF_LK_OUT_FULL, EF_LK_OUT_EMPTY, 1);
+    ch_start(0, 1, EF_BD_OUT_PING, rounds);
 }
-__attribute__((noinline)) static void cfg_out(unsigned len, unsigned rounds) { cfg_out_at(AR_OUT, len, rounds); }
 static void out_drained() {
     LK_ACQ(EF_LK_OUT_EMPTY, 1);
     LK_REL(EF_LK_OUT_EMPTY, 1);
+}
+
+// n 128-byte vectors (any element type; buffers 64-byte aligned): one copy of each
+// loop in program memory
+__attribute__((noinline)) static void vcopy(void *dst, const void *src, unsigned n) {
+    for (unsigned i = 0; i < n; i++)
+        chess_prepare_for_pipelining aie::store_v((float *)dst + i * 32, aie::load_v<32>((const float *)src + i * 32));
+}
+__attribute__((noinline)) static void vzero(void *dst, unsigned n) {
+    for (unsigned i = 0; i < n; i++)
+        chess_prepare_for_pipelining aie::store_v((float *)dst + i * 32, aie::zeros<float, 32>());
 }
 
 // ---- GEMM -------------------------------------------------------------------
@@ -121,12 +135,6 @@ __attribute__((noinline)) static void mac_chunk(const bfloat16 *__restrict A, co
         }
 }
 
-__attribute__((noinline)) static void zero_c(float *C) {
-    const V32 z = aie::zeros<float, 32>();
-    for (unsigned i = 0; i < WE_TM * WE_TN / 32; i++)
-        chess_prepare_for_pipelining aie::store_v(C + i * 32, z);
-}
-
 // float vector arithmetic that stays in vector<float> (aie::mul yields an accumulator)
 // fp32 multiply is emulated on this core (3 bf16 products): one out-of-line copy
 // keeps the 16 KB program memory from filling up with inlined expansions.
@@ -158,7 +166,7 @@ typedef aie::vector<int16, 32> VI;
 // 0.5x + bf16(x^2)/sqrt(2 pi) below, x / 0 beyond. Only native ops: integer,
 // table lookup, bf16 x bf16 -> fp32 products, fp32 add.
 __attribute__((always_inline)) static inline VB gelu_bf16(const VB &xb) {
-    static aie::lut<4, bfloat16> lut(WE_GELU_LUT_N, we_gelu_ab, we_gelu_cd);
+    const aie::lut<4, bfloat16> lut(WE_GELU_LUT_N, we_gelu_ab, we_gelu_cd); /* not static: no guard / atexit code */
     aie::parallel_lookup<int16, aie::lut<4, bfloat16>> lk(lut, 0, 0);
     const VI u = xb.template cast_to<int16>();
     const VI e = aie::bit_and((int16)0xFF, aie::downshift(u, 7));
@@ -204,16 +212,93 @@ __attribute__((noinline)) static void epilogue(const float *C, const float *bias
             }
 }
 
-// Logits: fp32 (no bias), one row group -> [nt 6][4][8] fp32
-__attribute__((noinline)) static void epilogue_logit(const float *C, float *out, int rg) {
-    for (unsigned nt = 0; nt < 6; nt++)
-        aie::store_v(out + nt * 32, aie::load_v<32>(C + (rg * 6 + nt) * 32));
+// Logits: fp32, one row group -> [nt 6][4][8] fp32 (+ d: the folded LayerNorm's beta W^T)
+__attribute__((noinline)) static void epilogue_logit(const float *C, const float *bias8, float *out, int rg) {
+    for (unsigned nt = 0; nt < 6; nt++) {
+        const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
+        aie::store_v(out + nt * 32, aie::add(aie::load_v<32>(C + (rg * 6 + nt) * 32), aie::concat(b8, b8, b8, b8)));
+    }
 }
 
-// bf16 parameters (header) -> fp32 table, vectorized (n multiple of 32)
-__attribute__((noinline)) static void prm_to_f32(const bfloat16 *src, float *dst, unsigned n) {
-    for (unsigned i = 0; i < n; i += 32)
-        chess_prepare_for_pipelining aie::store_v(dst + i, to_f32(aie::load_v<32>(src + i)));
+// ---- LayerNorm folded into the GEMM (WE_F_LN, we_desc.h) ---------------------------
+// One A chunk [rg16][kt6][4][8] of x: partial sums into tmp[rg] -- lanes 0..3 of
+// each row's 8 lanes hold sums of x, lanes 4..7 sums of x^2 (fp32; x^2 exact).
+__attribute__((noinline)) static void ln_acc(const bfloat16 *A, float *tmp, int first) {
+    if (first)
+        vzero(tmp, 16);
+    const VB one = aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::mask<32> hi4 = aie::mask<32>::from_uint32(0xF0F0F0F0u);
+    for (unsigned rg = 0; rg < 16; rg++)
+        chess_prepare_for_pipelining chess_loop_range(16, 16) {
+            const VB x0 = aie::load_v<32>(A + rg * 6 * 32);
+            aie::accum<accfloat, 32> sa = aie::mul(x0, one), qa = aie::mul(x0, x0);
+            for (unsigned kt = 1; kt < 6; kt++)
+                chess_unroll_loop() {
+                    const VB x = aie::load_v<32>(A + (rg * 6 + kt) * 32);
+                    sa = aie::mac(sa, x, one);
+                    qa = aie::mac(qa, x, x);
+                }
+            V32 sv = sa.template to_vector<float>(), qv = qa.template to_vector<float>();
+            sv = aie::add(sv, aie::shuffle_down(sv, 4));
+            qv = aie::add(qv, aie::shuffle_down(qv, 4));
+            aie::store_v(tmp + rg * 32,
+                         aie::add(aie::load_v<32>(tmp + rg * 32), aie::select(sv, aie::shuffle_up(qv, 4), hi4)));
+        }
+}
+
+// Per row of the block: rstd*mu and rstd -> st[0..64) and st[64..128). The row
+// sums are first compacted in place in tmp ([row][sum x, sum x^2]), so the fp32
+// math (vector invsqrt included) runs on 2 vectors, not 16.
+__attribute__((noinline)) static void ln_fin(float *tmp, float *st, float invk, float eps) {
+    for (unsigned rg = 0; rg < 16; rg++) {
+        V32 t = aie::load_v<32>(tmp + rg * 32);
+        t = aie::add(t, aie::shuffle_down(t, 2));
+        t = aie::add(t, aie::shuffle_down(t, 1)); /* lane 8i: sum x, lane 8i+4: sum x^2 of row i */
+        aie::store_v(tmp + rg * 8, aie::filter_even(aie::filter_even(t)));
+    }
+    const V32 ik = aie::broadcast<float, 32>(invk), ev = aie::broadcast<float, 32>(eps);
+    for (unsigned h = 0; h < 2; h++) {
+        const V32 va = aie::load_v<32>(tmp + h * 64), vb = aie::load_v<32>(tmp + h * 64 + 32);
+        const V32 m = fmul(aie::concat(aie::filter_even(va), aie::filter_even(vb)), ik);
+        const V32 e2 = fmul(aie::concat(aie::filter_odd(va), aie::filter_odd(vb)), ik);
+        const V32 r = aie::invsqrt(aie::add(aie::sub(e2, fmul(m, m)), ev));
+        aie::store_v(st + h * 32, fmul(r, m));
+        aie::store_v(st + 64 + h * 32, r);
+    }
+}
+
+// C (one 64x48 block) <- rstd (C - mu c) = rstd C - (rstd mu) c, all on the multiplier
+// with hi/lo bf16 operands (fp32 accumulation, only the lo x lo terms dropped):
+//   rstd C : A1 = [diag(r_hi) | diag(r_lo)] x B1 = [C_hi; C_hi]  +  A2 = [diag(r_hi) | 0] x B2 = [C_lo; 0]
+//   (rstd mu) c : A3 rows [-q_hi, -q_hi, -q_lo, 0..] x B3 rows [c_hi; c_lo; c_hi; 0..]
+__attribute__((noinline)) static void ln_apply(float *C, const float *st, const bfloat16 *ch, const bfloat16 *cl) {
+    const aie::vector<bfloat16, 8> z8 = aie::zeros<bfloat16, 8>();
+    const VB z = aie::zeros<bfloat16, 32>();
+    const aie::mask<32> m01 = aie::mask<32>::from_uint32(0x03030303u), m2 = aie::mask<32>::from_uint32(0x04040404u);
+    const aie::mask<32> dg = aie::mask<32>::from_uint32(0x08040201u), dg4 = aie::mask<32>::from_uint32(0x80402010u);
+    for (unsigned rg = 0; rg < 16; rg++) {
+        const float *q = st + rg * 4, *r = st + 64 + rg * 4;
+        const V32 qm = aie::concat(aie::broadcast<float, 8>(q[0]), aie::broadcast<float, 8>(q[1]),
+                                   aie::broadcast<float, 8>(q[2]), aie::broadcast<float, 8>(q[3]));
+        const V32 rs = aie::concat(aie::broadcast<float, 8>(r[0]), aie::broadcast<float, 8>(r[1]),
+                                   aie::broadcast<float, 8>(r[2]), aie::broadcast<float, 8>(r[3]));
+        const VB rh = to_bf16(rs), rl = to_bf16(aie::sub(rs, to_f32(rh)));
+        const VB qh = aie::neg(to_bf16(qm)), ql = aie::neg(to_bf16(aie::sub(qm, to_f32(to_bf16(qm)))));
+        const VB a2 = aie::select(z, rh, dg), a1 = aie::select(a2, rl, dg4);
+        const VB a3 = aie::select(aie::select(z, qh, m01), ql, m2);
+        for (unsigned nt = 0; nt < 6; nt++)
+            chess_prepare_for_pipelining {
+                float *c = C + (rg * 6 + nt) * 32;
+                const V32 cv = aie::load_v<32>(c);
+                const VB c_h = to_bf16(cv), c_l = to_bf16(aie::sub(cv, to_f32(c_h)));
+                const aie::vector<bfloat16, 8> h8 = aie::load_v<8>(ch + nt * 8);
+                MM acc;
+                acc.mul(a1, aie::concat(c_h, c_h));
+                acc.mac(a2, aie::concat(c_l, z));
+                acc.mac(a3, aie::concat(h8, aie::load_v<8>(cl + nt * 8), h8, z8, z8, z8, z8, z8));
+                aie::store_v(c, acc.template to_vector<float>());
+            }
+    }
 }
 
 // K^T / V tile variants (attention operands), rows paired into 8-key tiles:
@@ -225,12 +310,10 @@ __attribute__((noinline)) static void epilogue_kv(const float *C, const float *b
             chess_prepare_for_pipelining {
                 V32 lo = aie::load_v<32>(C + ((2 * kp) * 6 + nt) * 32);
                 V32 hi = aie::load_v<32>(C + ((2 * kp + 1) * 6 + nt) * 32);
-                if (flags & WE_F_BIAS) {
-                    const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
-                    const V32 b = aie::concat(b8, b8, b8, b8);
-                    lo = aie::add(lo, b);
-                    hi = aie::add(hi, b);
-                }
+                const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
+                const V32 b = aie::concat(b8, b8, b8, b8);
+                lo = aie::add(lo, b);
+                hi = aie::add(hi, b);
                 const aie::vector<bfloat16, 64> kd = aie::concat(to_bf16(lo), to_bf16(hi));
                 if (tr)
                     aie::store_v(out + (nt * 8 + kp) * 64, aie::transpose(kd, 8, 8));
@@ -242,19 +325,28 @@ __attribute__((noinline)) static void epilogue_kv(const float *C, const float *b
 __attribute__((noinline)) static void op_gemm(const int32_t *h) {
     const int MB = h[WH_MB], NB = h[WH_NB], KCN = h[WH_KCN], flags = h[WH_FLAGS];
     const int kt_lo = h[WH_KT_LO], kt_hi = h[WH_KT_HI], vt_lo = h[WH_VT_LO], vt_hi = h[WH_VT_HI];
-    const int lrg = h[WH_LRG];        /* the header buffer is reused by A chunks: read everything now */
-    float *bias8 = AR(AR_PRM, float); /* [N]: tile cb at cb*48 */
-    if (flags & WE_F_BIAS)            /* all N (aligned start), indexed by tile below */
-        prm_to_f32((const bfloat16 *)((const int8_t *)h + WE_PRM_OFF), bias8, (unsigned)(h[WH_N] + 31) & ~31u);
+    const int lrg = h[WH_LRG], ln = flags & WE_F_LN, KST = h[WH_KST]; /* the header buffer is reused */
+    const float lneps = ((const float *)h)[WH_LNEPS], invk = ((const float *)h)[WH_LNINVK]; /* by A chunks */
+    // own column tiles' parameters out of the header (contiguous: tiles g_mc*NB ..)
+    const int nsb48 = h[WH_N], o48 = g_mc * NB * 48;
+    const float *hd = (const float *)((const int8_t *)h + WE_PRM_OFF);
+    const bfloat16 *hc = (const bfloat16 *)(hd + nsb48);
+    float *d8 = AR(AR_PRM, float);
+    bfloat16 *ch8 = AR(AR_PRM + 768, bfloat16), *cl8 = AR(AR_PRM + 1152, bfloat16);
+    for (int i = 0; i < NB * 3; i++) {
+        aie::store_v(d8 + i * 16, aie::load_v<16>(hd + o48 + i * 16));
+        aie::store_v(ch8 + i * 16, aie::load_v<16>(hc + o48 + i * 16));
+        aie::store_v(cl8 + i * 16, aie::load_v<16>(hc + nsb48 + o48 + i * 16));
+    }
     chess_memory_fence();
     LK_REL(EF_LK_IN_EMPTY, 1); /* header consumed */
     const int res = flags & WE_F_RES;
     const unsigned blocks = (unsigned)(NB * MB);
     const unsigned a_per_blk = (unsigned)KCN + (res ? 4u : 0u);
     cfg_a(WE_A_CHUNK, blocks * a_per_blk);
-    cfg_b(WE_B_CHUNK, blocks * KCN);
-    cfg_out((flags & WE_F_LOGIT) ? 6 * 32 * 4 : WE_BLK, blocks);
-    float *C = AR(AR_C, float);
+    cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AR_B0, AR_B1, WE_B_CHUNK, EF_LK_W_EMPTY, EF_LK_W_FULL, blocks * KCN);
+    cfg_out_at(AR_OUT, (flags & WE_F_LOGIT) ? 6 * 32 * 4 : WE_BLK, blocks);
+    float *C = AR(AR_C, float), *st = AR(AR_ST, float), *tmp = AR(AR_TMP, float);
     bfloat16 *out = AR(AR_OUT, bfloat16);
     unsigned ia = 0, ib = 0;
     for (int nb = 0; nb < NB; nb++) {
@@ -262,36 +354,41 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
         const int kt = (flags & WE_F_KT) && cb >= kt_lo && cb < kt_hi;
         const int vt = (flags & WE_F_VT) && cb >= vt_lo && cb < vt_hi;
         for (int mb = 0; mb < MB; mb++) {
-            zero_c(C);
+            vzero(C, WE_TM * WE_TN / 32);
             for (int k = 0; k < KCN; k++) {
                 LK_ACQ(EF_LK_IN_FULL, 1);
                 LK_ACQ(EF_LK_W_FULL, 1);
-                mac_chunk(AR(ia ? AR_A1 : AR_A0, bfloat16), AR(ib ? AR_B1 : AR_B0, bfloat16), C);
+                const bfloat16 *A = AR(ia ? AR_A1 : AR_A0, bfloat16);
+                mac_chunk(A, AR(ib ? AR_B1 : AR_B0, bfloat16), C);
+                if (ln && nb == 0 && k < KST) /* stats from the first column tile's pass */
+                    ln_acc(A, tmp, k == 0);
                 LK_REL(EF_LK_IN_EMPTY, 1);
                 LK_REL(EF_LK_W_EMPTY, 1);
                 ia ^= 1;
                 ib ^= 1;
+            }
+            if (ln) {
+                if (nb == 0)
+                    ln_fin(tmp, st + mb * 128, invk, lneps);
+                ln_apply(C, st + mb * 128, ch8 + nb * 48, cl8 + nb * 48);
             }
             LK_ACQ(EF_LK_OUT_EMPTY, 1);
             if (res) {
                 // 4 chunks, one per mesh column; ours (chunk mc) -> out, the epilogue adds it in place
                 for (int q = 0; q < 4; q++) {
                     LK_ACQ(EF_LK_IN_FULL, 1);
-                    if (q == g_mc) {
-                        const bfloat16 *src = AR(ia ? AR_A1 : AR_A0, bfloat16);
-                        for (unsigned i = 0; i < WE_BLK / 2 / 32; i++)
-                            aie::store_v(out + i * 32, aie::load_v<32>(src + i * 32));
-                    }
+                    if (q == g_mc)
+                        vcopy(out, AR(ia ? AR_A1 : AR_A0, bfloat16), WE_BLK / 128);
                     LK_REL(EF_LK_IN_EMPTY, 1);
                     ia ^= 1;
                 }
             }
             if (flags & WE_F_LOGIT)
-                epilogue_logit(C, (float *)out, lrg);
+                epilogue_logit(C, d8 + nb * WE_TN, (float *)out, lrg);
             else if (kt || vt)
-                epilogue_kv(C, bias8 + cb * WE_TN, out, flags, kt);
+                epilogue_kv(C, d8 + nb * WE_TN, out, flags, kt);
             else
-                epilogue(C, bias8 + cb * WE_TN, out, out, flags);
+                epilogue(C, d8 + nb * WE_TN, out, out, flags);
             chess_memory_fence();
             LK_REL(EF_LK_OUT_FULL, 1);
         }
@@ -299,7 +396,7 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
     out_drained();
 }
 
-// ---- LayerNorm ----------------------------------------------------------------
+// ---- row helpers ------------------------------------------------------------
 // Sum the 8 lanes of each 4-row group's row (lanes i*8 .. i*8+7), result
 // replicated across those 8 lanes. Vector-only: the scalar unit has no FPU.
 __attribute__((always_inline)) static inline V32 row_sum8(const V32 &v) {
@@ -310,60 +407,8 @@ __attribute__((always_inline)) static inline V32 row_sum8(const V32 &v) {
                        aie::broadcast<float, 8>(t[24]));
 }
 
-// One 4-row group: x [cb 8][kt 6][4][8] bf16 -> y same layout. Statistics in
-// fp32: E[x] by native adds, E[x^2] by native bf16 x bf16 MACs (exact squares);
-// var = E[x^2] - E[x]^2 is safe here (Whisper's LN inputs: mean^2/var <= 11).
-__attribute__((noinline)) static void ln_group(const bfloat16 *x, bfloat16 *y, const float *g8, const float *b8,
-                                               const V32 &epsv) {
-    V32 s = aie::zeros<float, 32>();
-    aie::accum<accfloat, 32> q;
-    q.from_vector(aie::zeros<float, 32>(), 0);
-    for (unsigned t = 0; t < 48; t++)
-        chess_prepare_for_pipelining {
-            const VB xb = aie::load_v<32>(x + t * 32);
-            s = aie::add(s, to_f32(xb));
-            q = aie::mac(q, xb, xb);
-        }
-    const V32 inv_n = aie::broadcast<float, 32>(1.0f / 384.0f);
-    const V32 mv = fmul(row_sum8(s), inv_n);
-    const V32 ex2 = fmul(row_sum8(q.template to_vector<float>()), inv_n);
-    const V32 rv = aie::invsqrt(aie::add(aie::sub(ex2, fmul(mv, mv)), epsv));
-    for (unsigned t = 0; t < 48; t++)
-        chess_prepare_for_pipelining {
-            const aie::vector<float, 8> gg = aie::load_v<8>(g8 + t * 8), bb = aie::load_v<8>(b8 + t * 8);
-            const V32 d = aie::sub(to_f32(aie::load_v<32>(x + t * 32)), mv);
-            const V32 rg = fmul(rv, aie::concat(gg, gg, gg, gg));
-            aie::store_v(y + t * 32, to_bf16(aie::add(fmul(d, rg), aie::concat(bb, bb, bb, bb))));
-        }
-}
-
-__attribute__((noinline)) static void op_ln(const int32_t *h) {
-    const int RGC = h[WH_RGC];
-    const V32 epsv = aie::broadcast<int32, 32>(h[WH_EPS]).template cast_to<float>();
-    float *g8 = AR(AR_PRM, float), *b8 = g8 + 384;
-    prm_to_f32((const bfloat16 *)((const int8_t *)h + WE_PRM_OFF), g8, 768);
-    chess_memory_fence();
-    LK_REL(EF_LK_IN_EMPTY, 1);
-    const unsigned total = 4u * RGC; /* every group of the row block passes every core */
-    cfg_a(WE_RG_ROW, total);
-    cfg_out(WE_RG_ROW, RGC);
-    unsigned ia = 0;
-    for (unsigned g = 0; g < total; g++) {
-        LK_ACQ(EF_LK_IN_FULL, 1);
-        if ((int)(g & 3) == g_mc) { /* interleaved: the 4 cores of a row work in parallel */
-            LK_ACQ(EF_LK_OUT_EMPTY, 1);
-            ln_group(AR(ia ? AR_A1 : AR_A0, bfloat16), AR(AR_OUT, bfloat16), g8, b8, epsv);
-            chess_memory_fence();
-            LK_REL(EF_LK_OUT_FULL, 1);
-        }
-        LK_REL(EF_LK_IN_EMPTY, 1);
-        ia ^= 1;
-    }
-    out_drained();
-}
-
 // ---- attention ------------------------------------------------------------------
-__attribute__((always_inline)) static inline V32 row_max8(const V32 &v) {
+__attribute__((noinline)) static V32 row_max8(const V32 &v) {
     V32 t = aie::max(v, aie::shuffle_down(v, 4));
     t = aie::max(t, aie::shuffle_down(t, 2));
     t = aie::max(t, aie::shuffle_down(t, 1));
@@ -371,36 +416,40 @@ __attribute__((always_inline)) static inline V32 row_max8(const V32 &v) {
                        aie::broadcast<float, 8>(t[24]));
 }
 
-// S[32x64] = Q[32x64] K^T chunk[64x64]: Q [rg8][kd8][32], K [kd8][kp8][64], S [rg8][kp8][32]
+// S - m [32x64] = Q[32x64] K^T chunk[64x64] - m: Q [rg8][kd8][32], K [kd8][kp8][64],
+// S [rg8][kp8][32]. 4x2 register blocking (4 row groups x 2 key tiles), the
+// accumulators start at -m (the row references), the dim loop pipelined.
 __attribute__((noinline)) static void att_qk(const bfloat16 *__restrict Q, const bfloat16 *__restrict K,
                                              float *__restrict S) {
-    for (unsigned z = 0; z < 8; z += 2)
-        chess_loop_range(4, 4) for (unsigned j = 0; j < 8; j += 2) chess_prepare_for_pipelining {
-            MM C00, C01, C10, C11;
-            const bfloat16 *pa0 = Q + z * 8 * 32, *pa1 = pa0 + 8 * 32, *pb = K + j * 64;
-            for (unsigned k = 0; k < 8; k++)
+    for (unsigned z = 0; z < 8; z += 4)
+        chess_loop_range(2, 2) for (unsigned j = 0; j < 8; j += 2) chess_loop_range(4, 4) {
+            MM acc[4][2];
+            for (unsigned r = 0; r < 4; r++)
                 chess_unroll_loop() {
-                    const aie::vector<bfloat16, 32> a0 = aie::load_v<32>(pa0 + k * 32),
-                                                    a1 = aie::load_v<32>(pa1 + k * 32);
-                    const aie::vector<bfloat16, 64> b0 = aie::load_v<64>(pb + k * 8 * 64),
-                                                    b1 = aie::load_v<64>(pb + k * 8 * 64 + 64);
-                    if (k == 0) {
-                        C00.mul(a0, b0);
-                        C01.mul(a0, b1);
-                        C10.mul(a1, b0);
-                        C11.mul(a1, b1);
-                    } else {
-                        C00.mac(a0, b0);
-                        C01.mac(a0, b1);
-                        C10.mac(a1, b0);
-                        C11.mac(a1, b1);
-                    }
+                    const V32 nm = aie::neg(aie::load_v<32>(&we_att_ml[0][z + r][0]));
+                    acc[r][0] = MM(nm);
+                    acc[r][1] = MM(nm);
                 }
-            float *c00 = S + (z * 8 + j) * 32, *c10 = c00 + 8 * 32;
-            aie::store_v(c00, C00.template to_vector<float>());
-            aie::store_v(c00 + 32, C01.template to_vector<float>());
-            aie::store_v(c10, C10.template to_vector<float>());
-            aie::store_v(c10 + 32, C11.template to_vector<float>());
+            const bfloat16 *pa = Q + z * 8 * 32, *pb = K + j * 64;
+            for (unsigned k = 0; k < 8; k++)
+                chess_prepare_for_pipelining chess_loop_range(8, 8) {
+                    VB a[4];
+                    aie::vector<bfloat16, 64> b[2];
+                    for (unsigned r = 0; r < 4; r++)
+                        chess_unroll_loop() a[r] = aie::load_v<32>(pa + (r * 8 + k) * 32);
+                    b[0] = aie::load_v<64>(pb + k * 8 * 64);
+                    b[1] = aie::load_v<64>(pb + k * 8 * 64 + 64);
+                    for (unsigned r = 0; r < 4; r++)
+                        chess_unroll_loop() {
+                            acc[r][0].mac(a[r], b[0]);
+                            acc[r][1].mac(a[r], b[1]);
+                        }
+                }
+            for (unsigned r = 0; r < 4; r++)
+                chess_unroll_loop() {
+                    aie::store_v(S + ((z + r) * 8 + j) * 32, acc[r][0].template to_vector<float>());
+                    aie::store_v(S + ((z + r) * 8 + j + 1) * 32, acc[r][1].template to_vector<float>());
+                }
         }
 }
 
@@ -431,37 +480,24 @@ __attribute__((noinline)) static void att_pv(const bfloat16 *__restrict P, const
         }
 }
 
-// Rare path: a row's scores passed its reference by more than WE_SM_LAZY (or the
-// first chunk): raise the references of row group rg to the row maxima and
-// rescale that group's denominator lanes and O rows.
-__attribute__((noinline)) static void att_raise(const V32 &lmax, int rg, float *O) {
-    const V32 m_old = aie::load_v<32>(&we_att_ml[0][rg][0]);
-    const V32 m_new = aie::max(m_old, row_max8(lmax));
-    const V32 sc = aie::exp2<float>(aie::sub(m_old, m_new));
-    aie::store_v(&we_att_ml[1][rg][0], fmul(aie::load_v<32>(&we_att_ml[1][rg][0]), sc));
-    for (int dt = 0; dt < 8; dt++) {
-        float *o = O + (rg * 8 + dt) * 32;
-        aie::store_v(o, fmul(aie::load_v<32>(o), sc));
-    }
-    aie::store_v(&we_att_ml[0][rg][0], m_new);
-}
-
-// Softmax numerator for one S chunk: mask (last chunk / causal), lazy reference,
-// P = exp2(S - m) as bf16 in place over S, per-lane denominator += P.
 alignas(64) static const int32_t k_lane_k[32] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
                                                  0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7};
 alignas(64) static const int32_t k_lane_r[32] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
                                                  2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
-// keys >= nvalid (and, causal, keys after the query) -> -1e30
-__attribute__((noinline)) static void att_mask(float *S, int key0, int nvalid, int causal, int q0) {
+typedef struct {
+    int key0, nvalid, causal, q0, on;
+} AttMask;
+// row groups [rg0, rg0+nrg) of S (S points at rg0): keys >= nvalid (and, causal,
+// keys after the query) -> -1e30
+__attribute__((noinline)) static void att_mask(float *S, int rg0, int nrg, const AttMask *mk) {
     const aie::vector<int32, 32> lk = aie::load_v<32>(k_lane_k), lr = aie::load_v<32>(k_lane_r);
     const V32 neg = aie::broadcast<float, 32>(-1.0e30f);
-    for (int rg = 0; rg < 8; rg++) {
-        const aie::vector<int32, 32> row = aie::add(lr, q0 + rg * 4);
+    for (int rg = 0; rg < nrg; rg++) {
+        const aie::vector<int32, 32> row = aie::add(lr, mk->q0 + (rg0 + rg) * 4);
         for (int kp = 0; kp < 8; kp++) {
-            const aie::vector<int32, 32> key = aie::add(lk, key0 + kp * 8);
-            aie::mask<32> bad = aie::ge(key, nvalid);
-            if (causal)
+            const aie::vector<int32, 32> key = aie::add(lk, mk->key0 + kp * 8);
+            aie::mask<32> bad = aie::ge(key, mk->nvalid);
+            if (mk->causal)
                 bad = bad | aie::gt(key, row);
             float *p = S + (rg * 8 + kp) * 32;
             aie::store_v(p, aie::select(aie::load_v<32>(p), neg, bad));
@@ -469,41 +505,122 @@ __attribute__((noinline)) static void att_mask(float *S, int key0, int nvalid, i
     }
 }
 
-__attribute__((noinline)) static void att_softmax(float *S, float *O, int key0, int nvalid, int causal, int q0) {
-    bfloat16 *P = (bfloat16 *)S;
-    if (key0 + WE_KCH > nvalid || causal)
-        att_mask(S, key0, nvalid, causal, q0);
-    for (unsigned rg = 0; rg < 8; rg++) {
-        const float *srg = S + rg * 8 * 32;
-        V32 lmax = aie::load_v<32>(srg);
-        for (int kp = 1; kp < 8; kp++)
-            lmax = aie::max(lmax, aie::load_v<32>(srg + kp * 32));
-        const V32 lim = aie::add(aie::load_v<32>(&we_att_ml[0][rg][0]), WE_SM_LAZY);
-        if (!aie::gt(lmax, lim).empty())
-            att_raise(lmax, rg, O);
-        const V32 m = aie::load_v<32>(&we_att_ml[0][rg][0]);
-        V32 l = aie::load_v<32>(&we_att_ml[1][rg][0]);
-        for (int kp = 0; kp < 8; kp++) {
-            const V32 p = aie::exp2<float>(aie::sub(aie::load_v<32>(srg + kp * 32), m));
-            l = aie::add(l, p);
-            aie::store_v(P + (rg * 8 + kp) * 32, to_bf16(p));
+// P = exp2(S - m) in place (bf16 over the fp32 S) and the per-lane denominators
+// l[rg] += P (P x 1 on the multiplier: exact, from the rounded P that PV uses).
+// The write of vector i lands on S vector i/2, already read, and software
+// pipelining only moves loads earlier and stores later -- so the two views are
+// declared restrict (aliased, the loop serialises: 991 -> 273 cycles, probe m5).
+// Returns nonzero if some P passed 2^WE_SM_LAZY (a score above its reference).
+__attribute__((noinline)) static unsigned att_exp(const float *__restrict S, bfloat16 *__restrict P) {
+    const VB one = aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    VB pm = aie::zeros<bfloat16, 32>();
+    for (unsigned rg = 0; rg < 8; rg++)
+        chess_prepare_for_pipelining chess_loop_range(8, 8) {
+            aie::accum<accfloat, 32> l0, l1;
+            l0.from_vector(aie::load_v<32>(&we_att_ml[1][rg][0]), 0);
+            l1.from_vector(aie::zeros<float, 32>(), 0);
+            for (unsigned kp = 0; kp < 8; kp += 2)
+                chess_unroll_loop() {
+                    const VB p0 = aie::exp2<bfloat16>(aie::load_v<32>(S + (rg * 8 + kp) * 32));
+                    const VB p1 = aie::exp2<bfloat16>(aie::load_v<32>(S + (rg * 8 + kp + 1) * 32));
+                    aie::store_v(P + (rg * 8 + kp) * 32, p0);
+                    aie::store_v(P + (rg * 8 + kp + 1) * 32, p1);
+                    l0 = aie::mac(l0, p0, one);
+                    l1 = aie::mac(l1, p1, one);
+                    pm = aie::max(pm, aie::max(p0, p1));
+                }
+            aie::store_v(&we_att_ml[1][rg][0],
+                         aie::add(l0.template to_vector<float>(), l1.template to_vector<float>()));
         }
-        aie::store_v(&we_att_ml[1][rg][0], l);
+    return !aie::gt(pm, aie::broadcast<bfloat16, 32>((bfloat16)4294967296.0f)).empty();
+}
+
+// v * 2^-k, exact: exponent arithmetic on the fp32 bits (k per lane, any sign; a
+// result below the normal range, or v == 0, gives 0). In place over n vectors,
+// vector i scaled by k[(i / per) * 32 ..].
+__attribute__((noinline)) static void pow2one(float *v, const int32 *k) {
+    const aie::vector<int32, 32> kk = aie::load_v<32>(k), b = aie::load_v<32>(v).template cast_to<int32>();
+    const aie::vector<int32, 32> e = aie::bit_and((int32)0xFF, aie::downshift(b, 23));
+    aie::store_v(v, aie::select(aie::zeros<int32, 32>(), aie::sub(b, aie::upshift(kk, 23)), aie::gt(e, kk))
+                        .template cast_to<float>());
+}
+static void pow2scale(float *v, const int32 *k, unsigned n, unsigned per) {
+    for (unsigned i = 0; i < n; i++)
+        pow2one(v + i * 32, k + (i / per) * 32);
+}
+
+// One row group of a raise: k = round(max) + 1 where the row max passes thr (else
+// 0), m += k, k -> kout. The fp32 magic-number trick (x + 1.5*2^23 holds round(x)
+// in the low mantissa bits) needs no float<->int conversion.
+__attribute__((noinline)) static void raise_rg(const float *Srg, float *m, int32 *kout, float thr) {
+    V32 lmax = aie::load_v<32>(Srg);
+    for (unsigned kp = 1; kp < 8; kp++)
+        lmax = aie::max(lmax, aie::load_v<32>(Srg + kp * 32));
+    const V32 x = row_max8(lmax), mg = aie::broadcast<float, 32>(12582912.0f);
+    const aie::vector<int32, 32> ki = aie::add(
+        aie::sub(aie::add(x, mg).template cast_to<int32>(), aie::broadcast<int32, 32>((int32)0x4B400000)), (int32)1);
+    const aie::vector<int32, 32> k =
+        aie::select(aie::zeros<int32, 32>(), ki, aie::gt(x, aie::broadcast<float, 32>(thr)));
+    aie::store_v(kout, k);
+    aie::store_v(
+        m, aie::add(aie::load_v<32>(m),
+                    aie::sub(aie::add(k, aie::broadcast<int32, 32>((int32)0x4B400000)).template cast_to<float>(), mg)));
+}
+
+// Reference raise -- every row on a q-block's first chunk (m = l = O = 0 then), else
+// only the rows with a score past m + WE_SM_LAZY: S - m_old again, per row
+// k = round(max) + 1, m += k, l and O scaled by 2^-k exactly (references stay
+// integers, so the rescale is exponent arithmetic), then S - m once more.
+__attribute__((noinline)) static void att_raise(const bfloat16 *Q, const bfloat16 *K, float *S, float *O,
+                                                const AttMask *mk, int first) {
+    att_qk(Q, K, S);
+    if (mk->on)
+        att_mask(S, 0, 8, mk);
+    int32 *k = (int32 *)&we_att_ml[2][0][0];
+    for (unsigned rg = 0; rg < 8; rg++)
+        raise_rg(S + rg * 8 * 32, &we_att_ml[0][rg][0], k + rg * 32, first ? -3.0e38f : WE_SM_LAZY);
+    pow2scale(&we_att_ml[1][0][0], k, 8, 1);
+    pow2scale(O, k, 64, 8);
+    att_qk(Q, K, S);
+    if (mk->on)
+        att_mask(S, 0, 8, mk);
+}
+
+// One key chunk's numerator: P (bf16, over S) and l. The first chunk of a q-block
+// sets the references (att_raise from m = 0); later chunks redo through att_raise
+// only if a score passed its reference by 2^WE_SM_LAZY.
+__attribute__((noinline)) static void att_scores(const bfloat16 *Q, const bfloat16 *K, float *S, float *O,
+                                                 const AttMask *mk, int first) {
+    bfloat16 *P = (bfloat16 *)S;
+    if (first) {
+        vzero(&we_att_ml[0][0][0], 8);
+    } else {
+        att_qk(Q, K, S);
+        if (mk->on)
+            att_mask(S, 0, 8, mk);
+        vcopy(&we_att_ml[2][0][0], &we_att_ml[1][0][0], 8); /* l before this chunk, in case of a redo */
+        if (!att_exp(S, P))
+            return;
+        vcopy(&we_att_ml[1][0][0], &we_att_ml[2][0][0], 8);
     }
+    att_raise(Q, K, S, O, mk, first);
+    att_exp(S, P);
 }
 
 __attribute__((noinline)) static void att_finish(const float *O, bfloat16 *out) {
-    for (unsigned rg = 0; rg < 8; rg++) {
+    // 1/l per row (into the snapshot slot): bit-trick seed (rel. err < 12.5%) + 3
+    // Newton steps, vector ops only; one flat loop each, kept small for the 16 KB PM
+    for (unsigned i = 0; i < 24; i++) {
+        const unsigned rg = i & 7;
         const V32 ls = row_sum8(aie::load_v<32>(&we_att_ml[1][rg][0]));
-        // 1/ls: bit-trick seed (rel. err < 12.5%) + 3 Newton steps; vector ops only
-        V32 il =
-            aie::sub(aie::broadcast<int32, 32>(0x7EF311C7), ls.template cast_to<int32>()).template cast_to<float>();
-        for (int it = 0; it < 3; it++)
-            il = fmul(il, aie::sub(aie::broadcast<float, 32>(2.0f), fmul(ls, il)));
-        for (unsigned dt = 0; dt < 8; dt++)
-            chess_prepare_for_pipelining aie::store_v(out + (rg * 8 + dt) * 32,
-                                                      to_bf16(fmul(aie::load_v<32>(O + (rg * 8 + dt) * 32), il)));
+        V32 il = i < 8 ? aie::sub(aie::broadcast<int32, 32>(0x7EF311C7), ls.template cast_to<int32>())
+                             .template cast_to<float>()
+                       : aie::load_v<32>(&we_att_ml[2][rg][0]);
+        aie::store_v(&we_att_ml[2][rg][0], fmul(il, aie::sub(aie::broadcast<float, 32>(2.0f), fmul(ls, il))));
     }
+    for (unsigned i = 0; i < 64; i++)
+        aie::store_v(out + i * 32,
+                     to_bf16(fmul(aie::load_v<32>(O + i * 32), aie::load_v<32>(&we_att_ml[2][i >> 3][0]))));
 }
 
 __attribute__((noinline)) static void op_attn(const int32_t *h) {
@@ -520,11 +637,8 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
         bfloat16 *Q = AR(AT_Q, bfloat16);
         for (int c = 0; c < 4; c++) {
             LK_ACQ(EF_LK_IN_FULL, 1);
-            if (c == g_mc && st < nqb) { /* copy ours; the ring must keep moving for the other columns */
-                const bfloat16 *src = AR(ia ? AT_A1 : AT_A0, bfloat16);
-                for (unsigned i = 0; i < WE_Q_CHUNK / 2 / 32; i++)
-                    aie::store_v(Q + i * 32, aie::load_v<32>(src + i * 32));
-            }
+            if (c == g_mc && st < nqb) /* copy ours; the ring must keep moving for the other columns */
+                vcopy(Q, AR(ia ? AT_A1 : AT_A0, bfloat16), WE_Q_CHUNK / 128);
             LK_REL(EF_LK_IN_EMPTY, 1);
             ia ^= 1;
         }
@@ -533,13 +647,8 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
         out_drained(); /* the previous q-block's O left from AT_S */
         cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AT_B0, AT_B1, WE_KV_CHUNK, EF_LK_W_EMPTY, EF_LK_W_FULL,
                  (unsigned)(2 * NKC));
-        const V32 ninf = aie::broadcast<float, 32>(-1.0e30f), z = aie::zeros<float, 32>();
-        for (int rg = 0; rg < 8; rg++) {
-            aie::store_v(&we_att_ml[0][rg][0], ninf);
-            aie::store_v(&we_att_ml[1][rg][0], z);
-        }
-        for (unsigned i = 0; i < WE_QB * 64 / 32; i++)
-            aie::store_v(O + i * 32, z);
+        vzero(&we_att_ml[1][0][0], 8); /* l; m is set by the first chunk */
+        vzero(O, WE_QB * 64 / 32);
         const int qrow0 = q0 + st * WE_QB;
 #ifdef WE_PROF /* cycle split (never across a lock acquire: skill aiecoretimerlock) */
 #define WE_T(v) const uint64_t v = aie::tile::current().cycles()
@@ -549,14 +658,16 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
 #define WE_ACC(i, d)
 #endif
         WE_T(tq0);
+        AttMask mk = {0, T, causal, qrow0, 0};
         for (int kc = 0; kc < NKC; kc++) {
             LK_ACQ(EF_LK_W_FULL, 1);
             WE_T(c0);
-            att_qk(Q, AR(ib ? AT_B1 : AT_B0, bfloat16), S);
+            mk.key0 = kc * WE_KCH;
+            mk.on = mk.key0 + WE_KCH > T || causal;
+            att_scores(Q, AR(ib ? AT_B1 : AT_B0, bfloat16), S, O, &mk, kc == 0);
             WE_T(c1);
             LK_REL(EF_LK_W_EMPTY, 1);
             ib ^= 1;
-            att_softmax(S, O, kc * WE_KCH, T, causal, qrow0);
             WE_T(c2);
             LK_ACQ(EF_LK_W_FULL, 1);
             WE_T(c3);
@@ -579,6 +690,10 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
         out_drained();
 }
 
+// main never returns: an empty __cxa_finalize keeps the runtime's atexit.o (174 B
+// of the 16 KB program memory) out of the link
+extern "C" void __cxa_finalize(void *) {}
+
 // kernel_decl eng
 int32_t main() {
     AieKcReg kc[2];
@@ -590,7 +705,8 @@ int32_t main() {
     }
     aie::set_rounding(aie::rounding_mode::conv_even);
     const unsigned cid = get_coreid();
-    g_mc = ((int)(cid >> 16) - EF_PART_START_COL - EF_FIRST_COL) % EF_PART_NUM_COLS;
+    g_mc =
+        (int)((cid >> 16) & 0x7F) - EF_PART_START_COL - EF_FIRST_COL; /* absolute column (skill kcocoreidpartition) */
     g_mr = (int)(cid & 0x1F) - EF_FIRST_ROW;
     g_pkt = k_pkt[g_mr][g_mc];
     g_ooo = k_ooo[g_mr][g_mc];
@@ -606,11 +722,8 @@ int32_t main() {
             const unsigned reps = att ? (unsigned)h[WH_NQB + g_mc] : (op == WE_OP_GEMM ? 1u : 0u);
             LK_REL(EF_LK_IN_EMPTY, 1);
             for (unsigned r = 0; r < reps; r++) {
-                if (att)
-                    cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AT_B0, AT_B1, WE_KV_CHUNK, EF_LK_W_EMPTY, EF_LK_W_FULL,
-                             per);
-                else
-                    cfg_b(WE_B_CHUNK, per);
+                cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AT_B0, AT_B1, att ? WE_KV_CHUNK : WE_B_CHUNK, EF_LK_W_EMPTY,
+                         EF_LK_W_FULL, per);
                 for (unsigned i = 0; i < per; i++) {
                     LK_ACQ(EF_LK_W_FULL, 1);
                     LK_REL(EF_LK_W_EMPTY, 1);
@@ -620,8 +733,7 @@ int32_t main() {
         }
         if (op == WE_OP_GEMM)
             op_gemm(h);
-        else if (op == WE_OP_LN)
-            op_ln(h);
+
         else if (op == WE_OP_ATTN)
             op_attn(h);
         else

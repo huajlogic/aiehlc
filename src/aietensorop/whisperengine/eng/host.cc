@@ -43,10 +43,10 @@ static double now_us(void) {
 }
 
 static int g_trace = 1;
-/* per-op-type wall time of the encoder (us): conv ln qkv attn out fc1 fc2 xkv */
-enum { P_CONV, P_LN, P_QKV, P_ATTN, P_OUT, P_FC1, P_FC2, P_XKV, P_N };
+/* per-op-type wall time of the encoder (us); LayerNorms are folded into qkv / fc1 / xkv */
+enum { P_CONV, P_QKV, P_ATTN, P_OUT, P_FC1, P_FC2, P_XKV, P_N };
 static double g_pt[P_N];
-static const char *g_pn[P_N] = {"conv", "ln", "qkv", "attn", "out", "fc1", "fc2", "xkv"};
+static const char *g_pn[P_N] = {"conv", "qkv", "attn", "out", "fc1", "fc2", "xkv"};
 #define PT(k, call)                                                                                                    \
     ({                                                                                                                 \
         const double _t0 = now_us();                                                                                   \
@@ -59,21 +59,31 @@ static const char *g_pn[P_N] = {"conv", "ln", "qkv", "attn", "out", "fc1", "fc2"
 /* K^T / V tile ranges: self-attention q|k|v = tiles 8..16 / 16..24; cross k|v = 0..8 / 8..16 */
 static int g_kt0 = 8;
 static int g_ws; /* decoder + cross K/V: hi/lo split weights (gen_engine add_gemm hilo) */
-static int gemm(const WeAct *a, size_t w, size_t b, const WeAct *res, const WeAct *out, int n, int flags, int mbp,
-                int ract) {
+/* LayerNorm folded into a GEMM (we_desc.h WE_F_LN): gen_engine's <name>_ln block,
+ * d fp32 [n] then c_hi, c_lo bf16 [n] */
+static void set_ln(WeGemm *g, size_t ln, int n, int c0) {
+    if (!ln)
+        return;
+    g->lnd = (const float *)(wn_blob + ln) + c0;
+    g->lnc = (const bf16_t *)(wn_blob + ln + (size_t)n * 4) + c0;
+    g->lnn = n;
+}
+static int gemm(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *res, const WeAct *out, int n, int flags,
+                int mbp, int ract) {
     TR("gemm");
     WeGemm g = {a, W(w), b ? W(b) : 0, res, out, n, flags, g_kt0, g_kt0 + 8, ract, mbp, g_kt0 + 8, g_kt0 + 16};
     g.wsplit = g_ws;
+    set_ln(&g, ln, n, 0);
     if (!(flags & WE_F_KT))
         g.kt_lo = g.kt_hi = 0;
     if (!(flags & WE_F_VT))
         g.vt_lo = g.vt_hi = 0;
     return we_gemm(&g_e, &g);
 }
-static int gemm_kv(const WeAct *a, size_t w, size_t b, const WeAct *out) {
+static int gemm_kv(const WeAct *a, size_t w, size_t ln, const WeAct *out) {
     g_kt0 = 0;
     g_ws = 1;
-    const int rc = gemm(a, w, b, 0, out, 768, WE_F_KT | WE_F_VT, 0, 4);
+    const int rc = gemm(a, w, 0, ln, 0, out, 768, WE_F_KT | WE_F_VT, 0, 4);
     g_ws = 0;
     g_kt0 = 8;
     return rc;
@@ -83,21 +93,18 @@ static WeAct colview(const WeAct *t, int c0, int n) {
     return v;
 }
 /* split-weight GEMM in N chunks of nch columns (packed independently, gen_engine nchunk) */
-static int gemm_n(const WeAct *a, size_t w, size_t b, const WeAct *res, const WeAct *out, int n, int nch, int flags,
-                  int ract) {
+static int gemm_n(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *res, const WeAct *out, int n, int nch,
+                  int flags, int ract) {
     const int kp = a->c * 2;
     for (int c0 = 0; c0 < n; c0 += nch) {
         const WeAct ov = colview(out, c0, nch), rv = res ? colview(res, c0, nch) : ov;
         WeGemm g = {a, W(w) + (size_t)c0 * kp, b ? W(b) + c0 : 0, res ? &rv : 0, &ov, nch, flags, 0, 0, ract, 0, 0, 0};
         g.wsplit = 1;
+        set_ln(&g, ln, n, c0);
         if (we_gemm(&g_e, &g))
             return -1;
     }
     return 0;
-}
-static int ln(const WeAct *x, size_t gm, size_t bt, const WeAct *y, int ract) {
-    TR("ln");
-    return we_ln(&g_e, x, W(gm), W(bt), 1e-5f, y, ract);
 }
 static int attn(const WeAct *q, const WeAct *kv, int kt, int vt, const WeAct *o, int t, int causal, int ract,
                 int krows) {
@@ -130,7 +137,7 @@ static int check(const char *name, const WeAct *t, size_t goff, int valid) {
 }
 
 typedef struct {
-    WeAct x, x2, y, qkv, o, h, xa, kvx[4];
+    WeAct x, x2, qkv, o, h, kvx[4];
     bf16_t *x1;
 } Enc;
 
@@ -151,59 +158,55 @@ static int encoder(Enc *E, int verify) {
     }
     if (verify && check("conv", &E->x, WN_G_X0, 1500))
         return -1;
-    static const size_t L[4][12] = {
+    static const size_t L[4][8] = {
 #define ROW(l)                                                                                                         \
-    {WN_E##l##_LN1_G, WN_E##l##_LN1_B, WN_E##l##_QKV_W, WN_E##l##_QKV_B, WN_E##l##_OUT_W, WN_E##l##_OUT_B,             \
-     WN_E##l##_LN2_G, WN_E##l##_LN2_B, WN_E##l##_FC1_W, WN_E##l##_FC1_B, WN_E##l##_FC2_W, WN_E##l##_FC2_B}
+    {WN_E##l##_QKV_W, WN_E##l##_QKV_LN, WN_E##l##_OUT_W, WN_E##l##_OUT_B,                                              \
+     WN_E##l##_FC1_W, WN_E##l##_FC1_LN, WN_E##l##_FC2_W, WN_E##l##_FC2_B}
         ROW(0), ROW(1), ROW(2), ROW(3)};
 #undef ROW
     for (int l = 0; l < 4; l++) {
         const size_t *p = L[l];
-        if (PT(P_LN, ln(&E->x, p[0], p[1], &E->y, 4)) ||
-            PT(P_QKV, gemm(&E->y, p[2], p[3], 0, &E->qkv, 1152, WE_F_KT | WE_F_VT, 0, 4)) ||
+        if (PT(P_QKV, gemm(&E->x, p[0], 0, p[1], 0, &E->qkv, 1152, WE_F_KT | WE_F_VT, 0, 4)) ||
             PT(P_ATTN, attn(&E->qkv, &E->qkv, 8, 16, &E->o, 1500, 0, 4, 4)) ||
-            PT(P_OUT, gemm(&E->o, p[4], p[5], &E->x, &E->x2, 384, 0, 3, 4)) ||
-            PT(P_LN, ln(&E->x2, p[6], p[7], &E->y, 4)) ||
-            PT(P_FC1, gemm(&E->y, p[8], p[9], 0, &E->h, 1536, WE_F_GELU, 0, 4)) ||
-            PT(P_FC2, gemm(&E->h, p[10], p[11], &E->x2, &E->x, 384, 0, 2, 4)))
+            PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4)) ||
+            PT(P_FC1, gemm(&E->x2, p[4], 0, p[5], 0, &E->h, 1536, WE_F_GELU, 0, 4)) ||
+            PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 2, 4)))
             return -1;
         static const size_t gx[4] = {WN_G_X1, WN_G_X2, WN_G_X3, WN_G_X4};
         static const char *gn[4] = {"block0", "block1", "block2", "block3"};
         if (verify && check(gn[l], &E->x, gx[l], 1500))
             return -1;
     }
-    if (PT(P_LN, ln(&E->x, WN_LNPOST_G, WN_LNPOST_B, &E->xa, 4)))
-        return -1;
+    /* cross K/V of every decoder layer, ln_post folded in */
     const size_t xkv[4][2] = {
-        {WN_X0_KV_W, WN_X0_KV_B}, {WN_X1_KV_W, WN_X1_KV_B}, {WN_X2_KV_W, WN_X2_KV_B}, {WN_X3_KV_W, WN_X3_KV_B}};
+        {WN_X0_KV_W, WN_X0_KV_LN}, {WN_X1_KV_W, WN_X1_KV_LN}, {WN_X2_KV_W, WN_X2_KV_LN}, {WN_X3_KV_W, WN_X3_KV_LN}};
     for (int l = 0; l < 4; l++)
-        if (PT(P_XKV, gemm_kv(&E->xa, xkv[l][0], xkv[l][1], &E->kvx[l])))
+        if (PT(P_XKV, gemm_kv(&E->x, xkv[l][0], xkv[l][1], &E->kvx[l])))
             return -1;
-    const double t1 = now_us();
-    if (verify && check("enc_out", &E->xa, WN_G_XA, 1500))
-        return -1;
-    return (int)(t1 - t0);
+    return (int)(now_us() - t0);
 }
 
-// token embedding row (hi + lo) from the packed logits weight: slices of
-// WN_LOGIT_SLICE rows, W' = [hi | lo] (K' = 768), we_pack_w order with NB = 4, 1 sub-op
+// token embedding row from the packed logits weight: slices of WN_LOGIT_SLICE rows,
+// W' = [hi | lo] of gamma_ln (.) E (K' = 768, the final LayerNorm folded in), we_pack_w
+// order with NB = 4, 1 sub-op; E = (hi + lo) / gamma_ln in fp32 (we_model emb_lookup)
 static void emb_row(int tok, float *out) {
+    const bf16_t *gam = W(WN_LND_G);
     const int s = tok / WN_LOGIT_SLICE, n = tok % WN_LOGIT_SLICE, kcn = 16;
     const int c = n / 192, nb = (n % 192) / 48, nt = (n % 48) / 8, nn = n % 8;
     const size_t col = (size_t)WN_LOGIT_SLICE / 4 * 768;
-    const bf16_t *base = W(WN_EMB0_W) + (size_t)s * WN_LOGIT_SLICE * 768 + c * col;
+    const bf16_t *base = W(WN_EMB0_W + (size_t)s * (WN_EMB1_W - WN_EMB0_W)) + c * col;
     for (int k = 0; k < 384; k++) {
         float v = 0;
         for (int half = 0; half < 2; half++) {
             const int kk2 = k + half * 384, kc = kk2 / 48, kt = (kk2 % 48) / 8, kk = kk2 % 8;
             v += bf2f(base[((((size_t)nb * kcn + kc) * 6 + kt) * 6 + nt) * 64 + kk * 8 + nn]);
         }
-        out[k] = v;
+        out[k] = v / bf2f(gam[k]);
     }
 }
 
 typedef struct {
-    WeAct x, x2, y, qkv, o, q, h;
+    WeAct x, x2, qkv, o, q, h;
     float *logits;
 } Dec;
 
@@ -225,28 +228,27 @@ static int decode_step(Enc *E, Dec *D, const int *toks, int n, float *lg_out) {
     __Runtime_sync_for_dev(g_dev, D->x.p, we_act_bytes(&D->x));
     dcheck("d_x0", &D->x, WN_G_D_X0, n);
     g_ws = 1;
-    static const size_t L[4][18] = {
+    static const size_t L[4][12] = {
 #define ROW(l)                                                                                                         \
-    {WN_D##l##_LN1_G, WN_D##l##_LN1_B, WN_D##l##_QKV_W, WN_D##l##_QKV_B, WN_D##l##_OUT_W,  WN_D##l##_OUT_B,            \
-     WN_D##l##_LNX_G, WN_D##l##_LNX_B, WN_D##l##_Q_W,   WN_D##l##_Q_B,   WN_D##l##_XOUT_W, WN_D##l##_XOUT_B,           \
-     WN_D##l##_LN2_G, WN_D##l##_LN2_B, WN_D##l##_FC1_W, WN_D##l##_FC1_B, WN_D##l##_FC2_W,  WN_D##l##_FC2_B}
+    {WN_D##l##_QKV_W,  WN_D##l##_QKV_LN, WN_D##l##_OUT_W, WN_D##l##_OUT_B,  WN_D##l##_Q_W,   WN_D##l##_Q_LN,           \
+     WN_D##l##_XOUT_W, WN_D##l##_XOUT_B, WN_D##l##_FC1_W, WN_D##l##_FC1_LN, WN_D##l##_FC2_W, WN_D##l##_FC2_B}
         ROW(0), ROW(1), ROW(2), ROW(3)};
 #undef ROW
     for (int l = 0; l < 4; l++) {
         const size_t *p = L[l];
-        if (ln(&D->x, p[0], p[1], &D->y, 1) || gemm(&D->y, p[2], p[3], 0, &D->qkv, 1152, WE_F_KT | WE_F_VT, 0, 1) ||
-            attn(&D->qkv, &D->qkv, 8, 16, &D->o, n, 1, 1, 1) || gemm(&D->o, p[4], p[5], &D->x, &D->x2, 384, 0, 0, 1))
+        if (gemm(&D->x, p[0], 0, p[1], 0, &D->qkv, 1152, WE_F_KT | WE_F_VT, 0, 1) ||
+            attn(&D->qkv, &D->qkv, 8, 16, &D->o, n, 1, 1, 1) || gemm(&D->o, p[2], p[3], 0, &D->x, &D->x2, 384, 0, 0, 1))
             return -1;
         if (l == 0)
             dcheck("d_sa", &D->x2, WN_G_D_SA, n);
-        if (ln(&D->x2, p[6], p[7], &D->y, 1) || gemm(&D->y, p[8], p[9], 0, &D->q, 384, 0, 0, 1) ||
+        if (gemm(&D->x2, p[4], 0, p[5], 0, &D->q, 384, 0, 0, 1) ||
             attn(&D->q, &E->kvx[l], 0, 8, &D->o, 1500, 0, 1, 4) ||
-            gemm(&D->o, p[10], p[11], &D->x2, &D->x, 384, 0, 0, 1))
+            gemm(&D->o, p[6], p[7], 0, &D->x2, &D->x, 384, 0, 0, 1))
             return -1;
         if (l == 0)
             dcheck("d_ca", &D->x, WN_G_D_CA, n);
-        if (ln(&D->x, p[12], p[13], &D->y, 1) || gemm_n(&D->y, p[14], p[15], 0, &D->h, 1536, 768, WE_F_GELU, 1) ||
-            gemm_n(&D->h, p[16], p[17], &D->x, &D->x2, 384, 192, 0, 1))
+        if (gemm_n(&D->x, p[8], 0, p[9], 0, &D->h, 1536, 768, WE_F_GELU, 1) ||
+            gemm_n(&D->h, p[10], p[11], 0, &D->x, &D->x2, 384, 192, 0, 1))
             return -1;
         if (l == 0)
             dcheck("d_l0", &D->x2, WN_G_D_L0, n);
@@ -255,12 +257,10 @@ static int decode_step(Enc *E, Dec *D, const int *toks, int n, float *lg_out) {
         D->x2 = t;
     }
     g_ws = 0;
-    if (ln(&D->x, WN_LND_G, WN_LND_B, &D->y, 1))
-        return -1;
     const int lrg = (n - 1) / 4, lane = (n - 1) % 4;
     for (int s = 0; s < WN_NSLICE; s++) {
-        // hi/lo split weight: each slice is WN_LOGIT_SLICE x (2 * 384)
-        WeGemm g = {&D->y,      W(WN_EMB0_W) + (size_t)s * WN_LOGIT_SLICE * 768,
+        // hi/lo split weight: each slice is WN_LOGIT_SLICE x (2 * 384), its _ln block in front
+        WeGemm g = {&D->x,      W(WN_EMB0_W + (size_t)s * (WN_EMB1_W - WN_EMB0_W)),
                     0,          0,
                     0,          WN_LOGIT_SLICE,
                     WE_F_LOGIT, 0,
@@ -270,6 +270,7 @@ static int decode_step(Enc *E, Dec *D, const int *toks, int n, float *lg_out) {
                     0,          0,
                     0,          D->logits + (size_t)s * (WN_LOGIT_SLICE / 48) * 192,
                     lrg,        1};
+        set_ln(&g, WN_EMB0_LN + (size_t)s * (WN_EMB1_LN - WN_EMB0_LN), WN_LOGIT_SLICE, 0);
         if (we_gemm(&g_e, &g))
             return -1;
     }
@@ -334,15 +335,15 @@ int main() {
         }
     }
     static Enc E;
-    E.x = act(384, 384), E.x2 = act(384, 384), E.y = act(384, 384), E.qkv = act(384, 1152), E.o = act(384, 384);
-    E.h = act(384, 1536), E.xa = act(384, 384);
+    E.x = act(384, 384), E.x2 = act(384, 384), E.qkv = act(384, 1152), E.o = act(384, 384);
+    E.h = act(384, 1536);
     for (int l = 0; l < 4; l++)
         E.kvx[l] = act(384, 768);
     E.x1 = (bf16_t *)__Runtime_Alloc((size_t)3080 * 384 * 2);
     memset(E.x1, 0, (size_t)3080 * 384 * 2);
     __Runtime_sync_for_dev(g_dev, E.x1, (size_t)3080 * 384 * 2);
     static Dec D;
-    D.x = act(64, 384), D.x2 = act(64, 384), D.y = act(64, 384), D.qkv = act(64, 1152), D.o = act(64, 384);
+    D.x = act(64, 384), D.x2 = act(64, 384), D.qkv = act(64, 1152), D.o = act(64, 384);
     D.q = act(64, 384), D.h = act(64, 1536);
     D.logits = (float *)__Runtime_Alloc((size_t)WN_NSLICE * (WN_LOGIT_SLICE / 48) * 768);
     g_macs_enc = enc_macs();
@@ -379,18 +380,6 @@ int main() {
             printf(" %s %.0f", g_pn[k], g_pt[k]);
         printf("\n");
     }
-#ifdef WHISPER_GOLD_XA
-    /* debug: decoder on the reference encoder output (isolates decoder bugs from drift) */
-    memcpy(E.xa.p, wn_gold + WN_G_XA, we_act_bytes(&E.xa));
-    __Runtime_sync_for_dev(g_dev, E.xa.p, we_act_bytes(&E.xa));
-    {
-        const size_t xkv[4][2] = {
-            {WN_X0_KV_W, WN_X0_KV_B}, {WN_X1_KV_W, WN_X1_KV_B}, {WN_X2_KV_W, WN_X2_KV_B}, {WN_X3_KV_W, WN_X3_KV_B}};
-        for (int l = 0; l < 4; l++)
-            gemm_kv(&E.xa, xkv[l][0], xkv[l][1], &E.kvx[l]);
-    }
-    printf("WHISPER (debug) decoder runs on the reference encoder output\n");
-#endif
     // decoder: greedy from the start-of-transcript prompt
     int toks[64], n = 0;
     for (int i = 0; i < WN_NSOT; i++)
