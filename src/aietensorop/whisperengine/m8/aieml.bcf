@@ -1,0 +1,16 @@
+_entry_point _main_init
+_symbol _main _after  _main_init
+_symbol _main_init 0
+_symbol m8_c 0x71000
+_symbol m8_o0 0x74000
+_symbol m8_o1 0x76000
+_symbol m8_b 0x78000
+_symbol m8_x 0x7a000
+_symbol m8_res 0x79000
+_symbol we_gelu_ab 0x7c000
+_symbol we_gelu_cd 0x7ec00
+_stack DM_stack 0x70000 0x1000
+_reserved DMb 0x0 0x40000
+_reserved DMb 0x40000 0x10000
+_reserved DMb 0x50000 0x20000
+_reserved DMb 0x80000 0x80000

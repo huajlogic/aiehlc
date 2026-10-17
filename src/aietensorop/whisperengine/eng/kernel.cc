@@ -209,15 +209,15 @@ typedef aie::vector<int16, 32> VI;
 
 // Exact erf-GELU of a bf16 value (we_model.gelu_aie): table for 1/8 <= |x| < 4,
 // 0.5x + bf16(x^2)/sqrt(2 pi) below, x / 0 beyond. Only native ops: integer,
-// table lookup, bf16 x bf16 -> fp32 products, fp32 add.
+// table lookup, bf16 x bf16 -> fp32 products, fp32 add. The regimes are compares
+// on the magnitude bits |x| = exponent << 7 | mantissa.
 __attribute__((always_inline)) static inline VB gelu_bf16(const VB &xb) {
     const aie::lut<4, bfloat16> lut(WE_GELU_LUT_N, we_gelu_ab, we_gelu_cd); /* not static: no guard / atexit code */
     aie::parallel_lookup<int16, aie::lut<4, bfloat16>> lk(lut, 0, 0);
     const VI u = xb.template cast_to<int16>();
-    const VI e = aie::bit_and((int16)0xFF, aie::downshift(u, 7));
-    const VI m = aie::bit_and((int16)0x7F, u);
+    const VI a = aie::bit_and((int16)0x7FFF, u);
     const aie::mask<32> neg = aie::lt(u, (int16)0);
-    VI idx = aie::add(aie::upshift(aie::sub(e, (int16)124), 7), m);
+    VI idx = aie::sub(a, (int16)(124 << 7));
     idx = aie::select(idx, aie::add(idx, (int16)640), neg);
     const VB tab = lk.fetch(idx);
     // small |x|: 0.5 x + bf16(x^2) * c
@@ -225,32 +225,57 @@ __attribute__((always_inline)) static inline VB gelu_bf16(const VB &xb) {
     const VB x2 = aie::mul(xb, xb).template to_vector<bfloat16>();
     acc = aie::mac(acc, x2, aie::broadcast<bfloat16, 32>((bfloat16)0.3989422804f));
     const VB small = acc.template to_vector<bfloat16>();
-    VB y = aie::select(tab, small, aie::lt(e, (int16)124));
-    y = aie::select(y, aie::select(xb, aie::zeros<bfloat16, 32>(), neg), aie::ge(e, (int16)129));
+    VB y = aie::select(tab, small, aie::lt(a, (int16)(124 << 7)));
+    y = aie::select(y, aie::select(xb, aie::zeros<bfloat16, 32>(), neg), aie::ge(a, (int16)(129 << 7)));
     return y;
+}
+
+// GELU over n vectors, out of place through restrict pointers: the loop then
+// software-pipelines (m8 probe: 9462 -> 4408 cycles per 64x48 block with the
+// bias pass). r: residual added after GELU (in place on o), or null.
+__attribute__((noinline)) static void gelu_vec(const bfloat16 *__restrict x, bfloat16 *__restrict o, unsigned n) {
+    for (unsigned i = 0; i < n; i++)
+        chess_prepare_for_pipelining chess_loop_range(8, )
+            aie::store_v(o + i * 32, gelu_bf16(aie::load_v<32>(x + i * 32)));
+}
+__attribute__((noinline)) static void gelu_vec_res(const bfloat16 *__restrict x, bfloat16 *__restrict o, unsigned n) {
+    for (unsigned i = 0; i < n; i++)
+        chess_prepare_for_pipelining chess_loop_range(8, ) {
+            const VB g = gelu_bf16(aie::load_v<32>(x + i * 32));
+            aie::store_v(o + i * 32, to_bf16(aie::add(to_f32(g), to_f32(aie::load_v<32>(o + i * 32)))));
+        }
 }
 
 // out = epi(C) in [rg16][nt6][4][8] (or row-major [64][48] with WE_F_ROWMAJOR):
 // + d (the bias; zeros if none), GELU (bf16 in/out), + residual (bf16, same layout
 // as out), rounded once. Column tile outer so d is one vector per inner loop; one
 // branch-free loop per GELU / no GELU (a missing residual reads a zero vector).
+// GELU: x = bf16(C + d) is compacted into the consumed C (vector i over the bytes of
+// C vector i/2, already read) and the GELU pass reads it from there.
 alignas(64) static const bfloat16 k_zero32[32] = {};
-__attribute__((noinline)) static void epilogue(const float *C, const float *bias8, const bfloat16 *res, bfloat16 *out,
+__attribute__((noinline)) static void epilogue(float *C, const float *bias8, const bfloat16 *res, bfloat16 *out,
                                                int flags) {
     const unsigned rs = (flags & WE_F_RES) ? 6 * 32 : 0;
-    for (unsigned nt = 0; nt < 6; nt++) {
-        const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
-        const V32 b = aie::concat(b8, b8, b8, b8);
-        const float *c = C + nt * 32;
-        const bfloat16 *r = rs ? res + nt * 32 : k_zero32;
-        bfloat16 *o = out + nt * 32;
-        if (flags & WE_F_GELU) {
-            for (unsigned rg = 0; rg < 16; rg++)
-                chess_prepare_for_pipelining chess_loop_range(16, 16) {
-                    const VB g = gelu_bf16(to_bf16(aie::add(aie::load_v<32>(c + rg * 192), b)));
-                    aie::store_v(o + rg * 192, to_bf16(aie::add(to_f32(g), to_f32(aie::load_v<32>(r + rg * rs)))));
+    if (flags & WE_F_GELU) {
+        bfloat16 *x = (bfloat16 *)C;
+        for (unsigned rg = 0; rg < 16; rg++)
+            for (unsigned nt = 0; nt < 6; nt++)
+                chess_unroll_loop() {
+                    const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
+                    aie::store_v(x + (rg * 6 + nt) * 32, to_bf16(aie::add(aie::load_v<32>(C + (rg * 6 + nt) * 32),
+                                                                          aie::concat(b8, b8, b8, b8))));
                 }
-        } else {
+        if (rs)
+            gelu_vec_res(x, out, 96);
+        else
+            gelu_vec(x, out, 96);
+    } else {
+        for (unsigned nt = 0; nt < 6; nt++) {
+            const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
+            const V32 b = aie::concat(b8, b8, b8, b8);
+            const float *c = C + nt * 32;
+            const bfloat16 *r = rs ? res + nt * 32 : k_zero32;
+            bfloat16 *o = out + nt * 32;
             for (unsigned rg = 0; rg < 16; rg++)
                 chess_prepare_for_pipelining chess_loop_range(16, 16)
                     aie::store_v(o + rg * 192, to_bf16(aie::add(aie::add(aie::load_v<32>(c + rg * 192), b),
