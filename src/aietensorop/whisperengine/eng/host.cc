@@ -55,6 +55,16 @@ static void prof_op(int k) {
     u32 w[16];
     for (int i = 7; i < 14; i++)
         XAie_DataMemRdWord(g_dev, XAie_TileLoc(1, 3), 0x07C0 + 4 * i, &w[i]);
+#ifdef WE_PROF_MAC2
+    {
+        u32 m2;
+        XAie_DataMemRdWord(g_dev, XAie_TileLoc(1, 3), 0x07C0 + 4 * 9, &m2);
+        if (w[12])
+            printf("WHISPER   %-5s mac first %u, back-to-back again %u cyc/chunk\n", g_pn[k], w[10] / w[12],
+                   m2 / w[12]);
+        XAie_DataMemWrWord(g_dev, XAie_TileLoc(1, 3), 0x07C0 + 4 * 9, 0);
+    }
+#endif
     g_pc[k][0] += w[11], g_pc[k][1] += w[10], g_pc[k][2] += w[7], g_pc[k][3] += w[13], g_pc[k][4] += w[12],
         g_pc[k][5] += w[8];
     for (int i = 7; i < 14; i++)

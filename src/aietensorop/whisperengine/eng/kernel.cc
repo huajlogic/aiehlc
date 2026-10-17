@@ -455,6 +455,11 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
                 WE_T(m1);
                 WE_ACC(10, m1 - m0);
                 WE_ACC(12, 1);
+#ifdef WE_PROF_MAC2 /* probe: the same chunk again, back to back (results are wrong) */
+                mac_chunk(A, AR(ib ? AR_B1 : AR_B0, bfloat16), C);
+                WE_T(m3);
+                WE_ACC(9, m3 - m1);
+#endif
                 if (lnst && nb == 0 && k < KST) { /* stats from the first column tile's pass */
                     ln_acc(A, tmp, k == 0);
                     WE_T(m2);
