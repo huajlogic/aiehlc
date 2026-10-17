@@ -47,10 +47,27 @@ static int g_trace = 1;
 enum { P_CONV, P_QKV, P_ATTN, P_OUT, P_FC1, P_FC2, P_XKV, P_N };
 static double g_pt[P_N], g_pf[P_N], g_pa[P_N], g_pr[P_N]; /* wall, fill, arm, run */
 static const char *g_pn[P_N] = {"conv", "qkv", "attn", "out", "fc1", "fc2", "xkv"};
+#ifdef WE_PROF_GOP          /* per op kind core(1,3) cycles (kernel WE_PROF_G): drains after every op */
+static double g_pc[P_N][6]; /* op total, mac, ln apply, epilogue, chunks, ln stats */
+static void prof_op(int k) {
+    we_drain(&g_e);
+    u32 w[16];
+    for (int i = 7; i < 14; i++)
+        XAie_DataMemRdWord(g_dev, XAie_TileLoc(1, 3), 0x07C0 + 4 * i, &w[i]);
+    g_pc[k][0] += w[11], g_pc[k][1] += w[10], g_pc[k][2] += w[7], g_pc[k][3] += w[13], g_pc[k][4] += w[12],
+        g_pc[k][5] += w[8];
+    for (int i = 7; i < 14; i++)
+        XAie_DataMemWrWord(g_dev, XAie_TileLoc(1, 3), 0x07C0 + 4 * i, 0);
+}
+#define PROF_OP(k) prof_op(k)
+#else
+#define PROF_OP(k)
+#endif
 #define PT(k, call)                                                                                                    \
     ({                                                                                                                 \
         const double _t0 = now_us(), _f = g_e.t_fill, _a = g_e.t_arm, _r = g_e.t_run;                                  \
         const int _rc = (call);                                                                                        \
+        PROF_OP(k);                                                                                                    \
         g_pt[k] += now_us() - _t0;                                                                                     \
         g_pf[k] += g_e.t_fill - _f, g_pa[k] += g_e.t_arm - _a, g_pr[k] += g_e.t_run - _r;                              \
         _rc;                                                                                                           \
@@ -418,6 +435,17 @@ int main() {
         for (int k = 0; k < P_N; k++)
             printf("WHISPER   %-5s wall %6.0f  fill %6.0f  arm %6.0f  run %6.0f us\n", g_pn[k], g_pt[k], g_pf[k],
                    g_pa[k], g_pr[k]);
+#ifdef WE_PROF_GOP
+        for (int k = 0; k < P_N; k++) {
+            const double *c = g_pc[k];
+            if (c[0])
+                printf("WHISPER   %-5s core(1,3) op %7.0f us: mac %5.1f%% (%4.0f cyc/chunk) ln %4.1f%% + stats %4.1f%% "
+                       "epi %4.1f%% wait/other %4.1f%%\n",
+                       g_pn[k], c[0] / 1e3, 100 * c[1] / c[0], c[4] ? c[1] / c[4] : 0, 100 * c[2] / c[0],
+                       100 * c[5] / c[0], 100 * c[3] / c[0], 100 * (c[0] - c[1] - c[2] - c[3] - c[5]) / c[0]);
+        }
+        memset(g_pc, 0, sizeof(g_pc));
+#endif
     }
     // decoder: greedy from the start-of-transcript prompt
     int toks[64], n = 0;

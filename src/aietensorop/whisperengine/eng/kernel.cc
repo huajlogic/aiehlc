@@ -383,6 +383,7 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
     const int MB = h[WH_MB], NB = h[WH_NB], KCN = h[WH_KCN], flags = h[WH_FLAGS];
     const int kt_lo = h[WH_KT_LO], kt_hi = h[WH_KT_HI], vt_lo = h[WH_VT_LO], vt_hi = h[WH_VT_HI];
     const int lrg = h[WH_LRG], ln = flags & WE_F_LN, KST = h[WH_KST]; /* the header buffer is reused */
+    const int lnst = ln && !(flags & WE_F_LNKEEP); /* row stats here, else AR_ST from the previous sub-op */
     const float lneps = ((const float *)h)[WH_LNEPS], invk = ((const float *)h)[WH_LNINVK]; /* by A chunks */
     // own column tiles' parameters out of the header (contiguous: tiles g_mc*NB ..)
     const int nsb48 = h[WH_N], o48 = g_mc * NB * 48;
@@ -418,21 +419,29 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
                 LK_ACQ(EF_LK_W_FULL, 1);
                 const bfloat16 *A = AR(ia ? AR_A1 : AR_A0, bfloat16);
                 WE_T(m0);
+#ifndef WE_NOMAC /* probe: data delivery alone */
                 mac_chunk(A, AR(ib ? AR_B1 : AR_B0, bfloat16), C);
+#endif
                 WE_T(m1);
                 WE_ACC(10, m1 - m0);
                 WE_ACC(12, 1);
-                if (ln && nb == 0 && k < KST) /* stats from the first column tile's pass */
+                if (lnst && nb == 0 && k < KST) { /* stats from the first column tile's pass */
                     ln_acc(A, tmp, k == 0);
+                    WE_T(m2);
+                    WE_ACC(8, m2 - m1);
+                }
                 LK_REL(EF_LK_IN_EMPTY, 1);
                 LK_REL(EF_LK_W_EMPTY, 1);
                 ia ^= 1;
                 ib ^= 1;
             }
             if (ln) {
-                if (nb == 0)
+                WE_T(l0);
+                if (lnst && nb == 0)
                     ln_fin(tmp, st + mb * 128, invk, lneps);
                 ln_apply(C, st + mb * 128, ch8 + nb * 48, cl8 + nb * 48);
+                WE_T(l1);
+                WE_ACC(7, l1 - l0);
             }
             LK_ACQ(EF_LK_OUT_EMPTY, 1);
             if (res) {

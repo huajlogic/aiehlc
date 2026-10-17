@@ -809,7 +809,8 @@ static int32_t *we_gemm_headers(WeEng *e, const WeGemm *g, const WeGemmPlan *P) 
         h[WH_MB] = P->MBP;
         h[WH_NB] = P->NBS;
         h[WH_KCN] = P->KCN;
-        h[WH_FLAGS] = g->flags | (g->bias || ln ? WE_F_BIAS : 0) | (P->res ? WE_F_RES : 0) | (ln ? WE_F_LN : 0);
+        h[WH_FLAGS] = g->flags | (g->bias || ln ? WE_F_BIAS : 0) | (P->res ? WE_F_RES : 0) | (ln ? WE_F_LN : 0) |
+                      (ln && s > 0 ? WE_F_LNKEEP : 0); /* every pass starts at sub-op 0: stats once per pass */
         h[WH_N] = NSB * 48;
         h[WH_KT_LO] = g->kt_lo - s * NSB;
         h[WH_KT_HI] = g->kt_hi - s * NSB;

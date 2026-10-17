@@ -68,6 +68,7 @@ enum { WE_OP_GEMM = 1, WE_OP_ATTN = 3 }; /* 2 was the LayerNorm op, now folded (
 #define WE_F_ROWMAJOR 32 /* out block row-major [64][48] (conv1 -> conv2 window reads) */
 #define WE_F_LOGIT 64    /* out = fp32, one row group (WH_LRG) only: [nt 6][4][8] fp32 (768 B) */
 #define WE_F_LN 128      /* LayerNorm folded in (above) */
+#define WE_F_LNKEEP 256  /* WE_F_LN: the row statistics of the previous sub-op (same blocks) still hold */
 #define WE_A_CAUSAL 1
 #define WE_QB 32                      /* attention q-block rows */
 #define WE_KCH 64                     /* attention key chunk */
