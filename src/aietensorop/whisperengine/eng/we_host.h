@@ -503,7 +503,9 @@ typedef struct {
     int K, RB, MB, KCN, MBP, passes, NBS, NSUB, NSB, NBT, res, ws;
     size_t a_pass, r_pass, hdrs, wcol, tileb, ablk, rblk;
     int conv;    /* conv window source: one block per pass, two MT_A halves, no A/res locks */
-    size_t aoff; /* MT_A offset of this pass's blocks (conv: the half) */
+    int dbuf;    /* two MT_A halves: pass p+1 is filled while pass p computes */
+    size_t aoff; /* MT_A offset of this pass's blocks (conv / dbuf: the half) */
+    int lkoff;   /* dbuf: lock ids of this pass's half (+MBP) */
 } WeGemmPlan;
 
 static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
@@ -518,7 +520,8 @@ static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
     P->a_pass = P->ablk * P->MBP, P->r_pass = P->rblk * P->MBP;
     P->hdrs = (size_t)P->NSUB * WE_HDR_BYTES, P->wcol = (size_t)(g->n / 4) * P->K * (1 + P->ws);
     P->tileb = (size_t)P->RB * 48 * 2;
-    P->conv = g->conv_base != 0, P->aoff = 0;
+    P->conv = g->conv_base != 0, P->aoff = 0, P->lkoff = 0;
+    P->dbuf = !P->conv && P->passes > 1 && P->MBP <= 3 && P->hdrs + 2 * (P->a_pass + P->r_pass) <= EF_MT_BYTES;
     if ((P->conv && (P->MBP != 1 || P->hdrs + 2 * (P->a_pass + P->r_pass) > EF_MT_BYTES)) || P->MB % P->MBP ||
         g->n % 192 || P->hdrs + P->a_pass + P->r_pass > EF_MT_BYTES || P->wcol * 2 > EF_MT_BYTES ||
         (g->ract < 4 && P->passes > 1) || P->MBP > 6 || P->NBT > 8 || P->MBP * (1 + P->ws + P->res) > 11 ||
@@ -557,7 +560,8 @@ static void we_gemm_fill_b(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int f
 /* MT_A of pass p: headers, then block-major A (+ res); idle rows get the headers.
  * Memtile S2MM1 BDs 24.. / 36.. (bank fb) */
 static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p, const int32_t *hbuf, int fb, int ph) {
-    const int mb0 = p * P->MBP, b0 = fb ? 36 : 24;
+    const int half = P->dbuf ? (p & 1) : 0, mb0 = p * P->MBP, b0 = (fb ^ half) ? 36 : 24, lko = half * P->MBP;
+    const size_t hoff = (size_t)half * (P->a_pass + P->r_pass);
     for (int k = 1; k <= 4; k++) {
         const int r = k - 1, act = k <= g->ract;
         if (!act && p > 0)
@@ -568,14 +572,14 @@ static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p
             we_mt_bdl(e, ta, b0, EF_MT_BASE, (uint32_t)P->hdrs, 0, 0, 0, 0, 0, nfill ? b0 + 1 : -1, -1, WE_LK_H,
                       P->NSUB);
             for (int mb = 0, b = b0 + 1; mb < (act ? P->MBP : 0); mb++) {
-                const uint32_t base = EF_MT_BASE + (uint32_t)(P->hdrs + mb * (P->ablk + P->rblk));
+                const uint32_t base = EF_MT_BASE + (uint32_t)(P->hdrs + hoff + mb * (P->ablk + P->rblk));
                 const int last_a = !P->res && mb + 1 == P->MBP;
-                we_mt_bdl(e, ta, b, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, last_a ? -1 : b + 1, -1, WE_LK_A + mb,
+                we_mt_bdl(e, ta, b, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, last_a ? -1 : b + 1, -1, WE_LK_A + lko + mb,
                           P->NBT);
                 b++;
                 if (P->res) {
                     we_mt_bdl(e, ta, b, base + (uint32_t)P->ablk, (uint32_t)P->rblk, 0, 0, 0, 0, 0,
-                              mb + 1 == P->MBP ? -1 : b + 1, -1, WE_LK_R + mb, P->NBT);
+                              mb + 1 == P->MBP ? -1 : b + 1, -1, WE_LK_R + lko + mb, P->NBT);
                     b++;
                 }
             }
@@ -668,15 +672,15 @@ static void we_gemm_replay(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int s
                 const uint32_t base = EF_MT_BASE + (uint32_t)(P->hdrs + P->aoff + mb * (P->ablk + P->rblk));
                 const int b = o + 2 + mb * per, end = mb + 1 == P->MBP;
                 we_mt_bdl(e, ta, b, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, per > 1 || !end ? b + 1 : -1,
-                          P->conv ? -1 : WE_LK_A + mb, -1, 0);
+                          P->conv ? -1 : WE_LK_A + P->lkoff + mb, -1, 0);
                 if (P->ws) /* the same A chunks again, against Wl */
                     we_mt_bdl(e, ta, b + 1, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, P->res || !end ? b + 2 : -1, -1, -1,
                               0);
                 if (P->res) { /* 4 chunks (column c's tile s*NSB + c*NBS + nb), iterating nb */
                     const uint32_t sr[3] = {1, 768, (uint32_t)(P->NBS * 1536)}, wr[3] = {768, 2, 4};
                     we_mt_bdl(e, ta, b + per - 1, base + (uint32_t)P->ablk + (uint32_t)(s * P->NSB) * WE_BLK,
-                              4 * WE_BLK, 3, sr, wr, 1536, P->NBS, end ? -1 : b + per, P->conv ? -1 : WE_LK_R + mb, -1,
-                              0);
+                              4 * WE_BLK, 3, sr, wr, 1536, P->NBS, end ? -1 : b + per,
+                              P->conv ? -1 : WE_LK_R + P->lkoff + mb, -1, 0);
                 }
             }
             if (ph & WE_GO)
@@ -788,6 +792,10 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             if (we_gemm_conv_wait(e, g, p))
                 return -1;
             P.aoff = (size_t)(p & 1) * (P.ablk + P.rblk);
+        } else if (P.dbuf) { /* pass p was filled during pass p-1 (pass 0: now) */
+            if (p == 0)
+                we_gemm_fill_a(e, g, &P, 0, hbuf, fb, WE_GO);
+            P.aoff = (size_t)(p & 1) * (P.a_pass + P.r_pass), P.lkoff = (p & 1) * P.MBP;
         } else {
             we_gemm_fill_a(e, g, &P, p, hbuf, fb, p == 0 ? WE_GO : WE_BDS | WE_GO);
         }
@@ -820,6 +828,13 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                 we_arm_out(e, g->ract, dst, WE_BLK, P.NBS * P.MBP, WE_BLK, 1024, 6, 1024, ev);
             if (s + 1 < P.NSUB) /* queued behind s: the cores run on without a gap */
                 we_gemm_replay(e, g, &P, s + 1, bk ^ 1, WE_BDS | WE_GO);
+            if (P.dbuf && s == 0 && p + 1 < P.passes) { /* the next pass into the other half; its
+                                                           shim BDs are this pass's: wait for its fill */
+                for (int k = 1; k <= g->ract; k++)
+                    if (we_wait_ch(e, we_shim(k), 1, DMA_MM2S))
+                        return -1;
+                we_gemm_fill_a(e, g, &P, p + 1, hbuf, fb, WE_BDS | WE_GO);
+            }
             XTime_GetTime(&q1);
             e->t_arm += we_us(q0, q1);
             WE_EV('a', q0);

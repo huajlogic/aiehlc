@@ -191,7 +191,7 @@ static int encoder(Enc *E, int verify) {
             PT(P_ATTN, attn(&E->qkv, &E->qkv, 8, 16, &E->o, 1500, 0, 4, 4)) ||
             PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4)) ||
             PT(P_FC1, gemm(&E->x2, p[4], 0, p[5], 0, &E->h, 1536, WE_F_GELU, 0, 4)) ||
-            PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 2, 4)))
+            PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 1, 4)))
             return -1;
         static const size_t gx[4] = {WN_G_X1, WN_G_X2, WN_G_X3, WN_G_X4};
         static const char *gn[4] = {"block0", "block1", "block2", "block3"};
