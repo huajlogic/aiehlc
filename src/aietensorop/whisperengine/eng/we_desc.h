@@ -95,6 +95,7 @@ enum {
     WH_KST,    /* WE_F_LN: A chunks per block that carry x (K / 48; the rest replay it) */
     WH_LNEPS,  /* WE_F_LN: epsilon, float bits */
     WH_LNINVK, /* WE_F_LN: 1 / K, float bits (the core has no scalar FPU) */
+    WH_OOO,    /* added to the core's out-of-order BD id (on-chip storage: alternate BD banks per sub-op) */
     /* ATTN */
     WH_T = 4,      /* valid keys */
     WH_NKC,        /* key chunks */

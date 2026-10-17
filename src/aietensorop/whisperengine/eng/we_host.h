@@ -354,13 +354,13 @@ static void we_dump(WeEng *e) {
         }
 }
 /* Output wait with a 2 s timeout and a dump instead of the runtime's ~20 s spin. */
-static int we_wait_out(WeEng *e, struct_ioevent ev) {
+static int we_wait_out_le(WeEng *e, struct_ioevent ev, int left) {
     XTime t0, t1;
     XTime_GetTime(&t0);
     for (;;) {
         u8 n = 1;
         XAie_DmaGetPendingBdCount(e->dev, ev.io.tile_loc, ev.io.channel_id, ev.io.direction, &n);
-        if (!n)
+        if (n <= left)
             return 0;
         XTime_GetTime(&t1);
         if (we_us(t0, t1) > 2e6) {
@@ -371,6 +371,7 @@ static int we_wait_out(WeEng *e, struct_ioevent ev) {
         }
     }
 }
+static int we_wait_out(WeEng *e, struct_ioevent ev) { return we_wait_out_le(e, ev, 0); }
 
 static int we_drain(WeEng *e) {
     if (!e->pending)
@@ -557,14 +558,18 @@ static void we_st_init(WeEng *e) {
 }
 /* FC1 sub-op s of pass j: core (r,c)'s MBP packets (its tile s*4+c of each block)
  * land in we_st(r, j) at tile s*4+c, block mb at mb * 196 KB */
+/* odd sub-ops use BD ids + WE_ST_OOO2 (the header's WH_OOO), so sub-op s+1's BDs are
+ * armed while s still writes */
+#define WE_ST_OOO2 12
 static void we_arm_out_st(WeEng *e, int s, int j, int MBP, struct_ioevent *ev) {
     const uint32_t blk = 32u * WE_BLK;
+    const int o2 = (s & 1) ? WE_ST_OOO2 : 0;
     for (int r = 0; r < 4; r++) {
         const XAie_LocType t = we_st(r, j);
         for (int c = 0; c < 4; c++)
-            we_mt_bd(e, t, we_ooo[r][c], EF_MT_BASE + (uint32_t)(s * 4 + c) * WE_BLK, WE_BLK, 0, 0, 0, blk / 4,
+            we_mt_bd(e, t, we_ooo[r][c] + o2, EF_MT_BASE + (uint32_t)(s * 4 + c) * WE_BLK, WE_BLK, 0, 0, 0, blk / 4,
                      (uint32_t)MBP, -1);
-        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)we_ooo[r][0], (u32)(4 * MBP), XAIE_DISABLE);
+        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)(we_ooo[r][0] + o2), (u32)(4 * MBP), XAIE_DISABLE);
         memset(&ev[r], 0, sizeof(ev[r]));
         ev[r].io.tile_loc = t, ev[r].io.channel_id = 0, ev[r].io.direction = DMA_S2MM;
     }
@@ -901,6 +906,7 @@ static int32_t *we_gemm_headers(WeEng *e, const WeGemm *g, const WeGemmPlan *P) 
         h[WH_VT_HI] = g->vt_hi - s * NSB;
         h[WH_LRG] = g->lrg;
         h[WH_KST] = P->K / 48;
+        h[WH_OOO] = g->stor == WE_ST_OUT && (s & 1) ? WE_ST_OOO2 : 0;
         const float eps = 1e-5f, invk = 1.0f / (float)P->K;
         memcpy(&h[WH_LNEPS], &eps, 4);
         memcpy(&h[WH_LNINVK], &invk, 4);
@@ -995,9 +1001,10 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                                 : lg ? (bf16_t *)(g->logits + (size_t)cb * 192)
                                      : we_tile(g->out, r, cb) + (size_t)mb0 * 64 * 48;
                 }
-            if (g->stor == WE_ST_OUT)
-                we_arm_out_st(e, s, p, P.MBP, ev);
-            else if (rm)
+            if (g->stor == WE_ST_OUT) { /* sub-op s was armed with s-1 (or here, s = 0) */
+                if (s == 0)
+                    we_arm_out_st(e, 0, p, P.MBP, ev);
+            } else if (rm)
                 we_arm_out(e, g->ract, dst, WE_BLK, P.MBP, 64 * g->n * 2, 96, 64, g->n * 2, ev);
             else if (lg)
                 we_arm_out(e, g->ract, dst, 768, P.NBS, 768, 768, 1, 768, ev);
@@ -1005,6 +1012,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                 we_arm_out(e, g->ract, dst, WE_BLK, P.NBS * P.MBP, WE_BLK, 1024, 6, 1024, ev);
             if (s + 1 < P.NSUB) /* queued behind s: the cores run on without a gap */
                 we_gemm_replay(e, g, &P, s + 1, bk ^ 1, WE_BDS | WE_GO);
+            if (g->stor == WE_ST_OUT && s + 1 < P.NSUB) /* s+1's outputs too (the other BD bank) */
+                we_arm_out_st(e, s + 1, p, P.MBP, ev);
             if (P.dbuf && s == 0 && p + 1 < P.passes) { /* the next pass into the other half; its
                                                            shim BDs are this pass's: wait for its fill */
                 for (int k = 1; k <= g->ract; k++)
@@ -1022,8 +1031,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                 memcpy(e->pev, ev, sizeof(ev));
                 break;
             }
-            for (int r = 0; r < g->ract; r++)
-                if (we_wait_out(e, ev[r]))
+            for (int r = 0; r < g->ract; r++) /* storage: s+1's task may already be queued behind s */
+                if (we_wait_out_le(e, ev[r], g->stor == WE_ST_OUT && s + 1 < P.NSUB))
                     return -1;
             XTime_GetTime(&q2);
             WE_EV('w', q2);

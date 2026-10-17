@@ -417,6 +417,7 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
     const float lneps = ((const float *)h)[WH_LNEPS], invk = ((const float *)h)[WH_LNINVK]; /* by A chunks */
     // own column tiles' parameters out of the header (contiguous: tiles g_mc*NB ..)
     const int nsb48 = h[WH_N], o48 = g_mc * NB * 48;
+    g_ooo = k_ooo[g_mr][g_mc] + h[WH_OOO];
     const float *hd = (const float *)((const int8_t *)h + WE_PRM_OFF);
     const bfloat16 *hc = (const bfloat16 *)(hd + nsb48);
     float *d8 = AR(AR_PRM, float);
@@ -791,6 +792,7 @@ __attribute__((noinline)) static void take_q(bfloat16 *dst, unsigned *ia) {
 __attribute__((noinline)) static void op_attn(const int32_t *h) {
     const int T = h[WH_T], NKC = h[WH_NKC], causal = h[WH_AFLAGS] & WE_A_CAUSAL;
     const int nqb = h[WH_NQB + g_mc], q0 = h[WH_Q0 + g_mc], steps = h[WH_STEPS];
+    g_ooo = k_ooo[g_mr][g_mc];
     LK_REL(EF_LK_IN_EMPTY, 1); /* header consumed */
     cfg_s2mm(0, EF_BD_IN_PING, EF_BD_IN_PONG, AT_A0, AT_A1, WE_Q_CHUNK, EF_LK_IN_EMPTY, EF_LK_IN_FULL,
              (unsigned)(4 * steps));
