@@ -561,6 +561,20 @@ static void we_st_init(WeEng *e) {
 /* odd sub-ops use BD ids + WE_ST_OOO2 (the header's WH_OOO), so sub-op s+1's BDs are
  * armed while s still writes */
 #define WE_ST_OOO2 12
+/* WE_ST_OUTQ: sub-op 0 of a single-pass GEMM (NBS tiles per core, MB blocks) into
+ * we_st(r, 0) in DDR tile layout: tile c*NBS+nb at its tileb, block mb at mb * 6 KB --
+ * per core one run of NBS*MB packets, 6 KB apart */
+static void we_arm_out_stq(WeEng *e, int NBS, int MB, struct_ioevent *ev) {
+    for (int r = 0; r < 4; r++) {
+        const XAie_LocType t = we_st(r, 0);
+        for (int c = 0; c < 4; c++)
+            we_mt_bd(e, t, we_ooo[r][c], EF_MT_BASE + (uint32_t)(c * NBS * MB) * WE_BLK, WE_BLK, 0, 0, 0, WE_BLK / 4,
+                     (uint32_t)(NBS * MB), -1);
+        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)we_ooo[r][0], (u32)(4 * NBS * MB), XAIE_DISABLE);
+        memset(&ev[r], 0, sizeof(ev[r]));
+        ev[r].io.tile_loc = t, ev[r].io.channel_id = 0, ev[r].io.direction = DMA_S2MM;
+    }
+}
 static void we_arm_out_st(WeEng *e, int s, int j, int MBP, struct_ioevent *ev) {
     const uint32_t blk = 32u * WE_BLK;
     const int o2 = (s & 1) ? WE_ST_OOO2 : 0;
@@ -599,9 +613,10 @@ typedef struct {
     const float *lnd;
     const bf16_t *lnc;
     int lnn; /* full N of lnd / lnc (a column chunk of a wider GEMM indexes into them) */
-    int stor; /* WE_ST_OUT: output kept on chip (storage memtiles); WE_ST_IN: A read from there */
+    int stor; /* WE_ST_OUT: output kept on chip (storage memtiles); WE_ST_IN: A read from there;
+               * WE_ST_OUTQ: sub-op 0's output (Q of the Q/K/V GEMM) on chip, the rest to DDR */
 } WeGemm;
-enum { WE_ST_OUT = 1, WE_ST_IN = 2 };
+enum { WE_ST_OUT = 1, WE_ST_IN = 2, WE_ST_OUTQ = 3 };
 
 /* Column tiles per mesh column per sub-op: <= 2, so a sub-op's MT_B replay takes 2
  * of the memtile channel's 4 queue slots and the next sub-op's can be queued
@@ -670,7 +685,8 @@ static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
     P->tileb = (size_t)P->RB * 48 * 2;
     P->conv = g->conv_base != 0, P->aoff = 0, P->lkoff = 0;
     P->dbuf = !P->conv && P->passes > 1 && P->MBP <= 3 && P->hdrs + 2 * (P->a_pass + P->r_pass) <= EF_MT_BYTES;
-    if ((g->stor == WE_ST_OUT && (P->MB != 6 || P->MBP != 2 || P->NBS != 1 || g->n != 1536 || g->ract != 4)) ||
+    if ((g->stor == WE_ST_OUTQ && (P->passes != 1 || P->MB != 6 || g->ract != 4 || P->NSUB < 2)) ||
+        (g->stor == WE_ST_OUT && (P->MB != 6 || P->MBP != 2 || P->NBS != 1 || g->n != 1536 || g->ract != 4)) ||
         (g->stor == WE_ST_IN && (P->MBP != 1 || !P->dbuf || P->K != 1536)) || 1 + P->MBP * (1 + P->res) > 10) {
         printf("WE gemm: storage mode %d needs FC1 (N 1536, 2 blocks x 3 passes) / FC2 (K 1536, 1 block a pass)\n",
                g->stor);
@@ -986,6 +1002,10 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             XTime_GetTime(&q0);
             if (s == 0 && g->stor == WE_ST_OUT && we_st_east(e, p)) /* pass p's storage tiles */
                 return -1;
+            if (g->stor == WE_ST_OUTQ && we_st_east(e, s == 0 ? 0 : -1)) /* sub-op 0 on chip, then DDR */
+                return -1;
+            if (g->stor == WE_ST_OUTQ && s == 1) /* held back so no sub-op 1 packet entered the east lane */
+                we_gemm_replay(e, g, &P, 1, bk, WE_BDS | WE_GO);
             if (s == 0) { /* the first stage of a pass (pass 0: BDs written above): the cores
                              start on it while the outputs are armed (a packet waits) */
                 we_gemm_replay(e, g, &P, 0, bk, p == 0 ? WE_GO : WE_BDS | WE_GO);
@@ -1004,13 +1024,15 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             if (g->stor == WE_ST_OUT) { /* sub-op s was armed with s-1 (or here, s = 0) */
                 if (s == 0)
                     we_arm_out_st(e, 0, p, P.MBP, ev);
+            } else if (g->stor == WE_ST_OUTQ && s == 0) {
+                we_arm_out_stq(e, P.NBS, P.MB, ev);
             } else if (rm)
                 we_arm_out(e, g->ract, dst, WE_BLK, P.MBP, 64 * g->n * 2, 96, 64, g->n * 2, ev);
             else if (lg)
                 we_arm_out(e, g->ract, dst, 768, P.NBS, 768, 768, 1, 768, ev);
             else
                 we_arm_out(e, g->ract, dst, WE_BLK, P.NBS * P.MBP, WE_BLK, 1024, 6, 1024, ev);
-            if (s + 1 < P.NSUB) /* queued behind s: the cores run on without a gap */
+            if (s + 1 < P.NSUB && !(g->stor == WE_ST_OUTQ && s == 0)) /* queued behind s: no gap */
                 we_gemm_replay(e, g, &P, s + 1, bk ^ 1, WE_BDS | WE_GO);
             if (g->stor == WE_ST_OUT && s + 1 < P.NSUB) /* s+1's outputs too (the other BD bank) */
                 we_arm_out_st(e, s + 1, p, P.MBP, ev);
@@ -1059,6 +1081,7 @@ typedef struct {
     int t;            /* valid keys */
     int causal, ract; /* ract: mesh rows holding queries */
     int krows;        /* row blocks of kv holding keys */
+    int qst;          /* q tiles of mesh row r on chip in we_st(r, 0) (Q/K/V GEMM with WE_ST_OUTQ) */
 } WeAttn;
 
 /* Output packet: d0 = 2 kt (128 B), d1 = 4 pairs at 2 tiles, d2 = WE_QB/4 row groups */
@@ -1150,7 +1173,16 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
             we_mt_queue(e, ta, DMA_S2MM, 24, 1);
             we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, -1, 0, 0, 0);
             we_sh_start(e, k, 1, 12);
-            if (qf) { /* q-block i = 32 rows of each of the 8 q tiles (3 KB each) */
+            if (qf && a->qst) { /* the same q-blocks from on-chip storage over the west lane, into S2MM3 */
+                const uint32_t qs[2] = {1, (uint32_t)(qtile / 4)}, qw[2] = {768, 8};
+                we_st_west(e, r, 0);
+                const XAie_LocType st = we_st(r, 0);
+                we_mt_bdl(e, ta, 46, EF_MT_BASE + WE_HDR_BYTES, 8 * 3072, 2, qs, qw, 768, (uint32_t)steps, -1, -1,
+                          WE_ALK_Q, 1);
+                XAie_DmaChannelSetStartQueue(e->dev, ta, 3, DMA_S2MM, 46, (u32)steps, XAIE_DISABLE);
+                we_mt_bd(e, st, 20, EF_MT_BASE, 8 * 3072, 2, qs, qw, 768, (uint32_t)steps, -1);
+                we_mt_queue(e, st, DMA_MM2S, 20, steps);
+            } else if (qf) { /* q-block i = 32 rows of each of the 8 q tiles (3 KB each) */
                 const uint32_t qs[2] = {1, (uint32_t)(qtile / 4)}, qw[2] = {768, 8};
                 we_mt_bdl(e, ta, 25, EF_MT_BASE + WE_HDR_BYTES, 8 * 3072, 2, qs, qw, 768, (uint32_t)steps, -1, -1,
                           WE_ALK_Q, 1);

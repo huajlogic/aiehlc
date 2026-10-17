@@ -138,10 +138,11 @@ static int gemm_n(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *re
     }
     return 0;
 }
+static int g_qst; /* encoder: Q left on chip by the Q/K/V GEMM (WE_ST_OUTQ) */
 static int attn(const WeAct *q, const WeAct *kv, int kt, int vt, const WeAct *o, int t, int causal, int ract,
                 int krows) {
     TR("attn");
-    WeAttn a = {q, 0, kv, kt, vt, o, t, causal, ract, krows};
+    WeAttn a = {q, 0, kv, kt, vt, o, t, causal, ract, krows, g_qst};
     return we_attn(&g_e, &a);
 }
 
@@ -199,9 +200,9 @@ static int encoder(Enc *E, int verify) {
 #undef ROW
     for (int l = 0; l < 4; l++) {
         const size_t *p = L[l];
-        if (PT(P_QKV, gemm(&E->x, p[0], 0, p[1], 0, &E->qkv, 1152, WE_F_KT | WE_F_VT, 0, 4)) ||
-            PT(P_ATTN, attn(&E->qkv, &E->qkv, 8, 16, &E->o, 1500, 0, 4, 4)) ||
-            PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4)) ||
+        if ((g_stor = WE_ST_OUTQ, PT(P_QKV, gemm(&E->x, p[0], 0, p[1], 0, &E->qkv, 1152, WE_F_KT | WE_F_VT, 0, 4))) ||
+            (g_stor = 0, g_qst = 1, PT(P_ATTN, attn(&E->qkv, &E->qkv, 8, 16, &E->o, 1500, 0, 4, 4))) ||
+            (g_qst = 0, 0) || PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4)) ||
             (g_stor = WE_ST_OUT, PT(P_FC1, gemm(&E->x2, p[4], 0, p[5], 0, &E->h, 1536, WE_F_GELU, 2, 4))) ||
             (g_stor = WE_ST_IN, PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 1, 4))))
             return -1;
