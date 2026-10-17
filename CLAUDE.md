@@ -613,7 +613,7 @@ compared `l1_budget` *bytes* with *element* counts. Generated code for
 The compiler route above is compile-only; what runs on VEK385 is a hand-written
 engine. It uses the resnetengine fabric with memory tiles spliced in, two kernel
 programs (GEMM, attention) swapped over control packets, and the host re-arming only
-memtile/shim BDs. The encoder takes **25.6 ms (19.3 % of 4×4 bf16 peak)**; FC1→FC2 runs on chip through storage memtiles over the shim row (11-column partition), the decoder
+memtile/shim BDs. The encoder takes **25.1 ms (19.7 % of 4×4 bf16 peak)**; FC1→FC2 and Q→attention run on chip through storage memtiles over the shim row (11-column partition), the decoder
 ~27 ms/token, and the JFK transcript matches PyTorch. Build and run it with
 `build.sh eng` + `apppaltest.py --netload`. Profile it with `HDEFS=WE_TL` (host
 timeline), `KDEFS=WE_PROF_G HDEFS=WE_PROF_GOP` (per-op core split) and
