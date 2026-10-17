@@ -617,6 +617,10 @@ typedef struct {
     int lnn; /* full N of lnd / lnc (a column chunk of a wider GEMM indexes into them) */
     int stor; /* WE_ST_OUT: output kept on chip (storage memtiles); WE_ST_IN: A read from there;
                * WE_ST_OUTQ: sub-op 0's output (Q of the Q/K/V GEMM) on chip, the rest to DDR */
+    /* WE_ST_IN source: pass p's block from storage tile st_j0 + p / st_ppt, at (p % st_ppt) * 6 KB,
+     * its K chunks st_cs bytes apart (FC1's [chunk][block 2] layout: 0, 2, 12 KB; a DDR-tile
+     * layout of 384 rows: j, 6, 36 KB) */
+    int st_j0, st_ppt, st_cs;
 } WeGemm;
 enum { WE_ST_OUT = 1, WE_ST_IN = 2, WE_ST_OUTQ = 3 };
 
@@ -693,7 +697,8 @@ static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
     P->dbuf = !P->conv && P->passes > 1 && P->MBP <= 3 && P->hdrs + 2 * (P->a_pass + P->r_pass) <= EF_MT_BYTES;
     if ((g->stor == WE_ST_OUTQ && (P->passes != 1 || P->MB != 6 || g->ract != 4 || P->NSUB < 2)) ||
         (g->stor == WE_ST_OUT && (P->MB != 6 || P->MBP != 2 || P->NBS != 2 || g->n != 1536 || g->ract != 4)) ||
-        (g->stor == WE_ST_IN && (P->MBP != 1 || !P->dbuf || P->K != 1536)) || 1 + P->MBP * (1 + P->res) > 10) {
+        (g->stor == WE_ST_IN && (P->MBP != 1 || !P->dbuf || !g->st_ppt || !g->st_cs)) ||
+        1 + P->MBP * (1 + P->res) > 10) {
         printf("WE gemm: storage mode %d needs FC1 (N 1536, 2 blocks x 3 passes) / FC2 (K 1536, 1 block a pass)\n",
                g->stor);
         return -1;
@@ -781,12 +786,15 @@ static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p
                 __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), dr, 1, 14, DMA_MM2S), 14, P->MBP);
                 we_ddr(e, we_shim(k), 14, P->MBP, DMA_MM2S);
             }
-            we_st_west(e, r, p / 2);
-            const XAie_LocType st = we_st(r, p / 2);
-            /* block p%2 of the [K chunk 32][block 2][64x48] layout: 32 chunks 12 KB apart */
-            const uint32_t gs[3] = {1, 768, 3072}, gw[3] = {768, 2, 32};
-            we_mt_bd(e, st, 20 + half, EF_MT_BASE + (uint32_t)((p % 2) * WE_BLK), (uint32_t)P->ablk, 3, gs, gw, 0, 0,
-                     -1);
+            const int tj = g->st_j0 + p / g->st_ppt;
+            if (e->st_west[r] != tj && e->st_west[r] >= 0 && we_wait_ch(e, ta, 3, DMA_S2MM))
+                return; /* the lane must be idle before it is switched */
+            we_st_west(e, r, tj);
+            const XAie_LocType st = we_st(r, tj);
+            /* the block's K chunks, st_cs apart */
+            const uint32_t gs[3] = {1, 768, (uint32_t)g->st_cs / 4}, gw[3] = {768, 2, (uint32_t)(P->K / 48)};
+            we_mt_bd(e, st, 20 + half, EF_MT_BASE + (uint32_t)((p % g->st_ppt) * WE_BLK), (uint32_t)P->ablk, 3, gs, gw,
+                     0, 0, -1);
             XAie_DmaChannelSetStartQueue(e->dev, ta, 3, DMA_S2MM, (u8)(46 + half), 1, XAIE_DISABLE);
             we_mt_queue(e, st, DMA_MM2S, 20 + half, 1);
             continue;
@@ -1090,6 +1098,7 @@ typedef struct {
     int causal, ract; /* ract: mesh rows holding queries */
     int krows;        /* row blocks of kv holding keys */
     int qst;          /* q tiles of mesh row r on chip in we_st(r, 0) (Q/K/V GEMM with WE_ST_OUTQ) */
+    int ost;          /* output kept on chip in we_st(r, 1) (the out-projection reads it, WE_ST_IN) */
 } WeAttn;
 
 /* Output packet: d0 = 2 kt (128 B), d1 = 4 pairs at 2 tiles, d2 = WE_QB/4 row groups */
@@ -1110,6 +1119,29 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
         ev[r] = __Runtime_startio(e->dev, __Runtime_dma_createio_4(s, d, we_out_ch[r], we_ooo[r][0], DMA_S2MM),
                                   we_ooo[r][0], any);
         we_ddr(e, s, we_ooo[r][0], any, DMA_S2MM);
+    }
+}
+
+/* we_arm_out_att into storage tile we_st(r, 1) (the DDR tile layout of the 384-row block):
+ * out-of-order memtile BDs with the same 3-D pattern, in words */
+static void we_arm_out_att_st(WeEng *e, const int head[4], const int nqb[4], const int qb0[4], size_t tileb,
+                              struct_ioevent *ev) {
+    const uint32_t st[3] = {1, (uint32_t)(2 * tileb / 4), 96}, wr[3] = {32, 4, WE_QB / 4};
+    for (int r = 0; r < 4; r++) {
+        const XAie_LocType t = we_st(r, 1);
+        int any = 0;
+        for (int c = 0; c < 4; c++) {
+            if (!nqb[c])
+                continue;
+            const size_t off =
+                (size_t)(head[c] / 3) * tileb + ((size_t)(head[c] % 3) * 64 + (size_t)qb0[c] * 8 * 192) * 2;
+            we_mt_bd(e, t, we_ooo[r][c], EF_MT_BASE + (uint32_t)off, WE_Q_CHUNK, 3, st, wr, (WE_QB / 4) * 96,
+                     (uint32_t)nqb[c], -1);
+            any += nqb[c];
+        }
+        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)we_ooo[r][0], (u32)any, XAIE_DISABLE);
+        memset(&ev[r], 0, sizeof(ev[r]));
+        ev[r].io.tile_loc = t, ev[r].io.channel_id = 0, ev[r].io.direction = DMA_S2MM;
     }
 }
 
@@ -1170,7 +1202,13 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         for (int c = 0; c < 4; c++)
             dst[r][c] = we_tile(a->out, r, head[c] / 3) + (head[c] % 3) * 64 + (size_t)qb0[c] * (WE_QB / 4) * 6 * 32;
     we_sb_begin(e);
-    we_arm_out_att(e, a->ract, dst, nqb, tileb, ev);
+    if (a->ost) {
+        if (we_st_east(e, 1))
+            return -1;
+        we_arm_out_att_st(e, head, nqb, qb0, tileb, ev);
+    } else {
+        we_arm_out_att(e, a->ract, dst, nqb, tileb, ev);
+    }
     // A: header + this row block's q tiles; B: the head's K^T and V, gathered chunk-major
     for (int k = 1; k <= 4; k++) {
         const int r = k - 1, act = k <= a->ract;
