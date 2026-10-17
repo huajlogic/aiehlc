@@ -44,3 +44,15 @@ Two BD banks alternate per op. Pre-writing the next op's BDs into `rbank ^ 1`
 is only safe when that bank is not the one the still-running op uses — an
 earlier attempt (prepare replay(1) before `we_drain`) hung with
 `WE HANG waiting output tile(4,0) ch 0 op seq 17`.
+
+## 5. Dimension wraps are 10 bits
+A memtile or shim BD dimension wrap of 2048 is rejected
+(`_XAie2PS_DmaSetMultiDim(): Invalid stepsize or wrap`). A wrap of **1024 is not
+rejected**: it silently becomes 0, the BD then runs linear, and every chunk after the
+first lands in the wrong place (et2 round-1 gather: chunk 0 right, chunk 1's K region
+holding V). Keep each wrap at 1023 or below, e.g. an 8 KB run as 512 words × 4.
+
+## 6. A chained shim BD pair does not iterate per task repeat
+`startio(15, rk)` on a chain 15 → 14 (both with BD iteration) did not interleave K
+and V per row block. Queue K (repeat rk) and V (repeat rk) as separate tasks, and
+order the memtile chain to match.
