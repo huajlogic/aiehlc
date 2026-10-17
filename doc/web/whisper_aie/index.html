@@ -48,15 +48,15 @@
 <p class="sub">What this branch built to run OpenAI Whisper-tiny on the AIE array, how each layer of the encoder and the decoder is handled, and which parts came from aiehlc versus which were written by hand.</p>
 
 <div class="tiles">
-  <div class="tile"><div class="v">26.5 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
-  <div class="tile"><div class="v">18.7 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
+  <div class="tile"><div class="v">26.2 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
+  <div class="tile"><div class="v">18.9 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
   <div class="tile"><div class="v">~27 ms</div><div class="k">per decoder step (24 steps for the JFK clip)</div></div>
   <div class="tile"><div class="v">~0.67 s</div><div class="k">audio features in → tokens out</div></div>
   <div class="tile"><div class="v">match</div><div class="k">transcript identical to PyTorch, token for token</div></div>
   <div class="tile"><div class="v">16 cores</div><div class="k">4×4 mesh + 8 memory tiles, 5-column partition</div></div>
 </div>
 
-<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at <b>18.7 % (26.5 ms)</b>. Measured DDR bandwidth puts 30 % below the floor of this dataflow: see <a href="#floor">the DDR floor</a>. Numbers come from board runs on VEK385, booted over netboot.</div>
+<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at <b>18.9 % (26.2 ms)</b>. Measured DDR bandwidth puts 30 % below the floor of this dataflow: see <a href="#floor">the DDR floor</a>. Numbers come from board runs on VEK385, booted over netboot.</div>
 
 <nav class="toc"><b>Contents</b>
 <ol>
@@ -252,6 +252,7 @@
 <tr><td>Memory tiles zeroed at init; attention P·V in 4×2 blocks; K/V channel armed once per op; normalisation on native bf16 products (finish 10.3k → 3.7k cycles per q-block)</td><td class="num">27.0 ms</td><td class="num">18.3</td></tr>
 <tr><td>Double-buffered memory-tile passes: FC2's next pass is filled while the current one computes</td><td class="num">26.6 ms</td><td class="num">18.6</td></tr>
 <tr><td>Next q-block's Q prefetched during the current one; attention output in its own buffer (q-block start 3.7k → 1.0k cycles)</td><td class="num">26.5 ms</td><td class="num">18.7</td></tr>
+<tr><td>Attention round 1 streams its fill: Q q-block by q-block and K/V row block by row block under memory-tile locks, so the cores start before the fill ends; its BDs moved out of the next GEMM's bank</td><td class="num">26.2 ms</td><td class="num">18.9</td></tr>
 </table>
 
 <h3>Measured limits</h3>
