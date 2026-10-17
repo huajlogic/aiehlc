@@ -12,7 +12,7 @@
 #include <math.h>
 #include <stdlib.h>
 
-extern unsigned char _binary_kernel_eng_start[];
+extern unsigned char _binary_kernel_eng_start[], _binary_kernel_att_start[];
 static uint32_t g_seed = 7;
 static float rnd() {
     g_seed = g_seed * 1664525u + 1013904223u;
@@ -238,15 +238,25 @@ static int test(WeEng *e, const char *name, int rb, int rows, int causal, int ra
 
 int main() {
     printf("=== ET2: engine attention ===\n");
+    /* two kernel programs (GEMM, attention) swapped over the control-packet plane, as eng/host.cc */
+    __Runtime_ctrl_high_throughput_enable(1);
+    __Runtime_ctrl_pmap_enable(0);
     XAie_DevInst *dev = __Runtime_init_mesh_partition(0, EF_PART_START_COL, EF_PART_NUM_COLS);
+    static __Runtime_CtrlRowFabric fab;
+    static const __Runtime_CtrlRowChain fab_rows[] = {{3, 1, 4}, {4, 1, 4}, {5, 1, 4}, {6, 1, 4}};
+    __Runtime_ctrl_plan_init(&fab, dev, 0, 0, 1, fab_rows, 4);
+    __Runtime_ctrl_plan_set_exclusive(&fab, 1);
     XAie_LocType tiles[16];
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
             tiles[r * 4 + c] = XAie_TileLoc((uint8_t)(EF_FIRST_COL + c), (uint8_t)(EF_FIRST_ROW + r));
-    __Runtime_set_kernel_elf(_binary_kernel_eng_start);
-    __Runtime_launch_kernel_group(dev, __Runtime_load_kernel_group_nt(dev, tiles, 16));
     static WeEng e;
     we_init(&e, dev);
+    e.ctrl = &fab;
+    e.prog[1] = _binary_kernel_eng_start, e.prog[2] = _binary_kernel_att_start;
+    memcpy(e.tiles, tiles, sizeof(tiles));
+    if (we_prog(&e, 1))
+        return 1;
     dev_g = dev;
     int fails = 0;
     fails += test(&e, "dec nomask T64", 64, 64, 0, 1);
