@@ -70,6 +70,8 @@ typedef struct {
     int32_t *hdr;                 /* WE_HDR_BYTES DMA buffer per op slot */
     double t_fill, t_arm, t_run;  /* accumulated, us */
     double b_rd, b_wr;            /* DDR bytes moved by the shims (we_ddr), accumulated */
+    int st_east;                  /* storage pass whose east lanes are routed (-1: outputs to the shims) */
+    int st_west[4];               /* storage tile index feeding MT_A(r) over its west lane (-1: none) */
     unsigned seq;
 } WeEng;
 
@@ -289,8 +291,31 @@ static int we_wait_ch(WeEng *e, XAie_LocType t, int ch, XAie_DmaDirection dir) {
 }
 
 /* Hang dump: every engine DMA channel's status plus the cores' progress words. */
+static XAie_LocType we_st(int r, int j);
 static void we_dump(WeEng *e) {
     const char *dn[2] = {"S2MM", "MM2S"};
+    for (int r = 0; r < 4; r++) { /* on-chip storage paths */
+        u32 st = 0;
+        u8 pend = 0;
+        XAie_DmaGetChannelStatus(e->dev, we_mt(r + 1, EF_MT_A_ROW), 3, DMA_S2MM, &st);
+        XAie_DmaGetPendingBdCount(e->dev, we_mt(r + 1, EF_MT_A_ROW), 3, DMA_S2MM, &pend);
+        printf("WE dump MT_A(%d) S2MM3 status %08x pending %u; west lane from storage %d\n", r, (unsigned)st, pend,
+               e->st_west[r]);
+        for (int j = 0; j < 3; j++)
+            for (int d = 0; d < 2; d++) {
+                XAie_DmaGetChannelStatus(e->dev, we_st(r, j), 0, (XAie_DmaDirection)d, &st);
+                XAie_DmaGetPendingBdCount(e->dev, we_st(r, j), 0, (XAie_DmaDirection)d, &pend);
+                if (st || pend)
+                    printf("WE dump storage(%d,%d) %s0 status %08x pending %u\n", r, j, dn[d], (unsigned)st, pend);
+            }
+    }
+    for (int k = 1; k <= 4; k++)
+        for (int l = 0; l < 16; l++) {
+            u32 v = 0;
+            XAie_LockGetValue(e->dev, we_mt(k, EF_MT_A_ROW), XAie_LockInit((u16)l, 0), &v);
+            if (v)
+                printf("WE dump MT_A(%d) lock %d = %u\n", k - 1, l, (unsigned)v);
+        }
     for (int k = 1; k <= 4; k++)
         for (int row = 0; row <= 6; row++)
             for (int ch = 0; ch < 2; ch++)
@@ -360,6 +385,7 @@ static int we_drain(WeEng *e) {
     return rc;
 }
 
+static void we_st_init(WeEng *e);
 static void we_init(WeEng *e, XAie_DevInst *dev) {
     memset(e, 0, sizeof(*e));
     e->dev = dev;
@@ -391,6 +417,7 @@ static void we_init(WeEng *e, XAie_DevInst *dev) {
             we_wait_ch(e, we_mt(k, row), row == EF_MT_A_ROW, DMA_S2MM),
                 we_wait_ch(e, we_shim(k), row == EF_MT_A_ROW, DMA_MM2S);
     e->b_rd = 0;
+    we_st_init(e);
 }
 
 static void we_hdr_begin(WeEng *e, int op, int ract) {
@@ -429,6 +456,120 @@ static void we_arm_out(WeEng *e, int ract, bf16_t *const dst[4][4], int len, int
     }
 }
 
+/* ---- on-chip storage (FC1 -> FC2) ----------------------------------------
+ * Memory tiles have no east/west stream ports, so the storage tiles beyond the mesh
+ * (rel cols 5..10, both memtile rows) are reached over the shim row (probes m11,
+ * m12). Mesh row r owns lane r in each direction:
+ *   east  (FC1 out): its output shim's NORTH port -> EAST r -> ... -> storage column
+ *         shim WEST r -> NORTH 2+r -> memtile (row 1 or through it to row 2) S2MM0,
+ *         out-of-order (the cores' packet headers pick the BD, as at a shim);
+ *   west  (FC2 in):  storage MM2S0 -> SOUTH r -> shim NORTH r -> WEST r -> ... ->
+ *         shim(r+1) NORTH 2 -> MT_A(r) SOUTH 2 -> S2MM3 (BDs 46/47).
+ * Storage tile we_st(r, j) holds mesh row r's FC1 output of pass j (2 row blocks of
+ * 64 x 1536, A-block layout: [block][K chunk 32][64x48]). Routes are switched per
+ * pass; the east lanes are put back to the shims before any other op runs. */
+#define WE_ST_COL0 5
+static inline XAie_LocType we_st(int r, int j) {
+    const int i = r * 3 + j;
+    return XAie_TileLoc((uint8_t)(WE_ST_COL0 + i / 2), (uint8_t)(1 + i % 2));
+}
+static const int we_out_nport[4] = {1, 2, 2, 3}; /* output shim NORTH slave of mesh row r */
+static const int we_out_sport[4] = {1, 3, 1, 3}; /* ... and its SOUTH (to the shim DMA) master */
+typedef AieRC (*we_cct_fn)(XAie_DevInst *, XAie_LocType, StrmSwPortType, u8, StrmSwPortType, u8);
+static int we_lane_east(WeEng *e, int r, XAie_LocType T, int on) {
+    const we_cct_fn f = on ? XAie_StrmConnCctEnable : XAie_StrmConnCctDisable;
+    const int o = we_out_col[r];
+    const u8 L = (u8)r, n = (u8)(2 + r);
+    /* a circuit disable also disables its slave port: disables first, enables last */
+    int rc =
+        on ? XAie_StrmConnCctDisable(e->dev, we_shim(o), NORTH, (u8)we_out_nport[r], SOUTH, (u8)we_out_sport[r]) : 0;
+    rc |= f(e->dev, we_shim(o), NORTH, (u8)we_out_nport[r], EAST, L);
+    for (int c = o + 1; c < T.Col; c++)
+        rc |= f(e->dev, we_shim(c), WEST, L, EAST, L);
+    rc |= f(e->dev, we_shim(T.Col), WEST, L, NORTH, n);
+    if (T.Row == 1) {
+        rc |= f(e->dev, T, SOUTH, n, DMA, 0);
+    } else {
+        rc |= f(e->dev, XAie_TileLoc(T.Col, 1), SOUTH, n, NORTH, n);
+        rc |= f(e->dev, T, SOUTH, n, DMA, 0);
+    }
+    if (!on)
+        rc |= XAie_StrmConnCctEnable(e->dev, we_shim(o), NORTH, (u8)we_out_nport[r], SOUTH, (u8)we_out_sport[r]);
+    return rc;
+}
+static int we_lane_west(WeEng *e, int r, XAie_LocType S, int on) {
+    const we_cct_fn f = on ? XAie_StrmConnCctEnable : XAie_StrmConnCctDisable;
+    const u8 L = (u8)r;
+    int rc = 0;
+    if (S.Row == 2) {
+        rc |= f(e->dev, S, DMA, 0, SOUTH, L);
+        rc |= f(e->dev, XAie_TileLoc(S.Col, 1), NORTH, L, SOUTH, L);
+    } else {
+        rc |= f(e->dev, S, DMA, 0, SOUTH, L);
+    }
+    rc |= f(e->dev, we_shim(S.Col), NORTH, L, WEST, L);
+    for (int c = S.Col - 1; c > r + 1; c--)
+        rc |= f(e->dev, we_shim(c), EAST, L, WEST, L);
+    rc |= f(e->dev, we_shim(r + 1), EAST, L, NORTH, 2);
+    rc |= f(e->dev, we_mt(r + 1, EF_MT_A_ROW), SOUTH, 2, DMA, 3);
+    return rc;
+}
+/* east lanes to pass j's storage tiles (j < 0: outputs back to the shims) */
+static int we_st_east(WeEng *e, int j) {
+    int rc = 0;
+    if (e->st_east == j)
+        return 0;
+    if (e->st_east >= 0)
+        for (int r = 0; r < 4; r++)
+            rc |= we_lane_east(e, r, we_st(r, e->st_east), 0);
+    if (j >= 0)
+        for (int r = 0; r < 4; r++)
+            rc |= we_lane_east(e, r, we_st(r, j), 1);
+    e->st_east = j;
+    return rc;
+}
+/* west lane of mesh row r from storage tile j */
+static int we_st_west(WeEng *e, int r, int j) {
+    int rc = 0;
+    if (e->st_west[r] == j)
+        return 0;
+    if (e->st_west[r] >= 0)
+        rc |= we_lane_west(e, r, we_st(r, e->st_west[r]), 0);
+    rc |= we_lane_west(e, r, we_st(r, j), 1);
+    e->st_west[r] = j;
+    return rc;
+}
+static void we_st_init(WeEng *e) {
+    e->st_east = -1;
+    for (int r = 0; r < 4; r++) {
+        e->st_west[r] = -1;
+        XAie_DmaChannelEnable(e->dev, we_mt(r + 1, EF_MT_A_ROW), 3, DMA_S2MM);
+        for (int j = 0; j < 3; j++) {
+            const XAie_LocType t = we_st(r, j);
+            XAie_DmaChannelDesc cd;
+            XAie_DmaChannelDescInit(e->dev, &cd, t);
+            XAie_DmaChannelEnOutofOrder(&cd, XAIE_ENABLE);
+            XAie_DmaWriteChannel(e->dev, &cd, t, 0, DMA_S2MM);
+            XAie_DmaChannelEnable(e->dev, t, 0, DMA_S2MM);
+            XAie_DmaChannelEnable(e->dev, t, 0, DMA_MM2S);
+        }
+    }
+}
+/* FC1 sub-op s of pass j: core (r,c)'s MBP packets (its tile s*4+c of each block)
+ * land in we_st(r, j) at tile s*4+c, block mb at mb * 196 KB */
+static void we_arm_out_st(WeEng *e, int s, int j, int MBP, struct_ioevent *ev) {
+    const uint32_t blk = 32u * WE_BLK;
+    for (int r = 0; r < 4; r++) {
+        const XAie_LocType t = we_st(r, j);
+        for (int c = 0; c < 4; c++)
+            we_mt_bd(e, t, we_ooo[r][c], EF_MT_BASE + (uint32_t)(s * 4 + c) * WE_BLK, WE_BLK, 0, 0, 0, blk / 4,
+                     (uint32_t)MBP, -1);
+        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)we_ooo[r][0], (u32)(4 * MBP), XAIE_DISABLE);
+        memset(&ev[r], 0, sizeof(ev[r]));
+        ev[r].io.tile_loc = t, ev[r].io.channel_id = 0, ev[r].io.direction = DMA_S2MM;
+    }
+}
+
 /* ---- GEMM -------------------------------------------------------------- */
 typedef struct {
     const WeAct *a;     /* [M x K] */
@@ -453,7 +594,9 @@ typedef struct {
     const float *lnd;
     const bf16_t *lnc;
     int lnn; /* full N of lnd / lnc (a column chunk of a wider GEMM indexes into them) */
+    int stor; /* WE_ST_OUT: output kept on chip (storage memtiles); WE_ST_IN: A read from there */
 } WeGemm;
+enum { WE_ST_OUT = 1, WE_ST_IN = 2 };
 
 /* Column tiles per mesh column per sub-op: <= 2, so a sub-op's MT_B replay takes 2
  * of the memtile channel's 4 queue slots and the next sub-op's can be queued
@@ -522,6 +665,12 @@ static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
     P->tileb = (size_t)P->RB * 48 * 2;
     P->conv = g->conv_base != 0, P->aoff = 0, P->lkoff = 0;
     P->dbuf = !P->conv && P->passes > 1 && P->MBP <= 3 && P->hdrs + 2 * (P->a_pass + P->r_pass) <= EF_MT_BYTES;
+    if ((g->stor == WE_ST_OUT && (P->MB != 6 || P->MBP != 2 || P->NBS != 1 || g->n != 1536 || g->ract != 4)) ||
+        (g->stor == WE_ST_IN && (P->MBP != 1 || !P->dbuf || P->K != 1536)) || 1 + P->MBP * (1 + P->res) > 10) {
+        printf("WE gemm: storage mode %d needs FC1 (N 1536, 2 blocks x 3 passes) / FC2 (K 1536, 1 block a pass)\n",
+               g->stor);
+        return -1;
+    }
     if ((P->conv && (P->MBP != 1 || P->hdrs + 2 * (P->a_pass + P->r_pass) > EF_MT_BYTES)) || P->MB % P->MBP ||
         g->n % 192 || P->hdrs + P->a_pass + P->r_pass > EF_MT_BYTES || P->wcol * 2 > EF_MT_BYTES ||
         (g->ract < 4 && P->passes > 1) || P->MBP > 6 || P->NBT > 8 || P->MBP * (1 + P->ws + P->res) > 11 ||
@@ -562,21 +711,27 @@ static void we_gemm_fill_b(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int f
 static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p, const int32_t *hbuf, int fb, int ph) {
     const int half = P->dbuf ? (p & 1) : 0, mb0 = p * P->MBP, b0 = (fb ^ half) ? 36 : 24, lko = half * P->MBP;
     const size_t hoff = (size_t)half * (P->a_pass + P->r_pass);
+    const int si = g->stor == WE_ST_IN; /* A from on-chip storage (MBP 1) over S2MM3, the rest from DDR */
     for (int k = 1; k <= 4; k++) {
         const int r = k - 1, act = k <= g->ract;
         if (!act && p > 0)
             continue;
         XAie_LocType ta = we_mt(k, EF_MT_A_ROW);
         if (ph & WE_BDS) {
-            const int nfill = act ? P->MBP * (1 + P->res) : 0;
+            const int nfill = act ? P->MBP * (!si + P->res) : 0;
             we_mt_bdl(e, ta, b0, EF_MT_BASE, (uint32_t)P->hdrs, 0, 0, 0, 0, 0, nfill ? b0 + 1 : -1, -1, WE_LK_H,
                       P->NSUB);
+            if (si && act)
+                we_mt_bdl(e, ta, 46 + half, EF_MT_BASE + (uint32_t)(P->hdrs + hoff), (uint32_t)P->ablk, 0, 0, 0, 0, 0,
+                          -1, -1, WE_LK_A + lko, P->NBT);
             for (int mb = 0, b = b0 + 1; mb < (act ? P->MBP : 0); mb++) {
                 const uint32_t base = EF_MT_BASE + (uint32_t)(P->hdrs + hoff + mb * (P->ablk + P->rblk));
                 const int last_a = !P->res && mb + 1 == P->MBP;
-                we_mt_bdl(e, ta, b, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, last_a ? -1 : b + 1, -1, WE_LK_A + lko + mb,
-                          P->NBT);
-                b++;
+                if (!si) {
+                    we_mt_bdl(e, ta, b, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, last_a ? -1 : b + 1, -1,
+                              WE_LK_A + lko + mb, P->NBT);
+                    b++;
+                }
                 if (P->res) {
                     we_mt_bdl(e, ta, b, base + (uint32_t)P->ablk, (uint32_t)P->rblk, 0, 0, 0, 0, 0,
                               mb + 1 == P->MBP ? -1 : b + 1, -1, WE_LK_R + lko + mb, P->NBT);
@@ -591,6 +746,22 @@ static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p
         we_sh_start(e, k, 1, 12);
         if (!act)
             continue;
+        if (si) { /* res from DDR on S2MM1; A block p from storage tile p/2 over the west lane */
+            if (P->res) {
+                XAie_DmaDesc dr =
+                    we_shim_bd(e, we_shim(k), we_tile(g->res, r, 0) + (size_t)mb0 * 64 * 48, 14, (int)P->rblk, -1, 0, 0,
+                               -1, 3, 4, 256, 1024, 6, (int)P->tileb, g->n / 48, WE_BLK, P->MBP);
+                __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), dr, 1, 14, DMA_MM2S), 14, P->MBP);
+                we_ddr(e, we_shim(k), 14, P->MBP, DMA_MM2S);
+            }
+            we_st_west(e, r, p / 2);
+            const XAie_LocType st = we_st(r, p / 2);
+            we_mt_bd(e, st, 20 + half, EF_MT_BASE + (uint32_t)((p % 2) * P->ablk), (uint32_t)P->ablk, 0, 0, 0, 0, 0,
+                     -1);
+            XAie_DmaChannelSetStartQueue(e->dev, ta, 3, DMA_S2MM, (u8)(46 + half), 1, XAIE_DISABLE);
+            we_mt_queue(e, st, DMA_MM2S, 20 + half, 1);
+            continue;
+        }
         /* block mb: for each K tile its 6 KB of rows (d0 x d1), tiles at tileb; iterate mb */
         const bf16_t *a = we_tile(g->a, r, 0) + (size_t)mb0 * 64 * 48;
         XAie_DmaDesc d = we_shim_bd(e, we_shim(k), a, 13, (int)P->ablk, P->res ? 14 : -1, 0, 0, -1, 3, 4, 256, 1024, 6,
@@ -773,6 +944,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
     /* after attention: the swap (it drains first) comes after this op's BDs are written */
     if (we_prog(e, 1) || we_drain(e))
         return -1;
+    if (g->stor != WE_ST_OUT && we_st_east(e, -1)) /* outputs back to the shims */
+        return -1;
     {
         XTime t;
         XTime_GetTime(&t);
@@ -805,6 +978,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             const int bk = (rb0 + st) & 1;
             XTime q0, q1, q2;
             XTime_GetTime(&q0);
+            if (s == 0 && g->stor == WE_ST_OUT && we_st_east(e, p)) /* pass p's storage tiles */
+                return -1;
             if (s == 0) { /* the first stage of a pass (pass 0: BDs written above): the cores
                              start on it while the outputs are armed (a packet waits) */
                 we_gemm_replay(e, g, &P, 0, bk, p == 0 ? WE_GO : WE_BDS | WE_GO);
@@ -820,7 +995,9 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                                 : lg ? (bf16_t *)(g->logits + (size_t)cb * 192)
                                      : we_tile(g->out, r, cb) + (size_t)mb0 * 64 * 48;
                 }
-            if (rm)
+            if (g->stor == WE_ST_OUT)
+                we_arm_out_st(e, s, p, P.MBP, ev);
+            else if (rm)
                 we_arm_out(e, g->ract, dst, WE_BLK, P.MBP, 64 * g->n * 2, 96, 64, g->n * 2, ev);
             else if (lg)
                 we_arm_out(e, g->ract, dst, 768, P.NBS, 768, 768, 1, 768, ev);
@@ -831,7 +1008,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             if (P.dbuf && s == 0 && p + 1 < P.passes) { /* the next pass into the other half; its
                                                            shim BDs are this pass's: wait for its fill */
                 for (int k = 1; k <= g->ract; k++)
-                    if (we_wait_ch(e, we_shim(k), 1, DMA_MM2S))
+                    if (we_wait_ch(e, we_shim(k), 1, DMA_MM2S) ||
+                        (g->stor == WE_ST_IN && we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 3, DMA_S2MM)))
                         return -1;
                 we_gemm_fill_a(e, g, &P, p + 1, hbuf, fb, WE_BDS | WE_GO);
             }

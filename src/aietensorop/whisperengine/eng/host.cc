@@ -98,11 +98,13 @@ static void set_ln(WeGemm *g, size_t ln, int n, int c0) {
     g->lnc = (const bf16_t *)(wn_blob + ln + (size_t)n * 4) + c0;
     g->lnn = n;
 }
+static int g_stor; /* we_gemm storage mode for the next gemm() (encoder FC1 / FC2: hidden kept on chip) */
 static int gemm(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *res, const WeAct *out, int n, int flags,
                 int mbp, int ract) {
     TR("gemm");
     WeGemm g = {a, W(w), b ? W(b) : 0, res, out, n, flags, g_kt0, g_kt0 + 8, ract, mbp, g_kt0 + 8, g_kt0 + 16};
     g.wsplit = g_ws;
+    g.stor = g_stor;
     set_ln(&g, ln, n, 0);
     if (!(flags & WE_F_KT))
         g.kt_lo = g.kt_hi = 0;
@@ -200,9 +202,10 @@ static int encoder(Enc *E, int verify) {
         if (PT(P_QKV, gemm(&E->x, p[0], 0, p[1], 0, &E->qkv, 1152, WE_F_KT | WE_F_VT, 0, 4)) ||
             PT(P_ATTN, attn(&E->qkv, &E->qkv, 8, 16, &E->o, 1500, 0, 4, 4)) ||
             PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4)) ||
-            PT(P_FC1, gemm(&E->x2, p[4], 0, p[5], 0, &E->h, 1536, WE_F_GELU, 0, 4)) ||
-            PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 1, 4)))
+            (g_stor = WE_ST_OUT, PT(P_FC1, gemm(&E->x2, p[4], 0, p[5], 0, &E->h, 1536, WE_F_GELU, 2, 4))) ||
+            (g_stor = WE_ST_IN, PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 1, 4))))
             return -1;
+        g_stor = 0;
         static const size_t gx[4] = {WN_G_X1, WN_G_X2, WN_G_X3, WN_G_X4};
         static const char *gn[4] = {"block0", "block1", "block2", "block3"};
         if (verify && check(gn[l], &E->x, gx[l], 1500))
