@@ -46,7 +46,38 @@ int main() {
         XAie_DmaChannelEnable(dev, mt(k, 2), 0, DMA_S2MM);
     }
     for (int rep = 0; rep < 2; rep++)
-        for (int mode = 1; mode <= 3; mode++) { /* 1 read, 2 write, 3 both */
+        for (int mode = 1; mode <= 7; mode++) { /* 1 read, 2 write, 3 both; reads over fewer channels: 4 MT_A
+                                                      only (one channel per shim), 5 two shims, 6 one shim, 7 one ch */
+            if (mode == 4 || mode == 5 || mode == 6 || mode == 7) {
+                const int nk = mode == 4 ? 4 : mode == 5 ? 2 : 1, rows = mode == 7 ? 1 : (mode == 4 ? 1 : 2);
+                XTime t0, t1;
+                XTime_GetTime(&t0);
+                for (int k = 1; k <= nk; k++)
+                    for (int row = 1; row <= rows; row++) {
+                        XAie_DmaDesc d;
+                        XAie_DmaDescInit(dev, &d, mt(k, row));
+                        XAie_DmaSetAddrLen(&d, EF_MT_BASE, (u32)rd);
+                        XAie_DmaEnableBd(&d);
+                        const int mbd = row == 1 ? 24 : 0;
+                        XAie_DmaWriteBd(dev, &d, mt(k, row), mbd);
+                        XAie_DmaChannelSetStartQueue(dev, mt(k, row), row == 1, DMA_S2MM, mbd, 1, XAIE_DISABLE);
+                        const int ch = row == 1 ? 1 : 0;
+                        XAie_DmaDesc s = __Runtime_dma_bd_config_multidim_ooo(
+                            dev, shim(k), src + (size_t)((k - 1) * 2 + row - 1) * rd, 12 + ch, rd, -1, 0, 0, 0, 0, 0, 0,
+                            -1, 3, 4, 64, 256, 512, 256 * 512, 0, 0, 0);
+                        __Runtime_startio(dev, __Runtime_dma_createio_4(shim(k), s, ch, 12 + ch, DMA_MM2S), 12 + ch, 1);
+                    }
+                for (int k = 1; k <= nk; k++)
+                    for (int row = 1; row <= rows; row++)
+                        wait_ch(dev, mt(k, row), row == 1, DMA_S2MM);
+                XTime_GetTime(&t1);
+                const double rb = (double)nk * rows * rd;
+                printf("M4 rep %d read over %d shim(s) x %d channel(s): %.0f KB in %.1f us = %.2f GB/s (%.2f per "
+                       "channel)\n",
+                       rep, nk, rows, rb / 1024, us(t0, t1), rb / us(t0, t1) / 1e3,
+                       rb / us(t0, t1) / 1e3 / (nk * rows));
+                continue;
+            }
             struct_ioevent ev[4];
             if (mode & 2) {
                 for (int r = 0; r < 4; r++) {

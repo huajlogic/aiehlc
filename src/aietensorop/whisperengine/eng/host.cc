@@ -165,12 +165,12 @@ static int encoder(Enc *E, int verify) {
     {
         WeAct a1 = {0, 768, 288};
         WeGemm g = {
-            &a1, W(WN_CONV1_W), W(WN_CONV1_B), 0, 0, 384, WE_F_GELU | WE_F_ROWMAJOR, 0, 0, 4, 4, 0, 0, W(WN_MEL),
+            &a1, W(WN_CONV1_W), W(WN_CONV1_B), 0, 0, 384, WE_F_GELU | WE_F_ROWMAJOR, 0, 0, 4, 1, 0, 0, W(WN_MEL),
             80,  240,           E->x1 + 384,   0, 0};
         if (PT(P_CONV, we_gemm(&g_e, &g)))
             return -1;
         WeAct a2 = {0, 384, 1152}, pos = {(bf16_t *)W(WN_POS_ENC), 384, 384};
-        WeGemm g2 = {&a2, W(WN_CONV2_W), W(WN_CONV2_B), &pos, &E->x, 384, WE_F_GELU, 0, 0, 4, 2, 0,
+        WeGemm g2 = {&a2, W(WN_CONV2_W), W(WN_CONV2_B), &pos, &E->x, 384, WE_F_GELU, 0, 0, 4, 1, 0,
                      0,   E->x1,         768,           1152, 0,     0,   0};
         if (PT(P_CONV, we_gemm(&g_e, &g2)))
             return -1;

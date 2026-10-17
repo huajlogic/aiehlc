@@ -1,0 +1,15 @@
+_entry_point _main_init
+_symbol _main _after  _main_init
+_symbol _main_init 0
+_symbol m9_c0 0x71000
+_symbol m9_c1 0x74000
+_symbol m9_st 0x77000
+_symbol m9_prm 0x78000
+_symbol m9_res 0x79000
+_symbol m9_aw 0x7a000
+_symbol m9_in 0x7c000
+_stack DM_stack 0x70000 0x1000
+_reserved DMb 0x0 0x40000
+_reserved DMb 0x40000 0x10000
+_reserved DMb 0x50000 0x20000
+_reserved DMb 0x80000 0x80000

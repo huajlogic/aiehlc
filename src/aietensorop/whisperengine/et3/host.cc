@@ -75,7 +75,7 @@ int main() {
     __Runtime_sync_for_dev(dev, w2p, 384 * 1152 * 2);
     bf16_t *x1 = dalloc((size_t)3080 * 384); /* conv1 out, row r+1 = time r */
     WeAct a1 = {0, 768, 288};
-    WeGemm g1 = {&a1, w1p, b1, 0, 0, 384, WE_F_GELU | WE_F_ROWMAJOR, 0, 0, 4, 4, 0, 0, mel, 80, 240, x1 + 384, 0};
+    WeGemm g1 = {&a1, w1p, b1, 0, 0, 384, WE_F_GELU | WE_F_ROWMAJOR, 0, 0, 4, 1, 0, 0, mel, 80, 240, x1 + 384, 0};
     XTime t0, t1, t2;
     XTime_GetTime(&t0);
     if (we_gemm(&e, &g1) || we_drain(&e))
@@ -88,7 +88,7 @@ int main() {
             pos.p[we_blk_idx(384, 384, i, j)] = f2bf(rnd());
     __Runtime_sync_for_dev(dev, pos.p, (size_t)1536 * 384 * 2);
     WeAct a2 = {0, 384, 1152};
-    WeGemm g2 = {&a2, w2p, b2, &pos, &x, 384, WE_F_GELU, 0, 0, 4, 2, 0, 0, x1, 768, 1152, 0, 0};
+    WeGemm g2 = {&a2, w2p, b2, &pos, &x, 384, WE_F_GELU, 0, 0, 4, 1, 0, 0, x1, 768, 1152, 0, 0};
     if (we_gemm(&e, &g2) || we_drain(&e))
         return 1;
     XTime_GetTime(&t2);
