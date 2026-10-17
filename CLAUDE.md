@@ -885,6 +885,7 @@ Read the matching skill when the task fits:
 | Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
 | Host-programmed memtile BD rejected/hangs: BD ≥ 24 on an even channel, fill waits on a lock it never asked for (`XAie_DmaSetLock` enables both sides), streaming-fill lock counts | memtilebdlockchannel |
 | Host timeline far slower once timestamps print (UART printf in the timed region); MMIO cost vs page type (Device-nGnRE / Normal-NC) | hosttimelinedistortion |
+| On-chip activations in memtiles outside the mesh over the shim row; output packets into out-of-order memtile S2MM; a circuit disable that kills its slave port | shimrowstorage |
 | A passing persistent engine now fails every run with all-NaN outputs (`N/N beyond ulp, max diff 0`), even after reverting; memtile contents survive partition init | memtilestalenan |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
