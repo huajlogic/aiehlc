@@ -471,6 +471,8 @@ static void we_arm_out(WeEng *e, int ract, bf16_t *const dst[4][4], int len, int
  * pass; the east lanes are put back to the shims before any other op runs. */
 #define WE_ST_COL0 5
 static inline XAie_LocType we_st(int r, int j) {
+    if (j == 3) /* the encoder output (last FC2) for the cross K/V GEMMs: rel cols 11, 12 */
+        return XAie_TileLoc((uint8_t)(11 + r / 2), (uint8_t)(1 + r % 2));
     const int i = r * 3 + j;
     return XAie_TileLoc((uint8_t)(WE_ST_COL0 + i / 2), (uint8_t)(1 + i % 2));
 }
@@ -545,7 +547,7 @@ static void we_st_init(WeEng *e) {
     for (int r = 0; r < 4; r++) {
         e->st_west[r] = -1;
         XAie_DmaChannelEnable(e->dev, we_mt(r + 1, EF_MT_A_ROW), 3, DMA_S2MM);
-        for (int j = 0; j < 3; j++) {
+        for (int j = 0; j < 4; j++) { /* j 3: the encoder output tiles */
             const XAie_LocType t = we_st(r, j);
             XAie_DmaChannelDesc cd;
             XAie_DmaChannelDescInit(e->dev, &cd, t);
@@ -571,6 +573,19 @@ static void we_arm_out_stq(WeEng *e, int NBS, int MB, struct_ioevent *ev) {
             we_mt_bd(e, t, we_ooo[r][c], EF_MT_BASE + (uint32_t)(c * NBS * MB) * WE_BLK, WE_BLK, 0, 0, 0, WE_BLK / 4,
                      (uint32_t)(NBS * MB), -1);
         XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)we_ooo[r][0], (u32)(4 * NBS * MB), XAIE_DISABLE);
+        memset(&ev[r], 0, sizeof(ev[r]));
+        ev[r].io.tile_loc = t, ev[r].io.channel_id = 0, ev[r].io.direction = DMA_S2MM;
+    }
+}
+/* stox: sub-op s of pass p (1 block, NBS 1): core c's packet -> tile s*4+c of block p */
+static void we_arm_out_stx(WeEng *e, int s, int p, struct_ioevent *ev) {
+    const int o2 = (s & 1) ? WE_ST_OOO2 : 0;
+    for (int r = 0; r < 4; r++) {
+        const XAie_LocType t = we_st(r, 3);
+        for (int c = 0; c < 4; c++)
+            we_mt_bd(e, t, we_ooo[r][c] + o2, EF_MT_BASE + (uint32_t)(p * 8 + s * 4 + c) * WE_BLK, WE_BLK, 0, 0, 0, 0,
+                     0, -1);
+        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)(we_ooo[r][0] + o2), 4, XAIE_DISABLE);
         memset(&ev[r], 0, sizeof(ev[r]));
         ev[r].io.tile_loc = t, ev[r].io.channel_id = 0, ev[r].io.direction = DMA_S2MM;
     }
@@ -620,7 +635,8 @@ typedef struct {
     /* WE_ST_IN source: pass p's block from storage tile st_j0 + p / st_ppt, at (p % st_ppt) * 6 KB,
      * its K chunks st_cs bytes apart (FC1's [chunk][block 2] layout: 0, 2, 12 KB; a DDR-tile
      * layout of 384 rows: j, 6, 36 KB) */
-    int st_j0, st_ppt, st_cs;
+    int st_j0, st_ppt, st_cs, st_bs; /* st_bs: bytes between consecutive blocks of a tile (0: 6 KB) */
+    int stox; /* output (N 384, 1 block a pass) also kept on chip in we_st(r, 3): [block][tile 8][64x48] */
 } WeGemm;
 enum { WE_ST_OUT = 1, WE_ST_IN = 2, WE_ST_OUTQ = 3 };
 
@@ -695,7 +711,8 @@ static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
     P->tileb = (size_t)P->RB * 48 * 2;
     P->conv = g->conv_base != 0, P->aoff = 0, P->lkoff = 0;
     P->dbuf = !P->conv && P->passes > 1 && P->MBP <= 3 && P->hdrs + 2 * (P->a_pass + P->r_pass) <= EF_MT_BYTES;
-    if ((g->stor == WE_ST_OUTQ && (P->passes != 1 || P->MB != 6 || g->ract != 4 || P->NSUB < 2)) ||
+    if ((g->stox && (P->NBS != 1 || P->MBP != 1 || g->n != 384 || g->ract != 4 || P->NSUB != 2)) ||
+        (g->stor == WE_ST_OUTQ && (P->passes != 1 || P->MB != 6 || g->ract != 4 || P->NSUB < 2)) ||
         (g->stor == WE_ST_OUT && (P->MB != 6 || P->MBP != 2 || P->NBS != 2 || g->n != 1536 || g->ract != 4)) ||
         (g->stor == WE_ST_IN && (P->MBP != 1 || !P->dbuf || !g->st_ppt || !g->st_cs)) ||
         1 + P->MBP * (1 + P->res) > 10) {
@@ -793,8 +810,8 @@ static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p
             const XAie_LocType st = we_st(r, tj);
             /* the block's K chunks, st_cs apart */
             const uint32_t gs[3] = {1, 768, (uint32_t)g->st_cs / 4}, gw[3] = {768, 2, (uint32_t)(P->K / 48)};
-            we_mt_bd(e, st, 20 + half, EF_MT_BASE + (uint32_t)((p % g->st_ppt) * WE_BLK), (uint32_t)P->ablk, 3, gs, gw,
-                     0, 0, -1);
+            we_mt_bd(e, st, 20 + half, EF_MT_BASE + (uint32_t)((p % g->st_ppt) * (g->st_bs ? g->st_bs : WE_BLK)),
+                     (uint32_t)P->ablk, 3, gs, gw, 0, 0, -1);
             XAie_DmaChannelSetStartQueue(e->dev, ta, 3, DMA_S2MM, (u8)(46 + half), 1, XAIE_DISABLE);
             we_mt_queue(e, st, DMA_MM2S, 20 + half, 1);
             continue;
@@ -938,7 +955,7 @@ static int32_t *we_gemm_headers(WeEng *e, const WeGemm *g, const WeGemmPlan *P) 
         h[WH_VT_HI] = g->vt_hi - s * NSB;
         h[WH_LRG] = g->lrg;
         h[WH_KST] = P->K / 48;
-        h[WH_OOO] = g->stor == WE_ST_OUT && (s & 1) ? WE_ST_OOO2 : 0;
+        h[WH_OOO] = (g->stor == WE_ST_OUT || g->stox) && (s & 1) ? WE_ST_OOO2 : 0;
         const float eps = 1e-5f, invk = 1.0f / (float)P->K;
         memcpy(&h[WH_LNEPS], &eps, 4);
         memcpy(&h[WH_LNINVK], &invk, 4);
@@ -982,7 +999,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
     /* after attention: the swap (it drains first) comes after this op's BDs are written */
     if (we_prog(e, 1) || we_drain(e))
         return -1;
-    if (g->stor != WE_ST_OUT && we_st_east(e, -1)) /* outputs back to the shims */
+    if (we_st_east(e, g->stor == WE_ST_OUT ? e->st_east : g->stox ? 3 : -1)) /* outputs back to the shims */
         return -1;
     {
         XTime t;
@@ -1037,7 +1054,10 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                                 : lg ? (bf16_t *)(g->logits + (size_t)cb * 192)
                                      : we_tile(g->out, r, cb) + (size_t)mb0 * 64 * 48;
                 }
-            if (g->stor == WE_ST_OUT) { /* sub-op s was armed with s-1 (or here, s = 0) */
+            if (g->stox) { /* sub-op s was armed with s-1 (or here, s = 0) */
+                if (s == 0)
+                    we_arm_out_stx(e, 0, p, ev);
+            } else if (g->stor == WE_ST_OUT) { /* sub-op s was armed with s-1 (or here, s = 0) */
                 if (s == 0)
                     we_arm_out_st(e, 0, p, P.NBS, P.MBP, ev);
             } else if (g->stor == WE_ST_OUTQ && s == 0) {
@@ -1052,6 +1072,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                 we_gemm_replay(e, g, &P, s + 1, bk ^ 1, WE_BDS | WE_GO);
             if (g->stor == WE_ST_OUT && s + 1 < P.NSUB) /* s+1's outputs too (the other BD bank) */
                 we_arm_out_st(e, s + 1, p, P.NBS, P.MBP, ev);
+            if (g->stox && s + 1 < P.NSUB)
+                we_arm_out_stx(e, s + 1, p, ev);
             if (P.dbuf && s == 0 && p + 1 < P.passes) { /* the next pass into the other half; its
                                                            shim BDs are this pass's: wait for its fill */
                 for (int k = 1; k <= g->ract; k++)
@@ -1070,7 +1092,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                 break;
             }
             for (int r = 0; r < g->ract; r++) /* storage: s+1's task may already be queued behind s */
-                if (we_wait_out_le(e, ev[r], g->stor == WE_ST_OUT && s + 1 < P.NSUB))
+                if (we_wait_out_le(e, ev[r], (g->stor == WE_ST_OUT || g->stox) && s + 1 < P.NSUB))
                     return -1;
             XTime_GetTime(&q2);
             WE_EV('w', q2);

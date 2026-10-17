@@ -98,6 +98,8 @@ static void set_ln(WeGemm *g, size_t ln, int n, int c0) {
     g->lnc = (const bf16_t *)(wn_blob + ln + (size_t)n * 4) + c0;
     g->lnn = n;
 }
+static int g_stox; /* the last FC2's output (encoder output) also into we_st(r, 3) for the cross K/V GEMMs */
+static int g_xst;  /* cross K/V GEMMs read A from we_st(r, 3) */
 static int g_stor; /* we_gemm storage mode for the next gemm() (encoder FC1 / FC2: hidden kept on chip) */
 static int gemm(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *res, const WeAct *out, int n, int flags,
                 int mbp, int ract) {
@@ -105,7 +107,10 @@ static int gemm(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *res,
     WeGemm g = {a, W(w), b ? W(b) : 0, res, out, n, flags, g_kt0, g_kt0 + 8, ract, mbp, g_kt0 + 8, g_kt0 + 16};
     g.wsplit = g_ws;
     g.stor = g_stor;
-    if (g_stor == WE_ST_IN) /* FC2 reads FC1's [chunk][block 2] tiles, the out-projection attention's tile */
+    g.stox = g_stox;
+    if (g_stor == WE_ST_IN && g_xst) /* the encoder output, [block][tile 8][64x48] */
+        g.st_j0 = 3, g.st_ppt = 6, g.st_cs = WE_BLK, g.st_bs = 8 * WE_BLK;
+    else if (g_stor == WE_ST_IN) /* FC2 reads FC1's [chunk][block 2] tiles, the out-projection attention's tile */
         g.st_j0 = a->c == 384 ? 1 : 0, g.st_ppt = a->c == 384 ? 6 : 2,
         g.st_cs = a->c == 384 ? 384 * 48 * 2 : 2 * WE_BLK;
     set_ln(&g, ln, n, 0);
@@ -118,7 +123,9 @@ static int gemm(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *res,
 static int gemm_kv(const WeAct *a, size_t w, size_t ln, const WeAct *out) {
     g_kt0 = 0;
     g_ws = 1;
-    const int rc = gemm(a, w, 0, ln, 0, out, 768, WE_F_KT | WE_F_VT, 3, 4); /* 2 passes: hi/lo chain <= 11 BDs */
+    g_stor = g_xst ? WE_ST_IN : 0; /* on chip: A block p from we_st(r, 3), one block a pass */
+    const int rc = gemm(a, w, 0, ln, 0, out, 768, WE_F_KT | WE_F_VT, g_xst ? 1 : 3, 4); /* hi/lo chain <= 11 BDs */
+    g_stor = 0;
     g_ws = 0;
     g_kt0 = 8;
     return rc;
@@ -208,9 +215,10 @@ static int encoder(Enc *E, int verify) {
             (g_stor = 0, g_qst = 1, PT(P_ATTN, attn(&E->qkv, &E->qkv, 8, 16, &E->o, 1500, 0, 4, 4))) ||
             (g_qst = 0, g_stor = 0, PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4))) ||
             (g_stor = WE_ST_OUT, PT(P_FC1, gemm(&E->x2, p[4], 0, p[5], 0, &E->h, 1536, WE_F_GELU, 2, 4))) ||
-            (g_stor = WE_ST_IN, PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 1, 4))))
+            (g_stor = WE_ST_IN, g_stox = 0 && !verify && l == 3, /* measured slower: cross K/V at 1 block a pass */
+             PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 1, 4))))
             return -1;
-        g_stor = 0;
+        g_stor = 0, g_stox = 0;
         static const size_t gx[4] = {WN_G_X1, WN_G_X2, WN_G_X3, WN_G_X4};
         static const char *gn[4] = {"block0", "block1", "block2", "block3"};
         if (verify && check(gn[l], &E->x, gx[l], 1500))
@@ -219,9 +227,11 @@ static int encoder(Enc *E, int verify) {
     /* cross K/V of every decoder layer, ln_post folded in */
     const size_t xkv[4][2] = {
         {WN_X0_KV_W, WN_X0_KV_LN}, {WN_X1_KV_W, WN_X1_KV_LN}, {WN_X2_KV_W, WN_X2_KV_LN}, {WN_X3_KV_W, WN_X3_KV_LN}};
+    g_xst = 0 && !verify; /* see g_stox */
     for (int l = 0; l < 4; l++)
         if (PT(P_XKV, gemm_kv(&E->x, xkv[l][0], xkv[l][1], &E->kvx[l])))
             return -1;
+    g_xst = 0;
     if (PT(P_XKV, we_drain(&g_e)))
         return -1;
     return (int)(now_us() - t0);

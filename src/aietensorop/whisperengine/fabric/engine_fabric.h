@@ -25,7 +25,7 @@
 #define ENGINE_FABRIC_H
 
 #define EF_PART_START_COL 2
-#define EF_PART_NUM_COLS 11 /* rel cols 5..10: storage memory tiles for on-chip activations (we_host.h we_st) */
+#define EF_PART_NUM_COLS 13 /* rel cols 5..12: storage memory tiles for on-chip activations (we_host.h we_st) */
 #define EF_MESH_ROWS 4
 #define EF_MESH_COLS 4
 #define EF_FIRST_ROW 3 /* physical row of mesh row 0 */
