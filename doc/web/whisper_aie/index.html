@@ -48,15 +48,15 @@
 <p class="sub">What this branch built to run OpenAI Whisper-tiny on the AIE array, how each layer of the encoder and the decoder is handled, and which parts came from aiehlc versus which were written by hand.</p>
 
 <div class="tiles">
-  <div class="tile"><div class="v">26.6 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
-  <div class="tile"><div class="v">18.6 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
+  <div class="tile"><div class="v">26.5 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
+  <div class="tile"><div class="v">18.7 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
   <div class="tile"><div class="v">~27 ms</div><div class="k">per decoder step (24 steps for the JFK clip)</div></div>
   <div class="tile"><div class="v">~0.67 s</div><div class="k">audio features in → tokens out</div></div>
   <div class="tile"><div class="v">match</div><div class="k">transcript identical to PyTorch, token for token</div></div>
   <div class="tile"><div class="v">16 cores</div><div class="k">4×4 mesh + 8 memory tiles, 5-column partition</div></div>
 </div>
 
-<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at <b>18.6 % (26.6 ms)</b>. Measured DDR bandwidth puts 30 % below the floor of this dataflow: see <a href="#floor">the DDR floor</a>. Numbers come from board runs on VEK385, booted over netboot.</div>
+<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at <b>18.7 % (26.5 ms)</b>. Measured DDR bandwidth puts 30 % below the floor of this dataflow: see <a href="#floor">the DDR floor</a>. Numbers come from board runs on VEK385, booted over netboot.</div>
 
 <nav class="toc"><b>Contents</b>
 <ol>
@@ -251,6 +251,7 @@
 <tr><td>Round-2 heads share K/V through the neighbour memory tile; convs on the streaming path</td><td class="num">27.8 ms</td><td class="num">17.8</td></tr>
 <tr><td>Memory tiles zeroed at init; attention P·V in 4×2 blocks; K/V channel armed once per op; normalisation on native bf16 products (finish 10.3k → 3.7k cycles per q-block)</td><td class="num">27.0 ms</td><td class="num">18.3</td></tr>
 <tr><td>Double-buffered memory-tile passes: FC2's next pass is filled while the current one computes</td><td class="num">26.6 ms</td><td class="num">18.6</td></tr>
+<tr><td>Next q-block's Q prefetched during the current one; attention output in its own buffer (q-block start 3.7k → 1.0k cycles)</td><td class="num">26.5 ms</td><td class="num">18.7</td></tr>
 </table>
 
 <h3>Measured limits</h3>
@@ -292,6 +293,7 @@
 </ul></li>
 <li><b>Everything else.</b> 77.8 MB read and 55.5 MB written. At the separate peaks (10.5 / 10 GB/s), as if reads and writes never shared the DDR, that is ≥ <b>13.0 ms</b>. At the measured concurrent rate (~8.3 GB/s), which is what a GEMM streaming its output really sees, it is ≥ <b>16.0 ms</b>.</li>
 </ul>
+<p>A further measurement points the same way. With all attention compute switched off (<code>WE_ATT_NOCOMP</code>), replaying K/V from the memory tiles alone takes 2083 cycles per 32×64 chunk, about 7.9 B/cycle per column. With compute it takes 2532. The current q-block size of 32 therefore sets a K/V stream floor of about 3.6 ms per core for attention. That is close to the compute floor above, and only larger q-blocks would lower it. They do not fit the 64 KB core data memory.</p>
 <p>Even with all those favourable assumptions, the bound is <b>16.95 ms = 29.4 %</b>. At the measured concurrent DDR rate it is <b>~20 ms = 25 %</b>. Both sit below the 30 % target, so 30 % is not reachable in this dataflow on this board.</p>
 <p>Moving the target would need much less traffic, chiefly keeping FC1's hidden activation on chip. That does not fit the hardware: FC1 + FC2 weights are 2.36 MB against 4 MB of memory tiles, half of which hold activations. The Q/K/V → attention fusion needs 523 KB in a 512 KB memory tile. Smaller cuts are still open (the cross-K/V GEMMs reading their input four times; the 36 padding rows). Together they are about 7 MB, roughly 0.7 ms.</p>
 
