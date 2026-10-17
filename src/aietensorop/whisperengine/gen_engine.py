@@ -182,7 +182,8 @@ def main():
         pw, pb = qkv_rows(p + ".attn")
         add_gemm(f"e{l}_qkv", pw, pb, 1, ln=p + ".attn_ln")
         add_gemm(f"e{l}_out", wt(p + ".attn.out.weight")[:, perm], wt(p + ".attn.out.bias"), 2)
-        add_gemm(f"e{l}_fc1", wt(p + ".mlp.0.weight"), wt(p + ".mlp.0.bias"), 3, ln=p + ".mlp_ln")  # 3 passes: on-chip FC1->FC2
+        # on-chip FC1 runs 3 passes but keeps 2 tiles per sub-op (we_gemm_plan WE_ST_OUT): single-pass packing
+        add_gemm(f"e{l}_fc1", wt(p + ".mlp.0.weight"), wt(p + ".mlp.0.bias"), 1, ln=p + ".mlp_ln")
         add_gemm(f"e{l}_fc2", wt(p + ".mlp.2.weight"), wt(p + ".mlp.2.bias"), 3)
     # ---- cross K/V (one GEMM per decoder layer on the encoder output) ----
     for l in range(4):
