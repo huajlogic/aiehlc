@@ -48,15 +48,15 @@
 <p class="sub">What this branch built to run OpenAI Whisper-tiny on the AIE array, how each layer of the encoder and the decoder is handled, and which parts came from aiehlc versus which were written by hand.</p>
 
 <div class="tiles">
-  <div class="tile"><div class="v">27.7 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
-  <div class="tile"><div class="v">17.8 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
+  <div class="tile"><div class="v">26.6 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
+  <div class="tile"><div class="v">18.6 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
   <div class="tile"><div class="v">~27 ms</div><div class="k">per decoder step (24 steps for the JFK clip)</div></div>
   <div class="tile"><div class="v">~0.67 s</div><div class="k">audio features in → tokens out</div></div>
   <div class="tile"><div class="v">match</div><div class="k">transcript identical to PyTorch, token for token</div></div>
   <div class="tile"><div class="v">16 cores</div><div class="k">4×4 mesh + 8 memory tiles, 5-column partition</div></div>
 </div>
 
-<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at <b>17.8 % (27.7 ms)</b>. Measured DDR bandwidth puts 30 % below the floor of this dataflow: see <a href="#floor">the DDR floor</a>. Numbers come from board runs on VEK385, booted over netboot.</div>
+<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at <b>18.6 % (26.6 ms)</b>. Measured DDR bandwidth puts 30 % below the floor of this dataflow: see <a href="#floor">the DDR floor</a>. Numbers come from board runs on VEK385, booted over netboot.</div>
 
 <nav class="toc"><b>Contents</b>
 <ol>
@@ -249,6 +249,8 @@
 <tr><td>LayerNorm row statistics once per pass instead of once per sub-op</td><td class="num">28.8 ms</td><td class="num">17.2</td></tr>
 <tr><td>GELU epilogue split into a bias pass and a pipelined GELU pass (probe m8: 9462 → 4408 cycles per block)</td><td class="num">28.1 ms</td><td class="num">17.6</td></tr>
 <tr><td>Round-2 heads share K/V through the neighbour memory tile; convs on the streaming path</td><td class="num">27.8 ms</td><td class="num">17.8</td></tr>
+<tr><td>Memory tiles zeroed at init; attention P·V in 4×2 blocks; K/V channel armed once per op; normalisation on native bf16 products (finish 10.3k → 3.7k cycles per q-block)</td><td class="num">27.0 ms</td><td class="num">18.3</td></tr>
+<tr><td>Double-buffered memory-tile passes: FC2's next pass is filled while the current one computes</td><td class="num">26.6 ms</td><td class="num">18.6</td></tr>
 </table>
 
 <h3>Measured limits</h3>
@@ -280,12 +282,17 @@
 <tr><td>FC2</td><td class="num">29.1</td><td class="num">4.7</td></tr>
 <tr><td>cross K/V (4 decoder layers)</td><td class="num">10.5</td><td class="num">9.4</td></tr>
 </table>
-<p><b>A lower bound for this dataflow.</b> The ops depend on each other in sequence: attention needs every key, and each GEMM needs the whole previous output. The encoder time is therefore at least the sum, over ops, of the larger of each op's DDR time and its compute time.</p>
+<p><b>A lower bound for this dataflow.</b> The ops depend on each other in sequence: attention needs every key, and each GEMM needs the whole previous output. The encoder time is therefore at least the sum, over ops, of each op's own lower bound. Every assumption below favours the bound:</p>
 <ul>
-<li><b>Attention compute.</b> 1728 chunks of 32 queries × 64 keys per core. The best pieces ever measured are qk 880 + exp 273 + pv 934 cycles (probes m5, m10), about 2087 cycles a chunk with every softmax rescale, mask and copy left out. That is ≥ <b>3.6 ms</b>.</li>
-<li><b>Everything else.</b> 77.8 MB read and 55.5 MB written. At the separate peaks (10.5 / 10 GB/s), as if no op ever read and wrote at the same time, that is ≥ <b>13.0 ms</b>. At the measured concurrent rate (~8.3 GB/s), which is what a GEMM that streams its output does, it is ≥ <b>16.0 ms</b>.</li>
+<li><b>Attention, per round.</b> No q-block can finish before all its keys have arrived. A round therefore takes at least the fill that must follow the Q/K/V GEMM, plus (q-blocks − 1) × one q-block's compute.
+<ul>
+<li>Optimistic case: K and V are prefetched while the Q/K/V GEMM is still running, so only Q (1.18 MB) remains, about 112 µs at 10.5 GB/s.</li>
+<li>Each q-block is 24 chunks at the best per-chunk cost ever measured: 880 + 273 + 934 = 2087 cycles (probes m5 and m10), with no softmax rescale, mask, copy or finish.</li>
+<li>Round 1: 112 + 11 × 50 µs. Round 2: 75 + 5 × 50 µs. That is ≥ 0.99 ms per layer, <b>≥ 3.95 ms</b> for the encoder.</li>
+</ul></li>
+<li><b>Everything else.</b> 77.8 MB read and 55.5 MB written. At the separate peaks (10.5 / 10 GB/s), as if reads and writes never shared the DDR, that is ≥ <b>13.0 ms</b>. At the measured concurrent rate (~8.3 GB/s), which is what a GEMM streaming its output really sees, it is ≥ <b>16.0 ms</b>.</li>
 </ul>
-<p>The bound is 16.6 ms (29.8 %) in the most optimistic reading and 19.6 ms (25 %) at the measured concurrent rate. Even the optimistic one sits above the 16.5 ms target.</p>
+<p>Even with all those favourable assumptions, the bound is <b>16.95 ms = 29.4 %</b>. At the measured concurrent DDR rate it is <b>~20 ms = 25 %</b>. Both sit below the 30 % target, so 30 % is not reachable in this dataflow on this board.</p>
 <p>Moving the target would need much less traffic, chiefly keeping FC1's hidden activation on chip. That does not fit the hardware: FC1 + FC2 weights are 2.36 MB against 4 MB of memory tiles, half of which hold activations. The Q/K/V → attention fusion needs 523 KB in a 512 KB memory tile. Smaller cuts are still open (the cross-K/V GEMMs reading their input four times; the 36 padding rows). Together they are about 7 MB, roughly 0.7 ms.</p>
 
 <h3>Comparison: the ORT/VitisAI all-AIE decoder</h3>
