@@ -962,6 +962,13 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
     }
 }
 
+/* Column c runs the same head as column c-1 (round 2 splits a head's q-blocks over
+ * two columns): its K/V are not fetched again -- MT_B(c) replays them out of
+ * MT_B(c-1), its west neighbour, which a memtile DMA addresses at 0x0. */
+static inline int we_kv_shared(const int head[4], const int nqb[4], int c) {
+    return c > 0 && head[c] == head[c - 1] && nqb[c - 1] > 0;
+}
+
 /* q_fill 0: MT_A still holds this layer's q tiles from the previous round (only the
  * header is refilled). The round is left running (e->pending, see we_drain); the BD
  * banks it does not touch (fill/replay bank 1) are what the next GEMM prepares in. */
@@ -1012,7 +1019,7 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
             we_sh_bd(e, k, 13, we_tile(a->q, r, a->q_cb), (int)(8 * qtile), -1, 0, 0, 0);
         we_sh_start(e, k, 1, 12);
         const int c = k - 1, h = head[c];
-        if (!nqb[c])
+        if (!nqb[c] || we_kv_shared(head, nqb, c))
             continue;
         /* chunk b (64 keys) = 16 KB: K^T [kd = 2j+dt][kp 8][64] then V [kp 8][dt = 2j+dtp][64] */
         const uint32_t kst[3] = {1, 256, 4096}, kwr[3] = {256, 2, 0};
@@ -1053,8 +1060,9 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
             }
             we_mt_queue(e, ta, DMA_MM2S, 3, steps);
         }
-        if (nqb[k - 1]) {
-            we_mt_bd(e, tb, 2, EF_MT_BASE, (uint32_t)(NKC * 2 * WE_KV_CHUNK), 0, 0, 0, 0, 0, -1);
+        if (nqb[k - 1]) { /* a shared head streams out of the west neighbour's memory (at 0x0) */
+            const uint32_t kv = we_kv_shared(head, nqb, k - 1) ? EF_MT_BASE - EF_MT_BYTES : EF_MT_BASE;
+            we_mt_bd(e, tb, 2, kv, (uint32_t)(NKC * 2 * WE_KV_CHUNK), 0, 0, 0, 0, 0, -1);
             we_mt_queue(e, tb, DMA_MM2S, 2, nqb[k - 1]);
         }
     }
