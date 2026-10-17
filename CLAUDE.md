@@ -613,7 +613,7 @@ compared `l1_budget` *bytes* with *element* counts. Generated code for
 The compiler route above is compile-only; what runs on VEK385 is a hand-written
 engine. It uses the resnetengine fabric with memory tiles spliced in, two kernel
 programs (GEMM, attention) swapped over control packets, and the host re-arming only
-memtile/shim BDs. The encoder takes **27.8 ms (17.8 % of 4×4 bf16 peak)**, the decoder
+memtile/shim BDs. The encoder takes **27.7 ms (17.8 % of 4×4 bf16 peak)**, the decoder
 ~27 ms/token, and the JFK transcript matches PyTorch. Build and run it with
 `build.sh eng` + `apppaltest.py --netload`. Profile it with `HDEFS=WE_TL` (host
 timeline), `KDEFS=WE_PROF_G HDEFS=WE_PROF_GOP` (per-op core split) and
@@ -625,7 +625,7 @@ Traps:
 - The host BD shadow writes only changed BD words; `XAie_DmaUpdateBdAddr` read-modify-writes, and each read costs ~400 ns.
 - The attention program's 0x540 stack overflows silently when an extra register-blocked loop is added (m10 4x2 pv was bit-exact standalone, NaN in the engine).
 
-Tutorial: `doc/web/whisper_aie/index.html`. Skills: **memtilebdlockchannel**, **hosttimelinedistortion**, **aie2psprogrammemory**, **dmaoutputdirtycache**.
+Tutorial: `doc/web/whisper_aie/index.html`. Skills: **memtilebdlockchannel**, **hosttimelinedistortion**, **memtilestalenan**, **aie2psprogrammemory**, **dmaoutputdirtycache**.
 
 ### `aiegraph` — the Python front door (`pip install -e .`)
 
@@ -885,6 +885,7 @@ Read the matching skill when the task fits:
 | Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
 | Host-programmed memtile BD rejected/hangs: BD ≥ 24 on an even channel, fill waits on a lock it never asked for (`XAie_DmaSetLock` enables both sides), streaming-fill lock counts | memtilebdlockchannel |
 | Host timeline far slower once timestamps print (UART printf in the timed region); MMIO cost vs page type (Device-nGnRE / Normal-NC) | hosttimelinedistortion |
+| A passing persistent engine now fails every run with all-NaN outputs (`N/N beyond ulp, max diff 0`), even after reverting; memtile contents survive partition init | memtilestalenan |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
 | Kernel codegen | kernelcodegen |
