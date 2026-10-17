@@ -573,27 +573,34 @@ __attribute__((noinline)) static void att_pv(const bfloat16 *__restrict P, const
             aie::store_v(ML(1, z), L0.template to_vector<float>());
             aie::store_v(ML(1, z + 1), L1.template to_vector<float>());
         }
-    for (unsigned z = 0; z < 8; z += 2)
-        chess_loop_range(4, 4) for (unsigned j = 0; j < 8; j += 2) chess_prepare_for_pipelining {
-            float *c00 = O + (z * 8 + j) * 32, *c10 = c00 + 8 * 32;
-            MM C00(aie::load_v<32>(c00)), C01(aie::load_v<32>(c00 + 32));
-            MM C10(aie::load_v<32>(c10)), C11(aie::load_v<32>(c10 + 32));
-            const bfloat16 *pa0 = P + z * 8 * 32, *pa1 = pa0 + 8 * 32, *pb = V + j * 64;
+    // 4x2 blocks (4 row groups x 2 dim tiles), one pipelined loop over the 8 blocks,
+    // k unrolled: 934 vs 1087 cycles for 2x2 (probe m10), bit-identical
+    for (unsigned b = 0; b < 8; b++)
+        chess_prepare_for_pipelining chess_loop_range(8, 8) {
+            const unsigned z = (b >> 2) * 4, j = (b & 3) * 2;
+            MM acc[4][2];
+            for (unsigned r = 0; r < 4; r++)
+                chess_unroll_loop() {
+                    acc[r][0] = MM(aie::load_v<32>(O + ((z + r) * 8 + j) * 32));
+                    acc[r][1] = MM(aie::load_v<32>(O + ((z + r) * 8 + j + 1) * 32));
+                }
+            const bfloat16 *pa = P + z * 8 * 32, *pb = V + j * 64;
             for (unsigned k = 0; k < 8; k++)
                 chess_unroll_loop() {
-                    const aie::vector<bfloat16, 32> a0 = aie::load_v<32>(pa0 + k * 32),
-                                                    a1 = aie::load_v<32>(pa1 + k * 32);
                     const aie::vector<bfloat16, 64> b0 = aie::load_v<64>(pb + k * 8 * 64),
                                                     b1 = aie::load_v<64>(pb + k * 8 * 64 + 64);
-                    C00.mac(a0, b0);
-                    C01.mac(a0, b1);
-                    C10.mac(a1, b0);
-                    C11.mac(a1, b1);
+                    for (unsigned r = 0; r < 4; r++)
+                        chess_unroll_loop() {
+                            const VB a = aie::load_v<32>(pa + (r * 8 + k) * 32);
+                            acc[r][0].mac(a, b0);
+                            acc[r][1].mac(a, b1);
+                        }
                 }
-            aie::store_v(c00, C00.template to_vector<float>());
-            aie::store_v(c00 + 32, C01.template to_vector<float>());
-            aie::store_v(c10, C10.template to_vector<float>());
-            aie::store_v(c10 + 32, C11.template to_vector<float>());
+            for (unsigned r = 0; r < 4; r++)
+                chess_unroll_loop() {
+                    aie::store_v(O + ((z + r) * 8 + j) * 32, acc[r][0].template to_vector<float>());
+                    aie::store_v(O + ((z + r) * 8 + j + 1) * 32, acc[r][1].template to_vector<float>());
+                }
         }
 }
 
