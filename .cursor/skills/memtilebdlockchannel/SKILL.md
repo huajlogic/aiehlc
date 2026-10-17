@@ -52,7 +52,7 @@ rejected**: it silently becomes 0, the BD then runs linear, and every chunk afte
 first lands in the wrong place (et2 round-1 gather: chunk 0 right, chunk 1's K region
 holding V). Keep each wrap at 1023 or below, e.g. an 8 KB run as 512 words × 4.
 
-## 6. A chained shim BD pair does not iterate per task repeat
-`startio(15, rk)` on a chain 15 → 14 (both with BD iteration) did not interleave K
-and V per row block. Queue K (repeat rk) and V (repeat rk) as separate tasks, and
-order the memtile chain to match.
+## 6. Chained shim BDs iterate per task repeat
+`startio(15, rk)` on a chain 15 -> 14, with both BDs iterating over rb, delivers K rb,
+V rb, K rb+1, ... and each BD advances its own iteration on every repeat. That is
+what whisperengine's streaming attention fill uses (et2 PASS).

@@ -989,27 +989,27 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
                     * iterations across task repeats, so K and V cannot alternate) */
             const bf16_t *ks = we_tile(a->kv, 0, a->kt_cb + h / 3) + (h % 3) * 1024;
             const bf16_t *vs = we_tile(a->kv, 0, a->vt_cb + h / 3) + (h % 3) * 128;
-            static const int fbd[8] = {9, 10, 11, 12, 13, 14, 15, 0};
+            /* GEMM bank-1 MT_B BDs (fill 16..23, replay 5..8): the next GEMM (bank 1) rewrites
+             * them while round 2 still runs; in bank 0 the GEMM after it paid ~60 us more MMIO */
+            static const int fbd[8] = {16, 17, 18, 19, 20, 21, 22, 23};
             /* 8 KB per chunk as 4 x 2 KB (a memtile wrap is 10 bits: 1024 already wraps to 0
              * and the BD runs linear), chunks 16 KB apart */
             const uint32_t cs[3] = {1, 512, 4096}, cw[3] = {512, 4, (uint32_t)KBPR};
-            for (int rb = 0; rb < rk; rb++) {
+            for (int rb = 0; rb < rk; rb++) { /* K rb, V rb, K rb+1, ... */
                 const uint32_t base = EF_MT_BASE + (uint32_t)(rb * KBPR) * 2 * WE_KV_CHUNK;
-                we_mt_bd(e, tb, fbd[rb], base, (uint32_t)(KBPR * WE_KV_CHUNK), 3, cs, cw, 0, 0,
-                         rb + 1 < rk ? fbd[rb + 1] : fbd[rk]);
-                we_mt_bdl(e, tb, fbd[rk + rb], base + WE_KV_CHUNK, (uint32_t)(KBPR * WE_KV_CHUNK), 3, cs, cw, 0, 0,
-                          rb + 1 < rk ? fbd[rk + rb + 1] : -1, -1, rb, nqb[c]);
+                we_mt_bd(e, tb, fbd[2 * rb], base, (uint32_t)(KBPR * WE_KV_CHUNK), 3, cs, cw, 0, 0, fbd[2 * rb + 1]);
+                we_mt_bdl(e, tb, fbd[2 * rb + 1], base + WE_KV_CHUNK, (uint32_t)(KBPR * WE_KV_CHUNK), 3, cs, cw, 0, 0,
+                          rb + 1 < rk ? fbd[2 * rb + 2] : -1, -1, rb, nqb[c]);
             }
             we_mt_queue(e, tb, DMA_S2MM, fbd[0], 1);
-            /* chunk-major: per 64-key block its 4 dim groups (2 KB of K^T, 4 x 256 B of V per 8 keys) */
-            XAie_DmaDesc d0 = we_shim_bd(e, we_shim(k), ks, 15, KBPR * WE_KV_CHUNK, -1, 0, 0, -1, 3, 4, 512,
-                                         (int)(2 * kvtile), 4, WE_BLK, KBPR, (int)kvrow, rk);
+            /* chunk-major: per 64-key block its 4 dim groups (2 KB of K^T, 4 x 256 B of V per 8 keys);
+             * the shim chain K -> V repeats rk times, each BD advancing its row-block iteration */
+            we_shim_bd(e, we_shim(k), ks, 15, KBPR * WE_KV_CHUNK, 14, 0, 0, -1, 3, 4, 512, (int)(2 * kvtile), 4, WE_BLK,
+                       KBPR, (int)kvrow, rk);
+            XAie_DmaDesc d0 = we_shim_bd(e, we_shim(k), vs, 14, KBPR * WE_KV_CHUNK, -1, 0, 0, -1, 3, 4, 64,
+                                         (int)(2 * kvtile), 4, 768, 8 * KBPR, (int)kvrow, rk);
             __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 15, DMA_MM2S), 15, rk);
-            d0 = we_shim_bd(e, we_shim(k), vs, 14, KBPR * WE_KV_CHUNK, -1, 0, 0, -1, 3, 4, 64, (int)(2 * kvtile), 4,
-                            768, 8 * KBPR, (int)kvrow, rk);
-            __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 14, DMA_MM2S), 14, rk);
             we_ddr(e, we_shim(k), 15, rk, DMA_MM2S);
-            we_ddr(e, we_shim(k), 14, rk, DMA_MM2S);
             continue;
         }
         /* chunk b (64 keys) = 16 KB: K^T [kd = 2j+dt][kp 8][64] then V [kp 8][dt = 2j+dtp][64] */
@@ -1057,9 +1057,9 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         }
         if (nqb[k - 1] && kvs) { /* K/V row block rb acquires lock rb (released by its fill) */
             for (int rb = 0; rb < rk; rb++)
-                we_mt_bdl(e, tb, 1 + rb, EF_MT_BASE + (uint32_t)(rb * KBPR) * 2 * WE_KV_CHUNK,
-                          (uint32_t)(KBPR * 2 * WE_KV_CHUNK), 0, 0, 0, 0, 0, rb + 1 < rk ? 2 + rb : -1, rb, -1, 0);
-            we_mt_queue(e, tb, DMA_MM2S, 1, nqb[k - 1]);
+                we_mt_bdl(e, tb, 5 + rb, EF_MT_BASE + (uint32_t)(rb * KBPR) * 2 * WE_KV_CHUNK,
+                          (uint32_t)(KBPR * 2 * WE_KV_CHUNK), 0, 0, 0, 0, 0, rb + 1 < rk ? 6 + rb : -1, rb, -1, 0);
+            we_mt_queue(e, tb, DMA_MM2S, 5, nqb[k - 1]);
         } else if (nqb[k - 1]) { /* a shared head streams out of the west neighbour's memory (at 0x0) */
             const uint32_t kv = we_kv_shared(head, nqb, k - 1) ? EF_MT_BASE - EF_MT_BYTES : EF_MT_BASE;
             we_mt_bd(e, tb, 2, kv, (uint32_t)(NKC * 2 * WE_KV_CHUNK), 0, 0, 0, 0, 0, -1);
