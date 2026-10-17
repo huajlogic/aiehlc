@@ -15,6 +15,17 @@
 #define NB_APP_LIMIT 0x78000000ULL    /* supervisor image starts here (build.sh) */
 #define NB_STAGING_BASE 0x7A200000ULL /* after the 2 MB BD-ring block at 0x7A000000 */
 #define NB_STAGING_SIZE (0x80000000ULL - NB_STAGING_BASE)
+/* An ELF larger than that (the Whisper engine embeds ~140 MB of weights) is
+ * staged in the top of the APP window instead. Apps only reach it with .heap /
+ * .stack (never file bytes or .bss: elf_place refuses that), so the upload is
+ * safe to place, but the copy does not survive a run whose PT_LOAD reaches it:
+ * nb_launch then drops it and RERUN needs a fresh LOAD_RUN. */
+#define NB_STAGING_BIG_BASE 0x50000000ULL
+#define NB_STAGING_BIG_SIZE (NB_APP_LIMIT - NB_STAGING_BIG_BASE)
+#define NB_STAGING_MAX NB_STAGING_BIG_SIZE
+static inline uint64_t nb_stage_base(uint64_t elf_size) {
+    return elf_size <= NB_STAGING_SIZE ? NB_STAGING_BASE : NB_STAGING_BIG_BASE;
+}
 
 #define NB_DEFAULT_TIMEOUT_MS 600000U
 
@@ -35,6 +46,7 @@ void nb_park(void);
 /* elfload.c */
 int elf_place(const uint8_t *img, uint64_t size, uint64_t *entry, char *msg, size_t msglen);
 int elf_patch_exit(const uint8_t *img, uint64_t size, uint64_t park_addr);
+int elf_reaches(const uint8_t *img, uint64_t size, uint64_t lo, uint64_t hi); /* any PT_LOAD memsz in [lo,hi) */
 
 /* sha256.c */
 void nb_sha256(const uint8_t *data, uint64_t len, uint8_t out[32]);

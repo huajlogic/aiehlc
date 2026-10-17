@@ -13,6 +13,74 @@ static int fail(char *msg, size_t msglen, const char *why) {
     return -1;
 }
 
+static int overlaps(uint64_t lo, uint64_t hi, const uint8_t *img, uint64_t size) {
+    uint64_t slo = (uint64_t)(uintptr_t)img;
+    return lo < slo + size && slo < hi;
+}
+
+/* Name of section header i, or "" when out of range. */
+static const char *sec_name(const uint8_t *img, uint64_t size, const Elf64_Shdr *sh, const Elf64_Shdr *str,
+                            unsigned i) {
+    if (sh[i].sh_name < str->sh_size && str->sh_offset + str->sh_size <= size)
+        return (const char *)img + str->sh_offset + sh[i].sh_name;
+    return "";
+}
+
+static const Elf64_Shdr *sec_table(const uint8_t *img, uint64_t size) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+    if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) || eh->e_shstrndx >= eh->e_shnum ||
+        eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > size)
+        return NULL;
+    return (const Elf64_Shdr *)(img + eh->e_shoff);
+}
+
+/* A .bss-like section elf_place zeroes (heap and stack are left alone). */
+static int zeroed_sec(const uint8_t *img, uint64_t size, const Elf64_Shdr *sh, unsigned i) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+    if (sh[i].sh_type != SHT_NOBITS || !(sh[i].sh_flags & SHF_ALLOC) || (sh[i].sh_flags & SHF_TLS) ||
+        sh[i].sh_size == 0)
+        return 0;
+    const char *name = sec_name(img, size, sh, &sh[eh->e_shstrndx], i);
+    return strcmp(name, ".heap") != 0 && strcmp(name, ".stack") != 0;
+}
+
+/* The staged file must survive placement (elf_patch_exit reads its symtab):
+ * no copied byte and no zeroed .bss may land on it. Only matters for the big
+ * staging window, which sits inside the app's address range. */
+static int check_staging(const uint8_t *img, uint64_t size, char *msg, size_t msglen) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(img + eh->e_phoff);
+    for (unsigned i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_LOAD && ph[i].p_filesz &&
+            overlaps(ph[i].p_paddr, ph[i].p_paddr + ph[i].p_filesz, img, size)) {
+            snprintf(msg, msglen, "PT_LOAD %u file bytes overlap the staging window at 0x%llx", i,
+                     (unsigned long long)(uintptr_t)img);
+            return -1;
+        }
+    }
+    const Elf64_Shdr *sh = sec_table(img, size);
+    for (unsigned i = 0; sh && i < eh->e_shnum; i++) {
+        if (zeroed_sec(img, size, sh, i) && overlaps(sh[i].sh_addr, sh[i].sh_addr + sh[i].sh_size, img, size)) {
+            snprintf(msg, msglen, ".bss-like section %u overlaps the staging window at 0x%llx", i,
+                     (unsigned long long)(uintptr_t)img);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int elf_reaches(const uint8_t *img, uint64_t size, uint64_t lo, uint64_t hi) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(img + eh->e_phoff);
+    for (unsigned i = 0; i < eh->e_phnum; i++) {
+        uint64_t a = ph[i].p_paddr, b = a + ph[i].p_memsz;
+        if (ph[i].p_type == PT_LOAD && ph[i].p_memsz && a < hi && lo < b)
+            return 1;
+    }
+    (void)size;
+    return 0;
+}
+
 static int check_headers(const uint8_t *img, uint64_t size, char *msg, size_t msglen) {
     if (size < sizeof(Elf64_Ehdr))
         return fail(msg, msglen, "file shorter than an ELF header");
@@ -45,7 +113,7 @@ static int check_headers(const uint8_t *img, uint64_t size, char *msg, size_t ms
             return -1;
         }
     }
-    return 0;
+    return check_staging(img, size, msg, msglen);
 }
 
 /* Zero the app's .bss-like sections exactly as a cold-boot crt0 would.
@@ -55,21 +123,11 @@ static int check_headers(const uint8_t *img, uint64_t size, char *msg, size_t ms
  * core's APU_PWRCTL bit says "warm boot", which a PLM wake-up can look like. */
 static uint64_t zero_bss(const uint8_t *img, uint64_t size) {
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
-    if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) || eh->e_shstrndx >= eh->e_shnum ||
-        eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > size)
-        return 0;
-    const Elf64_Shdr *sh = (const Elf64_Shdr *)(img + eh->e_shoff);
-    const Elf64_Shdr *str = &sh[eh->e_shstrndx];
+    const Elf64_Shdr *sh = sec_table(img, size);
     uint64_t zeroed = 0;
-    for (unsigned i = 0; i < eh->e_shnum; i++) {
-        if (sh[i].sh_type != SHT_NOBITS || !(sh[i].sh_flags & SHF_ALLOC) || (sh[i].sh_flags & SHF_TLS) ||
-            sh[i].sh_size == 0)
+    for (unsigned i = 0; sh && i < eh->e_shnum; i++) {
+        if (!zeroed_sec(img, size, sh, i))
             continue;
-        if (sh[i].sh_name < str->sh_size && str->sh_offset + str->sh_size <= size) {
-            const char *name = (const char *)img + str->sh_offset + sh[i].sh_name;
-            if (strcmp(name, ".heap") == 0 || strcmp(name, ".stack") == 0)
-                continue;
-        }
         uint64_t lo = sh[i].sh_addr, hi = lo + sh[i].sh_size;
         if (hi < lo || hi > NB_APP_LIMIT)
             continue;

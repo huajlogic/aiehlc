@@ -27,11 +27,13 @@
  *       WE_F_VT: blocks with cb in [vt_lo, vt_hi) are written as key-pair tiles
  *       [kp 8][nt 6][8 keys][8 dims] (the B tile of O = P V).
  * ATTN  flash attention, heads on mesh columns (round = up to 4 heads), q rows on
- *       mesh rows; q-blocks of 48 rows, key chunks of 32. Per q-block, A carries
- *       4 Q chunks [rg 12][kd 8][4][8] (chunk c = column c's head) and B carries
- *       NKC x (K^T chunk [kd 8][kp 4][8 dims][8 keys], V chunk [kp 4][dt 8][8][8]).
- *       Scores are in log2 units (log2(e)/sqrt(dh) folded into Wq): P = exp2(S - m).
- *       Out per q-block: O [rg 12][dt 8][4][8] bf16 (6 KB).
+ *       mesh rows; q-blocks of 32 rows, key chunks of 64. Per q-block, A carries
+ *       4 Q chunks [rg 8][kd 8][4][8] (chunk c = column c's head) and B carries
+ *       NKC x (K^T chunk [kd 8][kp 8][8 dims][8 keys], V chunk [kp 8][dt 8][8][8]).
+ *       Scores are in log2 units (log2(e)/sqrt(dh) folded into Wq): P = exp2(S - m),
+ *       m a per-row reference raised only when a score passes m + WE_SM_LAZY (softmax
+ *       is invariant to it); the denominator is kept per lane, reduced at the end.
+ *       Out per q-block: O [rg 8][dt 8][4][8] bf16 (4 KB).
  * LN    y = LayerNorm(x) * gamma + beta (C = 384); A carries the row block one
  *       4-row group at a time (3 KB: [cb 8][kt 6][4][8]); core c of the mesh row
  *       handles groups [c*RGC, (c+1)*RGC) and emits one 3 KB packet each.
@@ -60,10 +62,11 @@ enum { WE_OP_GEMM = 1, WE_OP_LN = 2, WE_OP_ATTN = 3 };
 #define WE_F_ROWMAJOR 32 /* out block row-major [64][48] (conv1 -> conv2 window reads) */
 #define WE_F_LOGIT 64    /* out = fp32, one row group (WH_LRG) only: [nt 6][4][8] fp32 (768 B) */
 #define WE_A_CAUSAL 1
-#define WE_QB 48                      /* attention q-block rows */
-#define WE_KCH 32                     /* attention key chunk */
-#define WE_Q_CHUNK (WE_QB * 64 * 2)   /* 6144 */
-#define WE_KV_CHUNK (WE_KCH * 64 * 2) /* 4096 */
+#define WE_QB 32                      /* attention q-block rows */
+#define WE_KCH 64                     /* attention key chunk */
+#define WE_SM_LAZY 32.0f              /* softmax reference raised only when a score passes it by this (log2) */
+#define WE_Q_CHUNK (WE_QB * 64 * 2)   /* 4096 */
+#define WE_KV_CHUNK (WE_KCH * 64 * 2) /* 8192 */
 
 enum {
     WH_MAGIC = 0,

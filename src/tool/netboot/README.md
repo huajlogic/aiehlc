@@ -37,7 +37,11 @@ NETBOOT_IP=10.10.70.50 NETBOOT_GW=10.10.70.101 src/tool/netboot/build.sh
 
 The supervisor occupies `0x7800_0000..0x7A20_0000` (image, then the GEM BD ring
 alone in its 2 MB MMU block at `0x7A00_0000`) and stages uploads at
-`0x7A20_0000..0x7FFF_FFFF`. It refuses an app `PT_LOAD` reaching `0x7800_0000`.
+`0x7A20_0000..0x7FFF_FFFF` (~94 MB). A bigger ELF (up to 640 MB; the Whisper
+engine is 147 MB) is staged at `0x5000_0000..0x77FF_FFFF` instead, inside the app
+window: placement refuses an image whose file bytes or `.bss` land there, and when
+the app's `.heap` reaches it the staged copy is dropped after launch (a RERUN then
+needs a fresh LOAD_RUN). It refuses an app `PT_LOAD` reaching `0x7800_0000`.
 
 The default IP sits on the lab board segment that `PALIP` serves on `eth1`
 (10.10.70.0/24, dhcpd range .1-.5), outside the DHCP range. The build refuses a

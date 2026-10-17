@@ -88,6 +88,8 @@ class EngineModel:
             y = bf(self.gelu(y))
         if res is not None:
             y = y + res
+            if self.fp32_residual:  # residual stream kept in fp32 (no rounding of x)
+                return y
         return self.act(y)
 
     def gelu(self, y):
@@ -127,8 +129,23 @@ class EngineModel:
         s = qh @ kh.transpose(1, 2)  # log2 units
         if mask is not None:
             s = s + mask
-        e = torch.exp2(s - s.max(dim=-1, keepdim=True).values)
-        o = (bf(e) @ vh) / e.sum(dim=-1, keepdim=True)  # P rounded unnormalized, divide after P V
+        # the kernel's online softmax (eng/kernel.cc att_softmax): 64-key chunks, a
+        # per-row reference m raised to the row max only when a score passes m + 32;
+        # P = bf16(exp2(s - m)) rescaled with m, denominator in fp32
+        m = torch.full(s.shape[:-1] + (1,), -1e30)
+        o = torch.zeros(qh.shape[0], Tq, vh.shape[-1])
+        l = torch.zeros(s.shape[:-1] + (1,))
+        for c0 in range(0, Tk, 64):
+            sc = s[..., c0:c0 + 64]
+            cmax = sc.max(dim=-1, keepdim=True).values
+            raise_ = cmax > m + 32
+            m_new = torch.where(raise_, torch.maximum(m, cmax), m)
+            f = torch.exp2(m - m_new)
+            o, l, m = o * f, l * f, m_new
+            e = torch.exp2(sc - m)
+            o = o + (e if getattr(self, "fp32_p", False) else bf(e)) @ vh[:, c0:c0 + 64]
+            l = l + e.sum(dim=-1, keepdim=True)
+        o = o / l
         return self.act(o.transpose(0, 1).reshape(Tq, -1))
 
     def mha(self, x, p, kv=None, cache=None, mask=None, res=None):

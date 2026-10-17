@@ -58,40 +58,73 @@ static int test(WeEng *e, const char *name, int rb, int rows, int causal, int ra
         return 1;
     XTime_GetTime(&t1);
     __Runtime_sync_for_cpu(e->dev, o.p, we_act_bytes(&o));
+    if (rb == 64 && !causal && rows == 64) { /* core (1,3) buffers after round 2: head 4, q-block 0 */
+        __Runtime_sync_for_cpu(e->dev, qkv.p, we_act_bytes(&qkv));
+        const u32 ARENA = 0x0C00, AQ = ARENA + 0xA000, AB0 = ARENA + 0x2000, AB1 = ARENA + 0x4000;
+        long qb = 0, kb = 0, vb = 0;
+        for (int w = 0; w < 1024; w++) {
+            u32 gq, gk, gv;
+            XAie_DataMemRdWord(dev_g, XAie_TileLoc(1, 3), AQ + 4 * w, &gq);
+            XAie_DataMemRdWord(dev_g, XAie_TileLoc(1, 3), AB0 + 4 * w, &gk);
+            XAie_DataMemRdWord(dev_g, XAie_TileLoc(1, 3), AB1 + 4 * w, &gv);
+            uint16_t wq[2], wk[2], wv[2];
+            for (int z2 = 0; z2 < 2; z2++) {
+                const int e2 = w * 2 + z2;
+                { /* Q [rg8][kd8][4][8] */
+                    const int rg = e2 / 256, kd = (e2 / 32) % 8, i = (e2 / 8) % 4, j = e2 % 8;
+                    wq[z2] = qkv.p[we_blk_idx(64, 1152, rg * 4 + i, we_head_col(4, kd * 8 + j))];
+                }
+                { /* K^T [kd8][kp8][8 dims][8 keys] (first half of 8 KB) */
+                    const int kd = e2 / 512, kp = (e2 / 64) % 8, dd = (e2 / 8) % 8, kk = e2 % 8;
+                    const int key = kp * 8 + kk, col = 384 + we_head_col(4, kd * 8 + dd);
+                    const int cb = col / 48, dt = (col % 48) / 8, d8 = col % 8;
+                    wk[z2] = qkv.p[((size_t)cb * 64) * 48 + ((dt * 8 + key / 8) * 8 + d8) * 8 + key % 8];
+                }
+                { /* V [kp8][dt8][8 keys][8 dims] */
+                    const int kp = e2 / 512, dt = (e2 / 64) % 8, kk = (e2 / 8) % 8, dd = e2 % 8;
+                    const int key = kp * 8 + kk, col = 768 + we_head_col(4, dt * 8 + dd);
+                    const int cb = col / 48, nt = (col % 48) / 8, d8 = col % 8;
+                    wv[z2] = qkv.p[((size_t)cb * 64) * 48 + ((key / 8 * 6 + nt) * 8 + key % 8) * 8 + d8];
+                }
+            }
+            if (gq != (wq[0] | ((u32)wq[1] << 16)) && qb++ < 3)
+                printf("  CORE Q word %d got %08x want %04x%04x\n", w, (unsigned)gq, wq[1], wq[0]);
+            if (gk != (wk[0] | ((u32)wk[1] << 16)) && kb++ < 3)
+                printf("  CORE K word %d got %08x want %04x%04x\n", w, (unsigned)gk, wk[1], wk[0]);
+            if (gv != (wv[0] | ((u32)wv[1] << 16)) && vb++ < 3)
+                printf("  CORE V word %d got %08x want %04x%04x\n", w, (unsigned)gv, wv[1], wv[0]);
+        }
+        printf("ET2 core(1,3) buffers: Q bad %ld, K bad %ld (first 4 KB), V bad %ld (first 4 KB)\n", qb, kb, vb);
+    }
     if (rb == 384) { /* round 2 left heads 4,4,5,5 in MT_B: check the gathered chunks of column 0 (head 4) */
         __Runtime_sync_for_cpu(e->dev, qkv.p, we_act_bytes(&qkv));
-        const int h = 4, nkc = 48;
+        const int h = 4;
         long nz = 0;
         for (size_t i = 0; i < (size_t)4 * 384 * 1152; i++)
             nz += qkv.p[i] != 0;
         printf("  qkv nonzero %ld of %ld; KT(0,9,0)[1056]=%04x q(0,0)=%04x\n", nz, (long)4 * 384 * 1152,
                qkv.p[(size_t)(9 * 384) * 48 + 1056], qkv.p[0]);
         long kbad = 0, vbad = 0;
-        for (int ch = 0; ch < nkc; ch++)
-            for (int w = 0; w < 2048; w++) { /* 8 KB chunk = 2048 words: K 1024 then V 1024 */
+        for (int ch = 0; ch < 24; ch++) /* 64-key chunks of 16 KB: K^T 2048 words then V 2048 */
+            for (int w = 0; w < 4096; w++) {
                 u32 got;
-                XAie_DataMemRdWord(dev_g, we_mt(1, EF_MT_B_ROW), (u32)(ch * 8192 + w * 4), &got);
-                const int isv = w >= 1024, el = (w % 1024) * 2;
+                XAie_DataMemRdWord(dev_g, we_mt(1, EF_MT_B_ROW), (u32)(ch * 16384 + w * 4), &got);
+                const int isv = w >= 2048, el = (w % 2048) * 2;
                 uint16_t want[2];
                 for (int z2 = 0; z2 < 2; z2++) {
                     const int e2 = el + z2;
                     int key, dim;
-                    if (!isv) { /* [kd 8][kp 4][8 dims][8 keys] */
-                        const int kd = e2 / 256, kp = (e2 / 64) % 4, dd = (e2 / 8) % 8, kk = e2 % 8;
-                        key = ch * 32 + kp * 8 + kk;
+                    if (!isv) { /* [kd 8][kp 8][8 dims][8 keys] */
+                        const int kd = e2 / 512, kp = (e2 / 64) % 8, dd = (e2 / 8) % 8, kk = e2 % 8;
+                        key = ch * 64 + kp * 8 + kk;
                         dim = kd * 8 + dd;
-                        want[z2] = qkv.p[0] ? f2bf(0) : 0;
-                        want[z2] = 0;
-                        (void)key;
-                        (void)dim;
-                        // value = k[key][h*64+dim] as the GEMM wrote it (KT tile): read via the BLK K^T block
                         const int col = we_head_col(h, dim), cb = 8 + col / 48, dt = (col % 48) / 8, d8 = col % 8;
                         const int r = key / 384, mb = (key % 384) / 64, kp8 = (key % 64) / 8, k8 = key % 8;
                         want[z2] =
                             qkv.p[((size_t)(r * 24 + cb) * 384 + mb * 64) * 48 + ((dt * 8 + kp8) * 8 + d8) * 8 + k8];
-                    } else { /* [kp 4][dt 8][8 keys][8 dims] */
+                    } else { /* [kp 8][dt 8][8 keys][8 dims] */
                         const int kp = e2 / 512, dt = (e2 / 64) % 8, kk = (e2 / 8) % 8, dd = e2 % 8;
-                        key = ch * 32 + kp * 8 + kk;
+                        key = ch * 64 + kp * 8 + kk;
                         dim = dt * 8 + dd;
                         const int col = we_head_col(h, dim), cb = 16 + col / 48, nt = (col % 48) / 8, d8 = col % 8;
                         const int r = key / 384, mb = (key % 384) / 64, kp8 = (key % 64) / 8, k8 = key % 8;
@@ -149,6 +182,16 @@ static int test(WeEng *e, const char *name, int rb, int rows, int causal, int ra
                 l += p;
                 prow[j] = bf2f(f2bf(p));
             }
+            if (rows <= 64 && h == 0 && (i == 0 || i == 5)) {
+                printf("  ROW %d want:", i);
+                for (int d = 0; d < 64; d++) {
+                    double a2 = 0;
+                    for (int j = 0; j < nk; j++)
+                        a2 += prow[j] * v[j][d];
+                    printf(" %.3f", a2 / l);
+                }
+                printf("\n");
+            }
             for (int d = 0; d < 64; d++) {
                 double acc = 0;
                 for (int j = 0; j < nk; j++)
@@ -181,6 +224,14 @@ static int test(WeEng *e, const char *name, int rb, int rows, int causal, int ra
                     printf(" %d/%d", hist[r][qbk][h], tot[r][qbk][h]);
                 printf("\n");
             }
+    if (rows <= 64) { /* decoder: row 0 / row 5, head 0, all dims */
+        for (int i = 0; i < 6; i += 5) {
+            printf("  ROW %d got :", i);
+            for (int d = 0; d < 64; d++)
+                printf(" %.3f", at(&o, i, we_head_col(0, d)));
+            printf("\n");
+        }
+    }
     printf("ET2 %-20s %s (%ld / %ld bad, max err %.3g)\n", name, bad ? "FAIL" : "PASS", bad, cnt, maxe);
     return bad != 0;
 }
@@ -198,6 +249,8 @@ int main() {
     we_init(&e, dev);
     dev_g = dev;
     int fails = 0;
+    fails += test(&e, "dec nomask T64", 64, 64, 0, 1);
+    fails += test(&e, "dec T20 noncausal", 64, 20, 0, 1);
     fails += test(&e, "decoder causal", 64, 20, 1, 1);
     fails += test(&e, "encoder 1500", 384, 1500, 0, 4);
     printf("ET2 %s\n", fails ? "FAIL" : "PASS");

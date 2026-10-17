@@ -39,11 +39,13 @@ static inline bf16_t f2bf(float f) {
 typedef struct {
     bf16_t *p;
     int rb, c;
+    int ct; /* 48-col tiles per row block of the underlying tensor (0: c / 48); a
+             * column view of a wider tensor keeps the parent's ct */
 } WeAct;
 static inline size_t we_tile_elems(const WeAct *t) { return (size_t)t->rb * 48; }
 static inline size_t we_act_bytes(const WeAct *t) { return (size_t)4 * t->rb * t->c * 2; }
 static inline bf16_t *we_tile(const WeAct *t, int r, int cb) {
-    return t->p + ((size_t)r * (t->c / 48) + cb) * we_tile_elems(t);
+    return t->p + ((size_t)r * (t->ct ? t->ct : t->c / 48) + cb) * we_tile_elems(t);
 }
 static inline size_t we_blk_idx(int rb, int c, int row, int col) {
     const int r = row / rb, rr = row % rb, cb = col / 48, cc = col % 48;
@@ -240,6 +242,7 @@ typedef struct {
     bf16_t *out_rm; /* WE_F_ROWMAJOR: row-major output, row 0 here, ld = n */
     float *logits;  /* WE_F_LOGIT: fp32 [tile][6][4][8] of row group lrg */
     int lrg;
+    int wsplit; /* weights as hi+lo bf16 pairs: W' = [Wh | Wl] (K' = 2K), A replayed twice */
 } WeGemm;
 
 /* Column tiles per mesh column per sub-op: <= 4 (memtile task queue), 1 when
@@ -275,13 +278,13 @@ static size_t we_pack_w(bf16_t *dst, const bf16_t *w, int n, int k, int passes) 
 }
 
 static int we_gemm(WeEng *e, const WeGemm *g) {
-    const int K = g->a->c, RB = g->a->rb, MB = RB / 64, KCN = K / 48;
+    const int K = g->a->c, RB = g->a->rb, MB = RB / 64, KCN = K * (1 + g->wsplit) / 48;
     const int MBP = g->mbp ? g->mbp : MB, passes = MB / MBP;
     const int rm = (g->flags & WE_F_ROWMAJOR) != 0, lg = (g->flags & WE_F_LOGIT) != 0;
     const int NBS = we_gemm_nbs(g->n, rm ? -1 : passes), NSUB = g->n / 192 / NBS, NSB = 4 * NBS;
     const int res = g->res != 0;
     const size_t a_pass = (size_t)MBP * 64 * K * 2, r_pass = res ? (size_t)MBP * 64 * g->n * 2 : 0;
-    const size_t hdrs = (size_t)NSUB * WE_HDR_BYTES, wcol = (size_t)(g->n / 4) * K;
+    const size_t hdrs = (size_t)NSUB * WE_HDR_BYTES, wcol = (size_t)(g->n / 4) * K * (1 + g->wsplit);
     if (MB % MBP || g->n % 192 || hdrs + a_pass + r_pass > EF_MT_BYTES || wcol * 2 > EF_MT_BYTES ||
         (g->ract < 4 && passes > 1) || (g->conv_base && 16 * MBP > 64) || (lg && MB != 1)) {
         printf("WE gemm: bad shape (N %d, passes %d, A %zu + res %zu, W %zu)\n", g->n, passes, a_pass, r_pass,
@@ -402,7 +405,10 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                     const uint32_t abase = EF_MT_BASE + (uint32_t)hdrs;
                     we_mt_bd(e, ta, 1, hoff, WE_HDR_BYTES, 0, 0, 0, 0, 0, -1);
                     const uint32_t sa[3] = {1, 768, (uint32_t)MBP * 1536}, wa[3] = {768, 2, 0};
-                    we_mt_bd(e, ta, 2, abase, (uint32_t)(64 * K * 2), 3, sa, wa, 1536, MBP, res ? 3 : -1);
+                    we_mt_bd(e, ta, 2, abase, (uint32_t)(64 * K * 2), 3, sa, wa, 1536, MBP,
+                             g->wsplit ? 8 : (res ? 3 : -1));
+                    if (g->wsplit) /* the same A chunks again, against Wl */
+                        we_mt_bd(e, ta, 8, abase, (uint32_t)(64 * K * 2), 3, sa, wa, 1536, MBP, res ? 3 : -1);
                     if (res) {
                         const uint32_t sr[3] = {1, 768, (uint32_t)(NBS * MBP * 1536)}, wr[3] = {768, 2, 0};
                         we_mt_bd(e, ta, 3, abase + (uint32_t)a_pass + (uint32_t)s * NSB * MBP * WE_BLK, 4 * WE_BLK, 3,
@@ -453,7 +459,7 @@ typedef struct {
     int krows;        /* row blocks of kv holding keys */
 } WeAttn;
 
-/* Output packet: d0 = 2 kt (128 B), d1 = 4 pairs at 2 tiles, d2 = 12 row groups */
+/* Output packet: d0 = 2 kt (128 B), d1 = 4 pairs at 2 tiles, d2 = WE_QB/4 row groups */
 static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const int nqb[4], size_t tileb,
                            struct_ioevent *ev) {
     for (int r = 0; r < ract; r++) {
@@ -465,7 +471,7 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
                 continue;
             d = __Runtime_dma_bd_config_multidim_ooo(e->dev, s, dst[r][c], we_ooo[r][c], WE_Q_CHUNK, -1, 0,
                                                      we_pkt[r][c], -1, 0, -1, 0, we_ooo[r][c], 3, 4, 32,
-                                                     (int)(2 * tileb), 4, 384, 12, 12 * 384, nqb[c]);
+                                                     (int)(2 * tileb), 4, 384, WE_QB / 4, WE_QB / 4 * 384, nqb[c]);
             any += nqb[c];
         }
         __Runtime_dma_channel_enable_ooo(e->dev, s, we_out_ch[r], DMA_S2MM);
@@ -475,7 +481,7 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
 }
 
 static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int nqb[4], const int qb0[4]) {
-    const int RB = a->q->rb, KBPR = a->kv->rb / 64, rk = a->krows, NKC = 2 * KBPR * rk;
+    const int RB = a->q->rb, KBPR = a->kv->rb / 64, rk = a->krows, NKC = KBPR * rk; /* 64-key chunks */
     const size_t tileb = (size_t)RB * 48 * 2, qtile = tileb, kvtile = (size_t)a->kv->rb * 48 * 2;
     const size_t kvrow = (size_t)(a->kv->c / 48) * kvtile; /* bytes between row blocks of kv */
     int steps = 0;
@@ -497,7 +503,7 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     bf16_t *dst[4][4];
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
-            dst[r][c] = we_tile(a->out, r, head[c] / 3) + (head[c] % 3) * 64 + (size_t)qb0[c] * 12 * 6 * 32;
+            dst[r][c] = we_tile(a->out, r, head[c] / 3) + (head[c] % 3) * 64 + (size_t)qb0[c] * (WE_QB / 4) * 6 * 32;
     we_arm_out_att(e, a->ract, dst, nqb, tileb, ev);
     // A: header + this row block's q tiles; B: the head's K^T and V, gathered chunk-major
     for (int k = 1; k <= 4; k++) {
@@ -512,10 +518,11 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         const int c = k - 1, h = head[c];
         if (!nqb[c])
             continue;
-        const uint32_t kst[4] = {1, 2048, 128, 4096}, kwr[4] = {128, 2, 2, 0};
-        we_mt_bd(e, tb, 0, EF_MT_BASE, (uint32_t)(2048 * KBPR * rk), 4, kst, kwr, 256, 4, -1);
-        const uint32_t vst[4] = {1, 256, 2048, 4096}, vwr[4] = {64, 4, 2, 0};
-        we_mt_bd(e, tb, 1, EF_MT_BASE + 4096, (uint32_t)(2048 * KBPR * rk), 4, vst, vwr, 64, 4, -1);
+        /* chunk b (64 keys) = 16 KB: K^T [kd = 2j+dt][kp 8][64] then V [kp 8][dt = 2j+dtp][64] */
+        const uint32_t kst[3] = {1, 256, 4096}, kwr[3] = {256, 2, 0};
+        we_mt_bd(e, tb, 0, EF_MT_BASE, (uint32_t)(2048 * KBPR * rk), 3, kst, kwr, 512, 4, -1);
+        const uint32_t vst[3] = {1, 256, 4096}, vwr[3] = {64, 8, 0};
+        we_mt_bd(e, tb, 1, EF_MT_BASE + 8192, (uint32_t)(2048 * KBPR * rk), 3, vst, vwr, 64, 4, -1);
         we_mt_queue(e, tb, DMA_S2MM, 0, 4);
         we_mt_queue(e, tb, DMA_S2MM, 1, 4);
         const bf16_t *ks = we_tile(a->kv, 0, a->kt_cb + h / 3) + (h % 3) * 1024;
@@ -542,10 +549,10 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         if (k <= a->ract) {
             for (int c = 0; c < 4; c++) {
                 const int h = head[c];
-                const uint32_t base =
-                    EF_MT_BASE + WE_HDR_BYTES + (uint32_t)((h / 3) * qtile + (h % 3) * 128 + (size_t)qb0[c] * 12 * 384);
+                const uint32_t base = EF_MT_BASE + WE_HDR_BYTES +
+                                      (uint32_t)((h / 3) * qtile + (h % 3) * 128 + (size_t)qb0[c] * (WE_QB / 4) * 384);
                 const uint32_t st[3] = {1, (uint32_t)(2 * qtile / 4), 96}, wr[3] = {32, 4, 0};
-                we_mt_bd(e, ta, 3 + c, base, WE_Q_CHUNK, 3, st, wr, 1152, steps, c < 3 ? 4 + c : -1);
+                we_mt_bd(e, ta, 3 + c, base, WE_Q_CHUNK, 3, st, wr, (WE_QB / 4) * 96, steps, c < 3 ? 4 + c : -1);
             }
             we_mt_queue(e, ta, DMA_MM2S, 3, steps);
         }

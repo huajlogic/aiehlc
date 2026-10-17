@@ -33,7 +33,7 @@ from we_model import EngineModel, bf  # noqa: E402
 SOT = (50258, 50259, 50359, 50363)
 EOT = 50257
 NVOCAB = 51865
-LOGIT_SLICE = 1536
+LOGIT_SLICE = 768  # rows per logits GEMM: hi/lo weights per mesh column must fit one memtile
 NSLICE = -(-NVOCAB // LOGIT_SLICE)  # 34
 
 
@@ -111,6 +111,12 @@ def main():
     cache = Path(args.cache)
     model = load_whisper("tiny", cache, verbose=False)
     em = EngineModel(model)
+    sd32 = {k: v.detach().float() for k, v in model.state_dict().items()}
+    for k in list(em.w):  # decoder GEMM weights carried as hi+lo bf16 pairs (see add_gemm)
+        if k.startswith("decoder.") and k.endswith("weight") and "_ln" not in k and not k.startswith("decoder.ln"):
+            full = sd32[k] * (em.qscale if k.endswith("query.weight") else 1)
+            hi = bf(full)
+            em.w[k] = hi + bf(full - hi)
     W = em.w
     perm = head_perm()
     blob, sym = Blob(), []
@@ -118,11 +124,19 @@ def main():
     def wt(name):
         return W[name].float()
 
-    def add_gemm(name, w: torch.Tensor, b, passes, k_pad=None):
+    def add_gemm(name, w: torch.Tensor, b, passes, k_pad=None, hilo=False, nchunk=None):
+        """hilo: W' = [bf16(W) | bf16(W - bf16(W))] (K' = 2K), ~16-bit weights for the
+        decoder (eng/we_host.h WeGemm.wsplit). nchunk: pack N in independent chunks."""
         w = w.float()
         if k_pad and w.shape[1] < k_pad:
             w = torch.nn.functional.pad(w, (0, k_pad - w.shape[1]))
-        blob.add(pack_w(u16(w).reshape(w.shape), passes), name + "_w", sym)
+        if hilo:
+            hi = bf(w)
+            w = torch.cat([hi, bf(w - hi)], dim=1)
+        n = w.shape[0]
+        step = nchunk or n
+        parts = [pack_w(u16(w[c0:c0 + step]).reshape(step, w.shape[1]), passes) for c0 in range(0, n, step)]
+        blob.add(np.concatenate(parts), name + "_w", sym)
         if b is not None:
             blob.add(u16(b.float()), name + "_b", sym)
 
@@ -164,26 +178,28 @@ def main():
         p = f"decoder.blocks.{l}.cross_attn"
         k, v = wt(p + ".key.weight"), wt(p + ".value.weight")
         add_gemm(f"x{l}_kv", torch.cat([k[perm], v[perm]]),
-                 torch.cat([torch.zeros(384), wt(p + ".value.bias")[perm]]), 1)
+                 torch.cat([torch.zeros(384), wt(p + ".value.bias")[perm]]), 1, hilo=True)
     # ---- decoder ----
     for l in range(4):
         p = f"decoder.blocks.{l}"
         add_vec(f"d{l}_ln1_g", wt(p + ".attn_ln.weight")); add_vec(f"d{l}_ln1_b", wt(p + ".attn_ln.bias"))
         pw, pb = qkv_rows(p + ".attn")
-        add_gemm(f"d{l}_qkv", pw, pb, 1)
-        add_gemm(f"d{l}_out", wt(p + ".attn.out.weight")[:, perm], wt(p + ".attn.out.bias"), 1)
+        add_gemm(f"d{l}_qkv", pw, pb, 1, hilo=True)
+        add_gemm(f"d{l}_out", wt(p + ".attn.out.weight")[:, perm], wt(p + ".attn.out.bias"), 1, hilo=True)
         add_vec(f"d{l}_lnx_g", wt(p + ".cross_attn_ln.weight")); add_vec(f"d{l}_lnx_b", wt(p + ".cross_attn_ln.bias"))
-        add_gemm(f"d{l}_q", wt(p + ".cross_attn.query.weight")[perm], wt(p + ".cross_attn.query.bias")[perm], 1)
-        add_gemm(f"d{l}_xout", wt(p + ".cross_attn.out.weight")[:, perm], wt(p + ".cross_attn.out.bias"), 1)
+        add_gemm(f"d{l}_q", wt(p + ".cross_attn.query.weight")[perm], wt(p + ".cross_attn.query.bias")[perm], 1,
+                 hilo=True)
+        add_gemm(f"d{l}_xout", wt(p + ".cross_attn.out.weight")[:, perm], wt(p + ".cross_attn.out.bias"), 1,
+                 hilo=True)
         add_vec(f"d{l}_ln2_g", wt(p + ".mlp_ln.weight")); add_vec(f"d{l}_ln2_b", wt(p + ".mlp_ln.bias"))
-        add_gemm(f"d{l}_fc1", wt(p + ".mlp.0.weight"), wt(p + ".mlp.0.bias"), 1)
-        add_gemm(f"d{l}_fc2", wt(p + ".mlp.2.weight"), wt(p + ".mlp.2.bias"), 1)
+        add_gemm(f"d{l}_fc1", wt(p + ".mlp.0.weight"), wt(p + ".mlp.0.bias"), 1, hilo=True, nchunk=768)
+        add_gemm(f"d{l}_fc2", wt(p + ".mlp.2.weight"), wt(p + ".mlp.2.bias"), 1, hilo=True, nchunk=192)
     add_vec("lnd_g", wt("decoder.ln.weight")); add_vec("lnd_b", wt("decoder.ln.bias"))
     E = wt("decoder.token_embedding.weight")
     Ep = torch.zeros(NSLICE * LOGIT_SLICE, 384)
     Ep[:NVOCAB] = E
     for s in range(NSLICE):
-        add_gemm(f"emb{s}", Ep[s * LOGIT_SLICE:(s + 1) * LOGIT_SLICE], None, 1)
+        add_gemm(f"emb{s}", Ep[s * LOGIT_SLICE:(s + 1) * LOGIT_SLICE], None, 1, hilo=True)
     blob.add(em.dec_pos[:48].float().numpy().astype(np.float32), "dec_pos", sym)
     (out / "blob.bin").write_bytes(b"".join(blob.parts))
 

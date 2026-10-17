@@ -55,12 +55,15 @@ int nb_launch(uint32_t timeout_ms, uint32_t *place_ms, char *msg, size_t msglen)
     }
     uint64_t t0 = nb_now_ms();
     uint64_t entry = 0;
-    if (elf_place((const uint8_t *)(uintptr_t)NB_STAGING_BASE, g_nb.staged_size, &entry, msg, msglen) != 0) {
+    const uint8_t *stage = (const uint8_t *)(uintptr_t)nb_stage_base(g_nb.staged_size);
+    if (elf_place(stage, g_nb.staged_size, &entry, msg, msglen) != 0) {
         g_nb.staged_size = 0;
         return -3;
     }
-    int patched =
-        elf_patch_exit((const uint8_t *)(uintptr_t)NB_STAGING_BASE, g_nb.staged_size, (uint64_t)(uintptr_t)nb_park);
+    int patched = elf_patch_exit(stage, g_nb.staged_size, (uint64_t)(uintptr_t)nb_park);
+    /* Big staging sits in the app window: a heap reaching it clobbers the copy. */
+    if (elf_reaches(stage, g_nb.staged_size, (uint64_t)(uintptr_t)stage, (uint64_t)(uintptr_t)stage + g_nb.staged_size))
+        g_nb.staged_size = 0;
     *place_ms = (uint32_t)(nb_now_ms() - t0);
     size_t n0 = strlen(msg);
     snprintf(msg + n0, msglen - n0, patched ? ", _exit -> park" : ", _exit NOT patched (core stays busy after exit)");
@@ -178,8 +181,9 @@ static void watchdog(void) {
 }
 
 int main(void) {
-    xil_printf("\r\n[netboot] supervisor (doc/design/lwip_elf_bootloader.md), staging 0x%llx\r\n",
-               (unsigned long long)NB_STAGING_BASE);
+    xil_printf("\r\n[netboot] supervisor (doc/design/lwip_elf_bootloader.md), staging 0x%llx (>%llu B: 0x%llx)\r\n",
+               (unsigned long long)NB_STAGING_BASE, (unsigned long long)NB_STAGING_SIZE,
+               (unsigned long long)NB_STAGING_BIG_BASE);
     install_fault_handlers();
     int pm = apu_init();
     if (pm != 0)

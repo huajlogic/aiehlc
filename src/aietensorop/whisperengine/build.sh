@@ -2,7 +2,7 @@
 # Build one whisperengine app (m0, eng, ...) into a scratch worklocal and link a
 # host ELF with hostcompile.sh. Usage: build.sh <app dir> [out dir]
 # Fabric: FABRIC=<dir> (default ./fabric) supplies routing.cc + aieml.prx +
-# engine_fabric.h. KDEFS="A=1 B" prepends #defines to kernel.cc.
+# engine_fabric.h. KDEFS="A=1 B" prepends #defines to kernel.cc, HDEFS to host.cc.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
@@ -19,6 +19,7 @@ if [ -f "$SRC/extra_inputs.txt" ]; then
     while read -r f; do [ -n "$f" ] && cp "$REPO/$f" "$W"/ || exit 1; done < "$SRC/extra_inputs.txt"
 fi
 for d in ${KDEFS:-}; do sed -i "1i #define ${d/=/ }" "$W/kernel.cc"; done
+for d in ${HDEFS:-}; do sed -i "1i #define ${d/=/ }" "$W/host.cc"; done
 source "$REPO/script/setup.sh" >/dev/null 2>&1
 if [ ! -f "$REPO/thirdparty/alib/lib/libxaienginea78.a" ]; then
     (cd "$REPO" && source script/aiehlc.sh --aie-version 5 --aielib-only) > "$OUT/aielib.log" 2>&1 \

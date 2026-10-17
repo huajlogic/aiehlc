@@ -65,9 +65,9 @@ static int header_ok(char *msg, size_t n) {
         snprintf(msg, n, "bad magic/version");
         return 0;
     }
-    if (r->cmd == NETBOOT_CMD_LOAD_RUN && (r->elf_size == 0 || r->elf_size > NB_STAGING_SIZE)) {
+    if (r->cmd == NETBOOT_CMD_LOAD_RUN && (r->elf_size == 0 || r->elf_size > NB_STAGING_MAX)) {
         snprintf(msg, n, "elf_size %llu exceeds staging %llu", (unsigned long long)r->elf_size,
-                 (unsigned long long)NB_STAGING_SIZE);
+                 (unsigned long long)NB_STAGING_MAX);
         return 0;
     }
     return 1;
@@ -83,7 +83,6 @@ static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) 
     }
     if (s_c.t_first_ms == 0)
         s_c.t_first_ms = nb_now_ms();
-    uint8_t *stage = (uint8_t *)(uintptr_t)NB_STAGING_BASE;
     for (struct pbuf *q = p; q; q = q->next) {
         const uint8_t *src = (const uint8_t *)q->payload;
         uint32_t len = q->len;
@@ -96,15 +95,15 @@ static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) 
         if (len && s_c.hdr_got == sizeof(s_c.req) && s_c.req.cmd == NETBOOT_CMD_LOAD_RUN) {
             uint64_t room = s_c.req.elf_size - s_c.payload_got;
             uint32_t take = (uint32_t)(len < room ? len : room);
-            if (s_c.req.elf_size <= NB_STAGING_SIZE)
-                memcpy(stage + s_c.payload_got, src, take);
+            if (s_c.req.elf_size <= NB_STAGING_MAX)
+                memcpy((uint8_t *)(uintptr_t)nb_stage_base(s_c.req.elf_size) + s_c.payload_got, src, take);
             s_c.payload_got += take;
         }
     }
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     if (s_c.hdr_got == sizeof(s_c.req) && (s_c.req.cmd != NETBOOT_CMD_LOAD_RUN || s_c.payload_got >= s_c.req.elf_size ||
-                                           s_c.req.elf_size > NB_STAGING_SIZE))
+                                           s_c.req.elf_size > NB_STAGING_MAX))
         s_c.ready = 1;
     return ERR_OK;
 }
@@ -141,15 +140,15 @@ int server_init(void) {
 static void handle_load_run(uint32_t rx_ms) {
     static char msg[256];
     uint8_t digest[32];
-    const uint8_t *stage = (const uint8_t *)(uintptr_t)NB_STAGING_BASE;
+    const uint8_t *stage = (const uint8_t *)(uintptr_t)nb_stage_base(s_c.req.elf_size);
     nb_sha256(stage, s_c.req.elf_size, digest);
     if (memcmp(digest, s_c.req.sha256, 32) != 0) {
         reply(-2, rx_ms, 0, "sha256 mismatch: upload corrupted, nothing placed");
         return;
     }
     g_nb.staged_size = s_c.req.elf_size;
-    xil_printf("[netboot] LOAD_RUN %llu B received in %u ms, sha256 ok\r\n", (unsigned long long)s_c.req.elf_size,
-               rx_ms);
+    xil_printf("[netboot] LOAD_RUN %llu B received in %u ms at 0x%llx, sha256 ok\r\n",
+               (unsigned long long)s_c.req.elf_size, rx_ms, (unsigned long long)(uintptr_t)stage);
     uint32_t place_ms = 0;
     int rc = nb_launch(s_c.req.timeout_ms, &place_ms, msg, sizeof(msg));
     reply(rc, rx_ms, place_ms, msg);
