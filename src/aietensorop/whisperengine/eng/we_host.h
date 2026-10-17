@@ -69,6 +69,7 @@ typedef struct {
     XTime pt;
     int32_t *hdr;                 /* WE_HDR_BYTES DMA buffer per op slot */
     double t_fill, t_arm, t_run;  /* accumulated, us */
+    double b_rd, b_wr;            /* DDR bytes moved by the shims (we_ddr), accumulated */
     unsigned seq;
 } WeEng;
 
@@ -148,6 +149,15 @@ static void we_bd_put(WeEng *e, XAie_LocType t, int bd, XAie_DmaDesc *d) {
     s->valid = 1;
     we_n_words += (unsigned long)n;
 }
+/* DDR accounting: every shim BD's length and successor, so a channel start can be
+ * charged repeat x (the chain's bytes) -- reads (MM2S) and writes (S2MM) apart */
+static int we_shlen[8][16], we_shnext[8][16];
+static void we_ddr(WeEng *e, XAie_LocType t, int bd, int repeat, XAie_DmaDirection dir) {
+    long n = 0;
+    for (int b = bd, i = 0; b >= 0 && i < 16; b = we_shnext[t.Col][b], i++)
+        n += we_shlen[t.Col][b];
+    *(dir == DMA_MM2S ? &e->b_rd : &e->b_wr) += (double)n * repeat;
+}
 /* shim BD (OOO / packet / iteration fields), through the shadow */
 static XAie_DmaDesc we_shim_bd(WeEng *e, XAie_LocType t, const void *buf, int bd, int len, int next, int pkt_en,
                                int pkt_id, int ooo, int nd, int s0, int w0, int s1, int w1, int s2, int w2, int it_step,
@@ -158,6 +168,7 @@ static XAie_DmaDesc we_shim_bd(WeEng *e, XAie_LocType t, const void *buf, int bd
     XAie_DmaDesc d;
     rt_seq_bd_desc(e->dev, t, (uint64_t)(uintptr_t)buf, &a, &d);
     we_bd_put(e, t, bd, &d);
+    we_shlen[t.Col][bd] = len, we_shnext[t.Col][bd] = next;
     return d;
 }
 
@@ -177,6 +188,7 @@ static void we_sh_bd(WeEng *e, int col, int bd, const void *src, int len, int ne
 static void we_sh_start(WeEng *e, int col, int ch, int bd) {
     XAie_DmaDesc d = {};
     __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(col), d, ch, bd, DMA_MM2S), bd, 1);
+    we_ddr(e, we_shim(col), bd, 1, DMA_MM2S);
 }
 
 /* Shim BD / channel writes go over the control-packet plane (~3 ns/word, not
@@ -359,6 +371,26 @@ static void we_init(WeEng *e, XAie_DevInst *dev) {
             for (int l = 0; l < 16; l++) /* streaming-fill locks (we_gemm) start at 0 */
                 XAie_LockSetValue(dev, we_mt(k, row), XAie_LockInit((u16)l, 0));
         }
+    /* Zero all eight memory tiles once: a column reset keeps their contents, and a
+     * NaN left by an earlier (broken) run in a region an op reads but never fills
+     * (zero-weighted K padding, masked keys) poisons every later run (0 x NaN). */
+    void *z = __Runtime_Alloc(EF_MT_BYTES);
+    memset(z, 0, EF_MT_BYTES);
+    __Runtime_sync_for_dev(dev, z, EF_MT_BYTES);
+    for (int k = 1; k <= 4; k++)
+        for (int row = EF_MT_A_ROW; row <= EF_MT_B_ROW; row++) {
+            const int a = row == EF_MT_A_ROW, mbd = a ? 24 : 0; /* a BD's length field: < 512 KB */
+            we_mt_bd(e, we_mt(k, row), mbd + 1, EF_MT_BASE + EF_MT_BYTES / 2, EF_MT_BYTES / 2, 0, 0, 0, 0, 0, -1);
+            we_mt_bd(e, we_mt(k, row), mbd, EF_MT_BASE, EF_MT_BYTES / 2, 0, 0, 0, 0, 0, mbd + 1);
+            we_mt_queue(e, we_mt(k, row), DMA_S2MM, mbd, 1);
+            we_sh_bd(e, k, 12 + a, z, (int)EF_MT_BYTES, -1, 0, 0, 0);
+            we_sh_start(e, k, a, 12 + a);
+        }
+    for (int k = 1; k <= 4; k++)
+        for (int row = EF_MT_A_ROW; row <= EF_MT_B_ROW; row++)
+            we_wait_ch(e, we_mt(k, row), row == EF_MT_A_ROW, DMA_S2MM),
+                we_wait_ch(e, we_shim(k), row == EF_MT_A_ROW, DMA_MM2S);
+    e->b_rd = 0;
 }
 
 static void we_hdr_begin(WeEng *e, int op, int ract) {
@@ -393,6 +425,7 @@ static void we_arm_out(WeEng *e, int ract, bf16_t *const dst[4][4], int len, int
         we_ooo_enable(e, s, we_out_ch[r]);
         ev[r] = __Runtime_startio(e->dev, __Runtime_dma_createio_4(s, d, we_out_ch[r], we_ooo[r][0], DMA_S2MM),
                                   we_ooo[r][0], 4 * n);
+        we_ddr(e, s, we_ooo[r][0], 4 * n, DMA_S2MM);
     }
 }
 
@@ -562,6 +595,7 @@ static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p
             we_shim_bd(e, we_shim(k), we_tile(g->res, r, 0) + (size_t)mb0 * 64 * 48, 14, (int)P->rblk, -1, 0, 0, -1, 3,
                        4, 256, 1024, 6, (int)P->tileb, g->n / 48, WE_BLK, P->MBP);
         __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d, 1, 13, DMA_MM2S), 13, P->MBP);
+        we_ddr(e, we_shim(k), 13, P->MBP, DMA_MM2S);
     }
 }
 
@@ -842,6 +876,7 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
         we_ooo_enable(e, s, we_out_ch[r]);
         ev[r] = __Runtime_startio(e->dev, __Runtime_dma_createio_4(s, d, we_out_ch[r], we_ooo[r][0], DMA_S2MM),
                                   we_ooo[r][0], any);
+        we_ddr(e, s, we_ooo[r][0], any, DMA_S2MM);
     }
 }
 
@@ -920,6 +955,8 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         XAie_DmaDesc d0 = {};
         __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 15, DMA_MM2S), 15, 4);
         __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 14, DMA_MM2S), 14, 4);
+        we_ddr(e, we_shim(k), 15, 4, DMA_MM2S);
+        we_ddr(e, we_shim(k), 14, 4, DMA_MM2S);
     }
     we_sb_sync(e);
     int rc = 0;

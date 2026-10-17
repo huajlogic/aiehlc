@@ -46,6 +46,7 @@ static int g_trace = 1;
 /* per-op-type wall time of the encoder (us); LayerNorms are folded into qkv / fc1 / xkv */
 enum { P_CONV, P_QKV, P_ATTN, P_OUT, P_FC1, P_FC2, P_XKV, P_N };
 static double g_pt[P_N], g_pf[P_N], g_pa[P_N], g_pr[P_N]; /* wall, fill, arm, run */
+static double g_prd[P_N], g_pwr[P_N];                     /* DDR bytes read / written */
 static const char *g_pn[P_N] = {"conv", "qkv", "attn", "out", "fc1", "fc2", "xkv"};
 #ifdef WE_PROF_GOP          /* per op kind core(1,3) cycles (kernel WE_PROF_G): drains after every op */
 static double g_pc[P_N][6]; /* op total, mac, ln apply, epilogue, chunks, ln stats */
@@ -65,11 +66,12 @@ static void prof_op(int k) {
 #endif
 #define PT(k, call)                                                                                                    \
     ({                                                                                                                 \
-        const double _t0 = now_us(), _f = g_e.t_fill, _a = g_e.t_arm, _r = g_e.t_run;                                  \
+        const double _t0 = now_us(), _f = g_e.t_fill, _a = g_e.t_arm, _r = g_e.t_run, _br = g_e.b_rd, _bw = g_e.b_wr;  \
         const int _rc = (call);                                                                                        \
         PROF_OP(k);                                                                                                    \
         g_pt[k] += now_us() - _t0;                                                                                     \
         g_pf[k] += g_e.t_fill - _f, g_pa[k] += g_e.t_arm - _a, g_pr[k] += g_e.t_run - _r;                              \
+        g_prd[k] += g_e.b_rd - _br, g_pwr[k] += g_e.b_wr - _bw;                                                        \
         _rc;                                                                                                           \
     })
 #define TR(name) (g_trace ? printf("WE op %s\n", name) : 0)
@@ -392,7 +394,7 @@ int main() {
     for (int run = 0; run < 3; run++) {
         g_e.t_fill = g_e.t_arm = g_e.t_run = 0;
         memset(g_pt, 0, sizeof(g_pt)), memset(g_pf, 0, sizeof(g_pf)), memset(g_pa, 0, sizeof(g_pa));
-        memset(g_pr, 0, sizeof(g_pr));
+        memset(g_pr, 0, sizeof(g_pr)), memset(g_prd, 0, sizeof(g_prd)), memset(g_pwr, 0, sizeof(g_pwr));
         const int us = encoder(&E, run == 0);
         g_trace = 0;
         if (us < 0) {
@@ -433,8 +435,16 @@ int main() {
             printf(" %s %.0f", g_pn[k], g_pt[k]);
         printf("\n");
         for (int k = 0; k < P_N; k++)
-            printf("WHISPER   %-5s wall %6.0f  fill %6.0f  arm %6.0f  run %6.0f us\n", g_pn[k], g_pt[k], g_pf[k],
-                   g_pa[k], g_pr[k]);
+            printf("WHISPER   %-5s wall %6.0f  fill %6.0f  arm %6.0f  run %6.0f us  DDR rd %6.2f wr %6.2f MB\n",
+                   g_pn[k], g_pt[k], g_pf[k], g_pa[k], g_pr[k], g_prd[k] / 1e6, g_pwr[k] / 1e6);
+        {
+            double rd = 0, wr = 0;
+            for (int k = 0; k < P_N; k++)
+                rd += g_prd[k], wr += g_pwr[k];
+            printf("WHISPER DDR traffic: read %.1f MB, written %.1f MB -> floor %.1f ms at 10.5/10 GB/s, %.1f ms at "
+                   "8.3 GB/s mixed\n",
+                   rd / 1e6, wr / 1e6, (rd / 10.5e9 + wr / 10e9) * 1e3, (rd + wr) / 8.3e9 * 1e3);
+        }
 #ifdef WE_PROF_GOP
         for (int k = 0; k < P_N; k++) {
             const double *c = g_pc[k];
