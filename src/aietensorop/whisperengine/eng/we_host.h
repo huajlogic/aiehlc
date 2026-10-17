@@ -895,6 +895,9 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
     }
 }
 
+/* attention memtile locks (streaming round): MT_A header / Q q-blocks; MT_B row block rb = lock rb */
+enum { WE_ALK_H = 0, WE_ALK_Q = 15 };
+
 /* Column c runs the same head as column c-1 (round 2 splits a head's q-blocks over
  * two columns): its K/V are not fetched again -- MT_B(c) replays them out of
  * MT_B(c-1), its west neighbour, which a memtile DMA addresses at 0x0. */
@@ -918,6 +921,16 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     const int RB = a->q->rb, KBPR = a->kv->rb / 64, rk = a->krows, NKC = KBPR * rk; /* 64-key chunks */
     const size_t tileb = (size_t)RB * 48 * 2, qtile = tileb, kvtile = (size_t)a->kv->rb * 48 * 2;
     const size_t kvrow = (size_t)(a->kv->c / 48) * kvtile; /* bytes between row blocks of kv */
+#ifndef WE_ATT_NOQS
+    const int qs = q_fill;
+#else
+    const int qs = 0;
+#endif
+#ifndef WE_ATT_NOKVS
+    const int kvs = q_fill;
+#else
+    const int kvs = 0;
+#endif
     int steps = 0;
     for (int c = 0; c < 4; c++)
         steps = nqb[c] > steps ? nqb[c] : steps;
@@ -945,15 +958,60 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         const int r = k - 1, act = k <= a->ract;
         XAie_LocType ta = we_mt(k, EF_MT_A_ROW), tb = we_mt(k, EF_MT_B_ROW);
         const int qf = act && q_fill;
-        we_mt_bd(e, ta, 24, EF_MT_BASE, (uint32_t)(WE_HDR_BYTES + (qf ? 8 * qtile : 0)), 0, 0, 0, 0, 0, -1);
-        we_mt_queue(e, ta, DMA_S2MM, 24, 1);
-        we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, qf ? 13 : -1, 0, 0, 0);
-        if (qf)
-            we_sh_bd(e, k, 13, we_tile(a->q, r, a->q_cb), (int)(8 * qtile), -1, 0, 0, 0);
-        we_sh_start(e, k, 1, 12);
+        if (qs) { /* streaming: header (lock 0), then Q q-block by q-block (lock 15) */
+            we_mt_bdl(e, ta, 24, EF_MT_BASE, WE_HDR_BYTES, 0, 0, 0, 0, 0, -1, -1, WE_ALK_H, 1);
+            we_mt_queue(e, ta, DMA_S2MM, 24, 1);
+            we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, -1, 0, 0, 0);
+            we_sh_start(e, k, 1, 12);
+            if (qf) { /* q-block i = 32 rows of each of the 8 q tiles (3 KB each) */
+                const uint32_t qs[2] = {1, (uint32_t)(qtile / 4)}, qw[2] = {768, 8};
+                we_mt_bdl(e, ta, 25, EF_MT_BASE + WE_HDR_BYTES, 8 * 3072, 2, qs, qw, 768, (uint32_t)steps, -1, -1,
+                          WE_ALK_Q, 1);
+                we_mt_queue(e, ta, DMA_S2MM, 25, steps);
+                XAie_DmaDesc dq = we_shim_bd(e, we_shim(k), we_tile(a->q, r, a->q_cb), 13, 8 * 3072, -1, 0, 0, -1, 2, 4,
+                                             768, (int)qtile, 8, 0, 0, 3072, steps);
+                __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), dq, 1, 13, DMA_MM2S), 13, steps);
+                we_ddr(e, we_shim(k), 13, steps, DMA_MM2S);
+            }
+        } else {
+            we_mt_bd(e, ta, 24, EF_MT_BASE, (uint32_t)(WE_HDR_BYTES + (qf ? 8 * qtile : 0)), 0, 0, 0, 0, 0, -1);
+            we_mt_queue(e, ta, DMA_S2MM, 24, 1);
+            we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, qf ? 13 : -1, 0, 0, 0);
+            if (qf)
+                we_sh_bd(e, k, 13, we_tile(a->q, r, a->q_cb), (int)(8 * qtile), -1, 0, 0, 0);
+            we_sh_start(e, k, 1, 12);
+        }
         const int c = k - 1, h = head[c];
         if (!nqb[c] || we_kv_shared(head, nqb, c))
             continue;
+        if (kvs) { /* streaming K/V: all K row blocks, then V row block by row block; V of
+                    * row block rb releases lock rb (a shim BD chain does not advance its BD
+                    * iterations across task repeats, so K and V cannot alternate) */
+            const bf16_t *ks = we_tile(a->kv, 0, a->kt_cb + h / 3) + (h % 3) * 1024;
+            const bf16_t *vs = we_tile(a->kv, 0, a->vt_cb + h / 3) + (h % 3) * 128;
+            static const int fbd[8] = {9, 10, 11, 12, 13, 14, 15, 0};
+            /* 8 KB per chunk as 4 x 2 KB (a memtile wrap is 10 bits: 1024 already wraps to 0
+             * and the BD runs linear), chunks 16 KB apart */
+            const uint32_t cs[3] = {1, 512, 4096}, cw[3] = {512, 4, (uint32_t)KBPR};
+            for (int rb = 0; rb < rk; rb++) {
+                const uint32_t base = EF_MT_BASE + (uint32_t)(rb * KBPR) * 2 * WE_KV_CHUNK;
+                we_mt_bd(e, tb, fbd[rb], base, (uint32_t)(KBPR * WE_KV_CHUNK), 3, cs, cw, 0, 0,
+                         rb + 1 < rk ? fbd[rb + 1] : fbd[rk]);
+                we_mt_bdl(e, tb, fbd[rk + rb], base + WE_KV_CHUNK, (uint32_t)(KBPR * WE_KV_CHUNK), 3, cs, cw, 0, 0,
+                          rb + 1 < rk ? fbd[rk + rb + 1] : -1, -1, rb, nqb[c]);
+            }
+            we_mt_queue(e, tb, DMA_S2MM, fbd[0], 1);
+            /* chunk-major: per 64-key block its 4 dim groups (2 KB of K^T, 4 x 256 B of V per 8 keys) */
+            XAie_DmaDesc d0 = we_shim_bd(e, we_shim(k), ks, 15, KBPR * WE_KV_CHUNK, -1, 0, 0, -1, 3, 4, 512,
+                                         (int)(2 * kvtile), 4, WE_BLK, KBPR, (int)kvrow, rk);
+            __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 15, DMA_MM2S), 15, rk);
+            d0 = we_shim_bd(e, we_shim(k), vs, 14, KBPR * WE_KV_CHUNK, -1, 0, 0, -1, 3, 4, 64, (int)(2 * kvtile), 4,
+                            768, 8 * KBPR, (int)kvrow, rk);
+            __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 14, DMA_MM2S), 14, rk);
+            we_ddr(e, we_shim(k), 15, rk, DMA_MM2S);
+            we_ddr(e, we_shim(k), 14, rk, DMA_MM2S);
+            continue;
+        }
         /* chunk b (64 keys) = 16 KB: K^T [kd = 2j+dt][kp 8][64] then V [kp 8][dt = 2j+dtp][64] */
         const uint32_t kst[3] = {1, 256, 4096}, kwr[3] = {256, 2, 0};
         we_mt_bd(e, tb, 0, EF_MT_BASE, (uint32_t)(2048 * KBPR * rk), 3, kst, kwr, 512, 4, -1);
@@ -975,15 +1033,16 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     }
     we_sb_sync(e);
     int rc = 0;
-    for (int k = 1; k <= 4 && !rc; k++) {
-        rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 1, DMA_S2MM);
-        if (nqb[k - 1])
+    for (int k = 1; k <= 4 && !rc; k++) { /* streaming: the locks gate the replays */
+        if (!qs)
+            rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 1, DMA_S2MM);
+        if (nqb[k - 1] && !kvs)
             rc |= we_wait_ch(e, we_mt(k, EF_MT_B_ROW), 0, DMA_S2MM);
     }
     XTime_GetTime(&p1);
     for (int k = 1; k <= 4; k++) {
         XAie_LocType ta = we_mt(k, EF_MT_A_ROW), tb = we_mt(k, EF_MT_B_ROW);
-        we_mt_bd(e, ta, 1, EF_MT_BASE, WE_HDR_BYTES, 0, 0, 0, 0, 0, -1);
+        we_mt_bdl(e, ta, 1, EF_MT_BASE, WE_HDR_BYTES, 0, 0, 0, 0, 0, -1, qs ? WE_ALK_H : -1, -1, 0);
         we_mt_queue(e, ta, DMA_MM2S, 1, 1);
         if (k <= a->ract) {
             for (int c = 0; c < 4; c++) {
@@ -991,11 +1050,17 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
                 const uint32_t base = EF_MT_BASE + WE_HDR_BYTES +
                                       (uint32_t)((h / 3) * qtile + (h % 3) * 128 + (size_t)qb0[c] * (WE_QB / 4) * 384);
                 const uint32_t st[3] = {1, (uint32_t)(2 * qtile / 4), 96}, wr[3] = {32, 4, 0};
-                we_mt_bd(e, ta, 3 + c, base, WE_Q_CHUNK, 3, st, wr, (WE_QB / 4) * 96, steps, c < 3 ? 4 + c : -1);
+                we_mt_bdl(e, ta, 3 + c, base, WE_Q_CHUNK, 3, st, wr, (WE_QB / 4) * 96, steps, c < 3 ? 4 + c : -1,
+                          qs && c == 0 ? WE_ALK_Q : -1, -1, 0);
             }
             we_mt_queue(e, ta, DMA_MM2S, 3, steps);
         }
-        if (nqb[k - 1]) { /* a shared head streams out of the west neighbour's memory (at 0x0) */
+        if (nqb[k - 1] && kvs) { /* K/V row block rb acquires lock rb (released by its fill) */
+            for (int rb = 0; rb < rk; rb++)
+                we_mt_bdl(e, tb, 1 + rb, EF_MT_BASE + (uint32_t)(rb * KBPR) * 2 * WE_KV_CHUNK,
+                          (uint32_t)(KBPR * 2 * WE_KV_CHUNK), 0, 0, 0, 0, 0, rb + 1 < rk ? 2 + rb : -1, rb, -1, 0);
+            we_mt_queue(e, tb, DMA_MM2S, 1, nqb[k - 1]);
+        } else if (nqb[k - 1]) { /* a shared head streams out of the west neighbour's memory (at 0x0) */
             const uint32_t kv = we_kv_shared(head, nqb, k - 1) ? EF_MT_BASE - EF_MT_BYTES : EF_MT_BASE;
             we_mt_bd(e, tb, 2, kv, (uint32_t)(NKC * 2 * WE_KV_CHUNK), 0, 0, 0, 0, 0, -1);
             we_mt_queue(e, tb, DMA_MM2S, 2, nqb[k - 1]);
@@ -1018,6 +1083,9 @@ static int we_attn(WeEng *e, const WeAttn *a) {
     const int h1[4] = {0, 1, 2, 3}, n1[4] = {QB, QB, QB, QB}, z[4] = {0, 0, 0, 0};
     if (we_attn_round(e, a, h1, n1, z, 1))
         return -1;
+#ifdef WE_ATT_R1ONLY /* probe: leave round 1's K/V in the memory tiles */
+    return we_drain(e);
+#endif
     if (QB >= 2) {
         const int h2[4] = {4, 4, 5, 5}, n2[4] = {QB / 2, QB - QB / 2, QB / 2, QB - QB / 2},
                   q2[4] = {0, QB / 2, 0, QB / 2};

@@ -98,7 +98,11 @@ static int test(WeEng *e, const char *name, int rb, int rows, int causal, int ra
     }
     if (rb == 384) { /* round 2 left heads 4,4,5,5 in MT_B: check the gathered chunks of column 0 (head 4) */
         __Runtime_sync_for_cpu(e->dev, qkv.p, we_act_bytes(&qkv));
+#ifdef WE_ATT_R1ONLY
+        const int h = 0;
+#else
         const int h = 4;
+#endif
         long nz = 0;
         for (size_t i = 0; i < (size_t)4 * 384 * 1152; i++)
             nz += qkv.p[i] != 0;
