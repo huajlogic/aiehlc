@@ -1,0 +1,17 @@
+_entry_point _main_init
+_symbol _main _after  _main_init
+_symbol _main_init 0
+_symbol m10_q 0x71000
+_symbol m10_ml 0x72000
+_symbol m10_res 0x72800
+_symbol m10_k 0x73000
+_symbol m10_v 0x75000
+_symbol m10_s0 0x77000
+_symbol m10_s1 0x79000
+_symbol m10_o0 0x7b000
+_symbol m10_o1 0x7d400
+_stack DM_stack 0x70000 0x1000
+_reserved DMb 0x0 0x40000
+_reserved DMb 0x40000 0x10000
+_reserved DMb 0x50000 0x20000
+_reserved DMb 0x80000 0x80000
