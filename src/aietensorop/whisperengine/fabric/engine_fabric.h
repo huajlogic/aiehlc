@@ -9,7 +9,8 @@
  * MEMORY TILE spliced into every input route, so an operand is fetched from
  * DDR once and replayed to the cores from on-chip memory:
  *
- *   A   shim (k,0) MM2S1 -> MT_A(k-1) = memtile (k,1) S2MM0 ;
+ *   A   shim (k,0) MM2S1 -> MT_A(k-1) = memtile (k,1) S2MM1 (odd channel: BDs 24..47,
+ *       so the MM2S0 replays keep all of 0..23 for two banks) ;
  *       MT_A MM2S0 -> broadcast to mesh row k-1          (core S2MM ch0)
  *   B   shim (k,0) MM2S0 -> MT_B(k-1) = memtile (k,2) S2MM0 ;
  *       MT_B MM2S0 -> broadcast to mesh col k-1          (core S2MM ch1)

@@ -787,6 +787,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
 - **[doc/modelsupportevaluate.md](doc/modelsupportevaluate.md)** — Gap analysis for Gemma / ResNet-50 / YOLO / MobileNet / BERT / ViT (none run on AIE today); proposed `aiephase` + `aiecfg` dialects (phase-based control-plane reconfiguration, overlay kernels), new Depthwise/Eltwise/Reduce/Attention/Pipeline/Move spaces, milestones M0–M8
 - **[doc/design/resnet_aie_engine.md](doc/design/resnet_aie_engine.md)** — whole int8 ResNet-18 on the AIE in 2.81 ms, bit-exact: persistent engine architecture, exactness proofs (fusions, 8-bit tensors, on-core residuals), measured optimization steps 1270 → 2.81 ms, what did not help, remaining limits
+- **[doc/web/whisper_aie/index.html](doc/web/whisper_aie/index.html)** — HTML tutorial: how Whisper-tiny is offloaded (aiehlc compiler route vs the hand-written persistent `whisperengine`), every encoder/decoder layer's handling, numerics, aiehlc-vs-hand file table, perf log. Serve with `python3 -m http.server 8150 --directory doc/web` → `http://<host>:8150/whisper_aie/`
 - **[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** — `#pragma KERNELCONFIGOFFLOAD`: core self-configured DMA, lock asymmetry, BD-id reservation
 - **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)** — `--aie-offload`: TVM BYOC → `libconv2dstem.a`, fused boundary, uint8 shift, weight-fingerprint layer mapping
 - **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
@@ -864,6 +865,8 @@ Read the matching skill when the task fits:
 | `[AIE ERROR] Overflow of program memory` at load though the build passed (kernel.map "Used" < 16 KB); shrinking a persistent AIE2PS kernel; chess "no Basic_block found" | aie2psprogrammemory |
 | AIE output correct except one/two 64-byte lines (stale / zero, different each run): dirty host cache lines evicted over DMA output | dmaoutputdirtycache |
 | Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
+| Host-programmed memtile BD rejected/hangs: BD ≥ 24 on an even channel, fill waits on a lock it never asked for (`XAie_DmaSetLock` enables both sides), streaming-fill lock counts | memtilebdlockchannel |
+| Host timeline far slower once timestamps print (UART printf in the timed region); MMIO cost vs page type (Device-nGnRE / Normal-NC) | hosttimelinedistortion |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
 | Kernel codegen | kernelcodegen |

@@ -69,7 +69,7 @@ static int test_gemm(WeEng *e, const char *name, int rb, int K, int N, int flags
     WeGemm g = {&a, wp, bias ? b : 0, res ? &rs : 0, &o, N, flags, kt_lo, kt_hi, ract, mbp};
     XTime t0, t1;
     XTime_GetTime(&t0);
-    if (we_gemm(e, &g))
+    if (we_gemm(e, &g) || we_drain(e))
         return check(name, 1, 1, 0);
     XTime_GetTime(&t1);
     __Runtime_sync_for_cpu(e->dev, o.p, we_act_bytes(&o));
@@ -148,7 +148,7 @@ static int test_ln_gemm(WeEng *e, int rb, int N) {
     gm.lnd = d, gm.lnc = c, gm.lnn = N;
     XTime t0, t1;
     XTime_GetTime(&t0);
-    if (we_gemm(e, &gm))
+    if (we_gemm(e, &gm) || we_drain(e))
         return check("ln-folded gemm", 1, 1, 0);
     XTime_GetTime(&t1);
     printf("ET1 ln-folded gemm %dx%d: %.1f us\n", 4 * rb, N, we_us(t0, t1));

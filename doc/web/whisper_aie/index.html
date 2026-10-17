@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whisper-tiny on the AIE — how every layer is offloaded</title>
+<style>
+  :root { --fg:#1d232b; --muted:#5b6672; --line:#d9dee4; --bg:#ffffff; --panel:#f5f7f9; --accent:#2f5d8a; --ok:#2e7d4f; --warn:#9a6a00; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e3e7ec; --muted:#9aa5b1; --line:#333b45; --bg:#14181d; --panel:#1c2229; --accent:#7fb0e0; --ok:#6cc08f; --warn:#e0b450; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 20px 80px; }
+  h1 { font-size: 30px; line-height:1.2; margin: 8px 0 6px; }
+  h2 { font-size: 22px; margin: 44px 0 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+  h3 { font-size: 17px; margin: 26px 0 8px; }
+  p, li { max-width: 78ch; }
+  .sub { color: var(--muted); margin: 0 0 18px; }
+  code, pre { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size: 13.5px; }
+  code { background: var(--panel); padding: 1px 4px; border-radius: 3px; }
+  pre { background: var(--panel); padding: 12px 14px; border-radius: 6px; overflow-x: auto; border:1px solid var(--line); }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0 16px; font-size: 14.5px; }
+  th, td { text-align: left; vertical-align: top; padding: 7px 9px; border-bottom: 1px solid var(--line); }
+  th { background: var(--panel); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tiles { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px,1fr)); gap:12px; margin: 18px 0; }
+  .tile { background: var(--panel); border:1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .tile .v { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .tile .k { color: var(--muted); font-size: 13.5px; }
+  .note { border-left: 3px solid var(--accent); background: var(--panel); padding: 10px 14px; margin: 14px 0; }
+  .warn { border-left-color: var(--warn); }
+  nav.toc { background: var(--panel); border:1px solid var(--line); border-radius: 8px; padding: 10px 16px; margin: 18px 0; }
+  nav.toc ol { margin: 6px 0; padding-left: 20px; columns: 2; }
+  .tag { display:inline-block; font-size: 12px; padding: 1px 7px; border-radius: 10px; border:1px solid var(--line); color: var(--muted); }
+  .hw { color: var(--ok); border-color: var(--ok); }
+  .gen { color: var(--accent); border-color: var(--accent); }
+  svg text { font: 12px system-ui,sans-serif; fill: var(--fg); }
+  .fig { margin: 14px 0; overflow-x:auto; }
+</style>
+</head>
+<body>
+<main>
+
+<p class="sub">aiehlc · branch <code>whisper</code> · VEK385 (AIE2PS) · October 2026</p>
+<h1>Whisper-tiny on the AI Engine: how every layer is offloaded</h1>
+<p class="sub">What this branch built to run OpenAI Whisper-tiny on the AIE array, how each layer of the encoder and the decoder is handled, and which parts came from aiehlc versus which were written by hand.</p>
+
+<div class="tiles">
+  <div class="tile"><div class="v">33.7 ms</div><div class="k">encoder, warm run (20.24 GMAC)</div></div>
+  <div class="tile"><div class="v">14.7 %</div><div class="k">of the 4×4 bf16 peak (4.1 TMAC/s)</div></div>
+  <div class="tile"><div class="v">~29 ms</div><div class="k">per decoder step (24 steps for the JFK clip)</div></div>
+  <div class="tile"><div class="v">~0.74 s</div><div class="k">audio features in → tokens out</div></div>
+  <div class="tile"><div class="v">match</div><div class="k">transcript identical to PyTorch, token for token</div></div>
+  <div class="tile"><div class="v">16 cores</div><div class="k">4×4 mesh + 8 memory tiles, 5-column partition</div></div>
+</div>
+
+<div class="note warn"><b>Status.</b> The performance goal is <b>30 % of the 4×4 bf16 peak</b> for the encoder (about 16.5 ms). The engine is at 14.7 % and the work continues; this page is updated as it moves. Numbers come from board runs on VEK385, booted over netboot.</div>
+
+<nav class="toc"><b>Contents</b>
+<ol>
+<li><a href="#routes">Two routes to the AIE</a></li>
+<li><a href="#hw">What runs where on the array</a></li>
+<li><a href="#op">How one operation runs</a></li>
+<li><a href="#encoder">Encoder, layer by layer</a></li>
+<li><a href="#decoder">Decoder, layer by layer</a></li>
+<li><a href="#numerics">Numerics: why the transcript matches</a></li>
+<li><a href="#who">aiehlc vs hand-written</a></li>
+<li><a href="#perf">Performance and where the time goes</a></li>
+<li><a href="#run">Build and run it</a></li>
+<li><a href="#traps">Traps found on the way</a></li>
+</ol>
+</nav>
+
+<!-- ===================================================================== -->
+<h2 id="routes">1. Two routes to the AIE</h2>
+
+<p>The branch took Whisper to the AIE twice. The first route uses the aiehlc compiler end to end and proves that every layer <i>can</i> be expressed and compiled; the second is a hand-written engine that actually runs on the board.</p>
+
+<table>
+<tr><th></th><th>Route A — TVM → aiehlc compiler</th><th>Route B — persistent engine (on the board)</th></tr>
+<tr><td>Where</td><td><code>src/frontend/tvmrelay/example/whisper/</code></td><td><code>src/aietensorop/whisperengine/</code></td></tr>
+<tr><td>Input</td><td>official <code>tiny.pt</code> → ONNX → TVM Relay</td><td>official <code>tiny.pt</code> → <code>gen_engine.py</code> packs weights directly</td></tr>
+<tr><td>Partition</td><td>AIE-first partitioner: 147 layers (encoder 56, decoder step 91), 0 ops left on the CPU</td><td>one op per GEMM / attention, LayerNorm folded away: 30 ops per encoder</td></tr>
+<tr><td>Kernels</td><td>24 aiehlc libraries generated from two templates: <code>aie::GemmSpace</code> GEMMs and the new <code>aie::RowSpace</code> row ops (LayerNorm, softmax, add)</td><td>one hand-written kernel source, built as two programs (GEMM, attention), loaded once</td></tr>
+<tr><td>Arithmetic</td><td>fp32 scalar C on the core</td><td>bf16 vector <code>aie::mmul&lt;4,8,8&gt;</code>, fp32 accumulation</td></tr>
+<tr><td>Per launch</td><td>aiehlc re-programs the array on every launch (96 encoder + 171 decoder-step launches); every tensor staged through host copies</td><td>kernel stays resident; the host only re-arms memory-tile and shim DMAs; each core programs its own DMAs from an op header</td></tr>
+<tr><td>Verified</td><td>x86 run of the resolved kernels reproduces the PyTorch transcript; board ELF linked (157 MB), not run</td><td>board run: transcript matches PyTorch</td></tr>
+</table>
+
+<p>Route A was the feasibility study: it found and fixed four aiehlc bugs that only show on non-square meshes or non-GEMM layers, and added <code>aie::RowSpace</code> (details in <code>GAP_ANALYSIS.md</code>). Its per-launch cost model — full array programming at ~350 ns per register write, fp32 scalar kernels, a batch of one per attention head — would put the encoder in the seconds. Route B keeps aiehlc's runtime, build flow and fabric, and replaces the per-launch compilation model with a persistent engine. The rest of this page describes Route B.</p>
+
+<!-- ===================================================================== -->
+<h2 id="hw">2. What runs where on the array</h2>
+
+<p>The device has 36 columns × 4 rows of AIE cores. The engine uses one 5-column partition (absolute columns 2–6):</p>
+
+<div class="fig">
+<svg viewBox="0 0 640 330" width="640" height="330" role="img" aria-label="Partition layout: control column, 4x4 core mesh, two memory-tile rows, shim row">
+  <g stroke="currentColor" fill="none">
+  </g>
+  <!-- column headers -->
+  <text x="70" y="18">col 2</text><text x="190" y="18">col 3</text><text x="300" y="18">col 4</text><text x="410" y="18">col 5</text><text x="520" y="18">col 6</text>
+  <!-- core rows 6..3 -->
+  <g>
+    <rect x="40" y="30" width="100" height="44" rx="5" fill="none" stroke="#8a95a1" stroke-dasharray="4 3"/>
+    <rect x="40" y="80" width="100" height="44" rx="5" fill="none" stroke="#8a95a1" stroke-dasharray="4 3"/>
+    <rect x="40" y="130" width="100" height="44" rx="5" fill="none" stroke="#8a95a1" stroke-dasharray="4 3"/>
+    <rect x="40" y="180" width="100" height="44" rx="5" fill="none" stroke="#8a95a1" stroke-dasharray="4 3"/>
+    <text x="52" y="105">control path</text>
+  </g>
+  <g fill="#2f5d8a" fill-opacity="0.18" stroke="#2f5d8a">
+    <rect x="160" y="30" width="100" height="44" rx="5"/><rect x="270" y="30" width="100" height="44" rx="5"/><rect x="380" y="30" width="100" height="44" rx="5"/><rect x="490" y="30" width="100" height="44" rx="5"/>
+    <rect x="160" y="80" width="100" height="44" rx="5"/><rect x="270" y="80" width="100" height="44" rx="5"/><rect x="380" y="80" width="100" height="44" rx="5"/><rect x="490" y="80" width="100" height="44" rx="5"/>
+    <rect x="160" y="130" width="100" height="44" rx="5"/><rect x="270" y="130" width="100" height="44" rx="5"/><rect x="380" y="130" width="100" height="44" rx="5"/><rect x="490" y="130" width="100" height="44" rx="5"/>
+    <rect x="160" y="180" width="100" height="44" rx="5"/><rect x="270" y="180" width="100" height="44" rx="5"/><rect x="380" y="180" width="100" height="44" rx="5"/><rect x="490" y="180" width="100" height="44" rx="5"/>
+  </g>
+  <text x="300" y="58">4×4 core mesh (rows 3–6)</text>
+  <!-- memtiles -->
+  <g fill="#2e7d4f" fill-opacity="0.18" stroke="#2e7d4f">
+    <rect x="160" y="236" width="100" height="26" rx="4"/><rect x="270" y="236" width="100" height="26" rx="4"/><rect x="380" y="236" width="100" height="26" rx="4"/><rect x="490" y="236" width="100" height="26" rx="4"/>
+    <rect x="160" y="266" width="100" height="26" rx="4"/><rect x="270" y="266" width="100" height="26" rx="4"/><rect x="380" y="266" width="100" height="26" rx="4"/><rect x="490" y="266" width="100" height="26" rx="4"/>
+  </g>
+  <text x="168" y="254">MT_B (weights)</text><text x="278" y="254">MT_B</text><text x="388" y="254">MT_B</text><text x="498" y="254">MT_B</text>
+  <text x="168" y="284">MT_A (activations)</text><text x="278" y="284">MT_A</text><text x="388" y="284">MT_A</text><text x="498" y="284">MT_A</text>
+  <!-- shims -->
+  <g fill="none" stroke="#8a95a1">
+    <rect x="40" y="298" width="100" height="24" rx="4"/>
+    <rect x="160" y="298" width="100" height="24" rx="4"/><rect x="270" y="298" width="100" height="24" rx="4"/><rect x="380" y="298" width="100" height="24" rx="4"/><rect x="490" y="298" width="100" height="24" rx="4"/>
+  </g>
+  <text x="48" y="315">ctrl shim</text><text x="168" y="315">shim (DDR)</text><text x="278" y="315">shim</text><text x="388" y="315">shim</text><text x="498" y="315">shim</text>
+</svg>
+</div>
+
+<table>
+<tr><th>Tiles</th><th>Count</th><th>Role</th></tr>
+<tr><td>Cores, rows 3–6 × cols 3–6</td><td class="num">16</td><td>all arithmetic: GEMMs, attention, folded LayerNorm, GELU, logits</td></tr>
+<tr><td>Memory tiles, row 1 (<b>MT_A</b>)</td><td class="num">4</td><td>one per mesh row: holds that row's activations (and the op headers); broadcasts them along the core row</td></tr>
+<tr><td>Memory tiles, row 2 (<b>MT_B</b>)</td><td class="num">4</td><td>one per mesh column: holds that column's weights (or an attention head's K/V); broadcasts them up the column</td></tr>
+<tr><td>Shim tiles, cols 3–6</td><td class="num">4</td><td>DDR ↔ array: fill MT_A/MT_B, collect outputs (packet-switched, out-of-order BDs)</td></tr>
+<tr><td>Column 2</td><td class="num">1 col</td><td>control-packet spine only: swaps the two kernel programs, no compute</td></tr>
+</table>
+
+<p>The fabric (<code>fabric/routing.cc</code>) is the 4×4 routing aiehlc generated for <code>conv2dstem</code>, reused by the ResNet engine, with the memory tiles spliced into every input path by hand: shim → MT_A → core row, shim → MT_B → core column. Outputs leave each core as packets and merge per mesh row into one shim S2MM channel.</p>
+
+<!-- ===================================================================== -->
+<h2 id="op">3. How one operation runs</h2>
+
+<p>Every operation — a GEMM pass or an attention round — follows the same protocol (<code>eng/we_desc.h</code>, <code>eng/we_host.h</code>, <code>eng/kernel.cc</code>):</p>
+
+<ol>
+<li><b>Header.</b> The host writes an 8 KB header per op: op code, shape (row blocks, column tiles, K chunks), flags (bias, GELU, residual, LayerNorm fold, K<sup>T</sup>/V tile output, row-major, logits) and the parameters of the op's output columns (bias / folded LayerNorm constants, fp32).</li>
+<li><b>Fill.</b> The shims stream the header and the activations into MT_A (block-major, 64 rows at a time) and the weights into MT_B (one panel per output tile group). Memory-tile locks per block let the cores start on block 0 while DDR still delivers the rest.</li>
+<li><b>Replay.</b> MT_A replays each 64-row A block once per output tile; MT_B replays each weight panel once per row block. The DDR is read once per op.</li>
+<li><b>Core self-configuration.</b> Each core reads the header and programs its own tile DMAs (S2MM ping/pong for A and B, MM2S for output packets) with <code>aie_kernel_runtime.h</code> encoders — no host register writes to the 16 cores.</li>
+<li><b>Compute and output.</b> 64×48 output blocks, K in chunks of 48, then the epilogue (folded LayerNorm, bias, GELU, residual, one bf16 rounding). Each block leaves as a 6 KB packet; the shim drops it at the right DDR address with out-of-order BDs.</li>
+<li><b>Overlap.</b> The host queues sub-op <i>s+1</i> while <i>s</i> runs, and writes the next op's memory-tile BDs into the bank the running op is not using. Only the output BDs are re-armed between ops.</li>
+</ol>
+
+<p>The 16 KB program memory of an AIE2PS core cannot hold the GEMM path and the attention path together, so <code>kernel.cc</code> is compiled twice (<code>WE_PROG=1</code> GEMM, <code>WE_PROG=2</code> attention). Between a GEMM op and an attention op the host swaps programs with the control-packet ELF load (~47 µs, 8 swaps per encoder).</p>
+
+<!-- ===================================================================== -->
+<h2 id="encoder">4. Encoder, layer by layer</h2>
+
+<p>Input: 3000 × 80 log-mel frames (computed offline by <code>gen_engine.py</code> and embedded in the ELF). Output: the K/V of the 4 decoder cross-attentions. All activations are bf16 in DDR in a tiled layout (<code>BLK</code>: 48-column tiles of 64-row blocks in the <code>mmul</code> A layout), so every op reads its input as contiguous 6 KB chunks. 1500 frames are padded to 1536 rows, 384 per mesh row.</p>
+
+<table>
+<tr><th>Layer</th><th>Engine op</th><th>How it is handled</th></tr>
+<tr><td>conv1 (80→384, k3)</td><td>GEMM K=240→288, N=384, GELU</td><td>im2col by the DMAs: the shim reads overlapping 3-frame windows of the mel, the memory tile re-tiles them. Output written <b>row-major</b> so conv2 can window it the same way.</td></tr>
+<tr><td>conv2 (384→384, k3, stride 2)</td><td>GEMM K=1152, N=384, GELU + residual</td><td>stride-2 windows of conv1's rows via the shim BD pattern; the positional embedding enters as the residual input.</td></tr>
+<tr><td>× 4 blocks: attn LayerNorm + Q/K/V</td><td>GEMM K=384, N=1152, <b>LN folded</b></td><td>LayerNorm never materialises (see §6). The epilogue writes Q in the head-permuted layout and K, V directly as K<sup>T</sup> and V tiles, the B operands of the attention matmuls.</td></tr>
+<tr><td>self-attention (6 heads)</td><td>attention, 2 rounds</td><td>Heads on mesh columns: round 1 heads 0–3, round 2 heads 4–5 split over two columns each. 32-row query blocks on mesh rows, keys in 64-key chunks gathered into MT_B. Flash attention with an integer lazy-max reference; softmax in exp2 (log<sub>2</sub>e folded into W<sub>q</sub>).</td></tr>
+<tr><td>attn out-projection + residual</td><td>GEMM K=384, N=384, residual, 2 passes</td><td>residual blocks travel with A in MT_A, added in the epilogue.</td></tr>
+<tr><td>MLP LayerNorm + FC1 + GELU</td><td>GEMM K=384, N=1536, <b>LN folded</b>, GELU</td><td>exact erf-GELU from a 1280-entry bf16 lookup table on the core.</td></tr>
+<tr><td>FC2 + residual</td><td>GEMM K=1536, N=384, residual, 3 passes</td><td>passes keep A + residual under the 512 KB memory tile.</td></tr>
+<tr><td>ln_post + cross K/V (× 4 decoder layers)</td><td>4 GEMMs K=384, N=768, <b>LN folded</b>, hi/lo weights, 2 passes</td><td>ln_post folded into each cross-attention K/V projection; outputs written as K<sup>T</sup>/V tiles, kept in DDR for every decoder step.</td></tr>
+</table>
+
+<!-- ===================================================================== -->
+<h2 id="decoder">5. Decoder, layer by layer</h2>
+
+<p>Greedy decoding from the 4-token start prompt. Each step processes the whole prefix (at most 64 tokens: one 64-row block on mesh row 0) and emits the logits of the last row only. All decoder weights are hi/lo bf16 pairs (§6).</p>
+
+<table>
+<tr><th>Layer</th><th>Engine op</th><th>How it is handled</th></tr>
+<tr><td>token embedding + position</td><td>A78</td><td>row lookup in the packed logits weight ((hi+lo)/γ, see §6) plus the positional row; the only arithmetic on the CPU besides argmax.</td></tr>
+<tr><td>× 4 blocks: LN + self Q/K/V</td><td>GEMM N=1152, LN folded, hi/lo</td><td>same op as the encoder's, one active mesh row.</td></tr>
+<tr><td>masked self-attention</td><td>attention, causal</td><td>causal mask on the core (vectorised lane tables).</td></tr>
+<tr><td>out-projection + residual</td><td>GEMM N=384, residual</td><td></td></tr>
+<tr><td>LN + cross-attention Q</td><td>GEMM N=384, LN folded</td><td></td></tr>
+<tr><td>cross-attention</td><td>attention over 1500 keys</td><td>reads the K<sup>T</sup>/V the encoder produced.</td></tr>
+<tr><td>out-projection + residual</td><td>GEMM N=384, residual</td><td></td></tr>
+<tr><td>LN + FC1 + GELU</td><td>2 GEMMs of 768 columns, LN folded</td><td>split so hi/lo weights fit one memory tile per column.</td></tr>
+<tr><td>FC2 + residual</td><td>2 GEMMs of 192 columns</td><td></td></tr>
+<tr><td>final LN + logits</td><td>68 GEMM slices × 768 vocabulary rows, LN folded</td><td>fp32 logits of one row group per slice (51,865 tokens); argmax on the A78.</td></tr>
+</table>
+
+<!-- ===================================================================== -->
+<h2 id="numerics">6. Numerics: why the transcript matches</h2>
+
+<p><code>we_model.py</code> is a PyTorch model of the engine's exact rounding points. It is run before every board change; it produced the engine's goldens and showed which precision choices keep the transcript.</p>
+
+<ul>
+<li><b>bf16 storage, fp32 accumulation.</b> Every tensor between ops is bf16; every product accumulates in fp32 in the <code>mmul</code> accumulators; each op rounds once.</li>
+<li><b>LayerNorm folded into the next GEMM.</b> With W′ = γ⊙W, c = Σ<sub>k</sub>W′ and d = b + βW<sup>T</sup>: y = rstd·(xW′<sup>T</sup> − μc) + d. The core takes μ and rstd from the A chunks it already receives (fp32 sums of x and x²), and applies −μc and the rstd scaling on the multiplier as hi/lo bf16 products. The LayerNorm op and its DDR round trip disappear, and the normalised x is never rounded to bf16.</li>
+<li><b>Softmax in exp2 with an integer reference.</b> log<sub>2</sub>e/√d is folded into W<sub>q</sub>. Scores are computed as S − m directly in the accumulator; m is the row maximum of the first chunk rounded up to an integer, raised only when a score passes it by 32, so rescaling O and l is exact exponent arithmetic.</li>
+<li><b>Exact GELU.</b> erf-GELU of the bf16 input, from a 1280-entry table for every bf16 value with ⅛ ≤ |x| &lt; 4 (<code>gen_gelu_lut.py</code>), closed forms outside.</li>
+<li><b>hi/lo decoder weights.</b> bf16 decoder weights turned step 14 (" ask" vs ",") into a coin flip. Every decoder GEMM, the cross K/V and the logits carry W ≈ W<sub>hi</sub> + W<sub>lo</sub>; the A operand is replayed twice. The token embedding is recovered as (hi+lo)/γ from the logits weight, so it is stored once.</li>
+</ul>
+
+<p>Result: the transcript matches PyTorch token for token — <i>"And so my fellow Americans ask not what your country can do for you ask what you can do for your country."</i> The board prints every step's top-2 logit margin (<code>WHISPER step N: … margin</code>) so a near-tie is visible before it flips.</p>
+
+<!-- ===================================================================== -->
+<h2 id="who">7. What came from aiehlc, what was written by hand</h2>
+
+<table>
+<tr><th>Piece</th><th>Origin</th><th>Notes</th></tr>
+<tr><td>AIE runtime: partition init, DMA BD helpers, out-of-order BDs, waits</td><td><span class="tag gen">aiehlc</span></td><td><code>src/mlir/runtime/aie_runtime.c</code>; two small APIs added (<code>__Runtime_ctrl_shim_bd_sync</code>, <code>__Runtime_dev_addr</code>)</td></tr>
+<tr><td>Control-packet plane and ELF load over the fabric</td><td><span class="tag gen">aiehlc</span></td><td>used for the GEMM ↔ attention program swap</td></tr>
+<tr><td>Core self-DMA encoders (<code>aie_kernel_runtime.h</code>)</td><td><span class="tag gen">aiehlc</span></td><td>written for <code>KERNELCONFIGOFFLOAD</code>; reused by the engine kernel</td></tr>
+<tr><td>Kernel build: <code>hostcompile.sh</code>, <code>kc.sh</code>, xchesscc, multi-kernel mode</td><td><span class="tag gen">aiehlc</span></td><td>multi-kernel mode now keeps each kernel's map; size flag <code>KC_OPT_LEVEL</code></td></tr>
+<tr><td>Fabric routing</td><td><span class="tag gen">aiehlc</span> + hand</td><td>conv2dstem's generated 4×4 routing; memory-tile splices and the MT_A fill channel added by hand</td></tr>
+<tr><td>Netboot (fast ELF load) and the board harness</td><td><span class="tag gen">aiehlc</span></td><td>from <code>main-1014</code>; staging extended for ELFs over 94 MB</td></tr>
+<tr><td>Route A: 24 Whisper layer libraries</td><td><span class="tag gen">aiehlc compiler</span></td><td>generated from <code>GemmSpace</code>/<code>RowSpace</code> templates; compile + x86 verified</td></tr>
+<tr><td>Engine kernel (<code>eng/kernel.cc</code>, two programs)</td><td><span class="tag hw">hand</span></td><td>4×2-blocked bf16 <code>mmul</code> GEMM, epilogues, folded LayerNorm, flash attention</td></tr>
+<tr><td>Op contract (<code>eng/we_desc.h</code>)</td><td><span class="tag hw">hand</span></td><td>header words, layouts, flags</td></tr>
+<tr><td>Host engine library (<code>eng/we_host.h</code>)</td><td><span class="tag hw">hand</span></td><td>op arming, streaming fills with memory-tile locks, BD banks and shadow cache, program swap</td></tr>
+<tr><td>Whisper driver (<code>eng/host.cc</code>)</td><td><span class="tag hw">hand</span></td><td>encoder/decoder schedule, greedy loop, checks and timing</td></tr>
+<tr><td>Weight packing + goldens (<code>gen_engine.py</code>), numerics model (<code>we_model.py</code>)</td><td><span class="tag hw">hand</span></td><td>fold LayerNorm, hi/lo split, pack into the DMA layouts</td></tr>
+<tr><td>Probes <code>m0</code>–<code>m7</code>, op tests <code>et1</code>–<code>et3</code></td><td><span class="tag hw">hand</span></td><td>measured mmul throughput, bandwidths, attention kernels, register-write cost</td></tr>
+</table>
+
+<!-- ===================================================================== -->
+<h2 id="perf">8. Performance and where the time goes</h2>
+
+<p>The metric is the encoder's useful bf16 MACs (20.24 G) over the 4×4 mesh peak: 16 cores × 256 MAC/cycle × 0.999 GHz = 4.1 TMAC/s. 30 % is about 16.5 ms.</p>
+
+<h3>Optimisation log (encoder, warm run)</h3>
+<table>
+<tr><th>Step</th><th class="num">Encoder</th><th class="num">% peak</th></tr>
+<tr><td>First full transcript on the board (memtile-fed engine)</td><td class="num">61.8 ms</td><td class="num">8.0</td></tr>
+<tr><td>Flash attention (32-row q-blocks, lazy max)</td><td class="num">48.9 ms</td><td class="num">10.1</td></tr>
+<tr><td>LayerNorm folded into GEMMs; 4×2 attention, in-place exp2 (5332 → ~2350 cycles per chunk)</td><td class="num">42.4 ms</td><td class="num">11.6</td></tr>
+<tr><td>Two programs + program swap, bank-aware core memory, 4×2 GEMM inner loop, BD shadow cache</td><td class="num">34.9 ms</td><td class="num">14.2</td></tr>
+<tr><td>Streaming fills (memory-tile locks), sub-ops queued ahead, next op prepared during the current one</td><td class="num">33.7 ms</td><td class="num">14.7</td></tr>
+</table>
+
+<h3>Measured limits</h3>
+<ul>
+<li><b>Host register writes</b> cost ~350 ns each on this board, and re-typing the aperture as Device-nGnRE does not change it (probe <code>m7</code>). Per-op set-up is hidden only by overlapping it with the running op.</li>
+<li><b>DDR</b> delivers ~10–12 GB/s for the whole array; the encoder moves ~150 MB, so DDR alone needs ~13 ms unless traffic is cut (e.g. keeping FC1's 4.7 MB output on chip).</li>
+<li><b>GEMM inner loop</b>: 1251 cycles per 64×48×48 chunk on the board (576 ideal); epilogues add ~18 % of core time.</li>
+<li><b>Attention</b>: ~2.2 ms per layer, of which ~0.65 ms is filling Q and K/V before compute starts.</li>
+</ul>
+
+<h3>Comparison: the ORT/VitisAI all-AIE decoder</h3>
+<p>The internal <a href="http://xsjpmteamserver50/md/decoder-option/layer-reuse/">layer-reuse report</a> runs Whisper tiny.en (same architecture, FP16) as seven ONNX graphs through VitisAI, one session per graph call. It measures 43.8 ms for one encoder call and 60.5 s for the JFK decode, of which 53.7 s is session construction. This engine keeps the kernel resident and does the same transcript in about 0.74 s.</p>
+
+<!-- ===================================================================== -->
+<h2 id="run">9. Build and run it</h2>
+<pre><code># 1. weights, goldens, expected tokens (needs the cached tiny.pt + JFK audio)
+python3 src/aietensorop/whisperengine/gen_engine.py
+
+# 2. build: two kernel programs + host ELF (~150 MB, weights embedded)
+bash src/aietensorop/whisperengine/build.sh eng $PWD/worklocal/whisperengine/build_eng
+
+# 3. run on VEK385 over netboot (ELFs over 94 MB stage at 0x50000000)
+python3 script/test/apppaltest.py -y -nonreboot --netload --netload-timeout-ms 1700000 \
+    worklocal/whisperengine/build_eng/aout/worklocal/build/host
+# look for: "WHISPER transcript MATCHES the PyTorch reference" and "PERF SUMMARY"</code></pre>
+<p>Op-level tests: <code>build.sh et1</code> (GEMM variants, folded LayerNorm), <code>et2</code> (attention), <code>et3</code> (conv stem, logits). Host timeline: build with <code>HDEFS=WE_TL</code>; core cycle split: <code>KDEFS=WE_PROF_G</code> or <code>WE_PROF_A</code>.</p>
+
+<!-- ===================================================================== -->
+<h2 id="traps">10. Traps found on the way</h2>
+<table>
+<tr><th>Symptom</th><th>Cause</th><th>Skill</th></tr>
+<tr><td><code>Overflow of program memory</code> at load though the build passed</td><td>16 KB program memory; the map's "Used" omits padding</td><td><code>aie2psprogrammemory</code></td></tr>
+<tr><td>one or two 64-byte lines of output wrong, different each run</td><td>dirty host cache lines evicted over DMA output</td><td><code>dmaoutputdirtycache</code></td></tr>
+<tr><td>memtile BD 25 rejected for channel 0</td><td>memory-tile BDs 0–23 serve even channels, 24–47 odd ones</td><td>—</td></tr>
+<tr><td>a fill BD stalls on a lock it never asked for</td><td><code>XAie_DmaSetLock</code> enables acquire and release together</td><td>—</td></tr>
+<tr><td>softmax loop 4× slower than its probe</td><td>in-place P over S defeats software pipelining; declared <code>restrict</code></td><td>—</td></tr>
+<tr><td>a 147 MB ELF refused by netboot</td><td>94 MB staging window; big ELFs now stage inside the app window</td><td><code>netbootsupervisor</code></td></tr>
+<tr><td>transcript flips one token</td><td>a near-tie in fp32 itself; bf16 decoder weights tip it — hi/lo weights</td><td><code>whisperaieoffload</code></td></tr>
+</table>
+
+<p class="sub">Source: <code>src/aietensorop/whisperengine/</code> (engine), <code>src/frontend/tvmrelay/example/whisper/</code> (compiler route). This page: <code>doc/web/whisper_aie/index.html</code>.</p>
+</main>
+</body>
+</html>

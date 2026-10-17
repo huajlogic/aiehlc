@@ -61,6 +61,11 @@ typedef struct {
     XAie_LocType tiles[16];
     double t_swap;
     unsigned nswap;
+    /* the last GEMM sub-op of an op is left running (we_gemm returns at once): the
+     * next op writes its BDs meanwhile; we_drain waits for it */
+    int pending, pract, rbank, fbank;
+    struct_ioevent pev[4];
+    XTime pt;
     int32_t *hdr;                 /* WE_HDR_BYTES DMA buffer per op slot */
     double t_fill, t_arm, t_run;  /* accumulated, us */
     unsigned seq;
@@ -75,13 +80,38 @@ static inline XAie_LocType we_shim(int c) { return XAie_TileLoc((uint8_t)c, 0); 
 static inline XAie_LocType we_mt(int k, int row) { return XAie_TileLoc((uint8_t)k, (uint8_t)row); }
 static inline double we_us(XTime a, XTime b) { return 1e6 * (double)(b - a) / COUNTS_PER_SECOND; }
 
+/* host timeline (WE_TL): events buffered, printed after a run (UART printing would
+ * distort it). Kinds: G op entry, p BDs prepared, d previous op drained, a/b stage
+ * arm start/end, w stage wait end, A attention round start, Z attention round end */
+#ifdef WE_TL
+#define WE_TL_N 4096
+static struct {
+    char k;
+    XTime t;
+} we_tl[WE_TL_N];
+static int we_tl_n;
+#define WE_EV(kind, time)                                                                                              \
+    do {                                                                                                               \
+        if (we_tl_n < WE_TL_N)                                                                                         \
+            we_tl[we_tl_n].k = (kind), we_tl[we_tl_n++].t = (time);                                                    \
+    } while (0)
+static void we_tl_print(void) {
+    for (int i = 0; i < we_tl_n; i++)
+        printf("%c%.0f%s", we_tl[i].k, i ? we_us(we_tl[i - 1].t, we_tl[i].t) : 0.0, i % 16 == 15 ? "\n" : " ");
+    printf("\n");
+    we_tl_n = 0;
+}
+#else
+#define WE_EV(kind, time)
+#endif
+
 /* ---- BD shadow ---------------------------------------------------------- */
 /* Every BD the host writes is remembered (parameters minus the buffer address).
  * Re-arming a BD with the same shape costs one address update (1-2 MMIO writes,
  * ~355 ns each: doc/performance/register_write_cost.md) instead of the full BD,
  * and an identical BD costs nothing. Only the host writes these BDs (the cores
  * program their own tile DMAs), so the shadow stays exact. */
-#define WE_SH_NP 20
+#define WE_SH_NP 20 /* >= the longest parameter list (we_mt_bdl: 18) */
 typedef struct {
     int valid;
     uint64_t addr;
@@ -157,9 +187,12 @@ static void we_sb_sync(WeEng *e) {
  * cores idle in main waiting for a header; the control-packet ELF load resets
  * cores and core DMAs, writes program + data memory as broadcast packets, and the
  * launch re-enables them. */
+static int we_drain(WeEng *e);
 static int we_prog(WeEng *e, int p) {
     if (e->cur == p || !e->prog[p] || !e->ctrl)
         return 0;
+    if (we_drain(e))
+        return -1;
     XTime t0, t1;
     XTime_GetTime(&t0);
     const XAie_LocType *t = e->tiles;
@@ -180,12 +213,15 @@ static int we_prog(WeEng *e, int p) {
 }
 
 /* ---- memtile ----------------------------------------------------------- */
-static void we_mt_bd(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t len, int nd, const uint32_t *st,
-                     const uint32_t *wr, uint32_t it_step, uint32_t it_wrap, int next) {
-    int32_t p[14] = {(int32_t)len, nd, (int32_t)it_step, (int32_t)it_wrap, next, 0x4D54};
+/* memtile BD; lka/lkr >= 0: acquire lka (-1: wait >= 1, decrement) before, release
+ * lkr by lkrv after (memtile-local lock ids) */
+static void we_mt_bdl(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t len, int nd, const uint32_t *st,
+                      const uint32_t *wr, uint32_t it_step, uint32_t it_wrap, int next, int lka, int lkr, int lkrv) {
+    int32_t p[18] = {(int32_t)len, nd,  (int32_t)it_step, (int32_t)it_wrap, next, 0x4D54, 0, 0, 0, 0, 0, 0, 0, 0, lka,
+                     lkr,          lkrv};
     for (int i = 0; i < nd && i < 4; i++)
         p[6 + 2 * i] = (int32_t)st[i], p[7 + 2 * i] = (int32_t)wr[i];
-    if (!we_shadow_check(e, t, bd, addr, p, 14))
+    if (!we_shadow_check(e, t, bd, addr, p, 18))
         return;
     XAie_DmaDesc d;
     XAie_DmaDescInit(e->dev, &d, t);
@@ -204,13 +240,26 @@ static void we_mt_bd(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t l
     }
     if (it_wrap > 1)
         XAie_DmaSetBdIteration(&d, it_step, (uint8_t)it_wrap, 0);
+    if (lka >= 0 || lkr >= 0) { /* XAie_DmaSetLock enables both sides: clear the unused one */
+        XAie_DmaSetLock(&d, XAie_LockInit((u16)(lka >= 0 ? lka : 0), (s8)(lka >= 0 ? -1 : 0)),
+                        XAie_LockInit((u16)(lkr >= 0 ? lkr : 0), (s8)(lkr >= 0 ? lkrv : 0)));
+        if (lka < 0)
+            d.LockDesc.LockAcqEn = 0, d.LockDesc.LockAcqVal = 0, d.LockDesc.LockAcqValEn = 0;
+        if (lkr < 0)
+            d.LockDesc.LockRelEn = 0, d.LockDesc.LockRelVal = 0, d.LockDesc.LockRelValEn = 0;
+    }
     if (next >= 0)
         XAie_DmaSetNextBd(&d, (uint8_t)next, XAIE_ENABLE);
     XAie_DmaEnableBd(&d);
     XAie_DmaWriteBd(e->dev, &d, t, (uint8_t)bd);
 }
+static void we_mt_bd(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t len, int nd, const uint32_t *st,
+                     const uint32_t *wr, uint32_t it_step, uint32_t it_wrap, int next) {
+    we_mt_bdl(e, t, bd, addr, len, nd, st, wr, it_step, it_wrap, next, -1, -1, 0);
+}
+/* memtile BDs 0..23 serve even channels, 24..47 odd ones: the BD picks the channel */
 static void we_mt_queue(WeEng *e, XAie_LocType t, XAie_DmaDirection dir, int bd, int repeat) {
-    XAie_DmaChannelSetStartQueue(e->dev, t, 0, dir, (uint8_t)bd, (uint32_t)repeat, XAIE_DISABLE);
+    XAie_DmaChannelSetStartQueue(e->dev, t, bd >= 24, dir, (uint8_t)bd, (uint32_t)repeat, XAIE_DISABLE);
 }
 static int we_wait_ch(WeEng *e, XAie_LocType t, int ch, XAie_DmaDirection dir) {
     u8 n = 1;
@@ -231,7 +280,7 @@ static void we_dump(WeEng *e) {
         for (int row = 0; row <= 6; row++)
             for (int ch = 0; ch < 2; ch++)
                 for (int d = 0; d < 2; d++) {
-                    if ((row == 1 || row == 2) && ch > 0)
+                    if ((row == 1 || row == 2) && ch > 0 && !(row == EF_MT_A_ROW && d == 0))
                         continue;
                     if (row >= 3 && d == 1 && ch > 0)
                         continue;
@@ -283,14 +332,29 @@ static int we_wait_out(WeEng *e, struct_ioevent ev) {
     }
 }
 
+static int we_drain(WeEng *e) {
+    if (!e->pending)
+        return 0;
+    e->pending = 0;
+    int rc = 0;
+    for (int r = 0; r < e->pract && !rc; r++)
+        rc |= we_wait_out(e, e->pev[r]);
+    XTime t;
+    XTime_GetTime(&t);
+    e->t_run += we_us(e->pt, t);
+    return rc;
+}
+
 static void we_init(WeEng *e, XAie_DevInst *dev) {
     memset(e, 0, sizeof(*e));
     e->dev = dev;
     e->hdr = (int32_t *)__Runtime_Alloc(WE_HDR_BYTES);
     for (int k = 1; k <= 4; k++)
         for (int row = EF_MT_A_ROW; row <= EF_MT_B_ROW; row++) {
-            XAie_DmaChannelEnable(dev, we_mt(k, row), 0, DMA_S2MM);
+            XAie_DmaChannelEnable(dev, we_mt(k, row), row == EF_MT_A_ROW, DMA_S2MM); /* MT_A fills: S2MM1 */
             XAie_DmaChannelEnable(dev, we_mt(k, row), 0, DMA_MM2S);
+            for (int l = 0; l < 16; l++) /* streaming-fill locks (we_gemm) start at 0 */
+                XAie_LockSetValue(dev, we_mt(k, row), XAie_LockInit((u16)l, 0));
         }
 }
 
@@ -355,16 +419,15 @@ typedef struct {
     int lnn; /* full N of lnd / lnc (a column chunk of a wider GEMM indexes into them) */
 } WeGemm;
 
-/* Column tiles per mesh column per sub-op: <= 4 (memtile task queue), 1 when
- * the op runs in M passes (keeps each core's output a 1-level BD iteration). */
+/* Column tiles per mesh column per sub-op: <= 2, so a sub-op's MT_B replay takes 2
+ * of the memtile channel's 4 queue slots and the next sub-op's can be queued
+ * while it runs (we_gemm); 1 when the op runs in M passes (keeps each core's
+ * output a 1-level BD iteration). Mirrored by gen_engine.gemm_nbs. */
 static inline int we_gemm_nbs(int n, int passes) {
     const int nbc = n / 192;
     if (passes > 1 || passes < 0) /* passes < 0: caller forces NB = 1 (row-major output) */
         return 1;
-    for (int d = 4; d > 1; d--)
-        if (nbc % d == 0)
-            return d;
-    return 1;
+    return nbc % 2 == 0 ? 2 : 1;
 }
 /* W [N][K] row-major (bf16) -> engine order. Returns elements per mesh column. */
 static size_t we_pack_w(bf16_t *dst, const bf16_t *w, int n, int k, int passes) {
@@ -387,9 +450,8 @@ static size_t we_pack_w(bf16_t *dst, const bf16_t *w, int n, int k, int passes) 
     return col;
 }
 
-static int we_gemm(WeEng *e, const WeGemm *g) {
-    if (we_prog(e, 1))
-        return -1;
+/* conv windows (conv1 / conv2): fill first, then replay -- the memtile write re-tiles the rows */
+static int we_gemm_legacy(WeEng *e, const WeGemm *g) {
     const int K = g->a->c, RB = g->a->rb, MB = RB / 64, KCN = K * (1 + g->wsplit) / 48;
     const int MBP = g->mbp ? g->mbp : MB, passes = MB / MBP;
     const int rm = (g->flags & WE_F_ROWMAJOR) != 0, lg = (g->flags & WE_F_LOGIT) != 0;
@@ -466,22 +528,22 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             if (!act && p > 0)
                 continue;
             const uint32_t tot = (uint32_t)(hdrs + (act && !g->conv_base ? a_pass + r_pass : 0));
-            we_mt_bd(e, ta, 0, EF_MT_BASE, tot, 0, 0, 0, 0, 0, -1);
-            we_mt_queue(e, ta, DMA_S2MM, 0, 1);
+            we_mt_bd(e, ta, 24, EF_MT_BASE, tot, 0, 0, 0, 0, 0, -1);
+            we_mt_queue(e, ta, DMA_S2MM, 24, 1);
             const int st[3] = {4, 1024, (int)tileb}, wa[3] = {256, 6 * MBP, K / 48};
             we_sh_bd(e, k, 12, hbuf, (int)hdrs, act ? 13 : -1, 0, 0, 0);
             if (act && g->conv_base) { /* rows t0.. of the windowed tensor, re-tiled by the memtile write */
                 const int t0 = r * RB + mb0 * 64, rows = MBP * 64, rowb = g->conv_len * 2;
-                we_mt_bd(e, ta, 0, EF_MT_BASE, (uint32_t)hdrs, 0, 0, 0, 0, 0, -1);
+                we_mt_bd(e, ta, 24, EF_MT_BASE, (uint32_t)hdrs, 0, 0, 0, 0, 0, -1);
                 const uint32_t cs[4] = {1, 16, (uint32_t)MBP * 1536, 4},
                                cw[4] = {4, 6, (uint32_t)(g->conv_len / 48), 4};
-                we_mt_bd(e, ta, 1, EF_MT_BASE + (uint32_t)hdrs, (uint32_t)(4 * rowb), 4, cs, cw, 96, 16 * MBP, -1);
-                we_mt_queue(e, ta, DMA_S2MM, 1, 16 * MBP);
+                we_mt_bd(e, ta, 25, EF_MT_BASE + (uint32_t)hdrs, (uint32_t)(4 * rowb), 4, cs, cw, 96, 16 * MBP, -1);
+                we_mt_queue(e, ta, DMA_S2MM, 25, 16 * MBP);
                 const int sd[3] = {4, g->conv_stride * 2, 0}, wd[3] = {rowb / 4, rows, 0};
                 we_sh_bd(e, k, 13, g->conv_base + (size_t)t0 * g->conv_stride, rows * rowb, res ? 14 : -1, 2, sd, wd);
                 if (res) {
-                    we_mt_bd(e, ta, 2, EF_MT_BASE + (uint32_t)(hdrs + a_pass), (uint32_t)r_pass, 0, 0, 0, 0, 0, -1);
-                    we_mt_queue(e, ta, DMA_S2MM, 2, 1);
+                    we_mt_bd(e, ta, 26, EF_MT_BASE + (uint32_t)(hdrs + a_pass), (uint32_t)r_pass, 0, 0, 0, 0, 0, -1);
+                    we_mt_queue(e, ta, DMA_S2MM, 26, 1);
                     const int wr[3] = {256, 6 * MBP, g->n / 48};
                     we_sh_bd(e, k, 14, we_tile(g->res, r, 0) + (size_t)mb0 * 64 * 48, (int)r_pass, -1, 3, st, wr);
                 }
@@ -497,7 +559,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
         we_sb_sync(e);
         for (int k = 1; k <= 4 && !rc; k++) {
             if (k <= g->ract || p == 0)
-                rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 0, DMA_S2MM);
+                rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 1, DMA_S2MM);
             if (p == 0)
                 rc |= we_wait_ch(e, we_mt(k, EF_MT_B_ROW), 0, DMA_S2MM);
         }
@@ -570,6 +632,293 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
     return rc;
 }
 
+/* ---- GEMM, streaming fill ----------------------------------------------
+ * The replay does not wait for the whole fill: memtile locks per block let the
+ * cores start on block 0 while DDR still delivers the rest.
+ *   MT_A (per pass): [headers][block 0: A (K/48 chunks) | res (N/48 chunks)][block 1]...
+ *     fill chain BD24..: headers (release L_H by NSUB), per block A (L_A(mb) by NBT),
+ *     res (L_R(mb) by NBT); replay BD1 header (acquire L_H) + chain BD2..: per block
+ *     A (acquire L_A(mb)), [A again for hi/lo weights], [4 res chunks, acquire L_R(mb),
+ *     iterating over nb], repeated NBS times (chain <= 11 BDs: two banks in 0..23; the
+ *     fill runs on S2MM1, BDs 24..).
+ *   MT_B (per op): fill chain BD8.. one per column panel (release L_B(i) by MB); the
+ *     replay BD 1+nb of a sub-op acquires its panel's lock once per M block.
+ * Every acquire is matched by a release: the locks are back at 0 after the op. */
+enum { WE_LK_H = 0, WE_LK_A = 1, WE_LK_R = 8, WE_LK_B = 0 };
+typedef struct {
+    int K, RB, MB, KCN, MBP, passes, NBS, NSUB, NSB, NBT, res, ws;
+    size_t a_pass, r_pass, hdrs, wcol, tileb, ablk, rblk;
+} WeGemmPlan;
+
+static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
+    P->K = g->a->c, P->RB = g->a->rb, P->MB = P->RB / 64, P->ws = g->wsplit;
+    P->KCN = P->K * (1 + P->ws) / 48;
+    P->MBP = g->mbp ? g->mbp : P->MB, P->passes = P->MB / P->MBP;
+    const int rm = (g->flags & WE_F_ROWMAJOR) != 0;
+    P->NBS = we_gemm_nbs(g->n, rm ? -1 : P->passes), P->NSUB = g->n / 192 / P->NBS, P->NSB = 4 * P->NBS;
+    P->NBT = g->n / 192;
+    P->res = g->res != 0;
+    P->ablk = (size_t)P->K * 128, P->rblk = P->res ? (size_t)g->n * 128 : 0; /* 64 rows x cols x 2 B */
+    P->a_pass = P->ablk * P->MBP, P->r_pass = P->rblk * P->MBP;
+    P->hdrs = (size_t)P->NSUB * WE_HDR_BYTES, P->wcol = (size_t)(g->n / 4) * P->K * (1 + P->ws);
+    P->tileb = (size_t)P->RB * 48 * 2;
+    if (P->MB % P->MBP || g->n % 192 || P->hdrs + P->a_pass + P->r_pass > EF_MT_BYTES || P->wcol * 2 > EF_MT_BYTES ||
+        (g->ract < 4 && P->passes > 1) || P->MBP > 6 || P->NBT > 8 || P->MBP * (1 + P->ws + P->res) > 11 ||
+        1 + P->MBP * (1 + P->res) > 24) {
+        printf("WE gemm: bad shape (N %d, passes %d, A %zu + res %zu, W %zu)\n", g->n, P->passes, P->a_pass, P->r_pass,
+               P->wcol * 2);
+        return -1;
+    }
+    return 0;
+}
+
+/* B: the column's whole weight slice, once per op; one memtile BD per panel */
+/* Phases: WE_BDS writes BD contents (a free bank: safe while the previous op still
+ * runs), WE_GO queues tasks and starts the shim (after it has finished). */
+enum { WE_BDS = 1, WE_GO = 2 };
+
+/* B: the column's whole weight slice, once per op; one memtile BD per panel (bank fb:
+ * BDs 8.. / 16..) */
+static void we_gemm_fill_b(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int fb, int ph) {
+    const uint32_t pan = (uint32_t)P->KCN * WE_B_CHUNK;
+    const int b0 = fb ? 16 : 8;
+    for (int k = 1; k <= 4; k++) {
+        XAie_LocType tb = we_mt(k, EF_MT_B_ROW);
+        if (ph & WE_BDS)
+            for (int i = 0; i < P->NBT; i++)
+                we_mt_bdl(e, tb, b0 + i, EF_MT_BASE + (uint32_t)i * pan, pan, 0, 0, 0, 0, 0,
+                          i + 1 < P->NBT ? b0 + i + 1 : -1, -1, WE_LK_B + i, P->MB);
+        if (ph & WE_GO) {
+            we_mt_queue(e, tb, DMA_S2MM, b0, 1);
+            we_sh_bd(e, k, 15, g->w + (size_t)(k - 1) * P->wcol, (int)(P->wcol * 2), -1, 0, 0, 0);
+            we_sh_start(e, k, 0, 15);
+        }
+    }
+}
+
+/* MT_A of pass p: headers, then block-major A (+ res); idle rows get the headers.
+ * Memtile S2MM1 BDs 24.. / 36.. (bank fb) */
+static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p, const int32_t *hbuf, int fb, int ph) {
+    const int mb0 = p * P->MBP, b0 = fb ? 36 : 24;
+    for (int k = 1; k <= 4; k++) {
+        const int r = k - 1, act = k <= g->ract;
+        if (!act && p > 0)
+            continue;
+        XAie_LocType ta = we_mt(k, EF_MT_A_ROW);
+        if (ph & WE_BDS) {
+            const int nfill = act ? P->MBP * (1 + P->res) : 0;
+            we_mt_bdl(e, ta, b0, EF_MT_BASE, (uint32_t)P->hdrs, 0, 0, 0, 0, 0, nfill ? b0 + 1 : -1, -1, WE_LK_H,
+                      P->NSUB);
+            for (int mb = 0, b = b0 + 1; mb < (act ? P->MBP : 0); mb++) {
+                const uint32_t base = EF_MT_BASE + (uint32_t)(P->hdrs + mb * (P->ablk + P->rblk));
+                const int last_a = !P->res && mb + 1 == P->MBP;
+                we_mt_bdl(e, ta, b, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, last_a ? -1 : b + 1, -1, WE_LK_A + mb,
+                          P->NBT);
+                b++;
+                if (P->res) {
+                    we_mt_bdl(e, ta, b, base + (uint32_t)P->ablk, (uint32_t)P->rblk, 0, 0, 0, 0, 0,
+                              mb + 1 == P->MBP ? -1 : b + 1, -1, WE_LK_R + mb, P->NBT);
+                    b++;
+                }
+            }
+        }
+        if (!(ph & WE_GO))
+            continue;
+        we_mt_queue(e, ta, DMA_S2MM, b0, 1);
+        we_sh_bd(e, k, 12, hbuf, (int)P->hdrs, -1, 0, 0, 0);
+        we_sh_start(e, k, 1, 12);
+        if (!act)
+            continue;
+        /* block mb: for each K tile its 6 KB of rows (d0 x d1), tiles at tileb; iterate mb */
+        const bf16_t *a = we_tile(g->a, r, 0) + (size_t)mb0 * 64 * 48;
+        XAie_DmaDesc d = we_shim_bd(e, we_shim(k), a, 13, (int)P->ablk, P->res ? 14 : -1, 0, 0, -1, 3, 4, 256, 1024, 6,
+                                    (int)P->tileb, P->K / 48, WE_BLK, P->MBP);
+        if (P->res)
+            we_shim_bd(e, we_shim(k), we_tile(g->res, r, 0) + (size_t)mb0 * 64 * 48, 14, (int)P->rblk, -1, 0, 0, -1, 3,
+                       4, 256, 1024, 6, (int)P->tileb, g->n / 48, WE_BLK, P->MBP);
+        __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d, 1, 13, DMA_MM2S), 13, P->MBP);
+    }
+}
+
+/* replays of sub-op s (outputs armed by the caller). Memtile MM2S0 BDs in bank bk --
+ * MT_A: header 1 / 0, chain 2.. / 13.. (<= 11); MT_B 1.. / 5.. -- so the next stage is
+ * armed and queued while this one runs */
+static void we_gemm_replay(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int s, int bk, int ph) {
+    const int hb = bk ? 0 : 1, o = bk ? 11 : 0, ob = bk ? 4 : 0;
+    for (int k = 1; k <= 4; k++) {
+        XAie_LocType ta = we_mt(k, EF_MT_A_ROW), tb = we_mt(k, EF_MT_B_ROW);
+        if (ph & WE_BDS)
+            we_mt_bdl(e, ta, hb, EF_MT_BASE + (uint32_t)s * WE_HDR_BYTES, WE_HDR_BYTES, 0, 0, 0, 0, 0, -1, WE_LK_H, -1,
+                      0);
+        if (ph & WE_GO)
+            we_mt_queue(e, ta, DMA_MM2S, hb, 1);
+        if (k <= g->ract) {
+            const int per = 1 + P->ws + P->res;
+            for (int mb = 0; mb < P->MBP && (ph & WE_BDS); mb++) {
+                const uint32_t base = EF_MT_BASE + (uint32_t)(P->hdrs + mb * (P->ablk + P->rblk));
+                const int b = o + 2 + mb * per, end = mb + 1 == P->MBP;
+                we_mt_bdl(e, ta, b, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, per > 1 || !end ? b + 1 : -1, WE_LK_A + mb,
+                          -1, 0);
+                if (P->ws) /* the same A chunks again, against Wl */
+                    we_mt_bdl(e, ta, b + 1, base, (uint32_t)P->ablk, 0, 0, 0, 0, 0, P->res || !end ? b + 2 : -1, -1, -1,
+                              0);
+                if (P->res) { /* 4 chunks (column c's tile s*NSB + c*NBS + nb), iterating nb */
+                    const uint32_t sr[3] = {1, 768, (uint32_t)(P->NBS * 1536)}, wr[3] = {768, 2, 4};
+                    we_mt_bdl(e, ta, b + per - 1, base + (uint32_t)P->ablk + (uint32_t)(s * P->NSB) * WE_BLK,
+                              4 * WE_BLK, 3, sr, wr, 1536, P->NBS, end ? -1 : b + per, WE_LK_R + mb, -1, 0);
+                }
+            }
+            if (ph & WE_GO)
+                we_mt_queue(e, ta, DMA_MM2S, o + 2, P->NBS);
+        }
+        const uint32_t pan = (uint32_t)P->KCN * WE_B_CHUNK;
+        for (int nb = 0; nb < P->NBS; nb++) {
+            const int i = s * P->NBS + nb;
+            if (ph & WE_BDS)
+                we_mt_bdl(e, tb, ob + 1 + nb, EF_MT_BASE + (uint32_t)i * pan, pan, 0, 0, 0, 0, 0, -1, WE_LK_B + i, -1,
+                          0);
+            if (ph & WE_GO)
+                we_mt_queue(e, tb, DMA_MM2S, ob + 1 + nb, P->MBP);
+        }
+    }
+}
+
+/* one header per sub-op, back to back in one DMA buffer (we_desc.h) */
+static int32_t *we_gemm_headers(WeEng *e, const WeGemm *g, const WeGemmPlan *P) {
+    /* two buffers: the previous op may still be running when this one is built */
+    static int32_t *hb[2];
+    static size_t hcap[2];
+    static int hi;
+    hi ^= 1;
+    if (hcap[hi] < P->hdrs) {
+        hb[hi] = (int32_t *)__Runtime_Alloc(P->hdrs);
+        hcap[hi] = P->hdrs;
+    }
+    int32_t *hbuf = hb[hi];
+    const int ln = g->lnd != 0, NSB = P->NSB;
+    for (int s = 0; s < P->NSUB; s++) {
+        int32_t *h = (int32_t *)((int8_t *)hbuf + (size_t)s * WE_HDR_BYTES);
+        memset(h, 0, WE_PRM_OFF);
+        h[WH_MAGIC] = WE_MAGIC;
+        h[WH_OP] = WE_OP_GEMM;
+        h[WH_SEQ] = (int32_t)e->seq++;
+        h[WH_RACT] = g->ract;
+        h[WH_MB] = P->MBP;
+        h[WH_NB] = P->NBS;
+        h[WH_KCN] = P->KCN;
+        h[WH_FLAGS] = g->flags | (g->bias || ln ? WE_F_BIAS : 0) | (P->res ? WE_F_RES : 0) | (ln ? WE_F_LN : 0);
+        h[WH_N] = NSB * 48;
+        h[WH_KT_LO] = g->kt_lo - s * NSB;
+        h[WH_KT_HI] = g->kt_hi - s * NSB;
+        h[WH_VT_LO] = g->vt_lo - s * NSB;
+        h[WH_VT_HI] = g->vt_hi - s * NSB;
+        h[WH_LRG] = g->lrg;
+        h[WH_KST] = P->K / 48;
+        const float eps = 1e-5f, invk = 1.0f / (float)P->K;
+        memcpy(&h[WH_LNEPS], &eps, 4);
+        memcpy(&h[WH_LNINVK], &invk, 4);
+        // parameters of this sub-op's NSB*48 columns: d fp32, then (LN) c_hi, c_lo bf16
+        float *d = (float *)((int8_t *)h + WE_PRM_OFF);
+        const size_t c0 = (size_t)s * NSB * 48;
+        for (int i = 0; i < NSB * 48; i++)
+            d[i] = ln ? g->lnd[c0 + i] : g->bias ? bf2f(g->bias[c0 + i]) : 0.0f;
+        if (ln) {
+            memcpy(d + NSB * 48, g->lnc + c0, (size_t)NSB * 48 * 2);
+            memcpy((bf16_t *)(d + NSB * 48) + NSB * 48, g->lnc + g->lnn + c0, (size_t)NSB * 48 * 2);
+        }
+    }
+    __Runtime_sync_for_dev(e->dev, hbuf, P->hdrs);
+    return hbuf;
+}
+
+static int we_gemm(WeEng *e, const WeGemm *g) {
+    if (we_prog(e, 1))
+        return -1;
+    if (g->conv_base) {
+        if (we_drain(e))
+            return -1;
+        return we_gemm_legacy(e, g);
+    }
+    WeGemmPlan P;
+    if (we_gemm_plan(g, &P))
+        return -1;
+    const int rm = (g->flags & WE_F_ROWMAJOR) != 0, lg = (g->flags & WE_F_LOGIT) != 0;
+    XTime t_op;
+    XTime_GetTime(&t_op);
+    const int32_t *hbuf = we_gemm_headers(e, g, &P);
+    /* while the previous op's last sub-op runs: this op's fill and first replay BDs,
+     * in the banks it is not using */
+    const int fb = e->fbank ^ 1, rb0 = e->rbank ^ 1;
+    we_gemm_fill_b(e, g, &P, fb, WE_BDS);
+    we_gemm_fill_a(e, g, &P, 0, hbuf, fb, WE_BDS);
+    we_gemm_replay(e, g, &P, 0, rb0, WE_BDS);
+    {
+        XTime t;
+        XTime_GetTime(&t);
+        WE_EV('G', t_op);
+        WE_EV('p', t);
+    }
+    if (we_drain(e))
+        return -1;
+    {
+        XTime t;
+        XTime_GetTime(&t);
+        WE_EV('d', t);
+    }
+    e->fbank = fb;
+    int st = 0; /* stage (pass, sub-op) counter: replay bank (rb0 + st) & 1 */
+    for (int p = 0; p < P.passes; p++) {
+        const int mb0 = p * P.MBP;
+        XTime p0, p1;
+        XTime_GetTime(&p0);
+        if (p == 0)
+            we_gemm_fill_b(e, g, &P, fb, WE_GO);
+        we_gemm_fill_a(e, g, &P, p, hbuf, fb, p == 0 ? WE_GO : WE_BDS | WE_GO);
+        XTime_GetTime(&p1);
+        e->t_fill += we_us(p0, p1);
+        for (int s = 0; s < P.NSUB; s++, st++) {
+            const int bk = (rb0 + st) & 1;
+            XTime q0, q1, q2;
+            XTime_GetTime(&q0);
+            struct_ioevent ev[4];
+            bf16_t *dst[4][4];
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++) {
+                    const int cb = s * P.NSB + c * P.NBS;
+                    dst[r][c] = rm   ? g->out_rm + ((size_t)r * P.RB + mb0 * 64) * g->n + cb * 48
+                                : lg ? (bf16_t *)(g->logits + (size_t)cb * 192)
+                                     : we_tile(g->out, r, cb) + (size_t)mb0 * 64 * 48;
+                }
+            if (rm)
+                we_arm_out(e, g->ract, dst, WE_BLK, P.MBP, 64 * g->n * 2, 96, 64, g->n * 2, ev);
+            else if (lg)
+                we_arm_out(e, g->ract, dst, 768, P.NBS, 768, 768, 1, 768, ev);
+            else
+                we_arm_out(e, g->ract, dst, WE_BLK, P.NBS * P.MBP, WE_BLK, 1024, 6, 1024, ev);
+            if (s == 0) /* the first stage of a pass (pass 0: BDs written above) */
+                we_gemm_replay(e, g, &P, 0, bk, p == 0 ? WE_GO : WE_BDS | WE_GO);
+            if (s + 1 < P.NSUB) /* queued behind s: the cores run on without a gap */
+                we_gemm_replay(e, g, &P, s + 1, bk ^ 1, WE_BDS | WE_GO);
+            XTime_GetTime(&q1);
+            e->t_arm += we_us(q0, q1);
+            WE_EV('a', q0);
+            WE_EV('b', q1);
+            if (p + 1 == P.passes && s + 1 == P.NSUB) { /* left running: see we_drain */
+                e->pending = 1, e->pract = g->ract, e->rbank = bk, e->pt = q1;
+                memcpy(e->pev, ev, sizeof(ev));
+                break;
+            }
+            for (int r = 0; r < g->ract; r++)
+                if (we_wait_out(e, ev[r]))
+                    return -1;
+            XTime_GetTime(&q2);
+            WE_EV('w', q2);
+            e->t_run += we_us(q1, q2);
+        }
+    }
+    return 0;
+}
+
 /* ---- attention ---------------------------------------------------------- */
 /* Column permutation of q/k/v/o (384 = 6 heads x 64): head h, dim d lives at
  * tile 2*(d/16) + h/3, kt (h%3)*2 + (d%16)/8, lane d%8 of the 8 48-col tiles, so
@@ -610,8 +959,15 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
 }
 
 static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int nqb[4], const int qb0[4]) {
-    if (we_prog(e, 2))
+    if (we_prog(e, 2) || we_drain(e))
         return -1;
+#ifdef WE_TL
+    {
+        XTime t;
+        XTime_GetTime(&t);
+        WE_EV('A', t);
+    }
+#endif
     const int RB = a->q->rb, KBPR = a->kv->rb / 64, rk = a->krows, NKC = KBPR * rk; /* 64-key chunks */
     const size_t tileb = (size_t)RB * 48 * 2, qtile = tileb, kvtile = (size_t)a->kv->rb * 48 * 2;
     const size_t kvrow = (size_t)(a->kv->c / 48) * kvtile; /* bytes between row blocks of kv */
@@ -641,8 +997,8 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     for (int k = 1; k <= 4; k++) {
         const int r = k - 1, act = k <= a->ract;
         XAie_LocType ta = we_mt(k, EF_MT_A_ROW), tb = we_mt(k, EF_MT_B_ROW);
-        we_mt_bd(e, ta, 0, EF_MT_BASE, (uint32_t)(WE_HDR_BYTES + (act ? 8 * qtile : 0)), 0, 0, 0, 0, 0, -1);
-        we_mt_queue(e, ta, DMA_S2MM, 0, 1);
+        we_mt_bd(e, ta, 24, EF_MT_BASE, (uint32_t)(WE_HDR_BYTES + (act ? 8 * qtile : 0)), 0, 0, 0, 0, 0, -1);
+        we_mt_queue(e, ta, DMA_S2MM, 24, 1);
         we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, act ? 13 : -1, 0, 0, 0);
         if (act)
             we_sh_bd(e, k, 13, we_tile(a->q, r, a->q_cb), (int)(8 * qtile), -1, 0, 0, 0);
@@ -670,7 +1026,7 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     we_sb_sync(e);
     int rc = 0;
     for (int k = 1; k <= 4 && !rc; k++) {
-        rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 0, DMA_S2MM);
+        rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 1, DMA_S2MM);
         if (nqb[k - 1])
             rc |= we_wait_ch(e, we_mt(k, EF_MT_B_ROW), 0, DMA_S2MM);
     }
@@ -702,6 +1058,7 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     e->t_fill += we_us(p0, p1);
     e->t_arm += we_us(p1, p2);
     e->t_run += we_us(p2, p3);
+    WE_EV('Z', p3);
     return rc;
 }
 

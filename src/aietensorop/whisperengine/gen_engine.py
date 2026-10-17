@@ -55,13 +55,11 @@ def head_perm():
 
 
 def gemm_nbs(n, passes):
+    """eng/we_host.h we_gemm_nbs"""
     nbc = n // 192
     if passes > 1 or passes < 0:
         return 1
-    for d in (4, 3, 2):
-        if nbc % d == 0:
-            return d
-    return 1
+    return 2 if nbc % 2 == 0 else 1
 
 
 def pack_w(w: np.ndarray, passes: int) -> np.ndarray:
@@ -191,7 +189,7 @@ def main():
         p = f"decoder.blocks.{l}.cross_attn"
         k, v = wt(p + ".key.weight"), wt(p + ".value.weight")
         add_gemm(f"x{l}_kv", torch.cat([k[perm], v[perm]]),
-                 torch.cat([torch.zeros(384), wt(p + ".value.bias")[perm]]), 1, hilo=True, ln="encoder.ln_post")
+                 torch.cat([torch.zeros(384), wt(p + ".value.bias")[perm]]), 2, hilo=True, ln="encoder.ln_post")
     # ---- decoder ----
     for l in range(4):
         p = f"decoder.blocks.{l}"

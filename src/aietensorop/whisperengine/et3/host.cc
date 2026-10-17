@@ -78,7 +78,7 @@ int main() {
     WeGemm g1 = {&a1, w1p, b1, 0, 0, 384, WE_F_GELU | WE_F_ROWMAJOR, 0, 0, 4, 4, 0, 0, mel, 80, 240, x1 + 384, 0};
     XTime t0, t1, t2;
     XTime_GetTime(&t0);
-    if (we_gemm(&e, &g1))
+    if (we_gemm(&e, &g1) || we_drain(&e))
         return 1;
     XTime_GetTime(&t1);
     // conv2: A row t' = x1[(2t') * 384 .. + 1152], + pos residual (BLK)
@@ -89,7 +89,7 @@ int main() {
     __Runtime_sync_for_dev(dev, pos.p, (size_t)1536 * 384 * 2);
     WeAct a2 = {0, 384, 1152};
     WeGemm g2 = {&a2, w2p, b2, &pos, &x, 384, WE_F_GELU, 0, 0, 4, 2, 0, 0, x1, 768, 1152, 0, 0};
-    if (we_gemm(&e, &g2))
+    if (we_gemm(&e, &g2) || we_drain(&e))
         return 1;
     XTime_GetTime(&t2);
     printf("ET3 conv1 %.1f us, conv2 %.1f us (fill %.1f arm %.1f run %.1f)\n", we_us(t0, t1), we_us(t1, t2), e.t_fill,
@@ -144,7 +144,7 @@ int main() {
     __Runtime_sync_for_dev(dev, lg, 1536 / 48 * 768);
     WeGemm g3 = {&xl, Ep, 0, 0, 0, 1536, WE_F_LOGIT, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, lg};
     XTime_GetTime(&t0);
-    if (we_gemm(&e, &g3))
+    if (we_gemm(&e, &g3) || we_drain(&e))
         return 1;
     XTime_GetTime(&t1);
     __Runtime_sync_for_cpu(dev, lg, 1536 / 48 * 768);

@@ -84,7 +84,7 @@ static int gemm(const WeAct *a, size_t w, size_t b, size_t ln, const WeAct *res,
 static int gemm_kv(const WeAct *a, size_t w, size_t ln, const WeAct *out) {
     g_kt0 = 0;
     g_ws = 1;
-    const int rc = gemm(a, w, 0, ln, 0, out, 768, WE_F_KT | WE_F_VT, 0, 4);
+    const int rc = gemm(a, w, 0, ln, 0, out, 768, WE_F_KT | WE_F_VT, 3, 4); /* 2 passes: hi/lo chain <= 11 BDs */
     g_ws = 0;
     g_kt0 = 8;
     return rc;
@@ -116,6 +116,7 @@ static int attn(const WeAct *q, const WeAct *kv, int kt, int vt, const WeAct *o,
 
 // bf16 tensors vs golden: count elements more than 2 bf16 ulp apart (rows < valid)
 static int check(const char *name, const WeAct *t, size_t goff, int valid) {
+    we_drain(&g_e); /* the last GEMM may still be running */
     __Runtime_sync_for_cpu(g_dev, t->p, we_act_bytes(t));
     const bf16_t *g = (const bf16_t *)(wn_gold + goff);
     long far = 0, n = 0;
@@ -184,16 +185,20 @@ static int encoder(Enc *E, int verify) {
     for (int l = 0; l < 4; l++)
         if (PT(P_XKV, gemm_kv(&E->x, xkv[l][0], xkv[l][1], &E->kvx[l])))
             return -1;
+    if (PT(P_XKV, we_drain(&g_e)))
+        return -1;
     return (int)(now_us() - t0);
 }
 
 // token embedding row from the packed logits weight: slices of WN_LOGIT_SLICE rows,
 // W' = [hi | lo] of gamma_ln (.) E (K' = 768, the final LayerNorm folded in), we_pack_w
-// order with NB = 4, 1 sub-op; E = (hi + lo) / gamma_ln in fp32 (we_model emb_lookup)
+// order (row tile T = (sub * 4 + c) * NBS + nb); E = (hi + lo) / gamma_ln in fp32
+// (we_model emb_lookup)
 static void emb_row(int tok, float *out) {
     const bf16_t *gam = W(WN_LND_G);
     const int s = tok / WN_LOGIT_SLICE, n = tok % WN_LOGIT_SLICE, kcn = 16;
-    const int c = n / 192, nb = (n % 192) / 48, nt = (n % 48) / 8, nn = n % 8;
+    const int nbs = we_gemm_nbs(WN_LOGIT_SLICE, 1), T = n / 48, sub = T / (4 * nbs);
+    const int c = (T / nbs) % 4, nb = sub * nbs + T % nbs, nt = (n % 48) / 8, nn = n % 8;
     const size_t col = (size_t)WN_LOGIT_SLICE / 4 * 768;
     const bf16_t *base = W(WN_EMB0_W + (size_t)s * (WN_EMB1_W - WN_EMB0_W)) + c * col;
     for (int k = 0; k < 384; k++) {
@@ -276,6 +281,8 @@ static int decode_step(Enc *E, Dec *D, const int *toks, int n, float *lg_out) {
             return -1;
     }
     const size_t nl = (size_t)WN_NSLICE * (WN_LOGIT_SLICE / 48) * 192;
+    if (we_drain(&g_e))
+        return -1;
     __Runtime_sync_for_cpu(g_dev, D->logits, nl * 4);
     int best = 0, second = 0;
     float bv = -1e30f, sv = -1e30f;
@@ -399,6 +406,11 @@ int main() {
                we_n_addr, we_n_skip, g_e.nswap, g_e.t_swap);
         we_n_full = we_n_addr = we_n_skip = 0;
         g_e.nswap = 0, g_e.t_swap = 0;
+#ifdef WE_TL
+        if (run == 2)
+            we_tl_print();
+        we_tl_n = 0;
+#endif
         printf("WHISPER encoder ops (us):");
         for (int k = 0; k < P_N; k++)
             printf(" %s %.0f", g_pn[k], g_pt[k]);

@@ -75,7 +75,7 @@ void routing(XAie_DevInst *v1) {
     if (v2) {
         int32_t v47 = XAie_EnableShimDmaToAieStrmPort(v1, XAie_TileLoc(1, 0), 7);
         int32_t v48 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(1, 0), SOUTH, 7, NORTH, 1);
-        int32_t v49 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(1, 1), SOUTH, 1, DMA, 0);    /* -> MT_A S2MM0 */
+        int32_t v49 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(1, 1), SOUTH, 1, DMA, 1); /* -> MT_A S2MM1 (BDs 24..47) */
         int32_t v49_mt = XAie_StrmConnCctEnable(v1, XAie_TileLoc(1, 1), DMA, 0, NORTH, 1); /* MT_A MM2S0 -> row */
         int32_t v50 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(1, 2), SOUTH, 1, NORTH, 1);
         int32_t v51 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(1, 3), SOUTH, 1, EAST, 1);
@@ -117,7 +117,7 @@ void routing(XAie_DevInst *v1) {
     if (v2) {
         int32_t v80 = XAie_EnableShimDmaToAieStrmPort(v1, XAie_TileLoc(2, 0), 7);
         int32_t v81 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(2, 0), SOUTH, 7, NORTH, 1);
-        int32_t v82 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(2, 1), SOUTH, 1, DMA, 0);    /* -> MT_A S2MM0 */
+        int32_t v82 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(2, 1), SOUTH, 1, DMA, 1); /* -> MT_A S2MM1 (BDs 24..47) */
         int32_t v82_mt = XAie_StrmConnCctEnable(v1, XAie_TileLoc(2, 1), DMA, 0, NORTH, 1); /* MT_A MM2S0 -> row */
         int32_t v83 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(2, 2), SOUTH, 1, NORTH, 1);
         int32_t v84 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(2, 3), SOUTH, 1, WEST, 3);
@@ -166,7 +166,8 @@ void routing(XAie_DevInst *v1) {
     if (v2) {
         int32_t v116 = XAie_EnableShimDmaToAieStrmPort(v1, XAie_TileLoc(3, 0), 7);
         int32_t v117 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(3, 0), SOUTH, 7, NORTH, 1);
-        int32_t v118 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(3, 1), SOUTH, 1, DMA, 0);    /* -> MT_A S2MM0 */
+        int32_t v118 =
+            XAie_StrmConnCctEnable(v1, XAie_TileLoc(3, 1), SOUTH, 1, DMA, 1); /* -> MT_A S2MM1 (BDs 24..47) */
         int32_t v118_mt = XAie_StrmConnCctEnable(v1, XAie_TileLoc(3, 1), DMA, 0, NORTH, 1); /* MT_A MM2S0 -> row */
         int32_t v119 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(3, 2), SOUTH, 1, NORTH, 1);
         int32_t v120 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(3, 3), SOUTH, 1, WEST, 3);
@@ -222,7 +223,8 @@ void routing(XAie_DevInst *v1) {
     if (v2) {
         int32_t v156 = XAie_EnableShimDmaToAieStrmPort(v1, XAie_TileLoc(4, 0), 7);
         int32_t v157 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(4, 0), SOUTH, 7, NORTH, 3);
-        int32_t v158 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(4, 1), SOUTH, 3, DMA, 0);    /* -> MT_A S2MM0 */
+        int32_t v158 =
+            XAie_StrmConnCctEnable(v1, XAie_TileLoc(4, 1), SOUTH, 3, DMA, 1); /* -> MT_A S2MM1 (BDs 24..47) */
         int32_t v158_mt = XAie_StrmConnCctEnable(v1, XAie_TileLoc(4, 1), DMA, 0, NORTH, 3); /* MT_A MM2S0 -> row */
         int32_t v159 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(4, 2), SOUTH, 3, NORTH, 3);
         int32_t v160 = XAie_StrmConnCctEnable(v1, XAie_TileLoc(4, 3), SOUTH, 3, NORTH, 3);

@@ -47,7 +47,7 @@ static int test(WeEng *e, const char *name, int rb, int rows, int causal, int ra
     we_pack_w(wq, wp, 1152, 384, 1);
     __Runtime_sync_for_dev(e->dev, wq, (size_t)1152 * 384 * 2);
     WeGemm g = {&x, wq, 0, 0, &qkv, 1152, WE_F_KT | WE_F_VT, 8, 16, ract, 0, 16, 24};
-    if (we_gemm(e, &g))
+    if (we_gemm(e, &g) || we_drain(e))
         return 1;
     memset(o.p, 0xFF, we_act_bytes(&o));
     __Runtime_sync_for_dev(e->dev, o.p, we_act_bytes(&o));
