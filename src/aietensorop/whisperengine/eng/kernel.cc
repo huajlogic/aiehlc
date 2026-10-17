@@ -511,13 +511,6 @@ __attribute__((always_inline)) static inline V32 row_sum8(const V32 &v) {
 }
 
 // ---- attention ------------------------------------------------------------------
-__attribute__((noinline)) static V32 row_max8(const V32 &v) {
-    V32 t = aie::max(v, aie::shuffle_down(v, 4));
-    t = aie::max(t, aie::shuffle_down(t, 2));
-    t = aie::max(t, aie::shuffle_down(t, 1));
-    return aie::concat(aie::broadcast<float, 8>(t[0]), aie::broadcast<float, 8>(t[8]), aie::broadcast<float, 8>(t[16]),
-                       aie::broadcast<float, 8>(t[24]));
-}
 
 // S - m [32x64] = Q[32x64] K^T chunk[64x64] - m: Q [rg8][kd8][32], K [kd8][kp8][64],
 // S [rg8][kp8][32]. 4x2 register blocking (4 row groups x 2 key tiles), the
@@ -661,22 +654,39 @@ static void pow2scale(float *v, const int32 *k, unsigned n, unsigned per) {
         pow2one(v + i * 32, k + (i / per) * 32);
 }
 
-// One row group of a raise: k = round(max) + 1 where the row max passes thr (else
-// 0), m += k, k -> kout. The fp32 magic-number trick (x + 1.5*2^23 holds round(x)
-// in the low mantissa bits) needs no float<->int conversion.
-__attribute__((noinline)) static void raise_rg(const float *Srg, float *m, int32 *kout, float thr) {
-    V32 lmax = aie::load_v<32>(Srg);
-    for (unsigned kp = 1; kp < 8; kp++)
-        lmax = aie::max(lmax, aie::load_v<32>(Srg + kp * 32));
-    const V32 x = row_max8(lmax), mg = aie::broadcast<float, 32>(12582912.0f);
-    const aie::vector<int32, 32> ki = aie::add(
-        aie::sub(aie::add(x, mg).template cast_to<int32>(), aie::broadcast<int32, 32>((int32)0x4B400000)), (int32)1);
-    const aie::vector<int32, 32> k =
-        aie::select(aie::zeros<int32, 32>(), ki, aie::gt(x, aie::broadcast<float, 32>(thr)));
-    aie::store_v(kout, k);
-    aie::store_v(
-        m, aie::add(aie::load_v<32>(m),
+// A raise over the 8 row groups: per row k = round(max) + 1 where the row max passes
+// thr (else 0), m += k, k -> kout. The row max stays in vector registers (reduce
+// down by 4/2/1 lanes, then spread lane 8i back over its 8 lanes with shifts and
+// selects); the fp32 magic-number trick (x + 1.5*2^23 holds round(x) in the low
+// mantissa bits) needs no float<->int conversion.
+__attribute__((noinline)) static void raise_all(const float *__restrict S, int32 *__restrict kout, float thr) {
+    const V32 mg = aie::broadcast<float, 32>(12582912.0f), th = aie::broadcast<float, 32>(thr);
+    const aie::mask<32> s1 = aie::mask<32>::from_uint32(0x02020202u), s2 = aie::mask<32>::from_uint32(0x0C0C0C0Cu),
+                        s4 = aie::mask<32>::from_uint32(0xF0F0F0F0u);
+    for (unsigned rg = 0; rg < 8; rg++)
+        chess_prepare_for_pipelining chess_loop_range(8, 8) {
+            const float *Srg = S + rg * 8 * 32;
+            V32 t = aie::load_v<32>(Srg);
+            for (unsigned kp = 1; kp < 8; kp++)
+                chess_unroll_loop() t = aie::max(t, aie::load_v<32>(Srg + kp * 32));
+            t = aie::max(t, aie::shuffle_down(t, 4));
+            t = aie::max(t, aie::shuffle_down(t, 2));
+            t = aie::max(t, aie::shuffle_down(t, 1)); /* lane 8i: row i's max */
+            t = aie::select(t, aie::shuffle_up(t, 1), s1);
+            t = aie::select(t, aie::shuffle_up(t, 2), s2);
+            const V32 x = aie::select(t, aie::shuffle_up(t, 4), s4);
+            const aie::vector<int32, 32> ki = aie::add(
+                aie::sub(aie::add(x, mg).template cast_to<int32>(), aie::broadcast<int32, 32>((int32)0x4B400000)),
+                (int32)1);
+            const aie::vector<int32, 32> k = aie::select(aie::zeros<int32, 32>(), ki, aie::gt(x, th));
+            aie::store_v(kout + rg * 32, k);
+            float *m = ML(0, rg);
+            aie::store_v(
+                m,
+                aie::add(
+                    aie::load_v<32>(m),
                     aie::sub(aie::add(k, aie::broadcast<int32, 32>((int32)0x4B400000)).template cast_to<float>(), mg)));
+        }
 }
 
 // Reference raise -- every row on a q-block's first chunk (m = l = O = 0 then), else
@@ -689,10 +699,11 @@ __attribute__((noinline)) static void att_raise(const bfloat16 *Q, const bfloat1
     if (mk->on)
         att_mask(S, 0, 8, mk);
     int32 *k = (int32 *)ML(2, 0);
-    for (unsigned rg = 0; rg < 8; rg++)
-        raise_rg(S + rg * 8 * 32, ML(0, rg), k + rg * 32, first ? -3.0e38f : WE_SM_LAZY);
-    pow2scale(ML(1, 0), k, 8, 1);
-    pow2scale(O, k, 64, 8);
+    raise_all(S, k, first ? -3.0e38f : WE_SM_LAZY);
+    if (!first) { /* first chunk: l = O = 0, and 0 * 2^-k is 0 -- nothing to rescale */
+        pow2scale(ML(1, 0), k, 8, 1);
+        pow2scale(O, k, 64, 8);
+    }
     att_qk(Q, K, S);
     if (mk->on)
         att_mask(S, 0, 8, mk);
@@ -707,29 +718,54 @@ __attribute__((noinline)) static void att_scores(const bfloat16 *Q, const bfloat
     if (first) {
         vzero(ML(0, 0), 8);
     } else {
+        WE_T(s0);
         att_qk(Q, K, S);
+        WE_T(s1);
         if (mk->on)
             att_mask(S, 0, 8, mk);
-        if (!att_exp(S, P))
+        const unsigned big = att_exp(S, P);
+        WE_T(s2);
+        WE_ACCA(10, s1 - s0);
+        WE_ACCA(11, s2 - s1);
+        WE_ACCA(12, 1);
+        if (!big)
             return;
+        WE_ACCA(13, 1);
     }
     att_raise(Q, K, S, O, mk, first);
     att_exp(S, P);
 }
 
-__attribute__((noinline)) static void att_finish(const float *O, bfloat16 *out) {
-    // 1/l per row (l holds the row sum in every lane) into ML(2): bit-trick seed
-    // (rel. err < 12.5%) + 3 Newton steps, vector ops only
-    for (unsigned i = 0; i < 24; i++) {
-        const unsigned rg = i & 7;
-        const V32 ls = aie::load_v<32>(ML(1, rg));
-        V32 il = i < 8 ? aie::sub(aie::broadcast<int32, 32>(0x7EF311C7), ls.template cast_to<int32>())
-                             .template cast_to<float>()
-                       : aie::load_v<32>(ML(2, rg));
-        aie::store_v(ML(2, rg), fmul(il, aie::sub(aie::broadcast<float, 32>(2.0f), fmul(ls, il))));
-    }
+// 1/l per row (l holds the row sum in every lane): bit-trick seed (rel. err < 12.5%)
+// + 3 Newton steps, then out = bf16(O / l). Inline multiplies in pipelined loops:
+// through the out-of-line fmul this took ~10k cycles per q-block.
+__attribute__((noinline)) static void att_finish(const float *__restrict O, bfloat16 *__restrict out) {
+    float *il = ML(2, 0);
+    const V32 two = aie::broadcast<float, 32>(2.0f);
+    for (unsigned rg = 0; rg < 8; rg++)
+        chess_prepare_for_pipelining chess_loop_range(8, 8) {
+            const V32 ls = aie::load_v<32>(ML(1, rg));
+            V32 x =
+                aie::sub(aie::broadcast<int32, 32>(0x7EF311C7), ls.template cast_to<int32>()).template cast_to<float>();
+            for (unsigned n = 0; n < 3; n++)
+                chess_unroll_loop() x =
+                    aie::mul(x, aie::sub(two, aie::mul(ls, x).template to_vector<float>())).template to_vector<float>();
+            const VB xh = to_bf16(x);
+            aie::store_v((bfloat16 *)il + rg * 64, xh);
+            aie::store_v((bfloat16 *)il + rg * 64 + 32, to_bf16(aie::sub(x, to_f32(xh))));
+        }
+    /* O / l = O_hi x il_hi + O_hi x il_lo + O_lo x il_hi: native bf16 products, fp32 sum */
+    const bfloat16 *ib = (const bfloat16 *)il;
     for (unsigned i = 0; i < 64; i++)
-        aie::store_v(out + i * 32, to_bf16(fmul(aie::load_v<32>(O + i * 32), aie::load_v<32>(ML(2, i >> 3)))));
+        chess_prepare_for_pipelining chess_loop_range(64, 64) {
+            const V32 ov = aie::load_v<32>(O + i * 32);
+            const VB oh = to_bf16(ov), ol = to_bf16(aie::sub(ov, to_f32(oh)));
+            const VB ih = aie::load_v<32>(ib + (i >> 3) * 64), lo = aie::load_v<32>(ib + (i >> 3) * 64 + 32);
+            aie::accum<accfloat, 32> acc = aie::mul(oh, ih);
+            acc = aie::mac(acc, oh, lo);
+            acc = aie::mac(acc, ol, ih);
+            aie::store_v(out + i * 32, acc.template to_vector<bfloat16>());
+        }
 }
 
 __attribute__((noinline)) static void op_attn(const int32_t *h) {
@@ -738,11 +774,22 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
     LK_REL(EF_LK_IN_EMPTY, 1); /* header consumed */
     cfg_s2mm(0, EF_BD_IN_PING, EF_BD_IN_PONG, AT_A0, AT_A1, WE_Q_CHUNK, EF_LK_IN_EMPTY, EF_LK_IN_FULL,
              (unsigned)(4 * steps));
-    if (nqb) /* K/V channel is armed per q-block: the start-queue repeat field is 8 bits */
+    if (nqb) {
         cfg_out_at(AT_S, WE_Q_CHUNK, (unsigned)nqb);
+        /* K/V for every q-block, armed once: the start-queue repeat field is 8 bits, so
+         * the ping-pong pairs go in as several queue entries (task queue depth 4) --
+         * re-arming per q-block stalled each q-block's first chunk on the restart */
+        cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AT_B0, AT_B1, WE_KV_CHUNK, EF_LK_W_EMPTY, EF_LK_W_FULL, 2);
+        for (unsigned left = (unsigned)(NKC * nqb) - 1; left;) {
+            const unsigned r = left > 240 ? 240 : left;
+            ch_start(1, 0, EF_BD_W_PING, r);
+            left -= r;
+        }
+    }
     float *S = AR(AT_S, float), *O = AR(AT_O, float);
     unsigned ia = 0, ib = 0;
     for (int st = 0; st < steps; st++) {
+        WE_T(sb0);
         bfloat16 *Q = AR(AT_Q, bfloat16);
         for (int c = 0; c < 4; c++) {
             LK_ACQ(EF_LK_IN_FULL, 1);
@@ -753,13 +800,12 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
         }
         if (st >= nqb)
             continue;
-        out_drained(); /* the previous q-block's O left from AT_S */
-        cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AT_B0, AT_B1, WE_KV_CHUNK, EF_LK_W_EMPTY, EF_LK_W_FULL,
-                 (unsigned)(2 * NKC));
+        out_drained();      /* the previous q-block's O left from AT_S */
         vzero(ML(1, 0), 8); /* l; m is set by the first chunk */
         vzero(O, WE_QB * 64 / 32);
         const int qrow0 = q0 + st * WE_QB;
         WE_T(tq0);
+        WE_ACCA(15, tq0 - sb0);
         AttMask mk = {0, T, causal, qrow0, 0};
         for (int kc = 0; kc < NKC; kc++) {
             LK_ACQ(EF_LK_W_FULL, 1);
@@ -784,7 +830,10 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
         }
         WE_ACCA(8, aie::tile::current().cycles() - tq0);
         LK_ACQ(EF_LK_OUT_EMPTY, 1);
+        WE_T(f0);
         att_finish(O, AR(AT_S, bfloat16));
+        WE_T(f1);
+        WE_ACCA(14, f1 - f0);
         chess_memory_fence();
         LK_REL(EF_LK_OUT_FULL, 1);
     }

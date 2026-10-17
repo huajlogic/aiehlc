@@ -413,12 +413,16 @@ int main() {
                     "WHISPER attn core(1,3): %u chunks, per chunk qk %u softmax %u pv %u, q-block total/chunk %u cyc\n",
                     w[9], w[5] / w[9], w[6] / w[9], w[7] / w[9], w[8] / w[9]);
             if (w[12])
+                printf("WHISPER attn core(1,3): %u plain chunks: qk %u exp+mask %u cyc; %u lazy raises; per q-block "
+                       "finish %u, Q/drain/zero %u cyc\n",
+                       w[12], w[10] / w[12], w[11] / w[12], w[13], w[14] / (w[9] / 24), w[15] / (w[9] / 24));
+            if (w[12])
                 printf("WHISPER gemm core(1,3): %u chunks, mac_chunk %u cyc/chunk, epilogue %u cyc total, op total %u "
                        "cyc (mac %.0f%%)\n",
                        w[12], w[10] / w[12], w[13], w[11], 100.0 * w[10] / (w[11] ? w[11] : 1));
             for (int r = 3; r <= 6; r++)
                 for (int c = 1; c <= 4; c++)
-                    for (int i = 5; i < 14; i++)
+                    for (int i = 5; i < 16; i++)
                         XAie_DataMemWrWord(g_dev, XAie_TileLoc((u8)c, (u8)r), 0x07C0 + 4 * i, 0);
         }
         printf("WHISPER BD writes: %lu new, %lu partial, %lu unchanged (%lu words); %u program swaps %.0f us\n",
