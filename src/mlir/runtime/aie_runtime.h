@@ -917,6 +917,11 @@ void __Runtime_ctrl_high_throughput_enable(int on);
 
 void __Runtime_ctrl_shim_bd_begin(__Runtime_CtrlRowFabric *f);
 void __Runtime_ctrl_shim_bd_commit(void);
+// commit + wait for the batch's ack: every captured shim register write has
+// landed (callers that poll DMA state themselves, not via __Runtime_wait_io)
+void __Runtime_ctrl_shim_bd_sync(void);
+// device (DMA) address of a host buffer from __Runtime_Alloc (the pointer itself if unknown)
+uint64_t __Runtime_dev_addr(void *p);
 void __Runtime_ctrl_shim_bd_ctrl_stats_print(void);
 
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and

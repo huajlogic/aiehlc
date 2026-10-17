@@ -17,7 +17,7 @@
 #include <math.h>
 #include <stdlib.h>
 
-extern unsigned char _binary_kernel_eng_start[];
+extern unsigned char _binary_kernel_eng_start[], _binary_kernel_att_start[];
 #define INCBIN(sym, path)                                                                                              \
     __asm__(".section .rodata\n.balign 64\n.global " #sym "\n" #sym ":\n.incbin \"" path "\"\n.previous\n")
 INCBIN(wn_blob, WN_BLOB_PATH);
@@ -45,13 +45,14 @@ static double now_us(void) {
 static int g_trace = 1;
 /* per-op-type wall time of the encoder (us); LayerNorms are folded into qkv / fc1 / xkv */
 enum { P_CONV, P_QKV, P_ATTN, P_OUT, P_FC1, P_FC2, P_XKV, P_N };
-static double g_pt[P_N];
+static double g_pt[P_N], g_pf[P_N], g_pa[P_N], g_pr[P_N]; /* wall, fill, arm, run */
 static const char *g_pn[P_N] = {"conv", "qkv", "attn", "out", "fc1", "fc2", "xkv"};
 #define PT(k, call)                                                                                                    \
     ({                                                                                                                 \
-        const double _t0 = now_us();                                                                                   \
+        const double _t0 = now_us(), _f = g_e.t_fill, _a = g_e.t_arm, _r = g_e.t_run;                                  \
         const int _rc = (call);                                                                                        \
         g_pt[k] += now_us() - _t0;                                                                                     \
+        g_pf[k] += g_e.t_fill - _f, g_pa[k] += g_e.t_arm - _a, g_pr[k] += g_e.t_run - _r;                              \
         _rc;                                                                                                           \
     })
 #define TR(name) (g_trace ? printf("WE op %s\n", name) : 0)
@@ -306,14 +307,28 @@ static double enc_macs(void) {
 
 int main() {
     printf("=== Whisper-tiny on the AIE engine (4x4 mesh, kernel loaded once) ===\n");
+    // shim BDs over the control-packet plane (resnetengine's set-up): AIE2PS needs
+    // high-throughput mode for it, set before device init; spine on partition col 0
+    __Runtime_ctrl_high_throughput_enable(1);
+    __Runtime_ctrl_pmap_enable(0);
     g_dev = __Runtime_init_mesh_partition(0, EF_PART_START_COL, EF_PART_NUM_COLS);
+    static __Runtime_CtrlRowFabric fab;
+    static const __Runtime_CtrlRowChain fab_rows[] = {{3, 1, 4}, {4, 1, 4}, {5, 1, 4}, {6, 1, 4}};
+    __Runtime_ctrl_plan_init(&fab, g_dev, 0, 0, 1, fab_rows, 4);
+    __Runtime_ctrl_plan_set_exclusive(&fab, 1);
     XAie_LocType tiles[16];
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
             tiles[r * 4 + c] = XAie_TileLoc((uint8_t)(EF_FIRST_COL + c), (uint8_t)(EF_FIRST_ROW + r));
-    __Runtime_set_kernel_elf(_binary_kernel_eng_start);
-    __Runtime_launch_kernel_group(g_dev, __Runtime_load_kernel_group_nt(g_dev, tiles, 16));
     we_init(&g_e, g_dev);
+    g_e.ctrl = &fab;
+    g_e.prog[1] = _binary_kernel_eng_start, g_e.prog[2] = _binary_kernel_att_start;
+    memcpy(g_e.tiles, tiles, sizeof(tiles));
+    if (we_prog(&g_e, 1)) /* kernel load over the control-packet plane */
+        return 1;
+#ifdef WE_CTRL /* measured: no gain -- small batches pay the control-packet round trip */
+    g_e.fab = &fab;
+#endif
     __Runtime_sync_for_dev(g_dev, (void *)wn_blob, WN_BLOB_BYTES);
     { /* MMIO cost: 1000 writes to an unused memtile BD word, before / after re-typing */
         const u64 probe = XAie_GetTileAddr(g_dev, EF_MT_A_ROW, 1) + 0xA0000 + 47 * 0x20; /* memtile BD 47 word 0 */
@@ -352,7 +367,8 @@ int main() {
     double best_enc = 1e30;
     for (int run = 0; run < 3; run++) {
         g_e.t_fill = g_e.t_arm = g_e.t_run = 0;
-        memset(g_pt, 0, sizeof(g_pt));
+        memset(g_pt, 0, sizeof(g_pt)), memset(g_pf, 0, sizeof(g_pf)), memset(g_pa, 0, sizeof(g_pa));
+        memset(g_pr, 0, sizeof(g_pr));
         const int us = encoder(&E, run == 0);
         g_trace = 0;
         if (us < 0) {
@@ -365,20 +381,31 @@ int main() {
         { /* attention cycle split on core (1,3), accumulated over this encoder run */
             u32 w[16];
             for (int i = 0; i < 16; i++)
-                XAie_DataMemRdWord(g_dev, XAie_TileLoc(1, 3), 0xF400 + 4 * i, &w[i]);
+                XAie_DataMemRdWord(g_dev, XAie_TileLoc(1, 3), 0x07C0 + 4 * i, &w[i]);
             if (w[9])
                 printf(
                     "WHISPER attn core(1,3): %u chunks, per chunk qk %u softmax %u pv %u, q-block total/chunk %u cyc\n",
                     w[9], w[5] / w[9], w[6] / w[9], w[7] / w[9], w[8] / w[9]);
+            if (w[12])
+                printf("WHISPER gemm core(1,3): %u chunks, mac_chunk %u cyc/chunk, epilogue %u cyc total, op total %u "
+                       "cyc (mac %.0f%%)\n",
+                       w[12], w[10] / w[12], w[13], w[11], 100.0 * w[10] / (w[11] ? w[11] : 1));
             for (int r = 3; r <= 6; r++)
                 for (int c = 1; c <= 4; c++)
-                    for (int i = 5; i < 10; i++)
-                        XAie_DataMemWrWord(g_dev, XAie_TileLoc((u8)c, (u8)r), 0xF400 + 4 * i, 0);
+                    for (int i = 5; i < 14; i++)
+                        XAie_DataMemWrWord(g_dev, XAie_TileLoc((u8)c, (u8)r), 0x07C0 + 4 * i, 0);
         }
+        printf("WHISPER BD writes: %lu full, %lu address-only, %lu skipped; %u program swaps %.0f us\n", we_n_full,
+               we_n_addr, we_n_skip, g_e.nswap, g_e.t_swap);
+        we_n_full = we_n_addr = we_n_skip = 0;
+        g_e.nswap = 0, g_e.t_swap = 0;
         printf("WHISPER encoder ops (us):");
         for (int k = 0; k < P_N; k++)
             printf(" %s %.0f", g_pn[k], g_pt[k]);
         printf("\n");
+        for (int k = 0; k < P_N; k++)
+            printf("WHISPER   %-5s wall %6.0f  fill %6.0f  arm %6.0f  run %6.0f us\n", g_pn[k], g_pt[k], g_pf[k],
+                   g_pa[k], g_pr[k]);
     }
     // decoder: greedy from the start-of-transcript prompt
     int toks[64], n = 0;

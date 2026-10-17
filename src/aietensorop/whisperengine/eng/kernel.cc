@@ -16,43 +16,76 @@
 #include "engine_fabric.h"
 #include "we_desc.h"
 
-/* One arena, carved per op (offsets below). The header always lands in A0.
- * The GELU table sits in two fixed 8 KB-aligned spots (aieml.bcf) so its two
- * copies are in different banks, as aie::lut<4> requires. */
-#define AR_A0 0x0000  /* A ping 6 KB (header too) */
-#define AR_A1 0x1800  /* A pong 6 KB              */
-#define AR_B0 0x3000  /* B ping 4.5 KB            */
-#define AR_B1 0x4200  /* B pong 4.5 KB            */
-#define AR_C 0x5400   /* GEMM accumulators 12 KB  */
-#define AR_OUT 0x8400 /* output block 6 KB        */
-#define AR_PRM 0x9C00 /* own tiles' params 1.5 KB: d fp32 [NB*48], c_hi, c_lo bf16 [NB*48] */
-#define AR_TMP 0xA200 /* LN: per-row-group partial sums of x, x^2 (2 KB) */
-#define AR_ST 0xAA00  /* LN: mu, rstd per row of the op's blocks [MB*64][2] (3 KB) */
-#define AR_BYTES 0xB600
-/* ATTN carve-up */
+/* One arena, carved per op (offsets below). Data memory is 8 banks of 8 KB
+ * (bank b = 0x70000 + b * 0x2000); buffers the core and the DMAs touch at the same
+ * time sit in different banks -- with A, B and C sharing banks mac_chunk ran 40%
+ * slower in the engine than in the standalone probe (m6).
+ *   bank 0: stack, we_dbg, A0          bank 1: A1, PRM | ATT: Q copy, m/l
+ *   bank 2: B0, TMP                    bank 3: B1, ST
+ *   banks 4-5: C | ATT: S, O           banks 6-7: GELU tables, OUT (we_out)
+ * The header always lands in A0 (8 KB: over A0 and the start of A1). The GELU
+ * table copies (aieml.bcf) are in different banks, as aie::lut<4> requires. */
+#define AR_A0 0x0000  /* A ping 6 KB (header too), bank 0 */
+#define AR_A1 0x1800  /* A pong 6 KB, bank 1 */
+#define AR_PRM 0x3000 /* own tiles' params 1.5 KB: d fp32 [NB*48], c_hi, c_lo bf16 [NB*48] */
+#define AR_B0 0x3800  /* B ping 4.5 KB, bank 2 */
+#define AR_TMP 0x4A00 /* LN: per-row-group partial sums of x, x^2 (2 KB) */
+#define AR_B1 0x5800  /* B pong 4.5 KB, bank 3 */
+#define AR_ST 0x6A00  /* LN: rstd*mu, rstd per row of the op's blocks (3 KB) */
+#define AR_C 0x7800   /* GEMM accumulators 12 KB, banks 4-5 */
+#define AR_OUT 0xCC00 /* output block 6 KB = we_out (0x7d400, banks 6-7), outside the arena */
+#define AR_BYTES 0xB800
+/* ATT carve-up */
 #define AT_A0 0x0000 /* Q chunk ping 4 KB (header too) */
 #define AT_A1 0x1000 /* Q chunk pong 4 KB */
-#define AT_B0 0x2000 /* K or V chunk 8 KB */
-#define AT_B1 0x4000
-#define AT_S 0x6000 /* S fp32 32x64, P bf16 in place; O bf16 goes out from here */
-#define AT_O 0x8000 /* O fp32 32x64 */
-#define AT_Q 0xA000 /* own Q chunk copy 4 KB */
+#define AT_Q 0x2000  /* own Q chunk copy 4 KB, bank 1 */
+#define AT_ML 0x3000 /* m, l [2][8][32] fp32 (2 KB) */
+#define AT_B0 0x3800 /* K or V chunk 8 KB, bank 2 */
+#define AT_B1 0x5800 /* bank 3 */
+#define AT_S 0x7800  /* S fp32 32x64, P bf16 in place; O bf16 goes out from here (bank 4) */
+#define AT_O 0x9800  /* O fp32 32x64 (bank 5) */
 alignas(64) int8_t we_arena[AR_BYTES];
+alignas(64) int8_t we_out[WE_BLK]; /* aieml.bcf: we_arena + AR_OUT */
 #define AR(off, T) ((T *)(we_arena + (off)))
+/* attention row state: [0] reference m per row (x8 lanes), [1] denominator l (the row
+ * sum, every lane), [2] scratch (raise k, 1/l; in we_out: no GEMM output during attention) */
+#define ML(i, rg) ((i) < 2 ? AR(AT_ML, float) + ((i) * 8 + (rg)) * 32 : (float *)we_out + (rg) * 32)
 #include "we_gelu_lut.h"
+#if WE_PROG != 2
 alignas(64) uint16_t we_gelu_ab[2 * WE_GELU_LUT_N] = WE_GELU_LUT_INIT;
 alignas(64) uint16_t we_gelu_cd[2 * WE_GELU_LUT_N] = WE_GELU_LUT_INIT;
-alignas(64) volatile int32_t we_dbg[16]; /* progress for host-side hang dumps (aieml.bcf: 0x7f400) */
-alignas(64) float we_att_ml[3][8][32]; /* [0] reference per row (x8 lanes), [1] per-lane denominator, [2] l snapshot */
+#else /* the attention program only keeps the symbols aieml.bcf places (no 10 KB .data to load) */
+alignas(64) uint16_t we_gelu_ab[2 * WE_GELU_LUT_N];
+alignas(64) uint16_t we_gelu_cd[2 * WE_GELU_LUT_N];
+#endif
+alignas(64) volatile int32_t we_dbg[16]; /* progress for host-side hang dumps (aieml.bcf: 0x707c0) */
 
 static const int k_pkt[EF_MESH_ROWS][EF_MESH_COLS] = EF_PKT_ID_TABLE;
 static const int k_ooo[EF_MESH_ROWS][EF_MESH_COLS] = EF_OOO_BD_TABLE;
 
+/* cycle split (never across a lock acquire: skill aiecoretimerlock): WE_PROF_G for
+ * the GEMM, WE_PROF_A for attention -- one at a time, both overflow the 16 KB PM */
+#if defined(WE_PROF_G) || defined(WE_PROF_A)
+#define WE_T(v) const uint64_t v = aie::tile::current().cycles()
+#else
+#define WE_T(v)
+#endif
+#ifdef WE_PROF_G
+#define WE_ACC(i, d) we_dbg[i] += (int32_t)(d)
+#else
+#define WE_ACC(i, d)
+#endif
+#ifdef WE_PROF_A
+#define WE_ACCA(i, d) we_dbg[i] += (int32_t)(d)
+#else
+#define WE_ACCA(i, d)
+#endif
 #define LK_ACQ(id, v) acquire_greater_equal(EF_LOCK_BASE + (id), (v))
 #define LK_REL(id, v) release(EF_LOCK_BASE + (id), (v))
 
 typedef aie::mmul<4, 8, 8, bfloat16, bfloat16, accauto> MM;
 typedef aie::vector<float, 32> V32;
+typedef aie::vector<bfloat16, 32> VB;
 
 static int g_mr, g_mc, g_pkt, g_ooo;
 
@@ -104,37 +137,6 @@ __attribute__((noinline)) static void vzero(void *dst, unsigned n) {
         chess_prepare_for_pipelining aie::store_v((float *)dst + i * 32, aie::zeros<float, 32>());
 }
 
-// ---- GEMM -------------------------------------------------------------------
-// C[64x48] += A chunk (64x48) * B chunk (48x48); 2x2 register blocking.
-__attribute__((noinline)) static void mac_chunk(const bfloat16 *__restrict A, const bfloat16 *__restrict B,
-                                                float *__restrict C) {
-    for (unsigned z = 0; z < 16; z += 2)
-        chess_loop_range(8, 8) for (unsigned j = 0; j < 6; j += 2) chess_loop_range(3, 3) chess_prepare_for_pipelining {
-            float *c00 = C + (z * 6 + j) * 32;
-            float *c10 = c00 + 6 * 32;
-            MM C00(aie::load_v<32>(c00)), C01(aie::load_v<32>(c00 + 32));
-            MM C10(aie::load_v<32>(c10)), C11(aie::load_v<32>(c10 + 32));
-            const bfloat16 *pa0 = A + z * 6 * 32;
-            const bfloat16 *pa1 = pa0 + 6 * 32;
-            const bfloat16 *pb = B + j * 64;
-            for (unsigned k = 0; k < 6; k++)
-                chess_unroll_loop() {
-                    const aie::vector<bfloat16, 32> a0 = aie::load_v<32>(pa0 + k * 32);
-                    const aie::vector<bfloat16, 32> a1 = aie::load_v<32>(pa1 + k * 32);
-                    const aie::vector<bfloat16, 64> b0 = aie::load_v<64>(pb + k * 6 * 64);
-                    const aie::vector<bfloat16, 64> b1 = aie::load_v<64>(pb + k * 6 * 64 + 64);
-                    C00.mac(a0, b0);
-                    C01.mac(a0, b1);
-                    C10.mac(a1, b0);
-                    C11.mac(a1, b1);
-                }
-            aie::store_v(c00, C00.template to_vector<float>());
-            aie::store_v(c00 + 32, C01.template to_vector<float>());
-            aie::store_v(c10, C10.template to_vector<float>());
-            aie::store_v(c10 + 32, C11.template to_vector<float>());
-        }
-}
-
 // float vector arithmetic that stays in vector<float> (aie::mul yields an accumulator)
 // fp32 multiply is emulated on this core (3 bf16 products): one out-of-line copy
 // keeps the 16 KB program memory from filling up with inlined expansions.
@@ -159,7 +161,50 @@ __attribute__((always_inline)) static inline aie::vector<bfloat16, 32> to_bf16(c
     return acc.template to_vector<bfloat16>();
 }
 
-typedef aie::vector<bfloat16, 32> VB;
+/* WE_PROG selects the program this file builds (build.sh compiles it twice):
+ * 1 = GEMM (+ LayerNorm fold, epilogues), 2 = attention. One 16 KB program memory
+ * cannot hold both; the host swaps programs over the control-packet plane
+ * (we_host.h we_prog). 0 = both (does not fit; probes only). */
+#ifndef WE_PROG
+#define WE_PROG 0
+#endif
+#if WE_PROG != 2
+// ---- GEMM -------------------------------------------------------------------
+// C[64x48] += A chunk (64x48) * B chunk (48x48): 4x2 register blocking (4 row
+// groups x 2 column tiles, 8 accumulators), the k loop pipelined -- 1042 vs 1336
+// cycles for 2x2 in the m6 probe (wider B blocking spills: 2x3 2405)
+__attribute__((noinline)) static void mac_chunk(const bfloat16 *__restrict A, const bfloat16 *__restrict B,
+                                                float *__restrict C) {
+    for (unsigned z = 0; z < 16; z += 4)
+        chess_loop_range(4, 4) for (unsigned j = 0; j < 6; j += 2) chess_loop_range(3, 3) {
+            MM acc[4][2];
+            for (unsigned r = 0; r < 4; r++)
+                chess_unroll_loop() {
+                    acc[r][0] = MM(aie::load_v<32>(C + ((z + r) * 6 + j) * 32));
+                    acc[r][1] = MM(aie::load_v<32>(C + ((z + r) * 6 + j + 1) * 32));
+                }
+            const bfloat16 *pa = A + z * 6 * 32, *pb = B + j * 64;
+            for (unsigned k = 0; k < 6; k++)
+                chess_prepare_for_pipelining chess_loop_range(6, 6) {
+                    VB a[4];
+                    for (unsigned r = 0; r < 4; r++)
+                        chess_unroll_loop() a[r] = aie::load_v<32>(pa + (r * 6 + k) * 32);
+                    const aie::vector<bfloat16, 64> b0 = aie::load_v<64>(pb + k * 6 * 64),
+                                                    b1 = aie::load_v<64>(pb + k * 6 * 64 + 64);
+                    for (unsigned r = 0; r < 4; r++)
+                        chess_unroll_loop() {
+                            acc[r][0].mac(a[r], b0);
+                            acc[r][1].mac(a[r], b1);
+                        }
+                }
+            for (unsigned r = 0; r < 4; r++)
+                chess_unroll_loop() {
+                    aie::store_v(C + ((z + r) * 6 + j) * 32, acc[r][0].template to_vector<float>());
+                    aie::store_v(C + ((z + r) * 6 + j + 1) * 32, acc[r][1].template to_vector<float>());
+                }
+        }
+}
+
 typedef aie::vector<int16, 32> VI;
 
 // Exact erf-GELU of a bf16 value (we_model.gelu_aie): table for 1/8 <= |x| < 4,
@@ -186,30 +231,42 @@ __attribute__((always_inline)) static inline VB gelu_bf16(const VB &xb) {
 }
 
 // out = epi(C) in [rg16][nt6][4][8] (or row-major [64][48] with WE_F_ROWMAJOR):
-// + bias, GELU (bf16 in/out), + residual (bf16, same layout as out), rounded once.
+// + d (the bias; zeros if none), GELU (bf16 in/out), + residual (bf16, same layout
+// as out), rounded once. Column tile outer so d is one vector per inner loop; one
+// branch-free loop per GELU / no GELU (a missing residual reads a zero vector).
+alignas(64) static const bfloat16 k_zero32[32] = {};
 __attribute__((noinline)) static void epilogue(const float *C, const float *bias8, const bfloat16 *res, bfloat16 *out,
                                                int flags) {
-    for (unsigned rg = 0; rg < 16; rg++)
-        for (unsigned nt = 0; nt < 6; nt++)
-            chess_prepare_for_pipelining {
-                const unsigned o = (rg * 6 + nt) * 32;
-                V32 v = aie::load_v<32>(C + o);
-                if (flags & WE_F_BIAS) {
-                    const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
-                    v = aie::add(v, aie::concat(b8, b8, b8, b8));
+    const unsigned rs = (flags & WE_F_RES) ? 6 * 32 : 0;
+    for (unsigned nt = 0; nt < 6; nt++) {
+        const aie::vector<float, 8> b8 = aie::load_v<8>(bias8 + nt * 8);
+        const V32 b = aie::concat(b8, b8, b8, b8);
+        const float *c = C + nt * 32;
+        const bfloat16 *r = rs ? res + nt * 32 : k_zero32;
+        bfloat16 *o = out + nt * 32;
+        if (flags & WE_F_GELU) {
+            for (unsigned rg = 0; rg < 16; rg++)
+                chess_prepare_for_pipelining chess_loop_range(16, 16) {
+                    const VB g = gelu_bf16(to_bf16(aie::add(aie::load_v<32>(c + rg * 192), b)));
+                    aie::store_v(o + rg * 192, to_bf16(aie::add(to_f32(g), to_f32(aie::load_v<32>(r + rg * rs)))));
                 }
-                if (flags & WE_F_GELU)
-                    v = to_f32(gelu_bf16(to_bf16(v)));
-                if (flags & WE_F_RES)
-                    v = aie::add(v, to_f32(aie::load_v<32>(res + o)));
-                const VB y = to_bf16(v);
-                if (flags & WE_F_ROWMAJOR) {
-                    for (unsigned i = 0; i < 4; i++)
-                        aie::store_v(out + (rg * 4 + i) * 48 + nt * 8, y.template extract<8>(i));
-                } else {
-                    aie::store_v(out + o, y);
-                }
+        } else {
+            for (unsigned rg = 0; rg < 16; rg++)
+                chess_prepare_for_pipelining chess_loop_range(16, 16)
+                    aie::store_v(o + rg * 192, to_bf16(aie::add(aie::add(aie::load_v<32>(c + rg * 192), b),
+                                                                to_f32(aie::load_v<32>(r + rg * rs)))));
+        }
+    }
+    if (flags & WE_F_ROWMAJOR) { /* conv1: tiles -> rows through the consumed C, then back */
+        bfloat16 *t = (bfloat16 *)C;
+        for (unsigned rg = 0; rg < 16; rg++)
+            for (unsigned nt = 0; nt < 6; nt++) {
+                const VB y = aie::load_v<32>(out + (rg * 6 + nt) * 32);
+                for (unsigned q = 0; q < 4; q++)
+                    aie::store_v(t + (rg * 4 + q) * 48 + nt * 8, y.template extract<8>(q));
             }
+        vcopy(out, t, WE_BLK / 128);
+    }
 }
 
 // Logits: fp32, one row group -> [nt 6][4][8] fp32 (+ d: the folded LayerNorm's beta W^T)
@@ -340,6 +397,7 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
     }
     chess_memory_fence();
     LK_REL(EF_LK_IN_EMPTY, 1); /* header consumed */
+    WE_T(g0);
     const int res = flags & WE_F_RES;
     const unsigned blocks = (unsigned)(NB * MB);
     const unsigned a_per_blk = (unsigned)KCN + (res ? 4u : 0u);
@@ -359,7 +417,11 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
                 LK_ACQ(EF_LK_IN_FULL, 1);
                 LK_ACQ(EF_LK_W_FULL, 1);
                 const bfloat16 *A = AR(ia ? AR_A1 : AR_A0, bfloat16);
+                WE_T(m0);
                 mac_chunk(A, AR(ib ? AR_B1 : AR_B0, bfloat16), C);
+                WE_T(m1);
+                WE_ACC(10, m1 - m0);
+                WE_ACC(12, 1);
                 if (ln && nb == 0 && k < KST) /* stats from the first column tile's pass */
                     ln_acc(A, tmp, k == 0);
                 LK_REL(EF_LK_IN_EMPTY, 1);
@@ -383,19 +445,26 @@ __attribute__((noinline)) static void op_gemm(const int32_t *h) {
                     ia ^= 1;
                 }
             }
+            WE_T(e0);
             if (flags & WE_F_LOGIT)
                 epilogue_logit(C, d8 + nb * WE_TN, (float *)out, lrg);
             else if (kt || vt)
                 epilogue_kv(C, d8 + nb * WE_TN, out, flags, kt);
             else
                 epilogue(C, d8 + nb * WE_TN, out, out, flags);
+            WE_T(e1);
+            WE_ACC(13, e1 - e0);
             chess_memory_fence();
             LK_REL(EF_LK_OUT_FULL, 1);
         }
     }
     out_drained();
+    WE_ACC(11, aie::tile::current().cycles() - g0);
 }
 
+#endif /* WE_PROG != 2 */
+
+#if WE_PROG != 1
 // ---- row helpers ------------------------------------------------------------
 // Sum the 8 lanes of each 4-row group's row (lanes i*8 .. i*8+7), result
 // replicated across those 8 lanes. Vector-only: the scalar unit has no FPU.
@@ -426,7 +495,7 @@ __attribute__((noinline)) static void att_qk(const bfloat16 *__restrict Q, const
             MM acc[4][2];
             for (unsigned r = 0; r < 4; r++)
                 chess_unroll_loop() {
-                    const V32 nm = aie::neg(aie::load_v<32>(&we_att_ml[0][z + r][0]));
+                    const V32 nm = aie::neg(aie::load_v<32>(ML(0, z + r)));
                     acc[r][0] = MM(nm);
                     acc[r][1] = MM(nm);
                 }
@@ -454,8 +523,22 @@ __attribute__((noinline)) static void att_qk(const bfloat16 *__restrict Q, const
 }
 
 // O[32x64] += P[32x64] V chunk[64x64]: P [rg8][kp8][32], V [kp8][dt8][64], O [rg8][dt8][32]
+// O += P V; first the denominators on the multiplier: l[rg] += P[rg] x 1 -- the
+// row sum, in every lane of the row, from the same rounded P as O
 __attribute__((noinline)) static void att_pv(const bfloat16 *__restrict P, const bfloat16 *__restrict V,
                                              float *__restrict O) {
+    const aie::vector<bfloat16, 64> ones = aie::broadcast<bfloat16, 64>((bfloat16)1.0f);
+    for (unsigned z = 0; z < 8; z += 2)
+        chess_prepare_for_pipelining chess_loop_range(4, 4) {
+            MM L0(aie::load_v<32>(ML(1, z))), L1(aie::load_v<32>(ML(1, z + 1)));
+            for (unsigned k = 0; k < 8; k++)
+                chess_unroll_loop() {
+                    L0.mac(aie::load_v<32>(P + (z * 8 + k) * 32), ones);
+                    L1.mac(aie::load_v<32>(P + ((z + 1) * 8 + k) * 32), ones);
+                }
+            aie::store_v(ML(1, z), L0.template to_vector<float>());
+            aie::store_v(ML(1, z + 1), L1.template to_vector<float>());
+        }
     for (unsigned z = 0; z < 8; z += 2)
         chess_loop_range(4, 4) for (unsigned j = 0; j < 8; j += 2) chess_prepare_for_pipelining {
             float *c00 = O + (z * 8 + j) * 32, *c10 = c00 + 8 * 32;
@@ -505,32 +588,20 @@ __attribute__((noinline)) static void att_mask(float *S, int rg0, int nrg, const
     }
 }
 
-// P = exp2(S - m) in place (bf16 over the fp32 S) and the per-lane denominators
-// l[rg] += P (P x 1 on the multiplier: exact, from the rounded P that PV uses).
-// The write of vector i lands on S vector i/2, already read, and software
-// pipelining only moves loads earlier and stores later -- so the two views are
-// declared restrict (aliased, the loop serialises: 991 -> 273 cycles, probe m5).
-// Returns nonzero if some P passed 2^WE_SM_LAZY (a score above its reference).
+// P = exp2(S - m) in place (bf16 over the fp32 S). The write of vector i lands on
+// S vector i/2, already read, and software pipelining only moves loads earlier and
+// stores later -- so the two views are declared restrict (aliased, the loop
+// serialises: 991 -> 273 cycles, probe m5). Returns nonzero if some P passed
+// 2^WE_SM_LAZY (a score above its reference). The denominators: att_pv.
 __attribute__((noinline)) static unsigned att_exp(const float *__restrict S, bfloat16 *__restrict P) {
-    const VB one = aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
     VB pm = aie::zeros<bfloat16, 32>();
-    for (unsigned rg = 0; rg < 8; rg++)
-        chess_prepare_for_pipelining chess_loop_range(8, 8) {
-            aie::accum<accfloat, 32> l0, l1;
-            l0.from_vector(aie::load_v<32>(&we_att_ml[1][rg][0]), 0);
-            l1.from_vector(aie::zeros<float, 32>(), 0);
-            for (unsigned kp = 0; kp < 8; kp += 2)
-                chess_unroll_loop() {
-                    const VB p0 = aie::exp2<bfloat16>(aie::load_v<32>(S + (rg * 8 + kp) * 32));
-                    const VB p1 = aie::exp2<bfloat16>(aie::load_v<32>(S + (rg * 8 + kp + 1) * 32));
-                    aie::store_v(P + (rg * 8 + kp) * 32, p0);
-                    aie::store_v(P + (rg * 8 + kp + 1) * 32, p1);
-                    l0 = aie::mac(l0, p0, one);
-                    l1 = aie::mac(l1, p1, one);
-                    pm = aie::max(pm, aie::max(p0, p1));
-                }
-            aie::store_v(&we_att_ml[1][rg][0],
-                         aie::add(l0.template to_vector<float>(), l1.template to_vector<float>()));
+    for (unsigned i = 0; i < 64; i += 2)
+        chess_prepare_for_pipelining chess_loop_range(32, 32) {
+            const VB p0 = aie::exp2<bfloat16>(aie::load_v<32>(S + i * 32));
+            const VB p1 = aie::exp2<bfloat16>(aie::load_v<32>(S + i * 32 + 32));
+            aie::store_v(P + i * 32, p0);
+            aie::store_v(P + i * 32 + 32, p1);
+            pm = aie::max(pm, aie::max(p0, p1));
         }
     return !aie::gt(pm, aie::broadcast<bfloat16, 32>((bfloat16)4294967296.0f)).empty();
 }
@@ -576,10 +647,10 @@ __attribute__((noinline)) static void att_raise(const bfloat16 *Q, const bfloat1
     att_qk(Q, K, S);
     if (mk->on)
         att_mask(S, 0, 8, mk);
-    int32 *k = (int32 *)&we_att_ml[2][0][0];
+    int32 *k = (int32 *)ML(2, 0);
     for (unsigned rg = 0; rg < 8; rg++)
-        raise_rg(S + rg * 8 * 32, &we_att_ml[0][rg][0], k + rg * 32, first ? -3.0e38f : WE_SM_LAZY);
-    pow2scale(&we_att_ml[1][0][0], k, 8, 1);
+        raise_rg(S + rg * 8 * 32, ML(0, rg), k + rg * 32, first ? -3.0e38f : WE_SM_LAZY);
+    pow2scale(ML(1, 0), k, 8, 1);
     pow2scale(O, k, 64, 8);
     att_qk(Q, K, S);
     if (mk->on)
@@ -593,34 +664,31 @@ __attribute__((noinline)) static void att_scores(const bfloat16 *Q, const bfloat
                                                  const AttMask *mk, int first) {
     bfloat16 *P = (bfloat16 *)S;
     if (first) {
-        vzero(&we_att_ml[0][0][0], 8);
+        vzero(ML(0, 0), 8);
     } else {
         att_qk(Q, K, S);
         if (mk->on)
             att_mask(S, 0, 8, mk);
-        vcopy(&we_att_ml[2][0][0], &we_att_ml[1][0][0], 8); /* l before this chunk, in case of a redo */
         if (!att_exp(S, P))
             return;
-        vcopy(&we_att_ml[1][0][0], &we_att_ml[2][0][0], 8);
     }
     att_raise(Q, K, S, O, mk, first);
     att_exp(S, P);
 }
 
 __attribute__((noinline)) static void att_finish(const float *O, bfloat16 *out) {
-    // 1/l per row (into the snapshot slot): bit-trick seed (rel. err < 12.5%) + 3
-    // Newton steps, vector ops only; one flat loop each, kept small for the 16 KB PM
+    // 1/l per row (l holds the row sum in every lane) into ML(2): bit-trick seed
+    // (rel. err < 12.5%) + 3 Newton steps, vector ops only
     for (unsigned i = 0; i < 24; i++) {
         const unsigned rg = i & 7;
-        const V32 ls = row_sum8(aie::load_v<32>(&we_att_ml[1][rg][0]));
+        const V32 ls = aie::load_v<32>(ML(1, rg));
         V32 il = i < 8 ? aie::sub(aie::broadcast<int32, 32>(0x7EF311C7), ls.template cast_to<int32>())
                              .template cast_to<float>()
-                       : aie::load_v<32>(&we_att_ml[2][rg][0]);
-        aie::store_v(&we_att_ml[2][rg][0], fmul(il, aie::sub(aie::broadcast<float, 32>(2.0f), fmul(ls, il))));
+                       : aie::load_v<32>(ML(2, rg));
+        aie::store_v(ML(2, rg), fmul(il, aie::sub(aie::broadcast<float, 32>(2.0f), fmul(ls, il))));
     }
     for (unsigned i = 0; i < 64; i++)
-        aie::store_v(out + i * 32,
-                     to_bf16(fmul(aie::load_v<32>(O + i * 32), aie::load_v<32>(&we_att_ml[2][i >> 3][0]))));
+        aie::store_v(out + i * 32, to_bf16(fmul(aie::load_v<32>(O + i * 32), aie::load_v<32>(ML(2, i >> 3)))));
 }
 
 __attribute__((noinline)) static void op_attn(const int32_t *h) {
@@ -647,16 +715,9 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
         out_drained(); /* the previous q-block's O left from AT_S */
         cfg_s2mm(1, EF_BD_W_PING, EF_BD_W_PONG, AT_B0, AT_B1, WE_KV_CHUNK, EF_LK_W_EMPTY, EF_LK_W_FULL,
                  (unsigned)(2 * NKC));
-        vzero(&we_att_ml[1][0][0], 8); /* l; m is set by the first chunk */
+        vzero(ML(1, 0), 8); /* l; m is set by the first chunk */
         vzero(O, WE_QB * 64 / 32);
         const int qrow0 = q0 + st * WE_QB;
-#ifdef WE_PROF /* cycle split (never across a lock acquire: skill aiecoretimerlock) */
-#define WE_T(v) const uint64_t v = aie::tile::current().cycles()
-#define WE_ACC(i, d) we_dbg[i] += (int32_t)(d)
-#else
-#define WE_T(v)
-#define WE_ACC(i, d)
-#endif
         WE_T(tq0);
         AttMask mk = {0, T, causal, qrow0, 0};
         for (int kc = 0; kc < NKC; kc++) {
@@ -675,12 +736,12 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
             WE_T(c4);
             LK_REL(EF_LK_W_EMPTY, 1);
             ib ^= 1;
-            WE_ACC(5, c1 - c0);
-            WE_ACC(6, c2 - c1);
-            WE_ACC(7, c4 - c3);
-            WE_ACC(9, 1);
+            WE_ACCA(5, c1 - c0);
+            WE_ACCA(6, c2 - c1);
+            WE_ACCA(7, c4 - c3);
+            WE_ACCA(9, 1);
         }
-        WE_ACC(8, aie::tile::current().cycles() - tq0);
+        WE_ACCA(8, aie::tile::current().cycles() - tq0);
         LK_ACQ(EF_LK_OUT_EMPTY, 1);
         att_finish(O, AR(AT_S, bfloat16));
         chess_memory_fence();
@@ -689,6 +750,8 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
     if (nqb)
         out_drained();
 }
+
+#endif /* WE_PROG != 1 */
 
 // main never returns: an empty __cxa_finalize keeps the runtime's atexit.o (174 B
 // of the 16 KB program memory) out of the link
@@ -731,13 +794,20 @@ int32_t main() {
             }
             continue;
         }
-        if (op == WE_OP_GEMM)
+#if WE_PROG != 2
+        if (op == WE_OP_GEMM) {
             op_gemm(h);
-
-        else if (op == WE_OP_ATTN)
+            continue;
+        }
+#endif
+#if WE_PROG != 1
+        if (op == WE_OP_ATTN) {
             op_attn(h);
-        else
-            LK_REL(EF_LK_IN_EMPTY, 1);
+            continue;
+        }
+#endif
+        we_dbg[1] = -op; /* an op of the other program: the host did not swap */
+        LK_REL(EF_LK_IN_EMPTY, 1);
     }
     return 0;
 }

@@ -6352,6 +6352,17 @@ void __Runtime_ctrl_shim_bd_begin(__Runtime_CtrlRowFabric *f) { rt_sb_begin(f); 
 
 void __Runtime_ctrl_shim_bd_commit(void) { rt_sb_commit(); }
 
+uint64_t __Runtime_dev_addr(void *p) {
+    uint64_t offset = 0U;
+    XAie_MemInst *mem = __vaddr_to_mem_offset(p, &offset);
+    return mem ? XAie_MemGetDevAddr(mem) + offset : (uint64_t)(uintptr_t)p;
+}
+
+void __Runtime_ctrl_shim_bd_sync(void) {
+    rt_sb_commit();
+    (void)rt_sb_ack_wait();
+}
+
 /**
  * Configure DMA buffer descriptor with multi-dimensional addressing.
  * Uses XAie_DmaSetMultiDimAddr with stride/wrap descriptors to enable

@@ -121,7 +121,7 @@ if [ ${#MULTI_KERNEL_FILES[@]} -gt 0 ]; then
 
         # compile_one_kernel builds kernel.cc — for multi-kernel, temporarily symlink
         ln -sf "${kfname}" "${WORKLOCAL_DIR}/kernel.cc"
-        if [ -n "$KPRX" ]; then
+        if [ -n "$KPRX" ] && [ "$KPRX" != "${WORKLOCAL_DIR}/aieml.prx" ]; then
             ln -sf "$(basename "$KPRX")" "${WORKLOCAL_DIR}/aieml.prx"
         fi
 
@@ -132,6 +132,8 @@ if [ ${#MULTI_KERNEL_FILES[@]} -gt 0 ]; then
         fi
         # Rename kernel.o to kernel_<name>.o to avoid overwriting
         mv -f "${BUILD_DIR}/kernel.o" "${BUILD_DIR}/kernel_${kname}.o"
+        # keep each kernel's link map (memory budget checks); the next build overwrites kernel.map
+        [ -f "${BUILD_DIR}/kernel.map" ] && cp -f "${BUILD_DIR}/kernel.map" "${BUILD_DIR}/kernel_${kname}.map"
         echo "✓ Compiled kernel: ${BUILD_DIR}/kernel_${kname}.o (func: ${kname})"
         KERNEL_OBJ_LIST="${KERNEL_OBJ_LIST} ${BUILD_DIR}/kernel_${kname}.o"
     done

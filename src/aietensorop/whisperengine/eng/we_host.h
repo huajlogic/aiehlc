@@ -54,7 +54,13 @@ static inline size_t we_blk_idx(int rb, int c, int row, int col) {
 
 typedef struct {
     XAie_DevInst *dev;
-    __Runtime_CtrlRowFabric *fab; /* non-null: shim BDs over control packets */
+    __Runtime_CtrlRowFabric *fab;  /* non-null: shim BDs over control packets */
+    __Runtime_CtrlRowFabric *ctrl; /* control-packet plane for the program swaps */
+    unsigned char *prog[3];        /* kernel ELFs: [1] GEMM, [2] attention (kernel.cc WE_PROG) */
+    int cur;                       /* program on the cores */
+    XAie_LocType tiles[16];
+    double t_swap;
+    unsigned nswap;
     int32_t *hdr;                 /* WE_HDR_BYTES DMA buffer per op slot */
     double t_fill, t_arm, t_run;  /* accumulated, us */
     unsigned seq;
@@ -69,6 +75,53 @@ static inline XAie_LocType we_shim(int c) { return XAie_TileLoc((uint8_t)c, 0); 
 static inline XAie_LocType we_mt(int k, int row) { return XAie_TileLoc((uint8_t)k, (uint8_t)row); }
 static inline double we_us(XTime a, XTime b) { return 1e6 * (double)(b - a) / COUNTS_PER_SECOND; }
 
+/* ---- BD shadow ---------------------------------------------------------- */
+/* Every BD the host writes is remembered (parameters minus the buffer address).
+ * Re-arming a BD with the same shape costs one address update (1-2 MMIO writes,
+ * ~355 ns each: doc/performance/register_write_cost.md) instead of the full BD,
+ * and an identical BD costs nothing. Only the host writes these BDs (the cores
+ * program their own tile DMAs), so the shadow stays exact. */
+#define WE_SH_NP 20
+typedef struct {
+    int valid;
+    uint64_t addr;
+    int32_t p[WE_SH_NP];
+} WeShadow;
+static WeShadow we_shadow[8][3][48]; /* [partition-relative col][row 0..2][bd] */
+static unsigned long we_n_full, we_n_addr, we_n_skip;
+/* 1: write the BD in full; 0: done (unchanged, or only its address updated) */
+static int we_shadow_check(WeEng *e, XAie_LocType t, int bd, uint64_t addr, const int32_t *p, int np) {
+    WeShadow *s = &we_shadow[t.Col][t.Row][bd];
+    int32_t q[WE_SH_NP] = {0};
+    memcpy(q, p, (size_t)np * 4);
+    if (s->valid && !memcmp(s->p, q, sizeof(q))) {
+        if (s->addr != addr) {
+            XAie_DmaUpdateBdAddr(e->dev, t, addr, (u16)bd);
+            s->addr = addr;
+            we_n_addr++;
+        } else {
+            we_n_skip++;
+        }
+        return 0;
+    }
+    s->valid = 1;
+    s->addr = addr;
+    memcpy(s->p, q, sizeof(q));
+    we_n_full++;
+    return 1;
+}
+/* shim BD through the runtime (OOO / packet / iteration fields), shadowed */
+static XAie_DmaDesc we_shim_bd(WeEng *e, XAie_LocType t, const void *buf, int bd, int len, int next, int pkt_en,
+                               int pkt_id, int ooo, int nd, int s0, int w0, int s1, int w1, int s2, int w2, int it_step,
+                               int it_n) {
+    const int32_t p[16] = {len, next, pkt_en, pkt_id, ooo, nd, s0, w0, s1, w1, s2, w2, it_step, it_n, 0x5348, 0};
+    XAie_DmaDesc d = {};
+    if (we_shadow_check(e, t, bd, __Runtime_dev_addr((void *)buf), p, 16))
+        d = __Runtime_dma_bd_config_multidim_ooo(e->dev, t, (void *)buf, bd, len, next, pkt_en, pkt_id, -1, 0, -1, 0,
+                                                 ooo, nd, s0, w0, s1, w1, s2, w2, it_step, it_n);
+    return d;
+}
+
 /* ---- shim -------------------------------------------------------------- */
 /* MM2S BD: up to 3 dims in BYTES (stride, wrap); nd = 0 -> contiguous. */
 static void we_sh_bd(WeEng *e, int col, int bd, const void *src, int len, int next, int nd, const int *st,
@@ -80,17 +133,60 @@ static void we_sh_bd(WeEng *e, int col, int bd, const void *src, int len, int ne
             w[i] = i < nd ? wr[i] : 0;
         }
     }
-    __Runtime_dma_bd_config_multidim_ooo(e->dev, we_shim(col), (void *)src, bd, len, next, 0, 0, 0, 0, 0, 0, -1,
-                                         nd ? nd : 3, s[0], w[0], s[1], w[1], s[2], w[2], 0, 0);
+    we_shim_bd(e, we_shim(col), src, bd, len, next, 0, 0, -1, nd ? nd : 3, s[0], w[0], s[1], w[1], s[2], w[2], 0, 0);
 }
 static void we_sh_start(WeEng *e, int col, int ch, int bd) {
     XAie_DmaDesc d = {};
     __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(col), d, ch, bd, DMA_MM2S), bd, 1);
 }
 
+/* Shim BD / channel writes go over the control-packet plane (~3 ns/word, not
+ * ~355 ns per MMIO write) when e->fab is set: captured between begin and sync.
+ * sync waits for the batch's ack, so DMA state polled afterwards is current. */
+static void we_sb_begin(WeEng *e) {
+    if (e->fab)
+        __Runtime_ctrl_shim_bd_begin(e->fab);
+}
+static void we_sb_sync(WeEng *e) {
+    if (e->fab)
+        __Runtime_ctrl_shim_bd_sync();
+}
+
+/* Program swap: the cores run the GEMM or the attention program (one 16 KB
+ * program memory cannot hold both, skill aie2psprogrammemory). Between ops the
+ * cores idle in main waiting for a header; the control-packet ELF load resets
+ * cores and core DMAs, writes program + data memory as broadcast packets, and the
+ * launch re-enables them. */
+static int we_prog(WeEng *e, int p) {
+    if (e->cur == p || !e->prog[p] || !e->ctrl)
+        return 0;
+    XTime t0, t1;
+    XTime_GetTime(&t0);
+    const XAie_LocType *t = e->tiles;
+    __Runtime_set_kernel_elf(e->prog[p]);
+    struct_kernel_group kg =
+        __Runtime_load_kernel_group_16t_ctrl(e->dev, e->ctrl, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8],
+                                             t[9], t[10], t[11], t[12], t[13], t[14], t[15], 16, 2, 0);
+    if (kg.num_tiles != 16) {
+        printf("WE program %d load FAILED\n", p);
+        return -1;
+    }
+    __Runtime_launch_kernel_group_ctrl(e->dev, e->ctrl, kg, 2, 0);
+    e->cur = p;
+    XTime_GetTime(&t1);
+    e->t_swap += we_us(t0, t1);
+    e->nswap++;
+    return 0;
+}
+
 /* ---- memtile ----------------------------------------------------------- */
 static void we_mt_bd(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t len, int nd, const uint32_t *st,
                      const uint32_t *wr, uint32_t it_step, uint32_t it_wrap, int next) {
+    int32_t p[14] = {(int32_t)len, nd, (int32_t)it_step, (int32_t)it_wrap, next, 0x4D54};
+    for (int i = 0; i < nd && i < 4; i++)
+        p[6 + 2 * i] = (int32_t)st[i], p[7 + 2 * i] = (int32_t)wr[i];
+    if (!we_shadow_check(e, t, bd, addr, p, 14))
+        return;
     XAie_DmaDesc d;
     XAie_DmaDescInit(e->dev, &d, t);
     if (nd) {
@@ -151,7 +247,7 @@ static void we_dump(WeEng *e) {
         for (int row = 3; row <= 6; row++) {
             u32 w[5];
             for (int i = 0; i < 5; i++)
-                XAie_DataMemRdWord(e->dev, we_mt(k, row), 0xF400 + 4 * i, &w[i]);
+                XAie_DataMemRdWord(e->dev, we_mt(k, row), 0x07C0 + 4 * i, &w[i]);
             u32 lut0 = 0;
             XAie_DataMemRdWord(e->dev, we_mt(k, row), 0xC000, &lut0);
             if (k == 1) { /* core DMA BDs 0..4 (6 words each) */
@@ -206,6 +302,16 @@ static void we_hdr_begin(WeEng *e, int op, int ract) {
     e->hdr[WH_RACT] = ract;
 }
 
+/* S2MM out-of-order mode, once per shim channel */
+static void we_ooo_enable(WeEng *e, XAie_LocType s, int ch) {
+    static unsigned done;
+    const unsigned bit = 1u << (s.Col * 2 + ch);
+    if (done & bit)
+        return;
+    __Runtime_dma_channel_enable_ooo(e->dev, s, ch, DMA_S2MM);
+    done |= bit;
+}
+
 /* Output: core (r,c) writes `n` packets of `len` bytes; the first lands at
  * dst[r][c], each next one `step` bytes further; inside a packet the bytes go
  * to d0 x d1 (bytes: d0 contiguous run, d1 count at d1_stride). */
@@ -215,10 +321,9 @@ static void we_arm_out(WeEng *e, int ract, bf16_t *const dst[4][4], int len, int
         XAie_LocType s = we_shim(we_out_col[r]);
         XAie_DmaDesc d = {};
         for (int c = 0; c < 4; c++)
-            d = __Runtime_dma_bd_config_multidim_ooo(e->dev, s, dst[r][c], we_ooo[r][c], len, -1, 0, we_pkt[r][c], -1,
-                                                     0, -1, 0, we_ooo[r][c], 3, 4, run / 4, stride, cnt, stride, 0,
-                                                     step, n);
-        __Runtime_dma_channel_enable_ooo(e->dev, s, we_out_ch[r], DMA_S2MM);
+            d = we_shim_bd(e, s, dst[r][c], we_ooo[r][c], len, -1, 0, we_pkt[r][c], we_ooo[r][c], 3, 4, run / 4, stride,
+                           cnt, stride, 0, step, n);
+        we_ooo_enable(e, s, we_out_ch[r]);
         ev[r] = __Runtime_startio(e->dev, __Runtime_dma_createio_4(s, d, we_out_ch[r], we_ooo[r][0], DMA_S2MM),
                                   we_ooo[r][0], 4 * n);
     }
@@ -283,6 +388,8 @@ static size_t we_pack_w(bf16_t *dst, const bf16_t *w, int n, int k, int passes) 
 }
 
 static int we_gemm(WeEng *e, const WeGemm *g) {
+    if (we_prog(e, 1))
+        return -1;
     const int K = g->a->c, RB = g->a->rb, MB = RB / 64, KCN = K * (1 + g->wsplit) / 48;
     const int MBP = g->mbp ? g->mbp : MB, passes = MB / MBP;
     const int rm = (g->flags & WE_F_ROWMAJOR) != 0, lg = (g->flags & WE_F_LOGIT) != 0;
@@ -337,6 +444,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
         }
     }
     __Runtime_sync_for_dev(e->dev, hbuf, hdrs);
+    we_sb_begin(e);
     // B: the column's whole weight slice, once per op
     for (int k = 1; k <= 4; k++) {
         we_mt_bd(e, we_mt(k, EF_MT_B_ROW), 0, EF_MT_BASE, (uint32_t)(wcol * 2), 0, 0, 0, 0, 0, -1);
@@ -349,6 +457,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
         const int mb0 = p * MBP;
         XTime p0, p1, p2, p3;
         XTime_GetTime(&p0);
+        if (p > 0)
+            we_sb_begin(e);
         // fill MT_A: [headers][A pass][res pass]; idle rows get only the headers
         for (int k = 1; k <= 4; k++) {
             const int r = k - 1, act = k <= g->ract;
@@ -384,6 +494,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             }
             we_sh_start(e, k, 1, 12);
         }
+        we_sb_sync(e);
         for (int k = 1; k <= 4 && !rc; k++) {
             if (k <= g->ract || p == 0)
                 rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 0, DMA_S2MM);
@@ -404,6 +515,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                                 : lg ? (bf16_t *)(g->logits + (size_t)cb * 192)
                                      : we_tile(g->out, r, cb) + (size_t)mb0 * 64 * 48;
                 }
+            we_sb_begin(e);
             if (rm)
                 we_arm_out(e, g->ract, dst, WE_BLK, MBP, 64 * g->n * 2, 96, 64, g->n * 2, ev);
             else if (lg)
@@ -440,6 +552,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                     we_mt_queue(e, tb, DMA_MM2S, 1 + nb, MBP);
                 }
             }
+            we_sb_sync(e);
             XTime_GetTime(&q1);
             for (int r = 0; r < g->ract; r++)
                 if (we_wait_out(e, ev[r]))
@@ -486,18 +599,19 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
         for (int c = 0; c < 4; c++) {
             if (!nqb[c])
                 continue;
-            d = __Runtime_dma_bd_config_multidim_ooo(e->dev, s, dst[r][c], we_ooo[r][c], WE_Q_CHUNK, -1, 0,
-                                                     we_pkt[r][c], -1, 0, -1, 0, we_ooo[r][c], 3, 4, 32,
-                                                     (int)(2 * tileb), 4, 384, WE_QB / 4, WE_QB / 4 * 384, nqb[c]);
+            d = we_shim_bd(e, s, dst[r][c], we_ooo[r][c], WE_Q_CHUNK, -1, 0, we_pkt[r][c], we_ooo[r][c], 3, 4, 32,
+                           (int)(2 * tileb), 4, 384, WE_QB / 4, WE_QB / 4 * 384, nqb[c]);
             any += nqb[c];
         }
-        __Runtime_dma_channel_enable_ooo(e->dev, s, we_out_ch[r], DMA_S2MM);
+        we_ooo_enable(e, s, we_out_ch[r]);
         ev[r] = __Runtime_startio(e->dev, __Runtime_dma_createio_4(s, d, we_out_ch[r], we_ooo[r][0], DMA_S2MM),
                                   we_ooo[r][0], any);
     }
 }
 
 static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int nqb[4], const int qb0[4]) {
+    if (we_prog(e, 2))
+        return -1;
     const int RB = a->q->rb, KBPR = a->kv->rb / 64, rk = a->krows, NKC = KBPR * rk; /* 64-key chunks */
     const size_t tileb = (size_t)RB * 48 * 2, qtile = tileb, kvtile = (size_t)a->kv->rb * 48 * 2;
     const size_t kvrow = (size_t)(a->kv->c / 48) * kvtile; /* bytes between row blocks of kv */
@@ -521,6 +635,7 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
             dst[r][c] = we_tile(a->out, r, head[c] / 3) + (head[c] % 3) * 64 + (size_t)qb0[c] * (WE_QB / 4) * 6 * 32;
+    we_sb_begin(e);
     we_arm_out_att(e, a->ract, dst, nqb, tileb, ev);
     // A: header + this row block's q tiles; B: the head's K^T and V, gathered chunk-major
     for (int k = 1; k <= 4; k++) {
@@ -544,14 +659,15 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         we_mt_queue(e, tb, DMA_S2MM, 1, 4);
         const bf16_t *ks = we_tile(a->kv, 0, a->kt_cb + h / 3) + (h % 3) * 1024;
         const bf16_t *vs = we_tile(a->kv, 0, a->vt_cb + h / 3) + (h % 3) * 128;
-        __Runtime_dma_bd_config_multidim_ooo(e->dev, we_shim(k), (void *)ks, 15, 2048 * KBPR * rk, -1, 0, 0, 0, 0, 0, 0,
-                                             -1, 3, 4, 512, WE_BLK, KBPR, (int)kvrow, rk, (int)(2 * kvtile), 4);
-        __Runtime_dma_bd_config_multidim_ooo(e->dev, we_shim(k), (void *)vs, 14, 2048 * KBPR * rk, -1, 0, 0, 0, 0, 0, 0,
-                                             -1, 3, 4, 64, 768, 8 * KBPR, (int)kvrow, rk, (int)(2 * kvtile), 4);
+        we_shim_bd(e, we_shim(k), ks, 15, 2048 * KBPR * rk, -1, 0, 0, -1, 3, 4, 512, WE_BLK, KBPR, (int)kvrow, rk,
+                   (int)(2 * kvtile), 4);
+        we_shim_bd(e, we_shim(k), vs, 14, 2048 * KBPR * rk, -1, 0, 0, -1, 3, 4, 64, 768, 8 * KBPR, (int)kvrow, rk,
+                   (int)(2 * kvtile), 4);
         XAie_DmaDesc d0 = {};
         __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 15, DMA_MM2S), 15, 4);
         __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), d0, 0, 14, DMA_MM2S), 14, 4);
     }
+    we_sb_sync(e);
     int rc = 0;
     for (int k = 1; k <= 4 && !rc; k++) {
         rc |= we_wait_ch(e, we_mt(k, EF_MT_A_ROW), 0, DMA_S2MM);

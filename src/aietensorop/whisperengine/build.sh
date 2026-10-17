@@ -18,7 +18,16 @@ cp "$FAB/routing.cc" "$FAB/aieml.prx" "$FAB/engine_fabric.h" "$W"/
 if [ -f "$SRC/extra_inputs.txt" ]; then
     while read -r f; do [ -n "$f" ] && cp "$REPO/$f" "$W"/ || exit 1; done < "$SRC/extra_inputs.txt"
 fi
-for d in ${KDEFS:-}; do sed -i "1i #define ${d/=/ }" "$W/kernel.cc"; done
+KSRC="$W/kernel.cc"
+if grep -q 'WE_PROG' "$W/kernel.cc" 2>/dev/null; then
+    # one source, two programs (kernel.cc WE_PROG): hostcompile's multi-kernel mode
+    # embeds _binary_kernel_eng_start (GEMM) and _binary_kernel_att_start (attention)
+    mv "$W/kernel.cc" "$W/we_kernel.cc"
+    KSRC="$W/we_kernel.cc"
+    printf '#define WE_PROG 1\n#include "we_kernel.cc"\n' > "$W/kernel_eng.cc"
+    printf '#define WE_PROG 2\n#include "we_kernel.cc"\n' > "$W/kernel_att.cc"
+fi
+for d in ${KDEFS:-}; do sed -i "1i #define ${d/=/ }" "$KSRC"; done
 for d in ${HDEFS:-}; do sed -i "1i #define ${d/=/ }" "$W/host.cc"; done
 source "$REPO/script/setup.sh" >/dev/null 2>&1
 if [ ! -f "$REPO/thirdparty/alib/lib/libxaienginea78.a" ]; then
@@ -35,11 +44,14 @@ rc=$?
 # AIE2PS program memory is 16 KB and an overflow only shows at load time
 # ("Overflow of program memory", the tail silently dropped). The map's "Used" omits
 # alignment padding: check the end address of the last PM item instead.
-MAP="$W/build/kernel.map"
-if [ -f "$MAP" ]; then
+pm_ends=""
+for MAP in "$W"/build/kernel_*.map "$W/build/kernel.map"; do
+    [ -f "$MAP" ] || continue
+    case "$MAP" in */kernel.map) ls "$W"/build/kernel_*.map >/dev/null 2>&1 && continue ;; esac
     pm_end=$(awk '/Memory map for memory .PM./{f=1} /Memory map for memory .DM/{f=0} f && /items\) :/{split($1,a,"\\.\\."); e=a[2]} END{print e}' "$MAP")
+    pm_ends="$pm_ends $(basename "$MAP" .map)=$pm_end"
     if [ -n "$pm_end" ] && [ $((pm_end)) -ge $((0x4000)) ]; then
-        echo "BUILD FAILED: kernel program memory ends at $pm_end, past 16 KB (0x4000)"; exit 1
+        echo "BUILD FAILED: $(basename "$MAP" .map) program memory ends at $pm_end, past 16 KB (0x4000)"; exit 1
     fi
-fi
-if [ -f "$W/build/host" ]; then echo "built $W/build/host (kernel PM end ${pm_end:-?})"; else echo "BUILD FAILED rc=$rc (log $OUT/build.log)"; grep -n 'error' "$OUT/build.log" | head; exit 1; fi
+done
+if [ -f "$W/build/host" ]; then echo "built $W/build/host (PM end:${pm_ends:- ?})"; else echo "BUILD FAILED rc=$rc (log $OUT/build.log)"; grep -n 'error' "$OUT/build.log" | head; exit 1; fi
