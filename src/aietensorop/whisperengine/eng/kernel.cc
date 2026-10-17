@@ -44,6 +44,11 @@
 #define AT_B1 0x5800 /* bank 3 */
 #define AT_S 0x7800  /* S fp32 32x64, P bf16 in place; O bf16 goes out from here (bank 4) */
 #define AT_O 0x9800  /* O fp32 32x64 (bank 5) */
+/* the attention program has no GELU tables: their space (aieml.bcf) holds the second Q
+ * buffer (the next q-block's, prefetched) and the output block, so the next q-block
+ * starts without waiting for this one's output to drain */
+#define AT_Q1 0xB800  /* = we_gelu_ab (0x7c000), 4 KB */
+#define AT_OUT 0xE400 /* = we_gelu_cd (0x7ec00), 4 KB */
 alignas(64) int8_t we_arena[AR_BYTES];
 alignas(64) int8_t we_out[WE_BLK]; /* aieml.bcf: we_arena + AR_OUT */
 #define AR(off, T) ((T *)(we_arena + (off)))
@@ -768,6 +773,16 @@ __attribute__((noinline)) static void att_finish(const float *__restrict O, bflo
         }
 }
 
+// One chunk of the Q ring (every column's chunk passes every core of the row): copy
+// it to dst if it is ours, then hand the buffer back
+__attribute__((noinline)) static void take_q(bfloat16 *dst, unsigned *ia) {
+    LK_ACQ(EF_LK_IN_FULL, 1);
+    if (dst)
+        vcopy(dst, AR(*ia ? AT_A1 : AT_A0, bfloat16), WE_Q_CHUNK / 128);
+    LK_REL(EF_LK_IN_EMPTY, 1);
+    *ia ^= 1;
+}
+
 __attribute__((noinline)) static void op_attn(const int32_t *h) {
     const int T = h[WH_T], NKC = h[WH_NKC], causal = h[WH_AFLAGS] & WE_A_CAUSAL;
     const int nqb = h[WH_NQB + g_mc], q0 = h[WH_Q0 + g_mc], steps = h[WH_STEPS];
@@ -775,7 +790,7 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
     cfg_s2mm(0, EF_BD_IN_PING, EF_BD_IN_PONG, AT_A0, AT_A1, WE_Q_CHUNK, EF_LK_IN_EMPTY, EF_LK_IN_FULL,
              (unsigned)(4 * steps));
     if (nqb) {
-        cfg_out_at(AT_S, WE_Q_CHUNK, (unsigned)nqb);
+        cfg_out_at(AT_OUT, WE_Q_CHUNK, (unsigned)nqb);
         /* K/V for every q-block, armed once: the start-queue repeat field is 8 bits, so
          * the ping-pong pairs go in as several queue entries (task queue depth 4) --
          * re-arming per q-block stalled each q-block's first chunk on the restart */
@@ -788,19 +803,15 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
     }
     float *S = AR(AT_S, float), *O = AR(AT_O, float);
     unsigned ia = 0, ib = 0;
+    int qn = 0; /* chunks of the coming step already taken (prefetched during this one) */
     for (int st = 0; st < steps; st++) {
         WE_T(sb0);
-        bfloat16 *Q = AR(AT_Q, bfloat16);
-        for (int c = 0; c < 4; c++) {
-            LK_ACQ(EF_LK_IN_FULL, 1);
-            if (c == g_mc && st < nqb) /* copy ours; the ring must keep moving for the other columns */
-                vcopy(Q, AR(ia ? AT_A1 : AT_A0, bfloat16), WE_Q_CHUNK / 128);
-            LK_REL(EF_LK_IN_EMPTY, 1);
-            ia ^= 1;
-        }
+        bfloat16 *Q = AR(st & 1 ? AT_Q1 : AT_Q, bfloat16);
+        for (; qn < 4; qn++) /* the rest of this step's Q ring (all of it on step 0) */
+            take_q(qn == g_mc && st < nqb ? Q : 0, &ia);
+        qn = 0;
         if (st >= nqb)
             continue;
-        out_drained();      /* the previous q-block's O left from AT_S */
         vzero(ML(1, 0), 8); /* l; m is set by the first chunk */
         vzero(O, WE_QB * 64 / 32);
         const int qrow0 = q0 + st * WE_QB;
@@ -812,14 +823,18 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
             WE_T(c0);
             mk.key0 = kc * WE_KCH;
             mk.on = mk.key0 + WE_KCH > T || causal;
+#ifndef WE_ATT_NOCOMP /* probe: K/V delivery alone */
             att_scores(Q, AR(ib ? AT_B1 : AT_B0, bfloat16), S, O, &mk, kc == 0);
+#endif
             WE_T(c1);
             LK_REL(EF_LK_W_EMPTY, 1);
             ib ^= 1;
             WE_T(c2);
             LK_ACQ(EF_LK_W_FULL, 1);
             WE_T(c3);
+#ifndef WE_ATT_NOCOMP
             att_pv((const bfloat16 *)S, AR(ib ? AT_B1 : AT_B0, bfloat16), O);
+#endif
             WE_T(c4);
             LK_REL(EF_LK_W_EMPTY, 1);
             ib ^= 1;
@@ -827,11 +842,15 @@ __attribute__((noinline)) static void op_attn(const int32_t *h) {
             WE_ACCA(6, c2 - c1);
             WE_ACCA(7, c4 - c3);
             WE_ACCA(9, 1);
+            if (kc >= 1 && qn < 4 && st + 1 < steps) { /* next step's Q, one chunk per key chunk */
+                take_q(qn == g_mc && st + 1 < nqb ? AR(st & 1 ? AT_Q : AT_Q1, bfloat16) : 0, &ia);
+                qn++;
+            }
         }
         WE_ACCA(8, aie::tile::current().cycles() - tq0);
         LK_ACQ(EF_LK_OUT_EMPTY, 1);
         WE_T(f0);
-        att_finish(O, AR(AT_S, bfloat16));
+        att_finish(O, AR(AT_OUT, bfloat16));
         WE_T(f1);
         WE_ACCA(14, f1 - f0);
         chess_memory_fence();
