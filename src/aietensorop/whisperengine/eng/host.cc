@@ -124,7 +124,7 @@ static int gemm_kv(const WeAct *a, size_t w, size_t ln, const WeAct *out) {
     g_kt0 = 0;
     g_ws = 1;
     g_stor = g_xst ? WE_ST_IN : 0; /* on chip: A block p from we_st(r, 3), one block a pass */
-    const int rc = gemm(a, w, 0, ln, 0, out, 768, WE_F_KT | WE_F_VT, g_xst ? 1 : 3, 4); /* hi/lo chain <= 11 BDs */
+    const int rc = gemm(a, w, 0, ln, 0, out, 768, WE_F_KT | WE_F_VT, 3, 4); /* 2 passes: hi/lo chain <= 11 BDs */
     g_stor = 0;
     g_ws = 0;
     g_kt0 = 8;
@@ -152,8 +152,7 @@ static int g_qst; /* encoder: Q left on chip by the Q/K/V GEMM (WE_ST_OUTQ) */
 static int attn(const WeAct *q, const WeAct *kv, int kt, int vt, const WeAct *o, int t, int causal, int ract,
                 int krows) {
     TR("attn");
-    WeAttn a = {q, 0,      kv,   kt,    vt,    o,
-                t, causal, ract, krows, g_qst, 0}; /* ost: measured slower (out-proj 1 block/pass) */
+    WeAttn a = {q, 0, kv, kt, vt, o, t, causal, ract, krows, g_qst, g_qst}; /* encoder: Q in, output on chip */
     return we_attn(&g_e, &a);
 }
 
@@ -213,9 +212,9 @@ static int encoder(Enc *E, int verify) {
         const size_t *p = L[l];
         if ((g_stor = WE_ST_OUTQ, PT(P_QKV, gemm(&E->x, p[0], 0, p[1], 0, &E->qkv, 1152, WE_F_KT | WE_F_VT, 0, 4))) ||
             (g_stor = 0, g_qst = 1, PT(P_ATTN, attn(&E->qkv, &E->qkv, 8, 16, &E->o, 1500, 0, 4, 4))) ||
-            (g_qst = 0, g_stor = 0, PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4))) ||
+            (g_qst = 0, g_stor = WE_ST_IN, PT(P_OUT, gemm(&E->o, p[2], p[3], 0, &E->x, &E->x2, 384, 0, 3, 4))) ||
             (g_stor = WE_ST_OUT, PT(P_FC1, gemm(&E->x2, p[4], 0, p[5], 0, &E->h, 1536, WE_F_GELU, 2, 4))) ||
-            (g_stor = WE_ST_IN, g_stox = 0 && !verify && l == 3, /* measured slower: cross K/V at 1 block a pass */
+            (g_stor = WE_ST_IN, g_stox = !verify && l == 3,
              PT(P_FC2, gemm(&E->h, p[6], p[7], 0, &E->x2, &E->x, 384, 0, 1, 4))))
             return -1;
         g_stor = 0, g_stox = 0;
@@ -227,7 +226,7 @@ static int encoder(Enc *E, int verify) {
     /* cross K/V of every decoder layer, ln_post folded in */
     const size_t xkv[4][2] = {
         {WN_X0_KV_W, WN_X0_KV_LN}, {WN_X1_KV_W, WN_X1_KV_LN}, {WN_X2_KV_W, WN_X2_KV_LN}, {WN_X3_KV_W, WN_X3_KV_LN}};
-    g_xst = 0 && !verify; /* see g_stox */
+    g_xst = !verify;
     for (int l = 0; l < 4; l++)
         if (PT(P_XKV, gemm_kv(&E->x, xkv[l][0], xkv[l][1], &E->kvx[l])))
             return -1;

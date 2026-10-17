@@ -714,7 +714,7 @@ static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
     if ((g->stox && (P->NBS != 1 || P->MBP != 1 || g->n != 384 || g->ract != 4 || P->NSUB != 2)) ||
         (g->stor == WE_ST_OUTQ && (P->passes != 1 || P->MB != 6 || g->ract != 4 || P->NSUB < 2)) ||
         (g->stor == WE_ST_OUT && (P->MB != 6 || P->MBP != 2 || P->NBS != 2 || g->n != 1536 || g->ract != 4)) ||
-        (g->stor == WE_ST_IN && (P->MBP != 1 || !P->dbuf || !g->st_ppt || !g->st_cs)) ||
+        (g->stor == WE_ST_IN && (P->MBP > 3 || !g->st_ppt || g->st_ppt % P->MBP || !g->st_cs)) ||
         1 + P->MBP * (1 + P->res) > 10) {
         printf("WE gemm: storage mode %d needs FC1 (N 1536, 2 blocks x 3 passes) / FC2 (K 1536, 1 block a pass)\n",
                g->stor);
@@ -770,9 +770,10 @@ static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p
             const int nfill = act ? P->MBP * (!si + P->res) : 0;
             we_mt_bdl(e, ta, b0, EF_MT_BASE, (uint32_t)P->hdrs, 0, 0, 0, 0, 0, nfill ? b0 + 1 : -1, -1, WE_LK_H,
                       P->NSUB);
-            if (si && act)
-                we_mt_bdl(e, ta, 46 + half, EF_MT_BASE + (uint32_t)(P->hdrs + hoff), (uint32_t)P->ablk, 0, 0, 0, 0, 0,
-                          -1, -1, WE_LK_A + lko, P->NBT);
+            for (int mb = 0; si && act && mb < P->MBP; mb++) /* S2MM3 BDs 40.. / 43..: one per block */
+                we_mt_bdl(e, ta, 40 + 3 * half + mb,
+                          EF_MT_BASE + (uint32_t)(P->hdrs + hoff + (size_t)mb * (P->ablk + P->rblk)), (uint32_t)P->ablk,
+                          0, 0, 0, 0, 0, mb + 1 < P->MBP ? 41 + 3 * half + mb : -1, -1, WE_LK_A + lko + mb, P->NBT);
             for (int mb = 0, b = b0 + 1; mb < (act ? P->MBP : 0); mb++) {
                 const uint32_t base = EF_MT_BASE + (uint32_t)(P->hdrs + hoff + mb * (P->ablk + P->rblk));
                 const int last_a = !P->res && mb + 1 == P->MBP;
@@ -803,16 +804,18 @@ static void we_gemm_fill_a(WeEng *e, const WeGemm *g, const WeGemmPlan *P, int p
                 __Runtime_startio(e->dev, __Runtime_dma_createio_4(we_shim(k), dr, 1, 14, DMA_MM2S), 14, P->MBP);
                 we_ddr(e, we_shim(k), 14, P->MBP, DMA_MM2S);
             }
-            const int tj = g->st_j0 + p / g->st_ppt;
+            const int b0 = p * P->MBP, tj = g->st_j0 + b0 / g->st_ppt; /* st_ppt: blocks per storage tile */
             if (e->st_west[r] != tj && e->st_west[r] >= 0 && we_wait_ch(e, ta, 3, DMA_S2MM))
                 return; /* the lane must be idle before it is switched */
             we_st_west(e, r, tj);
             const XAie_LocType st = we_st(r, tj);
-            /* the block's K chunks, st_cs apart */
-            const uint32_t gs[3] = {1, 768, (uint32_t)g->st_cs / 4}, gw[3] = {768, 2, (uint32_t)(P->K / 48)};
-            we_mt_bd(e, st, 20 + half, EF_MT_BASE + (uint32_t)((p % g->st_ppt) * (g->st_bs ? g->st_bs : WE_BLK)),
-                     (uint32_t)P->ablk, 3, gs, gw, 0, 0, -1);
-            XAie_DmaChannelSetStartQueue(e->dev, ta, 3, DMA_S2MM, (u8)(46 + half), 1, XAIE_DISABLE);
+            /* the pass's blocks (st_bs apart), each its K chunks (st_cs apart) */
+            const uint32_t bs = (uint32_t)(g->st_bs ? g->st_bs : WE_BLK);
+            const uint32_t gs[4] = {1, 768, (uint32_t)g->st_cs / 4, bs / 4},
+                           gw[4] = {768, 2, (uint32_t)(P->K / 48), (uint32_t)P->MBP};
+            we_mt_bd(e, st, 20 + half, EF_MT_BASE + (uint32_t)(b0 % g->st_ppt) * bs, (uint32_t)(P->MBP * P->ablk), 4,
+                     gs, gw, 0, 0, -1);
+            XAie_DmaChannelSetStartQueue(e->dev, ta, 3, DMA_S2MM, (u8)(40 + 3 * half), 1, XAIE_DISABLE);
             we_mt_queue(e, st, DMA_MM2S, 20 + half, 1);
             continue;
         }
