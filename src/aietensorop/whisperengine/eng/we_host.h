@@ -578,14 +578,14 @@ static void we_arm_out_stq(WeEng *e, int NBS, int MB, struct_ioevent *ev) {
     }
 }
 /* stox: sub-op s of pass p (1 block, NBS 1): core c's packet -> tile s*4+c of block p */
-static void we_arm_out_stx(WeEng *e, int s, int p, struct_ioevent *ev) {
+static void we_arm_out_stx(WeEng *e, int s, int p, int MBP, struct_ioevent *ev) {
     const int o2 = (s & 1) ? WE_ST_OOO2 : 0;
     for (int r = 0; r < 4; r++) {
         const XAie_LocType t = we_st(r, 3);
-        for (int c = 0; c < 4; c++)
-            we_mt_bd(e, t, we_ooo[r][c] + o2, EF_MT_BASE + (uint32_t)(p * 8 + s * 4 + c) * WE_BLK, WE_BLK, 0, 0, 0, 0,
-                     0, -1);
-        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)(we_ooo[r][0] + o2), 4, XAIE_DISABLE);
+        for (int c = 0; c < 4; c++) /* blocks p*MBP.., 8 tiles (48 KB) apart */
+            we_mt_bd(e, t, we_ooo[r][c] + o2, EF_MT_BASE + (uint32_t)(p * MBP * 8 + s * 4 + c) * WE_BLK, WE_BLK, 0, 0,
+                     0, 8 * WE_BLK / 4, (uint32_t)MBP, -1);
+        XAie_DmaChannelSetStartQueue(e->dev, t, 0, DMA_S2MM, (u8)(we_ooo[r][0] + o2), (u32)(4 * MBP), XAIE_DISABLE);
         memset(&ev[r], 0, sizeof(ev[r]));
         ev[r].io.tile_loc = t, ev[r].io.channel_id = 0, ev[r].io.direction = DMA_S2MM;
     }
@@ -711,7 +711,7 @@ static int we_gemm_plan(const WeGemm *g, WeGemmPlan *P) {
     P->tileb = (size_t)P->RB * 48 * 2;
     P->conv = g->conv_base != 0, P->aoff = 0, P->lkoff = 0;
     P->dbuf = !P->conv && P->passes > 1 && P->MBP <= 3 && P->hdrs + 2 * (P->a_pass + P->r_pass) <= EF_MT_BYTES;
-    if ((g->stox && (P->NBS != 1 || P->MBP != 1 || g->n != 384 || g->ract != 4 || P->NSUB != 2)) ||
+    if ((g->stox && (P->NBS != 1 || P->MBP > 2 || g->n != 384 || g->ract != 4 || P->NSUB != 2)) ||
         (g->stor == WE_ST_OUTQ && (P->passes != 1 || P->MB != 6 || g->ract != 4 || P->NSUB < 2)) ||
         (g->stor == WE_ST_OUT && (P->MB != 6 || P->MBP != 2 || P->NBS != 2 || g->n != 1536 || g->ract != 4)) ||
         (g->stor == WE_ST_IN && (P->MBP > 3 || !g->st_ppt || g->st_ppt % P->MBP || !g->st_cs)) ||
@@ -1059,7 +1059,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                 }
             if (g->stox) { /* sub-op s was armed with s-1 (or here, s = 0) */
                 if (s == 0)
-                    we_arm_out_stx(e, 0, p, ev);
+                    we_arm_out_stx(e, 0, p, P.MBP, ev);
             } else if (g->stor == WE_ST_OUT) { /* sub-op s was armed with s-1 (or here, s = 0) */
                 if (s == 0)
                     we_arm_out_st(e, 0, p, P.NBS, P.MBP, ev);
@@ -1076,7 +1076,7 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             if (g->stor == WE_ST_OUT && s + 1 < P.NSUB) /* s+1's outputs too (the other BD bank) */
                 we_arm_out_st(e, s + 1, p, P.NBS, P.MBP, ev);
             if (g->stox && s + 1 < P.NSUB)
-                we_arm_out_stx(e, s + 1, p, ev);
+                we_arm_out_stx(e, s + 1, p, P.MBP, ev);
             if (P.dbuf && s == 0 && p + 1 < P.passes) { /* the next pass into the other half; its
                                                            shim BDs are this pass's: wait for its fill */
                 for (int k = 1; k <= g->ract; k++)
