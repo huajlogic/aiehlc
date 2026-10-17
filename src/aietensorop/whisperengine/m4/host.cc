@@ -42,7 +42,7 @@ int main() {
     memset(src, 1, (size_t)8 * rd);
     __Runtime_sync_for_dev(dev, src, (size_t)8 * rd);
     for (int k = 1; k <= 4; k++) {
-        XAie_DmaChannelEnable(dev, mt(k, 1), 0, DMA_S2MM);
+        XAie_DmaChannelEnable(dev, mt(k, 1), 1, DMA_S2MM); /* MT_A fills: S2MM1 */
         XAie_DmaChannelEnable(dev, mt(k, 2), 0, DMA_S2MM);
     }
     for (int rep = 0; rep < 2; rep++)
@@ -70,8 +70,9 @@ int main() {
                         XAie_DmaDescInit(dev, &d, mt(k, row));
                         XAie_DmaSetAddrLen(&d, EF_MT_BASE, (u32)rd);
                         XAie_DmaEnableBd(&d);
-                        XAie_DmaWriteBd(dev, &d, mt(k, row), 0);
-                        XAie_DmaChannelSetStartQueue(dev, mt(k, row), 0, DMA_S2MM, 0, 1, XAIE_DISABLE);
+                        const int mbd = row == 1 ? 24 : 0; /* odd channels own BDs 24..47 */
+                        XAie_DmaWriteBd(dev, &d, mt(k, row), mbd);
+                        XAie_DmaChannelSetStartQueue(dev, mt(k, row), row == 1, DMA_S2MM, mbd, 1, XAIE_DISABLE);
                         const int ch = row == 1 ? 1 : 0;
                         XAie_DmaDesc s = __Runtime_dma_bd_config_multidim_ooo(
                             dev, shim(k), src + (size_t)((k - 1) * 2 + row - 1) * rd, 12 + ch, rd, -1, 0, 0, 0, 0, 0, 0,
@@ -90,7 +91,7 @@ int main() {
                 }
             if (mode & 1)
                 for (int k = 1; k <= 4; k++) {
-                    wait_ch(dev, mt(k, 1), 0, DMA_S2MM);
+                    wait_ch(dev, mt(k, 1), 1, DMA_S2MM);
                     wait_ch(dev, mt(k, 2), 0, DMA_S2MM);
                 }
             XTime tr;

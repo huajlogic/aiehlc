@@ -54,7 +54,7 @@ static int test(WeEng *e, const char *name, int rb, int rows, int causal, int ra
     WeAttn a = {&qkv, 0, &qkv, 8, 16, &o, rows, causal, ract, ract};
     XTime t0, t1;
     XTime_GetTime(&t0);
-    if (we_attn(e, &a))
+    if (we_attn(e, &a) || we_drain(e))
         return 1;
     XTime_GetTime(&t1);
     __Runtime_sync_for_cpu(e->dev, o.p, we_act_bytes(&o));

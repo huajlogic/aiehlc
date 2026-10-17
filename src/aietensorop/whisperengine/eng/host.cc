@@ -402,9 +402,9 @@ int main() {
                     for (int i = 5; i < 14; i++)
                         XAie_DataMemWrWord(g_dev, XAie_TileLoc((u8)c, (u8)r), 0x07C0 + 4 * i, 0);
         }
-        printf("WHISPER BD writes: %lu full, %lu address-only, %lu skipped; %u program swaps %.0f us\n", we_n_full,
-               we_n_addr, we_n_skip, g_e.nswap, g_e.t_swap);
-        we_n_full = we_n_addr = we_n_skip = 0;
+        printf("WHISPER BD writes: %lu new, %lu partial, %lu unchanged (%lu words); %u program swaps %.0f us\n",
+               we_n_full, we_n_addr, we_n_skip, we_n_words, g_e.nswap, g_e.t_swap);
+        we_n_full = we_n_addr = we_n_skip = we_n_words = 0;
         g_e.nswap = 0, g_e.t_swap = 0;
 #ifdef WE_TL
         if (run == 2)

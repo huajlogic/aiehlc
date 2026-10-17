@@ -15,6 +15,7 @@
 #ifndef WE_HOST_H
 #define WE_HOST_H
 #include "aie_runtime.h"
+#include "aie_runtime_xaie_seq.h"
 #include "aie_timer.h"
 #include "engine_fabric.h"
 #include "we_desc.h"
@@ -106,49 +107,57 @@ static void we_tl_print(void) {
 #endif
 
 /* ---- BD shadow ---------------------------------------------------------- */
-/* Every BD the host writes is remembered (parameters minus the buffer address).
- * Re-arming a BD with the same shape costs one address update (1-2 MMIO writes,
- * ~355 ns each: doc/performance/register_write_cost.md) instead of the full BD,
- * and an identical BD costs nothing. Only the host writes these BDs (the cores
+/* Every BD the host writes is kept as its register words (the driver's own
+ * WriteBdPrep encoding). A BD write compares the new words with the shadow and
+ * writes only the words that changed, with plain 32-bit writes: re-arming a BD at
+ * a new address costs the 1-2 address words, an identical BD nothing, and nothing
+ * ever reads the device (XAie_DmaUpdateBdAddr read-modify-writes: ~400 ns per read,
+ * doc/performance/register_write_cost.md). Only the host writes these BDs (the cores
  * program their own tile DMAs), so the shadow stays exact. */
-#define WE_SH_NP 20 /* >= the longest parameter list (we_mt_bdl: 18) */
 typedef struct {
     int valid;
-    uint64_t addr;
-    int32_t p[WE_SH_NP];
+    uint32_t w[12];
 } WeShadow;
 static WeShadow we_shadow[8][3][48]; /* [partition-relative col][row 0..2][bd] */
-static unsigned long we_n_full, we_n_addr, we_n_skip;
-/* 1: write the BD in full; 0: done (unchanged, or only its address updated) */
-static int we_shadow_check(WeEng *e, XAie_LocType t, int bd, uint64_t addr, const int32_t *p, int np) {
-    WeShadow *s = &we_shadow[t.Col][t.Row][bd];
-    int32_t q[WE_SH_NP] = {0};
-    memcpy(q, p, (size_t)np * 4);
-    if (s->valid && !memcmp(s->p, q, sizeof(q))) {
-        if (s->addr != addr) {
-            XAie_DmaUpdateBdAddr(e->dev, t, addr, (u16)bd);
-            s->addr = addr;
-            we_n_addr++;
-        } else {
-            we_n_skip++;
-        }
-        return 0;
+static unsigned long we_n_full, we_n_addr, we_n_skip, we_n_words;
+static void we_bd_put(WeEng *e, XAie_LocType t, int bd, XAie_DmaDesc *d) {
+    const u8 tt = e->dev->DevOps->GetTTypefromLoc(e->dev, t);
+    const XAie_DmaMod *m = e->dev->DevProp.DevMod[tt].DmaMod;
+    u32 w[12];
+    u64 a;
+    if (e->fab || m->BdSize > 12 || m->WriteBdPrep(e->dev, d, t, (u8)bd, w, &a) != XAIE_OK) {
+        XAie_DmaWriteBd(e->dev, d, t, (u8)bd); /* captured by the control-packet plane */
+        we_shadow[t.Col][t.Row][bd].valid = 0;
+        we_n_full++;
+        return;
     }
+    WeShadow *s = &we_shadow[t.Col][t.Row][bd];
+    int n = 0;
+    for (int i = 0; i < m->BdSize; i++)
+        if (!s->valid || s->w[i] != w[i]) {
+            XAie_Write32(e->dev, a + 4u * (u64)i, w[i]);
+            s->w[i] = w[i];
+            n++;
+        }
+    if (!s->valid)
+        we_n_full++;
+    else if (n)
+        we_n_addr++;
+    else
+        we_n_skip++;
     s->valid = 1;
-    s->addr = addr;
-    memcpy(s->p, q, sizeof(q));
-    we_n_full++;
-    return 1;
+    we_n_words += (unsigned long)n;
 }
-/* shim BD through the runtime (OOO / packet / iteration fields), shadowed */
+/* shim BD (OOO / packet / iteration fields), through the shadow */
 static XAie_DmaDesc we_shim_bd(WeEng *e, XAie_LocType t, const void *buf, int bd, int len, int next, int pkt_en,
                                int pkt_id, int ooo, int nd, int s0, int w0, int s1, int w1, int s2, int w2, int it_step,
                                int it_n) {
-    const int32_t p[16] = {len, next, pkt_en, pkt_id, ooo, nd, s0, w0, s1, w1, s2, w2, it_step, it_n, 0x5348, 0};
-    XAie_DmaDesc d = {};
-    if (we_shadow_check(e, t, bd, __Runtime_dev_addr((void *)buf), p, 16))
-        d = __Runtime_dma_bd_config_multidim_ooo(e->dev, t, (void *)buf, bd, len, next, pkt_en, pkt_id, -1, 0, -1, 0,
-                                                 ooo, nd, s0, w0, s1, w1, s2, w2, it_step, it_n);
+    rt_seq_bd_args a = {
+        bd,      len,  next, pkt_en, pkt_id, -1, 0, -1, 0, ooo, nd > 3 ? 3 : nd, {s0, s1, s2, 0}, {w0, w1, w2, 0},
+        it_step, it_n, 1};
+    XAie_DmaDesc d;
+    rt_seq_bd_desc(e->dev, t, (uint64_t)(uintptr_t)buf, &a, &d);
+    we_bd_put(e, t, bd, &d);
     return d;
 }
 
@@ -217,12 +226,6 @@ static int we_prog(WeEng *e, int p) {
  * lkr by lkrv after (memtile-local lock ids) */
 static void we_mt_bdl(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t len, int nd, const uint32_t *st,
                       const uint32_t *wr, uint32_t it_step, uint32_t it_wrap, int next, int lka, int lkr, int lkrv) {
-    int32_t p[18] = {(int32_t)len, nd,  (int32_t)it_step, (int32_t)it_wrap, next, 0x4D54, 0, 0, 0, 0, 0, 0, 0, 0, lka,
-                     lkr,          lkrv};
-    for (int i = 0; i < nd && i < 4; i++)
-        p[6 + 2 * i] = (int32_t)st[i], p[7 + 2 * i] = (int32_t)wr[i];
-    if (!we_shadow_check(e, t, bd, addr, p, 18))
-        return;
     XAie_DmaDesc d;
     XAie_DmaDescInit(e->dev, &d, t);
     if (nd) {
@@ -251,7 +254,7 @@ static void we_mt_bdl(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t 
     if (next >= 0)
         XAie_DmaSetNextBd(&d, (uint8_t)next, XAIE_ENABLE);
     XAie_DmaEnableBd(&d);
-    XAie_DmaWriteBd(e->dev, &d, t, (uint8_t)bd);
+    we_bd_put(e, t, bd, &d);
 }
 static void we_mt_bd(WeEng *e, XAie_LocType t, int bd, uint32_t addr, uint32_t len, int nd, const uint32_t *st,
                      const uint32_t *wr, uint32_t it_step, uint32_t it_wrap, int next) {
@@ -832,10 +835,8 @@ static int32_t *we_gemm_headers(WeEng *e, const WeGemm *g, const WeGemmPlan *P) 
 }
 
 static int we_gemm(WeEng *e, const WeGemm *g) {
-    if (we_prog(e, 1))
-        return -1;
     if (g->conv_base) {
-        if (we_drain(e))
+        if (we_prog(e, 1) || we_drain(e))
             return -1;
         return we_gemm_legacy(e, g);
     }
@@ -858,7 +859,8 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
         WE_EV('G', t_op);
         WE_EV('p', t);
     }
-    if (we_drain(e))
+    /* after attention: the swap (it drains first) comes after this op's BDs are written */
+    if (we_prog(e, 1) || we_drain(e))
         return -1;
     {
         XTime t;
@@ -880,6 +882,9 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
             const int bk = (rb0 + st) & 1;
             XTime q0, q1, q2;
             XTime_GetTime(&q0);
+            if (s == 0) /* the first stage of a pass (pass 0: BDs written above): the cores
+                           start on it while the outputs are armed (a packet waits) */
+                we_gemm_replay(e, g, &P, 0, bk, p == 0 ? WE_GO : WE_BDS | WE_GO);
             struct_ioevent ev[4];
             bf16_t *dst[4][4];
             for (int r = 0; r < 4; r++)
@@ -895,8 +900,6 @@ static int we_gemm(WeEng *e, const WeGemm *g) {
                 we_arm_out(e, g->ract, dst, 768, P.NBS, 768, 768, 1, 768, ev);
             else
                 we_arm_out(e, g->ract, dst, WE_BLK, P.NBS * P.MBP, WE_BLK, 1024, 6, 1024, ev);
-            if (s == 0) /* the first stage of a pass (pass 0: BDs written above) */
-                we_gemm_replay(e, g, &P, 0, bk, p == 0 ? WE_GO : WE_BDS | WE_GO);
             if (s + 1 < P.NSUB) /* queued behind s: the cores run on without a gap */
                 we_gemm_replay(e, g, &P, s + 1, bk ^ 1, WE_BDS | WE_GO);
             XTime_GetTime(&q1);
@@ -958,7 +961,10 @@ static void we_arm_out_att(WeEng *e, int ract, bf16_t *const dst[4][4], const in
     }
 }
 
-static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int nqb[4], const int qb0[4]) {
+/* q_fill 0: MT_A still holds this layer's q tiles from the previous round (only the
+ * header is refilled). The round is left running (e->pending, see we_drain); the BD
+ * banks it does not touch (fill/replay bank 1) are what the next GEMM prepares in. */
+static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int nqb[4], const int qb0[4], int q_fill) {
     if (we_prog(e, 2) || we_drain(e))
         return -1;
 #ifdef WE_TL
@@ -997,10 +1003,11 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
     for (int k = 1; k <= 4; k++) {
         const int r = k - 1, act = k <= a->ract;
         XAie_LocType ta = we_mt(k, EF_MT_A_ROW), tb = we_mt(k, EF_MT_B_ROW);
-        we_mt_bd(e, ta, 24, EF_MT_BASE, (uint32_t)(WE_HDR_BYTES + (act ? 8 * qtile : 0)), 0, 0, 0, 0, 0, -1);
+        const int qf = act && q_fill;
+        we_mt_bd(e, ta, 24, EF_MT_BASE, (uint32_t)(WE_HDR_BYTES + (qf ? 8 * qtile : 0)), 0, 0, 0, 0, 0, -1);
         we_mt_queue(e, ta, DMA_S2MM, 24, 1);
-        we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, act ? 13 : -1, 0, 0, 0);
-        if (act)
+        we_sh_bd(e, k, 12, e->hdr, WE_HDR_BYTES, qf ? 13 : -1, 0, 0, 0);
+        if (qf)
             we_sh_bd(e, k, 13, we_tile(a->q, r, a->q_cb), (int)(8 * qtile), -1, 0, 0, 0);
         we_sh_start(e, k, 1, 12);
         const int c = k - 1, h = head[c];
@@ -1051,14 +1058,12 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
         }
     }
     XTime_GetTime(&p2);
-    for (int r = 0; r < a->ract; r++)
-        if (we_wait_out(e, ev[r]))
-            return -1;
-    XTime_GetTime(&p3);
     e->t_fill += we_us(p0, p1);
     e->t_arm += we_us(p1, p2);
-    e->t_run += we_us(p2, p3);
-    WE_EV('Z', p3);
+    e->pending = 1, e->pract = a->ract, e->pt = p2;
+    e->rbank = 0, e->fbank = 0; /* the next GEMM prepares in bank 1: no BD this round uses */
+    memcpy(e->pev, ev, sizeof(ev));
+    WE_EV('Z', p2);
     return rc;
 }
 
@@ -1067,15 +1072,15 @@ static int we_attn_round(WeEng *e, const WeAttn *a, const int head[4], const int
 static int we_attn(WeEng *e, const WeAttn *a) {
     const int QB = a->q->rb / WE_QB; /* q-blocks per row block */
     const int h1[4] = {0, 1, 2, 3}, n1[4] = {QB, QB, QB, QB}, z[4] = {0, 0, 0, 0};
-    if (we_attn_round(e, a, h1, n1, z))
+    if (we_attn_round(e, a, h1, n1, z, 1))
         return -1;
     if (QB >= 2) {
         const int h2[4] = {4, 4, 5, 5}, n2[4] = {QB / 2, QB - QB / 2, QB / 2, QB - QB / 2},
                   q2[4] = {0, QB / 2, 0, QB / 2};
-        return we_attn_round(e, a, h2, n2, q2);
+        return we_attn_round(e, a, h2, n2, q2, 0);
     }
     const int h2[4] = {4, 5, 4, 5}, n2[4] = {QB, QB, 0, 0};
-    return we_attn_round(e, a, h2, n2, z);
+    return we_attn_round(e, a, h2, n2, z, 0);
 }
 
 /* Header to the idle mesh rows too (cores of rows >= ract only read it). */
