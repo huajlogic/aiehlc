@@ -613,7 +613,7 @@ compared `l1_budget` *bytes* with *element* counts. Generated code for
 The compiler route above is compile-only; what runs on VEK385 is a hand-written
 engine. It uses the resnetengine fabric with memory tiles spliced in, two kernel
 programs (GEMM, attention) swapped over control packets, and the host re-arming only
-memtile/shim BDs. The encoder takes **25.1 ms (19.7 % of 4×4 bf16 peak)**; FC1→FC2 and Q→attention run on chip through storage memtiles over the shim row (11-column partition), the decoder
+memtile/shim BDs. The encoder takes **24.3 ms (20.4 % of 4×4 bf16 peak)**, DDR traffic 91 MB (was 152); Q→attention, attention→out-projection, FC1→FC2 and encoder output→cross K/V run on chip through 16 storage memtiles reached over the shim row (13-column partition). All memtile use is hand-written (the compiler's memtile path is off: `RoutingmovedatabyioConvertdmap(..., 0)`), the decoder
 ~27 ms/token, and the JFK transcript matches PyTorch. Build and run it with
 `build.sh eng` + `apppaltest.py --netload`. Profile it with `HDEFS=WE_TL` (host
 timeline), `KDEFS=WE_PROF_G HDEFS=WE_PROF_GOP` (per-op core split) and
@@ -625,7 +625,7 @@ Traps:
 - The host BD shadow writes only changed BD words; `XAie_DmaUpdateBdAddr` read-modify-writes, and each read costs ~400 ns.
 - The attention program's 0x540 stack overflows silently when an extra register-blocked loop is added (m10 4x2 pv was bit-exact standalone, NaN in the engine).
 
-Tutorial: `doc/web/whisper_aie/index.html`. Skills: **memtilebdlockchannel**, **hosttimelinedistortion**, **memtilestalenan**, **aie2psprogrammemory**, **dmaoutputdirtycache**.
+Tutorial: `doc/web/whisper_aie/index.html`. Skills: **shimrowstorage**, **memtilebdlockchannel**, **hosttimelinedistortion**, **memtilestalenan**, **aie2psprogrammemory**, **dmaoutputdirtycache**.
 
 ### `aiegraph` — the Python front door (`pip install -e .`)
 
@@ -805,7 +805,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
 - **[doc/modelsupportevaluate.md](doc/modelsupportevaluate.md)** — Gap analysis for Gemma / ResNet-50 / YOLO / MobileNet / BERT / ViT (none run on AIE today); proposed `aiephase` + `aiecfg` dialects (phase-based control-plane reconfiguration, overlay kernels), new Depthwise/Eltwise/Reduce/Attention/Pipeline/Move spaces, milestones M0–M8
 - **[doc/design/resnet_aie_engine.md](doc/design/resnet_aie_engine.md)** — whole int8 ResNet-18 on the AIE in 2.81 ms, bit-exact: persistent engine architecture, exactness proofs (fusions, 8-bit tensors, on-core residuals), measured optimization steps 1270 → 2.81 ms, what did not help, remaining limits
-- **[doc/web/whisper_aie/index.html](doc/web/whisper_aie/index.html)** — HTML tutorial: how Whisper-tiny is offloaded (aiehlc compiler route vs the hand-written persistent `whisperengine`), every encoder/decoder layer's handling, numerics, aiehlc-vs-hand file table, perf log. Serve with `python3 -m http.server 8150 --directory doc/web` → `http://<host>:8150/whisper_aie/`
+- **[doc/web/whisper_aie/index.html](doc/web/whisper_aie/index.html)** — HTML tutorial: how Whisper-tiny is offloaded (aiehlc compiler route vs the hand-written persistent `whisperengine`), every encoder/decoder layer's handling, how aiehlc is used vs hand-written code, how the memory tiles (mesh + storage over the shim row) are used, why the compiler was not changed for them, numerics, perf log. Serve with `python3 -m http.server 8150 --directory doc/web` → `http://<host>:8150/whisper_aie/`
 - **[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** — `#pragma KERNELCONFIGOFFLOAD`: core self-configured DMA, lock asymmetry, BD-id reservation
 - **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)** — `--aie-offload`: TVM BYOC → `libconv2dstem.a`, fused boundary, uint8 shift, weight-fingerprint layer mapping
 - **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
