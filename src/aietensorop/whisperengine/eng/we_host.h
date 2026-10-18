@@ -88,7 +88,7 @@ static inline double we_us(XTime a, XTime b) { return 1e6 * (double)(b - a) / CO
  * distort it). Kinds: G op entry, p BDs prepared, d previous op drained, a/b stage
  * arm start/end, w stage wait end, A attention round start, Z attention round end */
 #ifdef WE_TL
-#define WE_TL_N 4096
+#define WE_TL_N 16384
 static struct {
     char k;
     XTime t;
