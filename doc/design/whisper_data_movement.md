@@ -144,8 +144,10 @@ bound** (~11 ms of its ~26 ms at 10.5 GB/s). The same weights are used by all 24
 steps. The placement rule above says:
 - the 12 MB of memory tiles cannot hold 113 MB, so keep resident the weights with the
   best **(steps × bytes saved) / memory-tile bytes** that the rest of the step does not
-  need on chip — the per-layer attention weights (Q/K/V, out, cross-Q, cross-out:
-  ~4.3 MB hi/lo for all 4 layers) are a natural first set;
+  need on chip. The per-layer attention weights (Q/K/V, out, cross-Q, cross-out) are
+  3.5 MB hi/lo per layer, 14 MB for all four. That is more than the 12 MB, so the
+  candidate is a subset: e.g. three layers' attention weights, or FC weights split so
+  the resident part is the one read by the most steps;
 - keep the logits (80 MB, read once per step, highest volume) in DDR and **cut its
   bytes instead**: only the argmax is needed, so a top-k over a pruned vocabulary or a
   bf16-only first pass with an hi/lo re-check of the top candidates would halve them;
