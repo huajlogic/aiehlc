@@ -355,6 +355,7 @@ Moving activations into on-chip storage memory tiles cut DDR traffic from 152 to
 <tr><td>(r, 3)</td><td>last layer's FC2 (encoder output)</td><td>[block 6][tile 8][64×48]</td><td>the 4 cross K/V GEMMs, 3 blocks a pass</td></tr>
 </table>
 
+<p>The general placement rules behind these choices, and the strategy when weights do not fit on chip, are written up in <code>doc/design/whisper_data_movement.md</code>.</p>
 <p>Still in DDR are K and V for attention (each column needs one head from all four rows' tiles), the residuals, the weights, and the decoder.</p>
 
 <!-- ===================================================================== -->
