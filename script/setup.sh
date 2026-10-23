@@ -64,7 +64,7 @@ PATH_SET_ONLY=0
 AIE_RT_DEFAULT_REPO="${AIE_RT_REPO:-https://github.com/AMD-AECG-AIENGINE/aie-rt.git}"
 #VITIS_SETTINGS_PATH="/proj/xbuilds/2025.2_0414_1/installs/lin64/HEAD/Vitis/settings64.sh"
 #VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
-VITIS_SETTINGS_PATH="/proj/xbuilds/2026.2_daily_latest/installs/lin64/2026.2/Vitis/settings64.sh"
+VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
