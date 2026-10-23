@@ -8,10 +8,10 @@ Unit test for the AST -> KernelOps -> C pipeline.
 
 Usage:
     # AST -> KernelOps only (no C++ .so needed):
-    cd src/mlir/mlirfront && python -m aietriton.aie_pass.test_ast_to_c
+    cd src/mlir/mlirfront/frontend && python -m aietriton.aie_pass.test_ast_to_c
 
-    # Full pipeline including C generation (requires built _aietriton_core.so):
-    cd src/mlir/mlirfront && python -m aietriton.aie_pass.test_ast_to_c --full
+    # Full pipeline including C generation (requires the built _aiebackend .so):
+    cd src/mlir/mlirfront/frontend && python -m aietriton.aie_pass.test_ast_to_c --full
 """
 
 import ast
@@ -127,12 +127,13 @@ def test_ast_to_kernel_ops():
 def test_full_pipeline(kernel_ops):
     """Test Phase 2: KernelOps -> pybind11 -> MLIR EmitC -> C string."""
     try:
-        from aietriton import _aietriton_core
+        import aiebackend
+        backend = aiebackend.load()
     except ImportError:
-        print("SKIP: _aietriton_core.so not built (run 'make' in build/ first)")
+        print("SKIP: _aiebackend .so not built (run 'make _aiebackend' in build/ first)")
         return
 
-    c_code = _aietriton_core.build_kernel_body(
+    c_code = backend.build_kernel_body(
         "matmul_simple",  # kernel name
         "int8",           # element type
         2,                # num input windows

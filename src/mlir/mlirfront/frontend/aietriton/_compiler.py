@@ -5,8 +5,26 @@
 
 import ast
 import inspect
+import sys
 import textwrap
+from pathlib import Path
+
 import numpy as np
+
+
+def _backend():
+    """The ``_aiebackend`` pybind module, imported in-process.
+
+    It lives in the sibling ``aiebackend`` package (shared with the TVM
+    frontend), not in this one. In-process is fine here: nothing else in a
+    Triton run links LLVM (contrast ``aiebackend.spawn()`` for TVM).
+    """
+    frontend_dir = str(Path(__file__).resolve().parents[1])
+    if frontend_dir not in sys.path:
+        sys.path.insert(0, frontend_dir)
+    import aiebackend
+
+    return aiebackend.load()
 
 
 def compile_and_run(fn, name, grid, args, kwargs):
@@ -50,10 +68,8 @@ def compile_and_run(fn, name, grid, args, kwargs):
     )
 
     # --- Phase 3: Call C++ pipeline via pybind11 ---
-    from . import _aietriton_core
-
     output_dir = "./worklocal"
-    success = _aietriton_core.run_aie_pipeline(
+    success = _backend().run_aie_pipeline(
         mesh_rows, mesh_cols, tensor_specs, output_dir, kernel_body, name
     )
     if not success:
@@ -148,9 +164,7 @@ def _extract_kernel_body(func_def, param_names, tensor_params, constexpr_params,
         return ""  # fallback to auto-gen if AST produced no ops
 
     # Phase 2: KernelOps -> pybind11 -> MLIR EmitC -> C string
-    from . import _aietriton_core
-
-    c_code = _aietriton_core.build_kernel_body(
+    c_code = _backend().build_kernel_body(
         kernel_name, element_type,
         num_input_windows, num_output_windows,
         kernel_ops

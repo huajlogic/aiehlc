@@ -7,8 +7,8 @@ AIEHLC has **three** frontends into `TilingLinalgPipeline`:
 | Frontend | Input | Reaches the pipeline via |
 |----------|-------|--------------------------|
 | **aiehlc** (C++) | C++ using `aie::SpatialPolicy` + Clang AST | `AieFrontEnd.cc` builds routing IR in-process |
-| **aietriton** (Python) | `@aie_triton.jit` GEMM kernel | AST → tensor specs + C body → `_aietriton_core.run_aie_pipeline` |
-| **tvm** (Python) | a model via ONNX → Relay | fused-graph walk → per-launch tensor specs + C body → `_aietriton_core.run_aie_pipeline` |
+| **aietriton** (Python) | `@aie_triton.jit` GEMM kernel | AST → tensor specs + C body → `_aiebackend.run_aie_pipeline` |
+| **tvm** (Python) | a model via ONNX → Relay | fused-graph walk → per-launch tensor specs + C body → `_aiebackend.run_aie_pipeline` |
 
 This document is the **"bring your own model" how-to** for the TVM frontend
 (`src/frontend/tvm/`). It is a companion to the frontend deep-dive
@@ -222,8 +222,9 @@ run_aie_pipeline(mesh_rows, mesh_cols, tensor_specs, out_dir, body, func_name
                  [, split_specs, dma_specs])
 ```
 
-`_aietriton_core` is the **shared** pybind extension imported from the aietriton
-package (`_compiler._core` at `_compiler.py:199`); build it (cmake with
+`_aiebackend` is the **shared** pybind extension in
+`src/mlir/mlirfront/frontend/aiebackend/` (in-process via `aiebackend.load()`,
+or out of process via `aiebackend.spawn()` when TVM is loaded); build it (cmake with
 `LLVM_INSTALL_DIR` + MLIR) before emitting. Each call writes one file set into its
 directory: `host.cc`, `kernel.cc`, `<kernel>.cc`, `routing.cc`, `aieml.bcf`,
 `aieml.prx`. `compile_plan` (`_compiler.py:230`) iterates the whole plan (~29
@@ -234,7 +235,7 @@ loop nest lives in the kernel body, so `dma_specs` is left empty.
 `im2col_dma_spec(H,W,Cin,K,stride)` (`_compiler.py:174`) builds the multi-dim shim
 DMA addressing the extended pybind `dma_specs` argument accepts. That argument is
 the Python surface of the generic `DmaAddressing` on `TensorParam`
-(`aietriton_pybind.cpp:21`), a per-tensor tuple:
+(`aiebackend_pybind.cpp:21`), a per-tensor tuple:
 
 ```cpp
 using DmaSpec = std::tuple<std::vector<std::pair<int,int>>,  // dims (stride,size)
@@ -245,7 +246,7 @@ using DmaSpec = std::tuple<std::vector<std::pair<int,int>>,  // dims (stride,siz
 ```
 
 Non-empty entries populate `TensorParam::shimDma`; empty dims + mode 0 = flat
-(`aietriton_pybind.cpp:38-49`). Defaulted to `{}` so the Triton path is
+(`aiebackend_pybind.cpp:38-49`). Defaulted to `{}` so the Triton path is
 unaffected. See [`conv2d_im2col_design.md §11`](conv2d_im2col_design.md).
 
 ## 10. Step 7 — Verify
@@ -401,7 +402,7 @@ initializers; new **maxpool / 7×7-stem / input-BN** kernel bodies; and
   `DmaAddressing` on `TensorParam` that `dma_specs` exposes to Python.
 - `src/frontend/tvm/README.md` — module usage.
 - `src/mlir/mlirfront/frontend/aietriton/README.md` — the sibling Triton frontend
-  and the `_aietriton_core` pybind bridge this frontend reuses.
+  and the `_aiebackend` pybind bridge this frontend reuses.
 - `example/tileprogram/design/triton/resnet18_triton.py` — the hand-written
   template whose launch sequence, kernel bodies, and CPU references the frontend
   reproduces.

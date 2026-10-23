@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ONNX ResNet-18 → TVM → int8 → AIE layer → board ELF — developer tutorial</title>
+<style>
+  :root { --fg:#1d2330; --muted:#5b6475; --bg:#ffffff; --side:#f5f7fa; --line:#e2e6ee;
+          --accent:#b4161b; --code:#f6f8fa; --ok:#1a7f37; --warn:#9a6700; --bad:#b4161b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.6 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         color:var(--fg); background:var(--bg); }
+  nav { position:fixed; top:0; left:0; bottom:0; width:290px; overflow-y:auto;
+        background:var(--side); border-right:1px solid var(--line); padding:18px 16px; font-size:14px; }
+  nav h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:14px 0 6px; }
+  nav a { display:block; color:var(--fg); text-decoration:none; padding:3px 6px; border-radius:4px; }
+  nav a:hover { background:#e8ecf3; }
+  nav a.sub { padding-left:20px; color:var(--muted); }
+  main { margin-left:290px; max-width:1020px; padding:28px 44px 120px; }
+  h1 { font-size:30px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:23px; margin:48px 0 10px; padding-top:10px; border-top:1px solid var(--line); }
+  h3 { font-size:18px; margin:28px 0 8px; }
+  p.lead { color:var(--muted); font-size:17px; margin-top:4px; }
+  code { font:13.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--code);
+         padding:1px 5px; border-radius:4px; }
+  pre { background:var(--code); border:1px solid var(--line); border-radius:6px; padding:12px 14px;
+        overflow-x:auto; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  pre code { background:none; padding:0; }
+  pre.diagram { background:#fbfcfe; line-height:1.35; }
+  table { border-collapse:collapse; width:100%; margin:12px 0; font-size:14.5px; }
+  th, td { border:1px solid var(--line); padding:6px 9px; text-align:left; vertical-align:top; }
+  th { background:var(--side); }
+  .box { border-left:4px solid #8aa4d6; background:#f3f6fc; padding:10px 14px; margin:14px 0; border-radius:0 6px 6px 0; }
+  .box.warn { border-color:#d4a72c; background:#fff8e6; }
+  .box.bad  { border-color:var(--bad); background:#fdf0f0; }
+  .box.ok   { border-color:var(--ok); background:#eef8f0; }
+  .box b:first-child { display:block; margin-bottom:2px; }
+  .tag { display:inline-block; font-size:12px; padding:0 7px; border-radius:10px; margin-left:6px;
+         vertical-align:middle; border:1px solid var(--line); color:var(--muted); }
+  .tag.ok { color:var(--ok); border-color:#9fd3ae; } .tag.bad { color:var(--bad); border-color:#e7a5a5; }
+  .step { counter-increment: step; }
+  ol li { margin:4px 0; }
+  .small { font-size:13.5px; color:var(--muted); }
+  @media (max-width: 900px) { nav { position:static; width:auto; } main { margin-left:0; padding:20px; } }
+</style>
+</head>
+<body>
+
+<nav>
+  <div style="font-weight:600;font-size:15px">TVM → AIE tutorial</div>
+  <div class="small">src/frontend/tvmrelay/tutorial</div>
+  <h2>Orientation</h2>
+  <a href="#overview">0. The whole flow on one page</a>
+  <a href="#run">1. Run it end to end</a>
+  <a href="#tree">2. What lands on disk</a>
+  <h2>Front half — model to C</h2>
+  <a href="#model">3. Model, import, int8 (brief)</a>
+  <a href="#build">4. relay.build → C</a>
+  <a href="#split">5. Split into layers/</a>
+  <h2>Back half — one layer to AIE</h2>
+  <a href="#select">6. Picking the layer</a>
+  <a href="#byoc">7. BYOC: fuse, select, partition, codegen</a>
+  <a class="sub" href="#byoc-status">7.5 Why BYOC fuses 0/20 today</a>
+  <a href="#aiegraph">8. aiegraph path (what runs today)</a>
+  <a href="#stem">9. conv2dstem.cc → layer aie/</a>
+  <a href="#entry">10. The packed-call entry</a>
+  <h2>Into the ELF</h2>
+  <a href="#driver">11. graph_driver.c</a>
+  <a href="#make">12. Makefile, link, main.elf</a>
+  <a href="#verify">13. Verify: local, test, board</a>
+  <h2>Working on it</h2>
+  <a href="#trouble">14. Troubleshooting</a>
+  <a href="#optimize">15. Where to optimize</a>
+  <a href="#handwrite">16. Hand-write a layer yourself</a>
+  <a href="#files">17. File map</a>
+</nav>
+
+<main>
+<h1>From an ONNX model to a ResNet-18 layer running on the AIE</h1>
+<p class="lead">A developer walkthrough of <code>src/frontend/tvmrelay/</code>: how ResNet-18 is
+downloaded, imported into TVM, quantized to int8, compiled to C, split into layers, how
+<b>layer 01</b> (the 7×7/s2 stem convolution) is handed to the AIE as
+<code>src/aietensorop/conv2dstem/conv2dstem.cc</code>, and how that is wired into
+<code>graph_driver.c</code> and linked into the board's <code>main.elf</code>. Written so you can
+debug it, speed it up, or rebuild any piece by hand.</p>
+
+<div class="box ok"><b>Verified state this tutorial describes (2026-10-09)</b>
+<code>run_test.sh</code> passes; on the board, layer 01 runs on the AIE
+(<code>[aie-offload] layer 01 … EXIT rc=0 … hash=2aeeab65</code>), the AIE output is
+<b>bit-exact</b> with TVM's own layer-01 output over all 802,816 bytes, and the top-5 is
+identical to the CPU-only <code>main_local.elf</code>: 258 Samoyed 12.0173, 279 Arctic fox
+8.5263, 259 Pomeranian 8.1906, 257 Great Pyrenees 7.9220, 270 white wolf 7.4521.</div>
+
+<!-- ================================================================== -->
+<h2 id="overview">0. The whole flow on one page</h2>
+
+<pre class="diagram">
+ ONNX resnet18-v1-7.onnx                                       deploy_flow.py stage
+   │  fetch_model / prefold_onnx                                  [2/7] model, fold
+   ▼
+ onnxruntime static PTQ ──► resnet18-v1-7.int8.qdq.onnx           [3/7] ptq
+   │  import_relay → to_integer_ops (FQ2I) → qnn_fold_zp           [3/7] fq2i, qnn zp
+   ▼
+ Relay qnn graph (qnn.conv2d, qnn.requantize, …)
+   │  relay.build(target = "c -keys=pe_int8,cpu")                  [4/7] codegen
+   │    Legalize(int8) · CanonicalizeOps · AlterOpLayout(NCHWc) · FuseOps
+   ▼
+ resnet18.c  +  resnet18_graph.json  +  resnet18_params.bin
+   │  split_layers                                                  [5/7] split
+   ▼
+ layers/00_…/  01_contrib_conv2d_NCHWc_…/  02_max_pool2d/ … manifest.json
+   │
+   │  --aie-offload --aie-layers 1                                  [6/7] aie, aiegrph
+   ├─► BYOC  (MergeComposite → select → PartitionGraph → relay.ext.aie)
+   │         → today: 0 composites, nothing changes (see §7.5)
+   └─► aiegraph lift → partition.json → layer 01 is the stem geometry
+             → aiehlc.sh conv2dstem.cc  ─► layers/01_…/aie/{host.cc, kernel.cc,
+                                                 conv2d_spatial.cc, routing.cc, …}
+             → append aie_&lt;kernel&gt;() to aie/host.cc → hostcompile.sh
+             → layers/01_…/aie/build/libconv2dstem.a
+   ▼
+ arm_build: graph_driver.c (one call per graph node; layer 01 → aie_&lt;kernel&gt;()
+            under #ifdef GRAPH_AIE_OFFLOAD) + main.c + Makefile         [6/7] arm
+   │  make            → main.elf        (board: layer 01 on the AIE mesh)
+   │  make local      → main_local.elf  (x86: every layer on the CPU — the reference)
+   ▼
+ apppaltest.py main.elf → console: [aie-offload] …, top-5               [7/7] cpu ref
+</pre>
+
+<p>Two ideas hold the whole thing together:</p>
+<ol>
+<li><b>TVM owns the network, the AIE owns one operator.</b> TVM compiles all 41 kernel calls to
+portable C. The offload replaces <i>one call</i> — the stem conv — with a function that has the
+exact same signature but runs on the AIE. Nothing else in the graph knows.</li>
+<li><b>The same C builds two ELFs.</b> <code>main.elf</code> (board, AIE) and
+<code>main_local.elf</code> (x86, CPU only) come from the same <code>graph_driver.c</code>; the
+only difference is the macro <code>GRAPH_AIE_OFFLOAD</code>. So the CPU ELF is always the
+reference the board must match.</li>
+</ol>
+
+<!-- ================================================================== -->
+<h2 id="run">1. Run it end to end</h2>
+
+<pre><code># once per shell: cross toolchain + Vitis (stage 6 links the board ELF with it)
+source script/setup.sh --path-set-only
+
+# default flow: CPU only, no AIE
+PYTHONPATH=src python3 src/frontend/tvmrelay/deploy_flow.py
+
+# offload layer 01 to the AIE (default --aie-layers 1) + regression test
+bash src/frontend/tvmrelay/test/run_test.sh --clean        # ~3.5 min
+
+# CPU reference from the same sources
+make -C worklocal/tvmrelay_deploy/arm_build local
+(cd worklocal/tvmrelay_deploy/arm_build &amp;&amp; ./main_local.elf)
+
+# board
+python3 script/test/apppaltest.py -y -nonreboot worklocal/tvmrelay_deploy/arm_build/main.elf</code></pre>
+
+<p>Run everything <b>from the repo root</b>: <code>deploy_flow.DEFAULT_OUT</code> is
+<code>./worklocal/tvmrelay_deploy</code>, relative to the cwd. From anywhere else you get a second
+output tree and compare against a stale one.</p>
+
+<p><code>run_test.sh</code> (= <code>test_aie_offload.py</code>) prints four verdicts:</p>
+<table>
+<tr><th>check</th><th>passes when</th></tr>
+<tr><td><code>[run ]</code></td><td><code>deploy_flow.py --aie-offload</code> exits 0 (log: <code>test/deploy_flow.log</code>)</td></tr>
+<tr><td><code>[tree]</code></td><td><code>layers/</code> is identical to <code>layers-golden/</code> (the <i>default</i> flow) — offload must not change any CPU layer</td></tr>
+<tr><td><code>[aie ]</code></td><td>layer 01's <code>aie/</code> holds host/kernel/routing.cc, was built from <code>conv2dstem.cc</code>, carries the int32 kernel</td></tr>
+<tr><td><code>[elf ]</code></td><td><code>main.elf</code> was rebuilt by this run and links <code>aie_&lt;kernel&gt;</code> + <code>conv2d_stem_nchwc</code></td></tr>
+</table>
+<div class="box warn"><b>deploy_flow.py exits 0 even if <code>make</code> fails.</b>
+It prints the link error and moves on. That is why <code>[elf ]</code> exists — without it a
+broken link passed the whole test once.</div>
+
+<!-- ================================================================== -->
+<h2 id="tree">2. What lands on disk</h2>
+<pre><code>worklocal/tvmrelay_deploy/
+├── resnet18-v1-7.onnx, *.folded.onnx, *.int8.qdq.onnx   model, cached
+├── resnet18.c                  all 33 TVM kernels, one C file          (stage 4)
+├── resnet18_graph.json         the graph: nodes, storage ids, shapes   (stage 4)
+├── resnet18_params.bin         every constant (weights, bias, requant) (stage 4)
+├── network.md                  human-readable graph (layer table, dtypes, Mermaid)
+├── layers/                                                             (stage 5)
+│   ├── manifest.json           index → dir → symbol → ops   (THE authority, not ls)
+│   ├── layers_common.h         shared prologue every layer includes
+│   ├── 00_divide_round_add_clip_cast_add_cast_pad_layout_transform/00_….c
+│   ├── 01_contrib_conv2d_NCHWc_subtract_add_subtract_…_1a1eefcf0256215e/
+│   │   ├── 01_….c              the CPU kernel (unchanged by offload)
+│   │   └── aie/                ONLY with --aie-offload (§9)
+│   │       ├── host.cc  kernel.cc  conv2d_spatial.cc  routing.cc  …
+│   │       └── build/libconv2dstem.a
+│   ├── …  32_contrib_dense_pack_…/
+│   ├── aiegraph.mlir, partition.json          ONLY with --aie-offload / --aiegraph
+├── layers-golden/              reference copy of the default-flow layers/
+└── arm_build/                                                         (stage 6)
+    ├── graph_driver.c  main.c  tvm_runtime_shim.c  Makefile  README.md
+    ├── weights.bin  input_image.h  imagenet_labels.h
+    ├── liblayers.a  aielib/   main.elf   main_local.elf   localobj/</code></pre>
+
+<!-- ================================================================== -->
+<h2 id="model">3. Model, import, int8 (brief)</h2>
+<p>This part is standard; the short version, with the one thing per step that bites.</p>
+<table>
+<tr><th>step</th><th>function</th><th>what it does</th><th>watch out</th></tr>
+<tr><td>download</td><td><code>deploy_flow.fetch_model</code></td><td>ONNX model zoo <code>resnet18-v1-7.onnx</code>, cached in the out dir</td><td>—</td></tr>
+<tr><td>prefold</td><td><code>prefold_onnx</code></td><td>folds constants / BN in ONNX before Relay sees it</td><td>—</td></tr>
+<tr><td>quantize</td><td><code>onnx_ptq.quantize_onnx_int8</code></td><td>onnxruntime static PTQ, calibrated on the dog image → QDQ ONNX. Per-channel <b>symmetric</b> int8 weights, <b>asymmetric</b> uint8 activations (input zero-point 113)</td><td>prints int8-vs-fp32 top-5; they must agree</td></tr>
+<tr><td>import</td><td><code>import_relay</code></td><td><code>relay.frontend.from_onnx</code></td><td>needs an LLVM-enabled TVM, else it falls back to fp32 (skill <b>tvmrelaynollvm</b>)</td></tr>
+<tr><td>to int ops</td><td><code>onnx_ptq.to_integer_ops</code></td><td>FakeQuantizationToInteger: dequantize→fp32 op→quantize becomes <code>qnn.conv2d</code>/<code>qnn.requantize</code></td><td>required, or you emit float kernels that still "pass"</td></tr>
+<tr><td>zp fold</td><td><code>qnn_fold_zp.fold_scalar_zero_points</code></td><td>turns the all-zero per-channel kernel zero-point into a scalar so TVM drops a dead correction chain: <b>120 → 41</b> kernel calls</td><td>default on; it also changes the IR BYOC matches (§7.5)</td></tr>
+<tr><td>int8 PE</td><td><code>pe_target.enable</code></td><td>target <code>c -keys=pe_int8,cpu</code> so QNN legalizes to int8×int8 (<code>x_i8 = x_u8 − 128</code>) instead of int16</td><td>default on; weights 23.5 → 11.9 MB</td></tr>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="build">4. <code>relay.build</code> → C</h2>
+<p><code>deploy_flow.build_c</code> calls <code>relay.build(mod, target=pe_target, params)</code> with
+<code>target_host="c"</code> and collects the C. Inside the build, the passes that decide what your
+layers look like:</p>
+<ul>
+<li><b>Legalize</b> (int8 rule from <code>pe_target</code>) and <b>qnn CanonicalizeOps</b>:
+<code>qnn.conv2d</code> becomes <code>nn.conv2d</code> + explicit zero-point / requantize integer math.</li>
+<li><b>AlterOpLayout</b>: <code>nn.conv2d</code> becomes <code>nn.contrib_conv2d_NCHWc</code>; tensors become 5-D
+<code>[N, C/c, H, W, c]</code>. That is why layer 01's output is <code>uint8[1,16,112,112,4]</code>.</li>
+<li><b>FuseOps</b>: groups ops into one C function each. Layer 01's function name spells out its
+fused body: <code>tvmgen_default_fused_nn_contrib_conv2d_NCHWc_subtract_add_subtract_fixed_point_multiply_per_axi_1a1eefcf0256215e_</code>.</li>
+</ul>
+<p>Output: <code>resnet18.c</code> (33 kernel functions), <code>resnet18_graph.json</code> (41 calls, which
+storage id each tensor lives in, every shape and dtype), <code>resnet18_params.bin</code>.</p>
+<p>Every kernel uses TVM's <b>packed-call ABI</b> — remember it, the AIE entry in §10 copies it:</p>
+<pre><code>int32_t fn(void* args,            /* TVMValue[]: .v_handle = DLTensor*       */
+           int32_t* arg_type_ids, /* 7 = kTVMDLTensorHandle                 */
+           int32_t num_args,      /* inputs then outputs; layer 01 has 8 + 1 */
+           void* out_ret_value, int32_t* out_ret_tcode, void* resource_handle);</code></pre>
+
+<!-- ================================================================== -->
+<h2 id="split">5. Split into <code>layers/</code></h2>
+<p><code>split_layers.py</code> cuts <code>resnet18.c</code> into one translation unit per kernel —
+<code>layers/NN_&lt;ops&gt;/NN_&lt;ops&gt;.c</code> — in first-use order, plus <code>layers_common.h</code>
+(the shared prologue) and <code>manifest.json</code>. Editing one operator recompiles one file.</p>
+<div class="box"><b>Three different things are all called "layer 01"</b>
+(1) the <b>call index</b> in the graph (<code>[01]</code> in a trace, <code>#</code> in network.md),
+(2) the folder prefix <code>01_</code> (distinct kernels; a kernel called twice has one folder),
+(3) the <code>--aie-layers</code> number (= the folder index). For the stem all three are 1;
+further down the network they diverge. The manifest maps folder → symbol; the graph maps
+symbol → call nodes.</div>
+
+<!-- ================================================================== -->
+<h2 id="select">6. Picking the layer: <code>--aie-layers 1</code></h2>
+<p><code>aie_offload.resolve_conv_targets</code> turns "layer 1" into an identity that survives
+graph rewrites:</p>
+<ol>
+<li>manifest entry 1 → symbol → the graph node calling it (<b>by symbol, not position</b> — a
+kernel called twice would shift every later layer by one);</li>
+<li>geometry from the graph's shapes, folding NCHWc back to channels:
+<code>[1,1,230,230,3] → [64,…]</code> gives <code>230×230×3 → 64ch K7 s2</code>
+(<code>aie_offload._layer_geometry</code>; skill <b>nchwclayoutfold</b>);</li>
+<li>the <b>weight fingerprint</b>: the conv's weights sorted, cast to int64, hashed
+(<code>byoc.aie_annotate.weight_fingerprint</code>). Layout- and dtype-independent, unique for all
+20 convs — this is how the pre-build Relay conv and the post-build graph node are matched.</li>
+</ol>
+
+<!-- ================================================================== -->
+<h2 id="byoc">7. BYOC: fuse, select, partition, codegen</h2>
+<p>This is TVM's "Bring Your Own Codegen" path, in <code>byoc/</code>. It runs on the
+<b>pre-build</b> Relay module (before AlterOpLayout makes convs 5-D), carves the selected conv out
+into a function marked <code>Compiler="aie"</code>, and lets <code>relay.build</code> call our
+codegen for it. <code>aie_byoc.partition_for_aie</code> drives four steps, one file each:</p>
+
+<table>
+<tr><th>#</th><th>file</th><th>does</th></tr>
+<tr><td>1 fuse</td><td><code>aie_fuse.fuse_layers</code></td><td>InferType → FoldConstant → <code>qnn.CanonicalizeOps</code> → FoldConstant → <b><code>MergeComposite(pattern_table())</code></b>; each match becomes a function with attribute <code>Composite="aie.qconv_fused"</code>, tagged <code>aie.weight_fp</code></td></tr>
+<tr><td>2 select</td><td><code>aie_annotate.ConvSelectAnnotator</code></td><td>keep a composite if its fingerprint is selected <b>and</b> <code>kernel_can_run</code> says yes; wrap it in <code>compiler_begin/end("aie")</code>; inline everything else back</td></tr>
+<tr><td>3 partition</td><td><code>aie_byoc</code></td><td><code>MergeCompilerRegions</code> → <code>PartitionGraph</code>: the region becomes a global function <code>tvmgen_default_aie_main_0</code></td></tr>
+<tr><td>4 codegen</td><td><code>aie_codegen</code> (<code>relay.ext.aie</code>)</td><td>during the second <code>relay.build</code>, emit C for that function: a wrapper calling <code>conv2d_stem_prepadded()</code> in <code>aout/libconv2dstem.a</code></td></tr>
+</table>
+
+<h3>7.1 What a "composite" is — the multi-op layer as one unit</h3>
+<p>The AIE kernel computes conv + bias + zero-point + per-channel requantize + clip + uint8 store
+in one pass and can produce nothing else, so the unit handed over must be that whole chain,
+not the bare conv. <code>aie_patterns.fused_qconv_pattern()</code> describes it with Relay's
+dataflow pattern language:</p>
+<pre><code>conv  = nn.conv2d(x, CONST)
+acc   = subtract(conv, multiply(CONST, repeat(avg_pool2d(multiply(sum(cast(x)), CONST)))))  | conv
+acc   = add(acc, CONST)                    # C2   ← required
+acc   = nn.bias_add(acc, CONST)            # C3
+acc   = cast(acc) | acc
+acc   = subtract(acc, CONST)               # C4
+acc   = fixed_point_multiply_per_axis(acc, CONST, CONST, CONST)   # C5 mult, C6 lshift, C7 rshift
+root  = cast(clip(acc))                    # uint8</code></pre>
+<p><code>MergeComposite</code> replaces every subgraph matching this with a call to a small function
+holding those ops. <code>extract_fused()</code> then walks it from the final cast down and names each
+constant — it is the single place that decides "what C2 means", used by both the checker and
+the codegen.</p>
+
+<h3>7.2 Two gates: shape, then capability</h3>
+<ul>
+<li><code>check_fused_qconv</code> (MergeComposite's check): is it well-formed? Shape only.</li>
+<li><code>kernel_can_run</code> (step 2): can <code>libconv2dstem.a</code> reproduce it bit-exactly? Exact
+<code>STEM_GEOMETRY</code> (230×230×3 → 64, 7×7/2, no padding — TVM hoisted it into <code>nn.pad</code>),
+zero weight zero-point, right-shift only, clip [0,255]. Returns <code>(ok, reason)</code>.</li>
+</ul>
+<p><code>deploy_flow</code> reports the two outcomes differently: <i>did not fuse</i>
+(<code>info["unmatched"]</code>) vs <i>fused but rejected, because …</i> (<code>info["rejected"]</code>).</p>
+
+<h3>7.3 Folding the epilogue into the kernel's four numbers</h3>
+<p>The kernel reads, per output channel, <code>{bias, zp, mult, shift}</code> and computes
+<code>v = (int64(acc + bias − zp) · mult + 2^(sh+30)) &gt;&gt; (sh+31)</code>, then clamps to [0,255].
+<code>aie_codegen.fold_qparams</code> maps the composite onto that:
+<code>bias = C2 + C3 − C4 + 128·Σw</code>, <code>zp = 0</code>, <code>mult = C5</code>, <code>shift = C7</code>.
+The <code>+128·Σw</code> is because the uint8 input (zp 113) is passed to the int8 kernel as
+<code>x − 128</code>; a plain reinterpret corrupts every pixel ≥ 128.</p>
+
+<h3>7.4 "Fuse" means two things — do not reorder them</h3>
+<p>Step 1's <code>MergeComposite</code> groups ops for the AIE. TVM's <code>FuseOps</code> is the last
+pass of the second <code>relay.build</code> and fuses whatever stayed on the CPU. BYOC must come
+first so <code>FuseOps</code> never fuses across the AIE boundary.</p>
+
+<h3 id="byoc-status">7.5 Why BYOC fuses 0 of 20 convs today <span class="tag bad">known gap</span></h3>
+<p>Every <code>--aie-offload</code> run prints:</p>
+<pre><code>[aie-byoc] 1/4 fuse  : nothing (AIE_BYOC_DEBUG=1 prints every non-match)
+[aie-byoc] 2/4 select: annotated 0 aie.qconv_fused for AIE (1 conv(s) selected; 0/20 convs fused)
+[aie] layer 01: does not match any AIE pattern -- stays on the APU</code></pre>
+<p>and <code>AIE_BYOC_DEBUG=1</code> prints <i>no</i> rejection — the checker is never even called,
+so the pattern's <b>structure</b> does not match. Dumping the canonicalized stem with today's
+defaults shows why:</p>
+<pre><code>%6  = nn.conv2d(%5, W:int8[64,3,7,7], strides=[2,2], …)
+%7  = subtract(%6, C:int32[1,64,1,1])          ← one constant subtract, no add
+%8  = nn.bias_add(%7, C3:int32[64])
+%9  = cast(%8, int32)
+%10 = subtract(%9, C4:int32[64,1,1])
+%11 = fixed_point_multiply_per_axis(%10, C5, C6, C7, is_rshift_required=True)
+%13 = cast(clip(%11, 0, 255), uint8)</code></pre>
+<p>The pattern was written against the IR <i>before</i> the qnn zero-point fold (§3) became the
+default. Then, the kernel zero-point was a per-channel tensor, and canonicalization produced
+<code>subtract(conv, multiply(C1, window_sum)) … add(C2)</code>. With the fold, the kernel
+zero-point is a scalar 0, the window-sum term disappears, and the input-zero-point term
+(<code>113·Σw</code>) becomes a <b>constant <code>subtract</code></b>. The pattern's
+<b>mandatory <code>add(acc, CONST)</code></b> has nothing to match.</p>
+<p id="byoc-nofold"><b>Checked (2026-10-10):</b> turn the fold off and the same pattern fuses.
+Without the fold the graph renumbers (64 layers; the stem is layer <b>6</b>), so:</p>
+<pre><code>AIE_BYOC_DEBUG=1 PYTHONPATH=src python3 src/frontend/tvmrelay/deploy_flow.py \
+    --aie-offload --aie-layers 6 --no-fold-qnn-zp --no-arm --out-dir /tmp/byocnofold
+
+[aie-byoc] fused qconv: {'in_hw': (230, 230), 'in_c': 3, 'kernel': (7, 7), 'strides': (2, 2), …, 'out_c': 64}
+…   (8 more 3×3 convs)
+[aie-byoc] 1/4 fuse  : aie.qconv_fused x9
+[aie-byoc] 2/4 select: annotated 1 aie.qconv_fused for AIE (1 conv(s) selected; 9/20 convs fused)
+[aie-byoc] 3/4 part  : 1 AIE subgraph(s): tvmgen_default_aie_main_0
+[6/7]          rebuilding the C with 1 AIE subgraph(s) (calls conv2d_stem_prepadded() in aout/libconv2dstem.a)</code></pre>
+<p>So the BYOC machinery works; the pattern is out of date for the default IR. Two side
+effects of that configuration worth knowing: the BYOC wrapper is compiled into the kernel C, so
+<code>make local</code> refuses to build, and the extra aiegraph lift fails verification on the
+unfolded graph (two <code>add</code>s in a conv's name are read as a residual) — it is reported as
+<code>aiegraph lift failed, no aie/ built</code> and the run continues.</p>
+<p><b>Fix direction</b> (not done): make the <code>add</code> optional and accept
+<code>subtract(conv, CONST)</code> as its negation in the pattern, and have
+<code>extract_fused</code> map it into C2 with the sign flipped. Then
+<code>verify_aie_stem.py</code> is the gate (0/802,816 mismatches, 0/1000 logits). Until then the
+offload goes through §8.</p>
+
+<!-- ================================================================== -->
+<h2 id="aiegraph">8. The aiegraph path — what actually runs layer 01 today</h2>
+<p><code>--aie-offload</code> also runs <code>aiegraph_partition.run_aiegraph</code> over the same
+<code>--aie-layers</code> selection. It never rewrites TVM's C — it <b>adds</b> AIE artifacts beside a
+layer:</p>
+<ol>
+<li><b>Lift</b> every graph node to an <code>aiegraph</code> op (<code>build_nodes</code>): a layer whose
+fused op list contains <code>conv2d</code> becomes <code>conv_bn</code> (or <code>conv_bn_relu</code>),
+with geometry from the graph JSON — 5-D NCHWc folded via <code>aie_offload._layer_geometry</code>.
+Written to <code>layers/aiegraph.mlir</code>, verified by the dialect:
+<pre><code>%0 = aiegraph.conv_bn %arg0 : tensor&lt;158700xi8&gt; {Cin = 3, Cout = 64, H = 230, W = 230,
+       K = 7, stride = 2, weights = @w9, …} -&gt; tensor&lt;846400xi8&gt;</code></pre></li>
+<li><b>Partition</b> (<code>partition_layers</code>): layers in <code>--aie-layers</code> whose ops are all
+offloadable go <code>target: aie</code>; everything else <code>cpu</code>, each with a reason →
+<code>layers/partition.json</code>.</li>
+<li><b>Build</b> each AIE layer (<code>_build_one</code>). If its geometry is exactly the stem
+(<code>aie_stem_lib.matches_stem</code>, against <code>STEM_GEOMETRY</code>), it is built from the
+hand-written <code>conv2dstem.cc</code> (§9). Otherwise the generic
+<code>run_aie_pipeline</code> + <code>kernels.conv_bn_body</code> placeholder is used — int16 accumulator,
+dummy quant: right shape, <b>not</b> TVM's arithmetic.</li>
+</ol>
+<p>The verdict for layer 01 in <code>partition.json</code>:</p>
+<pre><code>{ "index": 1, "target": "aie", "aiegraph": ["conv_bn"],
+  "backend": "aiehlc", "source": "src/aietensorop/conv2dstem/conv2dstem.cc",
+  "entry":    "aie_tvmgen_default_fused_nn_contrib_conv2d_NCHWc_…_1a1eefcf0256215e_",
+  "replaces": "tvmgen_default_fused_nn_contrib_conv2d_NCHWc_…_1a1eefcf0256215e_",
+  "archive":  "layers/01_…/aie/build/libconv2dstem.a" }</code></pre>
+<p><code>entry</code>/<code>replaces</code> is the contract stage 6 reads (§11).</p>
+
+<!-- ================================================================== -->
+<h2 id="stem">9. <code>conv2dstem.cc</code> → the layer's <code>aie/</code></h2>
+<h3>9.1 What conv2dstem.cc is</h3>
+<p>An aiehlc source holding <b>both</b> the AIE kernel and the host code around it:</p>
+<ul>
+<li><code>__global__(conv_policy) void conv2d_spatial(…)</code> — the core kernel: int32 accumulate
+over a 7×7×4 window, then <code>(sum·mult + 2^(sh+30)) &gt;&gt; (sh+31)</code>, clip, uint8. The
+per-channel <code>{bias, zp, mult, shift}</code> ride in the weight row's <b>pad channel</b>
+(channel 3 of <code>INPUT_C_ALIGN = 4</code>).</li>
+<li>Viewed as a GEMM: <code>M = 112·112 = 12544</code> output pixels, <code>N = 64</code> filters,
+<code>K = 7·7·4 = 196</code>, spread over a <b>4×4 mesh</b> of core tiles
+(<code>HW_ROWS/HW_COLS</code>) with three <code>aie::GemmSpace</code> descriptors (row broadcast of the
+input halo, column broadcast of weights, left-to-right merge of outputs).
+<code>static_assert</code>s pin the tiling to the geometry.</li>
+<li>Host side: <code>ensure_staging</code> (DMA-capable buffers), <code>stage_ifm_prepadded</code>
+(230×230×3 → ×4 channel-aligned), <code>stage_weights_nchwc</code> (OIHW3i4o → B<sup>T</sup>[64,196] with
+qparams in the pad channel), launch <code>conv2d_spatial&lt;&lt;&lt;mesh&gt;&gt;&gt;</code>,
+<code>collect_ofm_nchwc</code> (HWC → NCHW4c).</li>
+<li>Three public entries, same math, different layout: <code>conv2d_stem</code> (raw input),
+<code>conv2d_stem_prepadded</code> (BYOC, HWC), <code>conv2d_stem_nchwc</code> (TVM's packed layouts —
+<b>used here</b>).</li>
+</ul>
+<p><code>test_conv2d.cc</code> is the same file plus a <code>main()</code>: it reads TVM's real layer-01
+inputs (a <code>make TRACE=1</code> dump), calls <code>conv2d_stem_nchwc</code> and checks all 802,816
+outputs (<code>GOLDEN PASS 802816/802816</code>).</p>
+
+<h3>9.2 How it gets built into the layer</h3>
+<p><code>aie_stem_lib.build_stem_layer</code>:</p>
+<pre><code>scratch=$(mktemp -d); cd $scratch            # aiehlc writes aout/ relative to the CWD
+source script/aiehlc.sh --aie-version 5 \
+    --runtime-source-file src/aietensorop/conv2dstem/conv2dstem.cc
+# no main() → library mode: aout/worklocal/{host.cc, kernel.cc, conv2d_spatial.cc,
+#                                            routing.cc, aieml.bcf/.prx, build/libconv2dstem.a}
+cp -r aout/worklocal  layers/01_…/aie        # minus the 6 MB layeriohex data headers</code></pre>
+<p>aiehlc does the hard part: the Clang frontend extracts the <code>__global__</code> kernel into
+<code>conv2d_spatial.cc</code>/<code>kernel.cc</code> (compiled for the core with xchesscc), lowers
+<code>&lt;&lt;&lt;mesh&gt;&gt;&gt;</code> through the tilinglinalg MLIR pipeline into
+<code>host.cc</code> (device init, DMA BDs, locks, launch) and <code>routing.cc</code> (stream switches).
+Compared with aiehlc's build of <code>test_conv2d.cc</code>: <code>kernel.cc</code>, <code>routing.cc</code>,
+<code>aieml.bcf/.prx</code> are byte-identical; <code>host.cc</code> only lacks test_conv2d's
+<code>main()</code>.</p>
+
+<!-- ================================================================== -->
+<h2 id="entry">10. The packed-call entry appended to <code>aie/host.cc</code></h2>
+<p>The library speaks <code>conv2d_stem_nchwc(ifm, wts, qp, ofm)</code>; the graph speaks the TVM
+packed ABI with 9 tensors. <code>aie_stem_lib._ENTRY_TMPL</code> bridges them and is appended to
+<code>host.cc</code> (a sibling file would be dropped — <code>hostcompile.sh</code> compiles a fixed source
+set), then <code>hostcompile.sh</code> re-archives <code>libconv2dstem.a</code>. Condensed:</p>
+<pre><code>extern "C" int32_t aie_tvmgen_…_1a1eefcf0256215e_(void *args, int32_t *type_codes,
+        int32_t num_args, void *out_ret_value, int32_t *out_ret_tcode, void *rh) {
+    printf("[aie-offload] layer 01 …: ENTER aiehlc conv2dstem (conv2d_stem_nchwc on the AIE mesh)\n");
+    /* TVMValue.v_handle = DLTensor*, whose first field is data (byte_offset is 0) */
+    const int8_t  *ifm  = data(args,0);   /* int8  [1,1,230,230,3] zp-padded  */
+    const int8_t  *wts  = data(args,1);   /* int8  [16,1,7,7,3,4]  OIHW3i4o   */
+    const int32_t *zp_a = data(args,2), *bias = data(args,3), *zp_b = data(args,4),
+                  *mult = data(args,5), *unused = data(args,6), *shift = data(args,7);
+    uint8_t       *ofm  = data(args,8);   /* uint8 [1,16,112,112,4] NCHW4c    */
+    static conv2dstem_qparam qp[64];
+    for (oc = 0; oc &lt; 64; oc++) {          /* = test_conv2d.cc:fold_qparams()  */
+        if (zp_b[oc] || unused[oc]) return CONV2DSTEM_ERR_BAD_QPARAM;   /* refuse, don't guess */
+        qp[oc] = (conv2dstem_qparam){ bias[oc], zp_a[oc], mult[oc], shift[oc] };
+    }
+    int rc = conv2d_stem_nchwc(ifm, wts, qp, ofm);
+    printf("[aie-offload] layer 01: EXIT rc=%d, ofm[0..7]= …, hash=%08x\n", rc, h);
+    return rc == 0 ? 0 : -1;
+}</code></pre>
+<p>The <code>hash</code> is <code>h = h·31 + byte</code> over all output bytes — compute the same over
+TVM's layer-01 output and you have a one-line bit-exactness check (§13).</p>
+
+<!-- ================================================================== -->
+<h2 id="driver">11. <code>graph_driver.c</code> — TVM's graph executor as straight C</h2>
+<p><code>arm_build.generate_driver</code> replaces TVM's C++ runtime with generated C:</p>
+<ul>
+<li>one static buffer per <b>storage id</b> (TVM already did liveness and aliasing: 165 buffers,
+14.3 MB);</li>
+<li><code>graph_init()</code> points parameter tensors into the linked <code>weights.bin</code>;</li>
+<li><code>graph_run()</code>: for each of the 41 nodes, fill <code>args[]</code> with
+<code>&amp;tensors[i]</code> and call the kernel.</li>
+</ul>
+<p>For every symbol in <code>arm_build.aie_entries(layers/)</code> — read from
+<code>partition.json</code>, and only if the archive exists and its <code>host.cc</code> defines the
+entry — the call is emitted twice:</p>
+<pre><code>    args[0].v_handle = &amp;tensors[1];   …   args[8].v_handle = &amp;tensors[9];
+#ifdef GRAPH_AIE_OFFLOAD
+    aie_tvmgen_default_fused_nn_contrib_conv2d_NCHWc_…_1a1eefcf0256215e_(args, codes, 9, 0, 0, 0);
+#else
+    tvmgen_default_fused_nn_contrib_conv2d_NCHWc_…_1a1eefcf0256215e_(args, codes, 9, 0, 0, 0);
+#endif</code></pre>
+<p>Same arguments, same buffers, different implementation. Under <code>make TRACE=1</code> the
+lines around each call dump inputs/outputs (<code>layeriohex/</code>), which is how
+<code>test_conv2d.cc</code> got its real data.</p>
+<div class="box"><b>Do not hand-edit <code>graph_driver.c</code></b> — the next deploy_flow run
+overwrites it. Change <code>arm_build.generate_driver</code> / <code>_trace_lines</code> instead.</div>
+
+<!-- ================================================================== -->
+<h2 id="make">12. Makefile, link, <code>main.elf</code></h2>
+<p><code>arm_build.write_makefile</code> writes <code>arm_build/Makefile</code>; Python only generates,
+<code>make</code> builds, so you can re-run it by hand.</p>
+<pre><code>LAYER_SRCS      := $(wildcard layers/*/*.c)        → liblayers.a  (33 CPU kernels)
+AIE_LAYER_LIBS  := $(wildcard layers/*/aie/build/*.a)              (libconv2dstem.a)
+AIE_OFFLOAD_DEFS:= -DGRAPH_AIE_OFFLOAD      # board CFLAGS only, never LOCAL_CFLAGS
+main.elf: graph_driver.o tvm_runtime_shim.o main.o weights.o liblayers.a $(AIE_LAYER_LIBS)
+    $(CC) … $(AIE_LDIRS) -L$(BSP)/lib  -Wl,--start-group,-lm,-lxil,…,-lxaienginea78,-lstdc++,--end-group</code></pre>
+<ul>
+<li><code>aielib/</code> stages the AIE driver (<code>libxaienginea78.a</code>, from
+<code>thirdparty/alib/lib</code>, which every aiehlc run regenerates) and a copy of the BSP's
+<code>libxil.a</code> with its 62 stale <code>xaie*</code> members stripped — otherwise
+<code>multiple definition of XAie_UpdateNpiAddr</code>. <code>AIE_LDIRS</code> must come <b>before</b> the BSP.</li>
+<li><code>ld</code> only pulls archive members that resolve an undefined symbol, so the CPU kernel
+of layer 01 is still in <code>liblayers.a</code> but unused in <code>main.elf</code>.</li>
+<li><code>main.c</code>: <code>graph_init</code> → <code>graph_run</code> (timed) → top-5 →
+<code>device_teardown done</code>.</li>
+<li><code>make local</code> builds <code>main_local.elf</code> with host gcc
+(<code>-D__AIESIM__ -std=gnu11</code>), no AIE, no macro → the CPU reference.</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2 id="verify">13. Verify: local, test, board</h2>
+<table>
+<tr><th>question</th><th>how</th><th>expect</th></tr>
+<tr><td>Does the offload change any CPU layer?</td><td><code>run_test.sh</code> <code>[tree]</code></td><td>37 files identical to <code>layers-golden/</code></td></tr>
+<tr><td>Is layer 01 built from conv2dstem.cc and linked?</td><td><code>[aie ]</code>, <code>[elf ]</code>; <code>aarch64-none-elf-nm main.elf | grep aie_tvmgen</code></td><td>entry + <code>conv2d_stem_nchwc</code> defined</td></tr>
+<tr><td>What should the answer be?</td><td><code>make local &amp;&amp; ./main_local.elf</code></td><td>258 Samoyed 12.0173 …</td></tr>
+<tr><td>Did the board run layer 01 on the AIE?</td><td><code>apppaltest.py -y -nonreboot main.elf</code></td><td><code>[aie-offload] layer 01 … ENTER</code> / <code>EXIT rc=0</code></td></tr>
+<tr><td>Is the AIE layer bit-exact?</td><td>hash TVM's layer-01 output (below)</td><td>same as the board's <code>hash=</code> (<code>2aeeab65</code>)</td></tr>
+<tr><td>Does the whole network agree?</td><td>compare top-5 lines</td><td>identical logits to <code>main_local.elf</code></td></tr>
+</table>
+<pre><code># TVM's layer-01 output (from make TRACE=1, copied by conv2dstem/buildtest.sh)
+python3 - &lt;&lt;'EOF'
+import re
+t = open('src/aietensorop/conv2dstem/conv2d_stem_out_golden.h').read()
+body = t.split('out0_data[802816LL] = {', 1)[1].split('};', 1)[0]
+h = 0
+for v in (int(x, 16) for x in re.findall(r'0x([0-9a-f]{2})', body)): h = (h*31 + v) &amp; 0xffffffff
+print('hash=%08x' % h)          # 2aeeab65
+EOF</code></pre>
+<p>Board run notes (palmyra): the farm is held by a long-lived systest session, so use
+<code>-nonreboot</code>; that mode needs an <code>hw_server</code> on the lab host's port 3121
+(<code>connect -url TCP:&lt;PALIP&gt;:3121</code>) — <code>Connection refused</code> → <code>Invalid target</code>
+at <code>dow</code> means none is running.</p>
+
+<!-- ================================================================== -->
+<h2 id="trouble">14. Troubleshooting</h2>
+<table>
+<tr><th>symptom</th><th>cause</th><th>fix / where</th></tr>
+<tr><td><code>[aie-byoc] 1/4 fuse : nothing</code>, no debug rejection</td><td>pattern structure does not match the zp-folded IR</td><td>§7.5; aiegraph path still offloads</td></tr>
+<tr><td>aiegraph verdict <code>non-4D shapes; not a conv2d</code></td><td>5-D NCHWc not folded</td><td><code>aiegraph_partition._conv_geometry</code> delegates 5-D to <code>_layer_geometry</code></td></tr>
+<tr><td>layer 01 <code>aie/</code> holds <code>conv_bn_0.cc</code></td><td>generic placeholder kernel used (geometry ≠ stem)</td><td><code>aie_stem_lib.matches_stem</code>; check <code>partition.json</code> <code>backend</code></td></tr>
+<tr><td><code>undefined reference to rt_seq_start_queue</code></td><td>library archive missing <code>aie_runtime_xaie_seq.o</code></td><td>fixed in <code>hostcompile.sh</code> <code>HOST_OBJS</code>; rebuild old archives</td></tr>
+<tr><td><code>multiple definition of XAie_*</code></td><td>BSP <code>libxil.a</code> searched before the staged one</td><td><code>AIE_LDIRS</code> first; <code>arm_build/aielib</code></td></tr>
+<tr><td><code>libxaienginea78.a not found</code></td><td><code>thirdparty/alib/lib</code> wiped between aiehlc runs</td><td>re-run any <code>aiehlc.sh</code>, then the build, same shell</td></tr>
+<tr><td>test passes but board runs an old ELF</td><td><code>make</code> failed, deploy_flow still exit 0</td><td><code>[elf ]</code> freshness check; read <code>[arm]</code> lines</td></tr>
+<tr><td>no <code>[aie-offload]</code> lines on the console</td><td>driver built without <code>-DGRAPH_AIE_OFFLOAD</code> (no entry in <code>partition.json</code>)</td><td><code>grep AIE_OFFLOAD_DEFS arm_build/Makefile</code></td></tr>
+<tr><td><code>make local cannot link an AIE-offloaded build</code></td><td>a BYOC wrapper is compiled into the kernel C</td><td>only BYOC blocks local; per-layer offload does not</td></tr>
+<tr><td>plausible but wrong pixels</td><td>layout (NCHW4c vs HWC) or zero vs zero-point padding</td><td>skill <b>conv2dstemtvmlayer</b>; compare hashes</td></tr>
+<tr><td>layer gets another layer's geometry</td><td>manifest↔graph matched by position</td><td>map by symbol (<code>select_layers</code>)</td></tr>
+<tr><td><code>[AIE ERROR] Invalid column: 4..6</code> ×24</td><td>pre-existing in the conv2dstem library (also in standalone test_conv2d, which passes)</td><td>harmless today; see §15</td></tr>
+<tr><td>fp32 C instead of int8; <code>target.build.llvm is not enabled</code></td><td>TVM built without LLVM</td><td>skill <b>tvmrelaynollvm</b></td></tr>
+</table>
+<p>Useful knobs: <code>AIE_BYOC_DEBUG=1</code>, <code>make TRACE=1</code> (+ <code>TRACE_HEX=0</code>,
+<code>TRACE_HEX_PARAMS=0</code>), <code>network.md</code>, <code>layers/partition.json</code>,
+<code>layers/01_…/aiehlc_stem.log</code>, <code>aie/hostcompile.log</code>.</p>
+
+<!-- ================================================================== -->
+<h2 id="optimize">15. Where to optimize</h2>
+<ul>
+<li><b>Measure first.</b> Board: <code>inference 2477.876 ms</code> for the whole network with layer 01
+on the AIE (the other 40 calls are scalar C on the A78). Per-layer timing: wrap the call in
+<code>graph_driver.c</code>'s generator with <code>aie_timer.h</code>, or print in the entry.</li>
+<li><b>Per-call fixed cost in the entry path</b>: <code>conv2d_stem_nchwc</code> calls
+<code>aieSetDevice(0)</code> and partitions the mesh every call; staging scatters the whole
+230×230 input each call; weights are repacked only when the pointer changes
+(<code>g_wts_src</code>). For repeated inference, hoist init/partition out of the call.</li>
+<li><b>Host↔AIE register cost</b>: ~372 ns per <code>XAie_Write32</code> vs ~2.9 ns via control
+packets (<code>doc/performance/register_write_cost.md</code>) — BD/lock setup dominates small layers.</li>
+<li><b>More layers</b>: every other conv still uses the placeholder body. A second hand kernel =
+a new <code>matches_*</code> + <code>build_*_layer</code> in the style of <code>aie_stem_lib</code>, or fix
+the generic <code>kernels.conv_bn_body</code> to int32 + real requant.</li>
+<li><b>Layout copies</b>: <code>stage_ifm_prepadded</code> and <code>collect_ofm_nchwc</code> are host-side
+repacks around the AIE; consuming NCHW4c directly in the GemmSpace would remove them.</li>
+<li>The 24 <code>Invalid column</code> errors come from core-processor-bus config of tiles outside the
+opened partition; worth fixing before timing small effects.</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2 id="handwrite">16. Hand-write a layer yourself</h2>
+<p>Everything the flow automates, as manual steps — for bring-up of a new kernel or when you
+need to bisect the flow.</p>
+<ol>
+<li><b>Get the layer's real data.</b>
+<code>make -C worklocal/tvmrelay_deploy/arm_build clean-local &amp;&amp; make … local TRACE=1</code>, run
+<code>./main_local.elf</code> in <code>arm_build/</code> → <code>layeriohex/lNN_&lt;op&gt;_in.h / _out.h</code>
+(all inputs incl. named params, and the golden output). <code>network.md</code> tells you each
+argument's dtype, shape and role.</li>
+<li><b>Write the kernel library</b> as an aiehlc source with no <code>main()</code> (template:
+<code>conv2dstem.cc</code>): a <code>__global__</code> kernel, a launch <code>kernel&lt;&lt;&lt;mesh&gt;&gt;&gt;</code>,
+host staging, and a C-callable entry taking TVM's layouts.</li>
+<li><b>Prove it standalone</b> with a test entry file (<code>test_conv2d.cc</code> pattern:
+<code>#include "mykernel.cc"</code> + the dump headers + golden compare), built by
+<code>source script/aiehlc.sh --aie-version 5 --runtime-source-file …/test_mykernel.cc</code> and
+run with <code>apppaltest.py</code>. Do not continue until it prints a bit-exact PASS.</li>
+<li><b>Build the library into the layer</b>: run aiehlc on the library source in a scratch dir, copy
+<code>aout/worklocal/</code> to <code>layers/NN_…/aie/</code>.</li>
+<li><b>Add the packed entry</b> to <code>aie/host.cc</code> (§10 template): unpack
+<code>args[i]</code>, convert params, call your entry, print ENTER/EXIT. Re-archive:
+<code>cd layers/NN_…/aie &amp;&amp; bash $REPO/script/hostcompile.sh --aie-version 5</code>.</li>
+<li><b>Swap the call</b>: add <code>entry</code>/<code>replaces</code>/<code>archive</code>/<code>target: aie</code>
+to that layer in <code>partition.json</code> and re-run stage 6
+(<code>python3 -m frontend.tvmrelay.arm_build</code> or the flow), or hand-patch a copy of
+<code>graph_driver.c</code> with the <code>#ifdef</code> and add <code>-DGRAPH_AIE_OFFLOAD</code>.</li>
+<li><b>Link and compare</b>: <code>make</code> → <code>main.elf</code>; <code>make local</code> →
+<code>main_local.elf</code>; board top-5 must equal local, and your EXIT hash must equal the hash of
+<code>_out.h</code>.</li>
+</ol>
+<div class="box warn"><b>Invariants that fail silently (wrong pixels, no error)</b>
+<ul style="margin:4px 0 0">
+<li>Pad with the <b>zero-point</b>, not 0 (stem: −15 in int8 = 113 − 128).</li>
+<li>Accumulate in <b>int32</b> (stem peak |acc| = 1,023,225).</li>
+<li>Match TVM's <b>packed layouts</b> (OIHW3i4o weights, NCHW4c output) or repack explicitly.</li>
+<li>TVM subtracts <b>two</b> zero-point terms; folding to one is valid only if the second is 0 —
+check it, as <code>fold_qparams</code> does.</li>
+<li>Requant rounding is <code>(x·m + 2^(s+30)) &gt;&gt; (s+31)</code> in int64 (half-up).</li>
+<li>Read int32 params from byte arrays by assembling bytes — an unaligned cast faults on the A78.</li>
+</ul></div>
+
+<!-- ================================================================== -->
+<h2 id="files">17. File map</h2>
+<table>
+<tr><th>file</th><th>role</th></tr>
+<tr><td><code>deploy_flow.py</code></td><td>orchestrates stages 1–7; <code>run()</code> is the readable top level</td></tr>
+<tr><td><code>onnx_ptq.py</code>, <code>qnn_fold_zp.py</code>, <code>pe_target.py</code></td><td>int8: PTQ + FQ2I, zero-point fold, int8 legalization target</td></tr>
+<tr><td><code>split_layers.py</code></td><td>stage 5: <code>resnet18.c</code> → <code>layers/</code></td></tr>
+<tr><td><code>aie_offload.py</code></td><td>layer index → node → geometry → weight fingerprint</td></tr>
+<tr><td><code>byoc/aie_patterns.py</code></td><td>the composite pattern, <code>extract_fused</code>, both gates, <code>STEM_GEOMETRY</code></td></tr>
+<tr><td><code>byoc/aie_fuse.py · aie_annotate.py · aie_byoc.py · aie_codegen.py</code></td><td>BYOC steps 1–4</td></tr>
+<tr><td><code>byoc/verify_aie_stem.py</code></td><td>BYOC bit-exactness gate (needs LLVM TVM)</td></tr>
+<tr><td><code>aiegraph_partition.py</code></td><td>whole-graph lift, partition.json, per-layer build dispatch</td></tr>
+<tr><td><code>aie_stem_lib.py</code></td><td>stem layer: aiehlc on conv2dstem.cc, packed entry, re-archive</td></tr>
+<tr><td><code>aie_layer_lib.py</code>, <code>kernels.py</code></td><td>generic (placeholder) per-layer path</td></tr>
+<tr><td><code>arm_build.py</code></td><td>stage 6: graph_driver.c, main.c, Makefile, link; <code>aie_entries</code></td></tr>
+<tr><td><code>network_md.py</code></td><td><code>network.md</code> + parameter role classifier</td></tr>
+<tr><td><code>test/run_test.sh</code>, <code>test/test_aie_offload.py</code></td><td>regression test (4 checks)</td></tr>
+<tr><td><code>src/aietensorop/conv2dstem/</code></td><td><code>conv2dstem.cc/.h</code> (kernel + host lib), <code>test_conv2d.cc</code>, <code>buildtest.sh</code></td></tr>
+<tr><td><code>script/aiehlc.sh</code>, <code>script/hostcompile.sh</code></td><td>aiehlc driver; host compile / archive</td></tr>
+</table>
+<p class="small">Deeper reading: <code>src/frontend/tvmrelay/README.md</code>,
+<code>doc/design/aie_offload_byoc.md</code>, <code>src/aietensorop/conv2dstem/README.md</code>, skills
+<b>aieoffloadaiegraph</b>, <b>byocaieoffload</b>, <b>byocfusesplit</b>, <b>nchwclayoutfold</b>,
+<b>conv2dstemtvmlayer</b>, <b>tvmlocalhostelf</b>, <b>hostlibrarymode</b>.</p>
+</main>
+</body>
+</html>

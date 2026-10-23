@@ -205,6 +205,27 @@ def ensure_onnx_mapping() -> bool:
         import onnx.mapping  # noqa: F401
 
         return False  # real module present; nothing to do
+    except ModuleNotFoundError as exc:
+        # Distinguish "onnx is absent entirely" from "onnx is installed but
+        # 1.16 deleted onnx.mapping" -- the latter is the whole point of this
+        # shim and must fall through. Match the top-level name EXACTLY: a
+        # missing submodule reports name="onnx.mapping", which is the normal
+        # case, not an error. Letting a genuinely-absent onnx escape as a bare
+        # ModuleNotFoundError from a package import buries the real cause
+        # (usually: wrong interpreter, deps installed in a venv).
+        if exc.name == "onnx":
+            raise ModuleNotFoundError(
+                f"onnx is not installed for this interpreter "
+                f"({sys.executable}). The tvmrelay flow needs onnx, "
+                f"onnxruntime and TVM 0.16 -- they are usually in the project "
+                f"venv. Re-run with that interpreter, e.g.\n"
+                f"    <venv>/bin/python3 src/frontend/tvmrelay/deploy_flow.py",
+                name=exc.name,
+            ) from exc
+        # onnx.mapping (or a submodule of it) is what is missing -- the exact
+        # case this shim exists for. Fall through and install it. Note this
+        # clause must not `raise`: ModuleNotFoundError subclasses ImportError,
+        # so it shadows the handler below and nothing else will catch it.
     except ImportError:
         pass
 

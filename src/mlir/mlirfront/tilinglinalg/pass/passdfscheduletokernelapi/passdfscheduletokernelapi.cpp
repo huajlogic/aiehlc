@@ -122,7 +122,10 @@ static void collectAggregatedOutTiles(KernelModuleOp kernelModuleOp, SmallVector
 /// Always matches and does full conversion so we do not depend on nested patterns
 /// firing first (conversion may try the parent before descending into regions).
 struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
-    using OpConversionPattern::OpConversionPattern;
+    KernelModuleToEmitCPattern(const TypeConverter &tc, MLIRContext *ctx, int partStartCol)
+        : OpConversionPattern(tc, ctx), partStartCol(partStartCol) {}
+
+    int partStartCol;
 
     LogicalResult matchAndRewrite(KernelModuleOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -451,7 +454,11 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
     // aie_kc_encode_bd: constant "0, 0, 0, -1" for S2MM (circuit-switched), and
     // per-tile literals for MM2S. `indent` keeps the emitted C readable when this
     // sits inside a get_coreid() dispatch arm.
-    static std::string emitWindowBdAndLocks(const WindowInfo &w, StringRef pktArgs, StringRef indent) {
+    // lenBytes > 0 overrides sizeof(buffer): the host's BD length (CoreOffloadTileConfig::bdLenBytes)
+    // is authoritative, and an output buffer's C declaration can under-state it (conv2dstem
+    // declares v4int8[196] = 784 B for a 3136 B BCF slot), which deadlocks the shim S2MM.
+    static std::string emitWindowBdAndLocks(const WindowInfo &w, StringRef pktArgs, StringRef indent,
+                                            int32_t lenBytes = 0) {
         const std::string in = indent.str();
         // Register writes go through core_reg_write (aie_kernel_runtime.h), which
         // issues the TILE-LOCAL offset into the core's TM space via TM_W.
@@ -485,6 +492,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         const std::string ping = w.pingBuffer;
         const std::string pong = w.pongBuffer.empty() ? w.pingBuffer : w.pongBuffer;
         const std::string pkt = pktArgs.str();
+        const std::string pingLen = lenBytes > 0 ? std::to_string(lenBytes) : "sizeof(" + ping + ")";
+        const std::string pongLen = lenBytes > 0 ? std::to_string(lenBytes) : "sizeof(" + pong + ")";
 
         // The BD's acquire/release lock ids are SWAPPED for output, mirroring the
         // host (helper/flowtransfer_kernel.cpp: `bdAcquireLockId = isOutputFlow ?
@@ -505,16 +514,16 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
              "  int _k;\n" + in + "#endif\n";
         if (w.singleBuffer) {
             // Single buffer: one BD, no next chaining.
-            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pingBdId) + ", (uintptr_t)" + ping +
-                 ", sizeof(" + ping + "), -1, " + bdAcq + ", -1, " + bdRel + ", 1, " + pkt + ");\n" + flush;
+            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pingBdId) + ", (uintptr_t)" + ping + ", " +
+                 pingLen + ", -1, " + bdAcq + ", -1, " + bdRel + ", 1, " + pkt + ");\n" + flush;
         } else {
             // Ping-pong: pong BD (next -> ping) then ping BD (next -> pong).
-            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pongBdId) + ", (uintptr_t)" + pong +
-                 ", sizeof(" + pong + "), " + std::to_string(w.pingBdId) + ", " + bdAcq + ", -1, " + bdRel + ", 1, " +
-                 pkt + ");\n" + flush;
-            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pingBdId) + ", (uintptr_t)" + ping +
-                 ", sizeof(" + ping + "), " + std::to_string(w.pongBdId) + ", " + bdAcq + ", -1, " + bdRel + ", 1, " +
-                 pkt + ");\n" + flush;
+            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pongBdId) + ", (uintptr_t)" + pong + ", " +
+                 pongLen + ", " + std::to_string(w.pingBdId) + ", " + bdAcq + ", -1, " + bdRel + ", 1, " + pkt +
+                 ");\n" + flush;
+            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pingBdId) + ", (uintptr_t)" + ping + ", " +
+                 pingLen + ", " + std::to_string(w.pongBdId) + ", " + bdAcq + ", -1, " + bdRel + ", 1, " + pkt +
+                 ");\n" + flush;
         }
         // Lock INITS are the same expression in both directions — window ACQ gets
         // ppdepth, window REL gets 0 — even though the two directions mean opposite
@@ -633,7 +642,11 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 block += "  // packet_id and ooo_bd_id differ per tile, but one ELF runs on all of\n";
                 block += "  // them, so dispatch on the core's own id.\n";
                 block += "  unsigned _cid = get_coreid();\n";
-                block += "  int _col = (int)(_cid >> 16);\n";
+                // get_coreid() is the ABSOLUTE column; plan columns are partition-
+                // relative (host coordinates), so rebase or arms land on the wrong
+                // tiles -- and tiles past the partition origin offset arm nothing.
+                block +=
+                    "  int _col = (int)(_cid >> 16) - " + std::to_string(partStartCol) + "; // partition start col\n";
                 block += "  int _row = (int)(_cid & 0x1F);\n";
                 for (size_t i = 0; i < outTiles.size(); ++i) {
                     const CoreOffloadEntry &e = *outTiles[i];
@@ -641,7 +654,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                                       ", 0, " + std::to_string(e.oooBdId);
                     block += std::string("  ") + (i == 0 ? "if" : "else if") + " (_col == " + std::to_string(e.col) +
                              " && _row == " + std::to_string(e.row) + ") {\n";
-                    block += emitWindowBdAndLocks(w, pkt, "  ");
+                    block += emitWindowBdAndLocks(w, pkt, "  ", e.bdLenBytes);
                     block += "  }\n";
                 }
                 // No else: a core tile outside the plan has no host-programmed MM2S
@@ -789,7 +802,7 @@ void DfscheduleToKernelApiPass::runOnOperation() {
     typeConverter.addConversion([](Type type) { return type; });
 
     RewritePatternSet patterns(ctx);
-    patterns.add<KernelModuleToEmitCPattern>(typeConverter, ctx);
+    patterns.add<KernelModuleToEmitCPattern>(typeConverter, ctx, partStartCol);
 
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns))))
         signalPassFailure();

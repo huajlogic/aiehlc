@@ -650,11 +650,25 @@ def compute_flow_balance(flow_summary):
         note = ''
 
         if len(shim_prod) == 1 and core_cons and not core_prod and not shim_cons:
-            pattern = 'broadcast'
+            # One shim feeding N cores is either a REPLICATING broadcast (every
+            # core receives the whole stream -- e.g. a ColBC filter window sent
+            # down a column) or a SPLITTING scatter (each core takes its slice).
+            # The flow summary carries no flag for which, but the bytes decide
+            # it: replicate <=> every read == supply, split <=> sum == supply.
+            # Checking only the split form flagged every true broadcast as a
+            # 4x "under-supply" and painted all compute tiles red.
             supply = shim_prod[0]['bd_len']
-            demand = sum(c['bd_len'] for c in core_cons)
-            balanced = (supply == demand)
-            note = 'shim per-fire bytes vs sum of %d core reads' % len(core_cons)
+            reads = [c['bd_len'] for c in core_cons]
+            if len(core_cons) > 1 and all(r == supply for r in reads):
+                pattern = 'broadcast'
+                demand = supply
+                balanced = True
+                note = 'shim per-fire bytes replicated to each of %d core reads' % len(core_cons)
+            else:
+                pattern = 'scatter'
+                demand = sum(reads)
+                balanced = (supply == demand)
+                note = 'shim per-fire bytes vs sum of %d core reads' % len(core_cons)
         elif len(shim_cons) == 1 and core_prod and not core_cons and not shim_prod:
             pattern = 'gather'
             supply = sum(p['bd_len'] for p in core_prod)
@@ -4101,8 +4115,15 @@ function wireFolds(box, onChange){
 }
 
 const g = DATA.grid;
+// Occupied column span. A control-plane partition ({2,6} for a 4-col mesh)
+// reserves partition-relative col 0 as the control spine, so the data plane
+// starts at col 1; drawing from 0 would leave a blank 1fr column on the left.
+const gColMin = (g.col_list && g.col_list.length) ? Math.min(...g.col_list) : 0;
+const gNCols = Math.max(0, g.cols - gColMin);
 document.getElementById('meta').textContent =
-  'AIE Debug  ' + g.cols + '\u00d7' + g.rows + ' grid';
+  'AIE Debug  ' + gNCols + '\u00d7' + g.rows + ' grid' +
+  (gColMin ? '  (cols ' + gColMin + '..' + (g.cols - 1) +
+             '; lower cols have no data tiles, e.g. control spine)' : '');
 
 // build a loc->tile map
 const byLoc = {};
@@ -4156,10 +4177,10 @@ function highlightFlow(fi, loc, badgeEl){
 
 // grid: columns left->right, rows top (highest) -> bottom (0)
 const grid = document.getElementById('grid');
-grid.style.gridTemplateColumns = 'repeat(' + g.cols + ', 1fr)';
+grid.style.gridTemplateColumns = 'repeat(' + gNCols + ', 1fr)';
 const rowsDesc = g.row_list.slice().sort((a,b)=>b-a);
 rowsDesc.forEach(r => {
-  for (let c=0; c<g.cols; c++){
+  for (let c=gColMin; c<g.cols; c++){
     const t = byLoc[c+','+r];
     const cell = document.createElement('div');
     if (!t){ cell.style.visibility='hidden'; cell.className='tile'; grid.appendChild(cell); continue; }

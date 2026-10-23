@@ -24,7 +24,7 @@ model.export_onnx()            scaled ResNet (torch.nn) ─► ONNX
 ```
 
 Every stage degrades gracefully. Without TVM the plan comes straight from the
-canonical `model.layer_plan()`; without the built `_aietriton_core` pybind
+canonical `model.layer_plan()`; without the built `_aiebackend` pybind
 extension the CPU reference and plan recovery still work, only `compile_plan` /
 `run_resnet(emit_aie=True)` need it.
 
@@ -33,12 +33,12 @@ extension the CPU reference and plan recovery still work, only `compile_plan` /
 | Frontend | Input | How it reaches `TilingLinalgPipeline` | Scope |
 |----------|-------|---------------------------------------|-------|
 | **aiehlc** (C++) | C++ using `aie::SpatialPolicy` NTTP + Clang AST | `AieFrontEnd.cc` builds routing IR directly in-process | General GEMM / conv2d; `DmaTransform` / `Conv2dSpace`-derived im2col |
-| **aietriton** (Python) | `@aie_triton.jit` GEMM kernel | AST parse → tensor specs + C body → `_aietriton_core.run_aie_pipeline` | Single-kernel GEMM |
-| **tvm** (Python) | scaled ResNet-18 via ONNX → Relay | primitive walk + our-fusion → per-launch tensor specs + C body → `_aietriton_core.run_aie_pipeline` | Multi-launch CNN forward pass (~29 launches) |
+| **aietriton** (Python) | `@aie_triton.jit` GEMM kernel | AST parse → tensor specs + C body → `_aiebackend.run_aie_pipeline` | Single-kernel GEMM |
+| **tvm** (Python) | scaled ResNet-18 via ONNX → Relay | primitive walk + our-fusion → per-launch tensor specs + C body → `_aiebackend.run_aie_pipeline` | Multi-launch CNN forward pass (~29 launches) |
 
 The TVM frontend is **pipeline-internal** exactly like `aietriton`: it reuses the
-same compiled `_aietriton_core` pybind extension (imported as
-`from ..aietriton import _aietriton_core`), so a full CNN is expressed as a
+same compiled `_aiebackend` pybind extension (imported as
+`aiebackend`; in-process for Triton, out of process next to TVM), so a full CNN is expressed as a
 sequence of `run_aie_pipeline` calls — one per `LayerOp` — rather than a single
 GEMM. It shares the four hand-verified kernel bodies with `resnet18_triton.py`.
 
@@ -266,7 +266,7 @@ residual's `%skip` back-references the correct earlier launch (the downsample
 `skip_ds` conv, or an earlier residual). The verifier enforces that a residual's
 three operands share one element count.
 
-### pybind entries (`aietriton_pybind.cpp`)
+### pybind entries (`aiebackend_pybind.cpp`)
 
 ```python
 ir = build_aiegraph_module(op_dicts, func_name)   # build + verify -> textual IR
@@ -396,7 +396,7 @@ An **im2col path** is available via `_compiler.im2col_dma_spec(H, W, Cin, K, str
 which builds the multi-dim shim DMA addressing the extended pybind `dma_specs`
 argument accepts. This is the one C++ change the plan required.
 
-### The pybind change (Step 2, `aietriton_pybind.cpp`)
+### The pybind change (Step 2, `aiebackend_pybind.cpp`)
 
 `run_aie_pipeline` gained an optional per-tensor `dma_specs` argument, defaulted
 to `{}` so the existing Triton path is unaffected:
@@ -473,7 +473,7 @@ skipped, not failed):
   window ABI;
 * `test_run_resnet_smoke` — `run_resnet(emit_aie=False)` returns a full plan and
   a valid predicted class;
-* `test_emit_aie` — if `_aietriton_core` is built, emit one conv launch and
+* `test_emit_aie` — if `_aiebackend` is built, emit one conv launch and
   assert the output file set appears (skipped otherwise);
 * `test_cpu_codegen_bit_exact` — if TVM is present, build the residual and
   avgpool TE on `target="llvm"`, run random int8 inputs, and assert elementwise
@@ -497,7 +497,7 @@ pip install -r src/frontend/tvm/requirements.txt
 # numpy is always required; apache-tvm/onnx/torch enable the optional Relay path.
 ```
 
-Build `_aietriton_core` (cmake with `LLVM_INSTALL_DIR` + MLIR) before emitting
+Build `_aiebackend` (cmake with `LLVM_INSTALL_DIR` + MLIR) before emitting
 AIE code.
 
 ## Files
@@ -526,7 +526,7 @@ AIE code.
   frontend, plus the int8-config / fixed-op-set / placeholder-weight constraints.
 - `src/frontend/tvm/README.md` — module usage.
 - `src/mlir/mlirfront/frontend/aietriton/README.md` + `architecture.md` — the
-  sibling Triton frontend and the `_aietriton_core` pybind bridge this frontend
+  sibling Triton frontend and the `_aiebackend` pybind bridge this frontend
   reuses.
 - `doc/design/conv2d_im2col_design.md §11` — the generic `DmaAddressing` on
   `TensorParam` that `dma_specs` exposes to Python.

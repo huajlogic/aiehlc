@@ -4,13 +4,13 @@
 `@aie_triton.jit`-decorated GEMM kernel into the AIE output file set
 (`host.cc`, `kernel.cc`, `<kernel>.cc`, `routing.cc`, `aieml.bcf`, `aieml.prx`)
 by calling the `tilinglinalg` C++ pipeline **directly** through a pybind11
-module (`_aietriton_core`).
+module (`_aiebackend`).
 
 ```
 triton_matmul.py ──(import aietriton)──► _compiler.py (AST parse)
    │  tensor specs + kernel body
    ▼
-_aietriton_core.run_aie_pipeline()  (pybind11 → C++)
+_aiebackend.run_aie_pipeline()  (pybind11 → C++)
    │  buildRoutingIR + runPipeline
    ▼
 ./worklocal/{host,kernel,<kernel>,routing}.cc + aieml.bcf/.prx
@@ -38,12 +38,15 @@ Package root: `src/mlir/mlirfront/frontend/aietriton/`
 | `__init__.py` | Public API: `jit` decorator, `mesh()`, `set_device()`, `synchronize()`, `_JitKernel`, `_KernelLauncher` |
 | `language.py` | `tl.` stub namespace: types (`int8/16/32`, `float32`, `constexpr`) + op stubs (`load`, `store`, `dot`, `zeros`, `arange`, `program_id`, `make_block_ptr`, `advance`). Parsed via AST, **never executed** |
 | `_compiler.py` | AST engine: `compile_and_run()`, `_classify_params()`, `_is_input_tensor()`, `_extract_kernel_body()` |
-| `aietriton_pybind.cpp` | pybind11 bridge: `_aietriton_core.run_aie_pipeline()` and `build_kernel_body()` |
 | `aie_pass/ast_to_kernelops.py` | Python AST → flat `KernelOp` dict list |
-| `aie_pass/kernel_body_emitter.{h,cpp}` | C++ `KernelBodyEmitter`: `KernelOp[]` → MLIR EmitC `VerbatimOp` → `translateToCpp` → C string |
 | `aie_pass/test_ast_to_c.py` | Unit test: AST → KernelOps → C |
-| `CMakeLists.txt` | Builds `_aietriton_core.so`, links `mlirtestlib` + MLIR libs |
 | `architecture.md` | Deep-dive: every compiler stage, pass ordering, and Triton↔C mapping |
+
+The C++ side lives in the sibling **`../aiebackend/`** package, shared with the
+TVM frontend: `aiebackend_pybind.cpp` (the `_aiebackend` pybind module —
+`run_aie_pipeline()`, `build_kernel_body()`, …), `kernel_body_emitter.{h,cpp}`
+(`KernelOp[]` → MLIR EmitC → C string), and its `CMakeLists.txt`.
+`_compiler._backend()` imports it in-process via `aiebackend.load()`.
 
 Examples: `example/tileprogram/design/triton/triton_matmul.py`,
 `example/tileprogram/design/triton/resnet18_triton.py`.
@@ -54,14 +57,15 @@ Examples: `example/tileprogram/design/triton/triton_matmul.py`,
 
 ### 2.1 Build the pybind module
 
-`_aietriton_core.so` is built as part of the main `mlirfront` CMake project and
-installed next to the Python package:
+`_aiebackend.so` (in `../aiebackend/`) is built as part of the main `mlirfront`
+CMake project. `aiebackend.find_module_dir()` finds it in the build tree, so
+`make install` is optional:
 
 ```bash
 cd build
 cmake .. -DLLVM_INSTALL_DIR=/path/to/llvm/build
-make -j$(nproc) _aietriton_core
-make install                     # copies the .so next to __init__.py
+make -j$(nproc) _aiebackend
+make install                     # optional: copies the .so into ../aiebackend/
 ```
 
 > Without the `.so`, `import aietriton` still succeeds (the pybind module is
@@ -167,11 +171,11 @@ Follows Triton's `kernel[grid](*args)` shape (`__init__.py`):
  │                                                               │
  │  Phase 2  Kernel body extraction (aie_pass/)                  │
  │    ast_to_kernel_ops()  → KernelOp dict list                 │
- │    _aietriton_core.build_kernel_body() → C string            │
+ │    _aiebackend.build_kernel_body() → C string            │
  │    (empty ⇒ fall back to auto-generated GEMM kernel)          │
  │                                                               │
  │  Phase 3  C++ pipeline invocation (pybind11)                  │
- │    _aietriton_core.run_aie_pipeline(                          │
+ │    _aiebackend.run_aie_pipeline(                          │
  │        rows, cols, tensor_specs, "./worklocal",              │
  │        kernel_body, name)                                     │
  └───────────────────────────────────────────────────────────────┘
@@ -229,7 +233,7 @@ The list crosses the pybind11 boundary to `KernelBodyEmitter`, which builds one
 resulting C string is passed back as `userKernelBody` and written verbatim to
 `<kernel>.cc`.
 
-### 4.5 pybind11 bridge (`aietriton_pybind.cpp`)
+### 4.5 pybind11 bridge (`aiebackend_pybind.cpp`)
 
 | Entry point | Signature (Python → C++) |
 |-------------|--------------------------|
@@ -265,7 +269,7 @@ Written to `./worklocal/` (the `output_dir` in `_compiler.py`):
 # AST → KernelOps only (no .so needed):
 cd src/mlir/mlirfront/frontend && python3 -m aietriton.aie_pass.test_ast_to_c
 
-# Full pipeline incl. C generation (requires built _aietriton_core.so):
+# Full pipeline incl. C generation (requires built _aiebackend.so):
 cd src/mlir/mlirfront/frontend && python3 -m aietriton.aie_pass.test_ast_to_c --full
 ```
 
@@ -292,6 +296,6 @@ cd src/mlir/mlirfront/frontend && python3 -m aietriton.aie_pass.test_ast_to_c --
 - `architecture.md` — full stage-by-stage lowering trace and Triton↔C tables.
 - `../rcom/README.md` — the sibling ROCm/HIP front end (pipeline-external).
 - `../tvm/README.md`, `doc/design/tvm_frontend.md` — the TVM ResNet-18 front end,
-  which **reuses this package's `_aietriton_core`** to emit a full CNN as one
+  which **reuses the shared `_aiebackend`** to emit a full CNN as one
   `run_aie_pipeline` call per layer (a third frontend into `TilingLinalgPipeline`).
 - `doc/tilinglinalg.md`, `doc/lowering.md` — the C++ pipeline this front end drives.

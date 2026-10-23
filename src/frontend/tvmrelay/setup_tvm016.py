@@ -444,9 +444,151 @@ def apply_source_fixups(src_dir: Path, *, dry_run: bool = False) -> list:
     return changed
 
 
+#: Symbols LLVM's WindowsManifestMerger pulls from libxml2. That code is
+#: unreachable on Linux, so a stub exporting these satisfies the link.
+_LIBXML2_STUB_SYMS = (
+    "xmlAddChild", "xmlCopyNamespace", "xmlDocDumpFormatMemoryEnc",
+    "xmlDocGetRootElement", "xmlDocSetRootElement", "xmlFree", "xmlFreeDoc",
+    "xmlFreeNode", "xmlFreeNs", "xmlNewDoc", "xmlNewNs", "xmlNewProp",
+    "xmlReadMemory", "xmlSetGenericErrorFunc", "xmlStrdup", "xmlUnlinkNode",
+)
+
+#: Upstream header URLs, keyed by the soname version they must match.
+_HDR_URLS = {
+    "zlib": "https://raw.githubusercontent.com/madler/zlib/v{v}/{f}",
+    "zstd": "https://raw.githubusercontent.com/facebook/zstd/v{v}/lib/zstd.h",
+}
+
+
+def _default_llvm_config() -> str:
+    """Best ``llvm-config`` for an LLVM-enabled TVM build, or ``""``.
+
+    Checked in order: ``$LLVM_CONFIG``, ``$LLVM_INSTALL_DIR/bin`` (the var the
+    aiehlc cmake build already uses), ``PATH``, then the sibling llvm-project
+    build this repo is normally paired with.
+    """
+    env = os.environ.get("LLVM_CONFIG")
+    if env and Path(env).is_file():
+        return env
+
+    root = os.environ.get("LLVM_INSTALL_DIR")
+    if root:
+        cand = Path(root) / "bin" / "llvm-config"
+        if cand.is_file():
+            return str(cand)
+
+    found = shutil.which("llvm-config")
+    if found:
+        return found
+
+    # aiehlc builds against /scratch/.../llvm-project/build; reuse it.
+    for up in Path(__file__).resolve().parents:
+        cand = up.parent / "llvm-project" / "build" / "bin" / "llvm-config"
+        if cand.is_file():
+            return str(cand)
+    return ""
+
+
+def _find_soname(stem: str) -> tuple:
+    """Return ``(path, version)`` of an installed ``lib<stem>.so.X.Y.Z``."""
+    import glob
+    best = None
+    for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"):
+        for p in glob.glob(f"{d}/lib{stem}.so.*.*.*"):
+            ver = p.split(".so.", 1)[1]
+            if all(part.isdigit() for part in ver.split(".")):
+                best = best or (Path(p), ver)
+    return best or (None, None)
+
+
+def stage_llvm_link_deps(dest: Path, *, dry_run: bool = False) -> dict:
+    """Stage zlib/zstd headers + .so symlinks and a libxml2 stub into ``dest``.
+
+    LLVM reports ``-lz -lzstd -lxml2`` in ``llvm-config --system-libs``, so
+    TVM's ``find_llvm`` runs ``find_package(ZLIB)``/``Findzstd`` and fails when
+    the ``-dev`` packages are absent -- which is the usual reason a TVM here
+    ends up ``USE_LLVM=OFF``, silently costing the int8 path.
+
+    Rather than require sudo, point cmake at the *runtime* libs with headers
+    whose version matches the installed soname. Returns the cmake -D vars.
+    Network is needed once to fetch the two headers; they are cached in
+    ``dest``.
+    """
+    import urllib.request
+
+    inc, lib = dest / "include", dest / "lib"
+    if not dry_run:
+        inc.mkdir(parents=True, exist_ok=True)
+        lib.mkdir(parents=True, exist_ok=True)
+
+    zpath, zver = _find_soname("z")
+    spath, sver = _find_soname("zstd")
+    if zpath is None or spath is None:
+        raise ProvisionError(
+            "cannot stage LLVM link deps: no libz/libzstd runtime found. "
+            "Install zlib1g-dev + libzstd-dev, or build TVM with USE_LLVM=OFF "
+            "(int8 quantization will be unavailable)."
+        )
+
+    for stem, path, ver in (("z", zpath, zver), ("zstd", spath, sver)):
+        if not dry_run:
+            target = lib / f"lib{stem}.so"
+            if target.is_symlink() or target.exists():
+                target.unlink()
+            target.symlink_to(path)
+        _log(f"staged lib{stem}.so -> {path.name} (v{ver})")
+
+    # Headers must match the runtime soname, not be "some" version.
+    files = [("zlib", zver, "zlib.h"), ("zlib", zver, "zconf.h"),
+             ("zstd", sver, "zstd.h")]
+    for proj, ver, fname in files:
+        out = inc / fname
+        if out.exists():
+            continue
+        url = _HDR_URLS[proj].format(v=ver, f=fname)
+        _log(f"fetching {fname} v{ver}")
+        if not dry_run:
+            out.write_bytes(urllib.request.urlopen(url, timeout=60).read())
+
+    # libxml2: stub, since only the unreachable Windows-manifest path needs it.
+    xml_so = lib / "libxml2.so"
+    if not dry_run and not xml_so.exists():
+        src = dest / "xmlstub.c"
+        body = "\n".join(
+            f"void *{s}(void){{ abort(); }}" for s in _LIBXML2_STUB_SYMS)
+        src.write_text("#include <stdlib.h>\n" + body + "\n")
+        _run([os.environ.get("CC", "gcc"), "-shared", "-fPIC",
+              "-o", str(xml_so), str(src)], dry_run=dry_run)
+        _log(f"built libxml2 stub ({len(_LIBXML2_STUB_SYMS)} symbols)")
+
+    return {
+        "ZLIB_LIBRARY": str(lib / "libz.so"),
+        "ZLIB_INCLUDE_DIR": str(inc),
+        "zstd_LIBRARY": str(lib / "libzstd.so"),
+        "zstd_INCLUDE_DIR": str(inc),
+        "LIBXML2_LIBRARY": str(xml_so),
+        "LIBXML2_INCLUDE_DIR": str(inc),
+    }
+
+
 def _cmake_config(build_dir: Path, src_dir: Path, use_llvm: str, *, dry_run: bool) -> None:
     if not dry_run:
         build_dir.mkdir(parents=True, exist_ok=True)
+    extra = []
+    if use_llvm.upper() != "OFF":
+        # Only needed for an LLVM build, and only actually used when the -dev
+        # packages are missing -- a real ZLIB/zstd install wins the find anyway.
+        try:
+            for k, v in stage_llvm_link_deps(
+                    src_dir.parent / ".llvmdeps", dry_run=dry_run).items():
+                extra.append(f"-D{k}={v}")
+            extra.append(
+                f"-DCMAKE_SHARED_LINKER_FLAGS=-L{src_dir.parent/'.llvmdeps'/'lib'}")
+        except Exception as exc:
+            # Staging is a convenience: if it fails, let cmake try unaided and
+            # report its own (clearer) find_package error.
+            _log(f"note: could not stage LLVM link deps ({exc}); "
+                 f"relying on system zlib/zstd/libxml2")
     _run(
         [
             "cmake", "-G", "Ninja",
@@ -461,6 +603,7 @@ def _cmake_config(build_dir: Path, src_dir: Path, use_llvm: str, *, dry_run: boo
             # build TVM's C++ sanity tests, so take it out of the picture.
             "-DUSE_GTEST=OFF",
             f"-DUSE_LLVM={use_llvm}",
+            *extra,
         ],
         dry_run=dry_run,
     )
@@ -708,7 +851,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument(
         "--llvm", nargs="?", const="__auto__", default=None,
         metavar="PATH",
-        help="build with LLVM; PATH defaults to `which llvm-config` (default: OFF)",
+        help="build with LLVM at PATH; default is auto-detected (see "
+             "--no-llvm to opt out)",
+    )
+    p.add_argument(
+        "--no-llvm", action="store_true",
+        help="build with USE_LLVM=OFF; int8 quantization becomes unavailable "
+             "and deploy_flow.py falls back to fp32",
     )
     p.add_argument("--force-source", action="store_true", help="skip the wheel attempt")
     p.add_argument("--dry-run", action="store_true", help="print commands, change nothing")
@@ -720,7 +869,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = p.parse_args(argv)
 
     if args.llvm is None:
-        use_llvm = "OFF"
+        # Default to an LLVM build when we can find a usable llvm-config.
+        # int8 quantization -- the flow's DEFAULT path -- requires it: the QDQ
+        # import JIT-executes constant folds against a hardcoded "llvm" target.
+        # Defaulting to OFF produced a TVM that silently downgraded
+        # deploy_flow.py to fp32. Pass --no-llvm to force it off.
+        found = None if args.no_llvm else _default_llvm_config()
+        if args.no_llvm:
+            use_llvm = "OFF"
+        elif found:
+            use_llvm = found
+            _log(f"building with LLVM ({found}); --no-llvm to disable")
+        else:
+            use_llvm = "OFF"
+            _log("no llvm-config found; building with USE_LLVM=OFF -- "
+                 "int8 quantization will be UNAVAILABLE (fp32 only)")
     elif args.llvm == "__auto__":
         found = shutil.which("llvm-config")
         if not found:

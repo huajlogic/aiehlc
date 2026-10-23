@@ -77,7 +77,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from frontend.tvmrelay.aie_offload import CONFIG_SZ, check_layer, _core
+from frontend.tvmrelay.aie_offload import aie_backend
+
+#: Repo root: .../src/frontend/tvmrelay/aiegraph_partition.py -> up three.
+#: Needed to reach script/hostcompile.sh when archiving a layer.
+_REPO = Path(__file__).resolve().parents[3]
 
 __all__ = ["AIEGRAPH_OP_KINDS", "DEFAULT_AIE_OPS", "build_nodes",
            "build_ir_ops", "partition_layers", "run_aiegraph"]
@@ -87,7 +91,7 @@ AIEGRAPH_OP_KINDS = ("conv_bn_relu", "conv_bn", "residual_add_relu",
                      "avgpool_fc")
 
 #: Ops actually offloaded to the aiehlc kernel backend. Only the conv2d family
-#: has a kernel body in ``frontend.tvm.kernels`` and a ``run_aie_pipeline``
+#: has a kernel body in ``frontend.tvmrelay.kernels`` and a ``run_aie_pipeline``
 #: path; the rest reuse TVM's CPU C.
 DEFAULT_AIE_OPS = ("conv_bn_relu", "conv_bn")
 
@@ -165,7 +169,16 @@ def _conv_geometry(graph: dict, idx: int) -> dict:
     Nothing here re-derives convolution arithmetic: the shapes are the result of
     TVM's type inference, so ``stride`` is read back out of the input/output
     ratio and ``K`` off the weight tensor.
+
+    The int8 default graph is **NCHWc** (5-D feature maps, 6-D weights) after
+    ``AlterOpLayout``; that case is handed to ``aie_offload._layer_geometry``,
+    which folds ``C = C_outer * c`` (skill: nchwclayoutfold). Without it every
+    conv -- the stem included -- came back ``non-4D shapes; not a conv2d``.
     """
+    if any(len(s) == 5 for s in _input_shapes(graph, idx) + [_shape(graph, idx)]):
+        from frontend.tvmrelay.aie_offload import _layer_geometry
+
+        return _layer_geometry(graph, idx)
     producers = _data_inputs(graph, idx)
     inputs = _input_shapes(graph, idx)
     if not producers and not inputs:
@@ -370,17 +383,31 @@ def build_ir_ops(records: list) -> tuple:
 #  Partition
 # ═══════════════════════════════════════════════════════════════════════════
 
-def partition_layers(records: list, aie_ops=DEFAULT_AIE_OPS) -> list:
+def partition_layers(records: list, aie_ops=DEFAULT_AIE_OPS,
+                     layers=None) -> list:
     """Decide AIE vs CPU per layer. Returns one verdict dict per record.
 
     A layer goes to AIE only when **every** aiegraph op it expands to is in
     *aie_ops*. Partial eligibility is not offloadable: the TVM C for a residual
     block is a single fused function, so taking its conv to AIE would drop the
     residual add entirely.
+
+    *layers* is the ``--aie-layers`` selection: a list of ``layers/`` folder
+    indices, or ``None`` for "every eligible layer". A layer outside the
+    selection stays on the APU even when it is otherwise eligible -- this is the
+    same selection ``--aie-offload`` uses, so both flags target the same conv
+    (layer 6, the 7x7/s2 stem, under the int8-legalized graph).
     """
+    sel = None if layers is None else set(layers)
     verdicts = []
     for rec in records:
         kinds = rec["aiegraph"]
+        if sel is not None and rec.get("index") not in sel:
+            want = ",".join(str(i) for i in sorted(sel))
+            verdicts.append({**rec, "target": "cpu",
+                             "verdict_reason": f"not in the --aie-layers "
+                                               f"selection ({want})"})
+            continue
         if not kinds:
             reason = rec.get("reason", "no aiegraph op")
             target = "cpu"
@@ -401,7 +428,8 @@ def partition_layers(records: list, aie_ops=DEFAULT_AIE_OPS) -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
-                 emit_aie: bool = True, verbose: bool = True) -> dict:
+                 emit_aie: bool = True, layers=None,
+                 verbose: bool = True) -> dict:
     """Lift the whole graph to aiegraph, partition it, and offload the AIE part.
 
     Writes ``layers/aiegraph.mlir`` (the verified whole-graph IR) and
@@ -409,6 +437,11 @@ def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
     ``layers/<NN_name>/aie/`` for each offloaded layer. The TVM C of every layer
     is left exactly as stage 5 wrote it -- CPU layers reuse it as-is, and it is
     kept for AIE layers too so the APU ELF still links.
+
+    *layers* narrows the offload to those ``layers/`` indices (``--aie-layers``;
+    ``None`` = every eligible layer). The whole graph is still lifted and
+    verified either way -- the selection only decides which verified layers get
+    an ``aie/`` build.
     """
     out_dir = Path(out_dir).resolve()
     layers_dir = out_dir / "layers"
@@ -428,34 +461,35 @@ def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
         # stage-4/5 artifact is a stage-4/5 problem, not a crash here.
         return {"ok": False, "reason": f"unreadable {type(exc).__name__}: {exc}"}
     records = build_nodes(manifest, graph)
-    verdicts = partition_layers(records, aie_ops)
+    verdicts = partition_layers(records, aie_ops, layers)
 
     op_dicts, owners = build_ir_ops(records)
     if not op_dicts:
         return {"ok": False, "reason": "no layer mapped onto an aiegraph op",
                 "layers": verdicts}
 
-    core = _core()
-    ir = core.build_aiegraph_module(op_dicts, "resnet18")
+    backend = aie_backend()
+    ir = backend.build_aiegraph_module(op_dicts, "resnet18")
     ir_path = layers_dir / "aiegraph.mlir"
     ir_path.write_text(ir)
     if verbose:
         print(f"  [aiegraph] {len(op_dicts)} ops over {len(records)} layers, "
               f"verified -> {ir_path.name}")
 
-    built = _offload(core, ir, owners, verdicts, layers_dir, out_dir,
+    built = _offload(backend, ir, owners, verdicts, layers_dir, out_dir,
                      aie_ops, mesh, emit_aie, verbose)
 
     n_aie = sum(1 for v in verdicts if v["target"] == "aie")
     result = {"ok": all(b["ok"] for b in built) if built else True,
               "ir": str(ir_path), "op_count": len(op_dicts),
               "aie_count": n_aie, "cpu_count": len(verdicts) - n_aie,
-              "aie_ops": list(aie_ops), "layers": verdicts, "built": built}
+              "aie_ops": list(aie_ops), "layers": verdicts, "built": built,
+              "selection": None if layers is None else list(layers)}
     _write_partition(layers_dir, result, verbose)
     return result
 
 
-def _offload(core, ir: str, owners: list, verdicts: list, layers_dir: Path,
+def _offload(backend, ir: str, owners: list, verdicts: list, layers_dir: Path,
              out_dir: Path, aie_ops, mesh, emit_aie: bool,
              verbose: bool) -> list:
     """Run ``run_aie_pipeline`` for each AIE-bound layer. Returns build records.
@@ -475,10 +509,10 @@ def _offload(core, ir: str, owners: list, verdicts: list, layers_dir: Path,
     """
     if not emit_aie:
         return []
-    from frontend.tvm import kernels
+    from frontend.tvmrelay import kernels
 
     aie_dirs = {v["node"]: v for v in verdicts if v["target"] == "aie"}
-    launches = core.lower_aiegraph(ir)
+    launches = backend.lower_aiegraph(ir)
     # The launches are matched to owners positionally, so a backend that ever
     # reorders or merges ops would misattribute every later layer. Fail loudly
     # instead: silent misattribution is the exact bug this module exists to
@@ -505,45 +539,113 @@ def _offload(core, ir: str, owners: list, verdicts: list, layers_dir: Path,
         aie_dir = layers_dir / stem / "aie"
         if rec["node"] in multi_op:
             aie_dir = aie_dir / launch["op"]
-        entry = _build_one(core, kernels, launch, rec, verdict, aie_dir,
+        entry = _build_one(backend, kernels, launch, rec, verdict, aie_dir,
                            out_dir, mesh, verbose)
         built.append(entry)
         done[key] = entry
     return built
 
 
-def _build_one(core, kernels, launch: dict, rec: dict, verdict: dict,
+def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
                aie_dir: Path, out_dir: Path, mesh, verbose: bool) -> dict:
-    """Run ``run_aie_pipeline`` for one launch into *aie_dir*. Returns its record."""
+    """Run ``run_aie_pipeline`` for one launch into *aie_dir*. Returns its record.
+
+    A conv with exactly the ResNet stem geometry is built from
+    ``conv2dstem.cc`` by aiehlc instead -- the same logic ``test_conv2d.cc``
+    verifies bit-exact against this layer -- not from the generic placeholder
+    body (``aie_stem_lib``).
+    """
+    from frontend.tvmrelay import aie_stem_lib
+
+    if launch["op"].startswith("conv_") and aie_stem_lib.matches_stem(rec):
+        return _build_stem(aie_stem_lib, launch, rec, verdict, aie_dir,
+                           out_dir, verbose)
     aie_dir.mkdir(parents=True, exist_ok=True)
     specs = [(list(shape), int(bits), bool(is_in))
              for (shape, bits, is_in) in launch["tensor_specs"]]
     body = kernels.kernel_body_for(launch["op"], launch["func_name"])
-    ok = core.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir), body,
+    ok = backend.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir), body,
                                launch["func_name"])
-    # check_layer sizes a *convolution* working set (Cin*Cout*K^2 weights), so
-    # it only describes the conv-family launches; an elementwise op has no
-    # weights and would be reported against the wrong formula.
-    check = (check_layer(rec, mesh)
-             if launch["op"] in ("conv_bn", "conv_bn_relu") else None)
     produced = sorted(p.name for p in aie_dir.iterdir()) if ok else []
 
     if verbose:
-        if check is None:
-            budget = "elementwise -- no conv working-set estimate"
-        else:
-            fit = "fits" if check["fits"] else f"OVER {check['overrun']:.0f}x"
-            budget = f"{check['per_tile_bytes']:,} B/tile -- {fit}"
         print(f"  [aiegraph] layer {verdict['index']:02d} {verdict['kind']}"
               f" -> {launch['op']} -> {aie_dir.relative_to(out_dir)}/ "
-              f"({len(produced)} files, {budget})")
+              f"({len(produced)} files)")
 
-    return {"index": verdict["index"], "node": rec["node"],
-            "dir": str(aie_dir.relative_to(out_dir)), "ok": bool(ok),
-            "op": launch["op"], "func_name": launch["func_name"],
-            "files": produced,
-            "feasible": check["fits"] if check else None,
-            "per_tile_bytes": check["per_tile_bytes"] if check else None}
+    entry = {"index": verdict["index"], "node": rec["node"],
+             "dir": str(aie_dir.relative_to(out_dir)), "ok": bool(ok),
+             "op": launch["op"], "func_name": launch["func_name"],
+             "files": produced}
+
+    # The pipeline stops at source. Wrap it in an op entry and archive it, so
+    # the layer folder holds something a host program can actually link
+    # against rather than artifacts nothing consumes.
+    if ok:
+        entry.update(_archive_one(aie_dir, verdict, launch, specs, mesh,
+                                  out_dir, verbose))
+    return entry
+
+
+def _build_stem(aie_stem_lib, launch: dict, rec: dict, verdict: dict,
+                aie_dir: Path, out_dir: Path, verbose: bool) -> dict:
+    """aiehlc-build ``conv2dstem.cc`` into *aie_dir*. Returns its record."""
+    # The TVM kernel symbol rides along so host.cc gets a packed-call entry
+    # graph_driver.c can call in its place (aie_stem_lib._ENTRY_TMPL).
+    res = aie_stem_lib.build_stem_layer(aie_dir, index=verdict["index"],
+                                        func_name=rec["symbol"], verbose=False)
+    if verbose:
+        print(f"  [aiegraph] layer {verdict['index']:02d} {verdict['kind']}"
+              f" -> {launch['op']} (stem) -> aiehlc "
+              f"{aie_stem_lib.STEM_SOURCE.name} -> "
+              f"{aie_dir.relative_to(out_dir)}/ ({len(res['files'])} files)")
+    entry = {"index": verdict["index"], "node": rec["node"],
+             "dir": str(aie_dir.relative_to(out_dir)), "ok": res["ok"],
+             "op": launch["op"], "func_name": launch["func_name"],
+             "files": res["files"], "backend": "aiehlc",
+             "source": str(aie_stem_lib.STEM_SOURCE.relative_to(_REPO)),
+             "entry": res.get("entry"), "replaces": rec["symbol"]}
+    if res["archive"]:
+        entry["archive"] = str(Path(res["archive"]).relative_to(out_dir))
+        if verbose:
+            print(f"  [aiegraph]   -> {Path(res['archive']).name} "
+                  f"({Path(res['archive']).stat().st_size / 1024:,.0f} KB)")
+    else:
+        entry.update(archive=None,
+                     archive_reason=res.get("reason", "aiehlc built no archive"))
+        if verbose:
+            print(f"  [aiegraph]   no archive: {entry['archive_reason']}")
+    return entry
+
+
+def _archive_one(aie_dir: Path, verdict: dict, launch: dict, specs,
+                 mesh, out_dir: Path, verbose: bool) -> dict:
+    """Emit the op entry for one built layer and archive it. Never raises."""
+    from frontend.tvmrelay import aie_layer_lib
+
+    stem = aie_dir.parent.name if aie_dir.name == "aie" else aie_dir.name
+    try:
+        src = aie_layer_lib.emit_op_entry(aie_dir, stem, launch["func_name"],
+                                          specs, mesh)
+        built = aie_layer_lib.build_archive(aie_dir, stem, _REPO,
+                                            verbose=verbose)
+    except Exception as exc:                       # noqa: BLE001
+        return {"archive": None, "archive_reason": f"{type(exc).__name__}: {exc}"}
+
+    if not built.get("ok"):
+        if verbose:
+            print(f"  [aiegraph]   no archive: {built['reason']}")
+        return {"archive": None, "archive_reason": built["reason"],
+                "op_entry": src.name}
+
+    # Resolve both sides: aie_dir may arrive relative to the cwd while out_dir
+    # is absolute, and relative_to() raises rather than coping with the mix.
+    archive = Path(built["archive"]).resolve()
+    try:
+        shown = archive.relative_to(Path(out_dir).resolve())
+    except ValueError:                  # archive redirected outside out_dir
+        shown = archive
+    return {"archive": str(shown), "op_entry": src.name}
 
 
 def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
@@ -564,7 +666,20 @@ def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
             "aiegraph": v["aiegraph"], "target": v["target"],
             "reason": v["verdict_reason"],
             "aie_dir": built["dir"] if built else None,
-            "feasible": built["feasible"] if built else None,
+            # How aie/ was produced: "aiehlc" from a hand-written source
+            # (the stem -> conv2dstem.cc), else the generic aiegraph pipeline.
+            "backend": (built.get("backend", "run_aie_pipeline")
+                        if built else None),
+            "source": built.get("source") if built else None,
+            # graph_driver.c calls `entry` instead of `replaces` when built
+            # with -DGRAPH_AIE_OFFLOAD (arm_build.aie_entries).
+            "entry": built.get("entry") if built else None,
+            "replaces": built.get("replaces") if built else None,
+            # The linkable product of that folder, or why there isn't one.
+            # Null with a reason is the normal state on a box without the
+            # Vitis cross toolchain; null without one means it was never tried.
+            "archive": built.get("archive") if built else None,
+            "archive_reason": built.get("archive_reason") if built else None,
         })
     # Counts are over graph *invocations*, so two nodes sharing a symbol count
     # twice -- that is the honest number for "how much of the network runs on
