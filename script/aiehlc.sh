@@ -280,6 +280,10 @@ if [ -n "$runtime_source_file" ] && [[ "$runtime_source_file" != /* ]]; then
     runtime_source_file="$(cd "${AIEHLC_DIR}" && cd "$(dirname "$runtime_source_file")" && pwd)/$(basename "$runtime_source_file")"
 fi
 
+if [[ -z "${LLVM_AIE_PATH:-}" ]]; then
+    export LLVM_AIE_PATH="${AIEHLC_DIR}/thirdparty/llvm-aie-22.0.0.20261020/llvm-aie"
+fi
+
 #set up env
 run_cmd "source $SCRIPT_DIR/setup.sh --path-set-only"
 
@@ -558,6 +562,7 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     WORKLOCAL_DIR="${WORKLOCAL_DIR}" AIE_VERSION="${aie_version}" PLATFORM="${platform}" \
         SIM_TILES="${SIM_TILES:-}" DEBUG_SYMS="${DEBUG_SYMS}" \
         AIEHLC_PROFILING="${PROFILING}" EXTRA_DEFS="${hc_extra_defs}" \
+        USE_LLVM_AIE="${use_llvm_aie}" LLVM_AIE_PATH="${LLVM_AIE_PATH:-}" \
         bash "${AIEHLC_DIR}/script/hostcompile.sh"
     TILING_RC=$?
     if [ $TILING_RC -ne 0 ]; then
@@ -575,7 +580,7 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
         # No ELF: an app source with no main() is archived into a static library
         # by hostcompile.sh instead of linked. Report the .a so the build does not
         # look like it silently produced nothing.
-        _tiling_lib="$(ls "${TILING_BUILD_DIR}"/*.a 2>/dev/null | head -1)"
+        _tiling_lib="$(ls "${TILING_BUILD_DIR}"/*.a 2>/dev/null | head -1)" || true
         if [ -n "${_tiling_lib}" ]; then
             echo "Build complete (tiling mode, static library — host.cc has no main())."
             echo "    ${_tiling_lib}"

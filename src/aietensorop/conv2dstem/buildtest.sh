@@ -66,6 +66,7 @@ for arg in "$@"; do
     --skip-trace) SKIP_TRACE=1 ;;
     --no-aiehlc) RUN_AIEHLC=0 ;;
     --profiling) AIEHLC_EXTRA+=("--profiling") ;;
+    --use-llvm-aie) AIEHLC_EXTRA+=("--use-llvm-aie") ;;
     -h | --help)
         sed -n '7,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         exit 0

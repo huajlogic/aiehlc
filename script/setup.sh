@@ -119,7 +119,10 @@ if [ "$USE_LLVMAIE" -eq 1 ]; then
 else
     echo "Skipping llvm-aie installation due to --skip-llvm option."
 fi
-export LLVM_AIE_PATH="${AIEHLC_DIR}/thirdparty/llvm-aie"
+# Respect a caller-set LLVM_AIE_PATH (e.g. a versioned install like llvm-aie-22.*).
+if [[ -z "${LLVM_AIE_PATH:-}" ]]; then
+    export LLVM_AIE_PATH="${AIEHLC_DIR}/thirdparty/llvm-aie"
+fi
 popd
 
 #set up the vitis path

@@ -220,10 +220,11 @@ public:
 		ostr << indent_str << "} > data\n";
 		ostr << "\n";
 
-		ostr << indent_str << ". = 0x" << std::hex << stack[0] << ";\n";
-		ostr << indent_str << "_sp_start_value_DM_stack = .;\n";
-		ostr << indent_str << ". += 0x" << std::hex << stack[1] << "; /* stack */\n";
-		ostr << indent_str << ". = 0x71000;\n";
+        ostr << indent_str << ". = 0x" << std::hex << stack[0] << ";\n";
+        ostr << indent_str << ". += 0x" << std::hex << stack[1] << "; /* stack */\n";
+        ostr << indent_str
+             << "_sp_start_value_DM_stack = .; /* top of stack: crt0 loads directly into SP, stack grows down */\n";
+        ostr << indent_str << ". = 0x71000;\n";
 		ostr << "\n";
 
 		ostr << indent_str << ".bss : {\n";
