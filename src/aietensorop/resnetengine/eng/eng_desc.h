@@ -70,6 +70,22 @@ enum {
 #define ENG_F_COMB 4   /* out = clamp(Qself(v) + Qres(res), 0, 255) */
 #define ENG_F_RES_IN 8 /* all input rows of all chunks resident: streamed once, not P times */
 #define ENG_F_STEM 16  /* the stem: 7x7 s2 over [230][232][4] + fused 3x3 s2 maxpool, 56-px L8 out */
+/* Layer-major (batched) schedule: a block's conv1 and conv2 do not run back to
+ * back for one image, so the residual cannot stay in core memory. */
+#define ENG_F_RESX                                                                                                     \
+    32 /* COMB: before the conv, the input channel first delivers the residual                                         \
+        * tensor's rows (own output rows, P chunks); the core grabs its slice -> RES */
+#define ENG_F_DOWNOUT                                                                                                  \
+    64 /* DOWN: v_d leaves as output passes P..2P-1 (2C-channel output tensor),                                        \
+        * each OUT row slot = [main P passes | down P passes] */
+#define ENG_F_GO                                                                                                       \
+    128 /* hold the image's first output row until the host sets lock ENG_LK_GO: its                                   \
+         * out-of-order shim BDs are re-armed per image, and an idle OOO channel                                       \
+         * would land early packets at the previous image's addresses */
+#define ENG_LK_GO 8
+#define ENG_F_RI                                                                                                       \
+    256 /* row=image: this mesh row's own image, all output rows; q-outer -- input                                     \
+         * chunk q's rows stay while all P passes use them, ACC holds P x rows */
 
 /* Stem geometry (ENG_F_STEM). Input rows are 232 px x 4 B = 928 B, landing in
  * 960 B (64-aligned) ring slots. Mesh row r computes stem rows 28r-1 .. 28r+27

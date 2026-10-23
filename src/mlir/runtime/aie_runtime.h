@@ -370,6 +370,11 @@ struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_Ctr
 void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
 void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
 void __Runtime_ctrl_kernel_pkt_set(const void *blob, unsigned int bytes);
+// Encode a kernel ELF once into the blob __Runtime_ctrl_kernel_pkt_set takes
+// (malloc'd; NULL on failure) -- for callers that reload one kernel often.
+void *__Runtime_ctrl_kernel_pkt_build(__Runtime_CtrlRowFabric *fab, const unsigned char *elf, unsigned int *bytes);
+// Warm ctrl-plane ELF reload (program memory not resent when unchanged); default on.
+void __Runtime_ctrl_elf_warm_enable(int on);
 void __Runtime_ctrl_aot_register(const void *table);
 void __Runtime_ctrl_aot_window(XAie_DevInst *dev, __Runtime_CtrlRowFabric *f, int nbuf, ...);
 struct_ioevent __Runtime_ioevent_make(XAie_LocType tile, int32_t channel, int32_t bd_id, XAie_DmaDirection dir);
@@ -917,6 +922,7 @@ void __Runtime_ctrl_high_throughput_enable(int on);
 
 void __Runtime_ctrl_shim_bd_begin(__Runtime_CtrlRowFabric *f);
 void __Runtime_ctrl_shim_bd_commit(void);
+int __Runtime_ctrl_shim_bd_sync(void);
 void __Runtime_ctrl_shim_bd_ctrl_stats_print(void);
 
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and

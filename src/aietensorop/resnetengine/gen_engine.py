@@ -413,7 +413,7 @@ def plan(L, prev_res):
     a = DM_W + 2 * g["chunk"]
     g["A_EPD"] = a if L["down"] else 0
     a += EPSET_BYTES if L["down"] else 0
-    acc = rmax * mb * 2 * 256 if Q > 1 else 0
+    acc = (rmax if Q > 1 else 1) * mb * 2 * 256  # Q == 1: one row (the epilogue reads it back)
     others = acc * (2 if L["down"] else 1) + (2 if P == 1 else rmax) * P * 2 * g["WR"] * 8
     top = DM_TOP - res_bytes if uses_res else DM_TOP
     slot = CHUNK_BLK * g["WST"] * 8
@@ -421,8 +421,9 @@ def plan(L, prev_res):
     resident = P > 1 and room >= Q * max(g["rows_in"])
     if resident:          # every input row of every chunk stays: streamed once, not P times
         g["ring_slots"] = Q * max(g["rows_in"])
-    else:                 # spare memory -> prefetch: up to two chunks' rows
-        g["ring_slots"] = max(g["ring_slots"], min(room, 2 * max(g["rows_in"]), 31))
+    else:                 # spare memory -> prefetch: up to two chunks' rows; short of memory, the
+        # ring may shrink to S + 2 slots (the 3-row window + the S rows the next row brings)
+        g["ring_slots"] = max(min(g["ring_slots"], max(room, S + 2)), min(room, 2 * max(g["rows_in"]), 31))
     assert room >= g["ring_slots"], f"call {L['call']}: core memory overflow"
     g["resident"] = resident
     g["A_RING"] = a
@@ -435,14 +436,56 @@ def plan(L, prev_res):
     assert a <= top
     if L["comb"] is not None:
         assert prev_res == g["A_RES"], "residual moved between producer and consumer"
+    if L["down"]:  # layer-major schedule (ENG_F_DOWNOUT): OUT row slots hold [main | v_d]
+        assert g["A_OUT"] + 2 * (a - g["A_OUT"]) <= DM_TOP, f"call {L['call']}: DOWNOUT slots overflow"
+    if L["comb"] is not None and resident:  # ENG_F_RESX staging: 2 input slots inside OUT
+        assert a - g["A_OUT"] >= 2 * slot, f"call {L['call']}: RESX staging does not fit in OUT"
     g["used"] = a - DM_W + (res_bytes if uses_res else 0)
+    return g
+
+
+RI_P = 4  # passes per row=image sub-layer (core memory: ACC grows with P' x all rows)
+
+
+def ri_eligible(L):
+    """7x7 stride-1 layers run row=image in the layer-major schedule: each mesh
+    row takes a different image, so one column weight stream serves 4 images."""
+    return not L.get("stem") and L["S"] == 1 and L["Ho"] == 7 and L["down"] is None
+
+
+def plan_ri(L):
+    """Core-memory map of a row=image sub-layer (RI_P passes, all 7 rows, q-outer)."""
+    S, Q, P = 1, L["Cin"] // 64, RI_P
+    rows, mb = [L["Ho"]] * MESH, -(-L["Wo"] // 8)
+    g = dict(S=S, Q=Q, P=P, rows=rows, MB=mb, WR=mb * 8, WST=wst(L["Ho"]), WSTO=wst(L["Wo"]), Hin=L["Ho"],
+             NTAP=9, resident=False, ri=True, A_EPD=0, A_ACCD=0)
+    g["chunk"] = PRM_BYTES + 9 * CHUNK_BLK * 128
+    g["rows_in"] = [(r - 1) * S + 3 for r in rows]
+    rmax = max(rows)
+    a = DM_W + 2 * g["chunk"]
+    acc = P * rmax * mb * 2 * 256          # ACC row = p * rows + oh
+    out = rmax * P * 2 * g["WR"] * 8       # every row stays until the last pass
+    res = out if L["comb"] is not None else 0
+    top = DM_TOP - res
+    slot = CHUNK_BLK * g["WST"] * 8
+    room = (top - a - acc - out - RING_SLACK) // slot
+    g["ring_slots"] = min(room, 2 * max(g["rows_in"]), 31)
+    assert g["ring_slots"] >= max(g["rows_in"]), f"call {L['call']}: RI core memory overflow"
+    g["A_RING"] = a
+    a += g["ring_slots"] * slot + RING_SLACK
+    g["A_ACC"], a = a, a + acc
+    g["A_OUT"], a = a, a + out
+    g["A_RES"] = top
+    assert a <= top
+    g["used"] = a - DM_W + res
     return g
 
 
 def header(L, g):
     h = dict(MAGIC=ENG_MAGIC, LAYER=L["call"], S=g["S"], Q=g["Q"], P=g["P"], WST=g["WST"], WO=L["Wo"],
              MB=g["MB"], FLAGS=(1 if L["down"] else 0) | (2 if L["grab"] else 0) | (4 if L["comb"] else 0)
-             | (8 if g["resident"] else 0) | (16 if L.get("stem") else 0), A_EPD=g["A_EPD"],
+             | (8 if g["resident"] else 0) | (16 if L.get("stem") else 0) | (256 if g.get("ri") else 0),
+             A_EPD=g["A_EPD"],
              A_SROW=g.get("A_SROW", 0),
              C0=L["c0"], C0D=L["down"]["c0"] if L["down"] else 0, NTAP=g["NTAP"], CHUNK=g["chunk"],
              RING_SLOTS=g["ring_slots"], A_RING=g["A_RING"], A_ACC=g["A_ACC"], A_ACCD=g["A_ACCD"],
@@ -505,6 +548,7 @@ def emit(net, layers, outs, x1, img_in, out_dir: Path, cpu=None):
         print(f"  call {L['call']:2d}: P{g['P']} Q{g['Q']} chunk {g['chunk']} rows {g['rows']} "
               f"ring {g['ring_slots']}{' resident' if g['resident'] else ''} "
               f"core mem {g['used'] / 1024:.1f} KB  weights/col {(len(blob) - offs[-1]) / 1024:.0f} KB")
+    lm = layer_major_table(rows_c, blob)
     (out_dir / "eng_blob.bin").write_bytes(blob)
     (out_dir / "eng_gold.bin").write_bytes(gold)
     (out_dir / "eng_x1.bin").write_bytes(to_l8(x1))
@@ -521,15 +565,23 @@ def emit(net, layers, outs, x1, img_in, out_dir: Path, cpu=None):
              "#define ENG_IMG_BYTES (230 * 232 * 4)",
              f"#define ENG_BLOB_BYTES {len(blob)}", f"#define ENG_GOLD_BYTES {len(gold)}",
              f"#define ENG_X1_BYTES {len(to_l8(x1))}",
+             "/* in_blk/out_blk: 8-channel blocks per row of the input/output tensor (a DOWN",
+             " * layer's output carries v_d after y: 2*Cout/8). res_act/res_blk0: where a COMB",
+             " * layer's residual lives in DDR for the layer-major schedule (activation index,",
+             " * first block), -1 if none. flags: the header's ENG_F_* (image-major schedule). */",
              "typedef struct {",
              "    int call, stem, S, P, Q, Cin, Cout, Hin, Ho, Wo, wst_in, wst_out, resident, rows[4];",
              "    long blob_off[4], blob_len, gold_off, gold_len;",
+             "    int flags, in_blk, out_blk, res_act, res_blk0;",
+             "    int p0, ri, in_act, out_act; /* first pass (sub-layer); row=image; act buffers read/written */",
              "} eng_layer_t;",
              "static const eng_layer_t eng_layers[ENG_NLAYERS] = {"]
-    for L, g, offs, blen, goff, glen in rows_c:
-        lines.append(f"    {{{L['call']}, {int(bool(L.get('stem')))}, {g['S']}, {g['P']}, {g['Q']}, {L['Cin']}, {L['Cout']}, {g['Hin']}, "
-                     f"{L['Ho']}, {L['Wo']}, {g['WST']}, {g['WSTO']}, {int(g['resident'])}, {{{', '.join(map(str, g['rows']))}}}, "
-                     f"{{{', '.join(map(str, offs))}}}, {blen}, {goff}, {glen}}},")
+    for i, (L, g, offs, blen, goff, glen) in enumerate(rows_c):
+        lines.append(table_line(rows_c, i, L, g, offs, blen, goff, glen, 0, i))
+    lines += ["};", f"#define ENG_LM_NLAYERS {len(lm)}",
+              "/* layer-major schedule: the 7x7 stride-1 layers split into row=image sub-layers */",
+              "static const eng_layer_t eng_lm_layers[ENG_LM_NLAYERS] = {"]
+    lines += [table_line(rows_c, i, L, g, offs, blen, goff, glen, p0, i) for (i, L, g, offs, blen, goff, glen, p0) in lm]
     lines += ["};"] + (emit_cpu(cpu, out_dir) if cpu else []) + ["#endif", ""]
     (out_dir / "eng_net.h").write_text("\n".join(lines))
     print(f"wrote {out_dir}: blob {len(blob) / 1e6:.2f} MB, gold {len(gold) / 1e6:.2f} MB")
@@ -558,6 +610,47 @@ def cpu_tail(net: Net, last: dict) -> dict:
                 dense_mult=mult.reshape(-1), dense_shift=shift.reshape(-1), fq=fq,
                 image=dump(net.deploy, 0, "in")[0].astype(np.float32),
                 logits=dump(net.deploy, k_dense, "out")[0].astype(np.float32))
+
+
+def table_line(rows_c, i, L, g, offs, blen, goff, glen, p0, act):
+    """One eng_layer_t initializer. act: index of the layer's input activation."""
+    prev = rows_c[i - 1][0] if i else None
+    in_blk = L["Cin"] // 8 * (2 if prev is not None and prev["down"] else 1)
+    out_blk = L["Cout"] // 8 * (2 if L["down"] else 1)
+    res_act, res_blk0 = -1, 0
+    if L["comb"] is not None:  # identity: block input (conv1's input); downsample: v_d half of conv1's output
+        res_act, res_blk0 = (i, L["Cout"] // 8) if L["res_from_down"] else (i - 1, 0)
+    flags = struct.unpack_from("<i", header(L, g), 4 * EH.index("FLAGS"))[0]
+    return (f"    {{{L['call']}, {int(bool(L.get('stem')))}, {g['S']}, {g['P']}, {g['Q']}, {L['Cin']}, {L['Cout']}, {g['Hin']}, "
+            f"{L['Ho']}, {L['Wo']}, {g['WST']}, {g['WSTO']}, {int(g['resident'])}, {{{', '.join(map(str, g['rows']))}}}, "
+            f"{{{', '.join(map(str, offs))}}}, {blen}, {goff}, {glen}, {flags}, {in_blk}, {out_blk}, {res_act}, {res_blk0}, "
+            f"{p0}, {int(bool(g.get('ri')))}, {act}, {act + 1}}},")
+
+
+def layer_major_table(rows_c, blob):
+    """Entries of the layer-major schedule: the spatial ones, except that a
+    ri_eligible layer becomes P / RI_P row=image sub-layers (blob appended:
+    per column header + chunks q-outer, passes p0 .. p0 + RI_P). Only the last
+    sub-layer carries the golden (the output is complete after it)."""
+    lm = []
+    for i, (L, g, offs, blen, goff, glen) in enumerate(rows_c):
+        if not ri_eligible(L):
+            lm.append((i, L, g, offs, blen, goff, glen, 0))
+            continue
+        gr = plan_ri(L)
+        for p0 in range(0, g["P"], RI_P):
+            hdr, roffs = header(L, gr), []
+            for c in range(MESH):
+                roffs.append(len(blob))
+                blob += hdr
+                for q in range(gr["Q"]):
+                    for p in range(p0, p0 + RI_P):
+                        blob += chunk(L, gr, c, p, q)
+            last = p0 + RI_P >= g["P"]
+            lm.append((i, L, gr, roffs, len(blob) - roffs[-1], goff if last else 0, glen if last else 0, p0))
+            print(f"  call {L['call']:2d} RI p0={p0}: P{gr['P']} Q{gr['Q']} ring {gr['ring_slots']} "
+                  f"core mem {gr['used'] / 1024:.1f} KB  weights/col {(len(blob) - roffs[-1]) / 1024:.0f} KB")
+    return lm
 
 
 def emit_cpu(t: dict, out_dir: Path) -> list:

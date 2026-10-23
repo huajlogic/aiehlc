@@ -506,7 +506,10 @@ conv, residuals stay in core memory (GRAB/COMB), every inter-layer tensor is 8-b
 Measured limits: AIE clock 998 MHz, ~2.3 GB/s per shim MM2S channel (burst/AxCACHE
 don't move it), compute only ~6 % of engine time. Design + step-by-step optimization
 log: **[doc/design/resnet_aie_engine.md](doc/design/resnet_aie_engine.md)**; skill
-**resnetengine**.
+**resnetengine**. Runtime mode switch `engine_set_mode(e, eager, layer_major)`: persistent,
+eager (kernel reloaded per layer), eager layer-major (B images per layer). Kernel
+reverted to the 2026-10-20 engine (~1.61 ms/image at B=32): the faster kernels
+(1.364 ms) hang ~1 run in 3 in residual layers (skill **shimctrlpushloss**).
 
 ### TVM `--aie-offload` → AIE via BYOC
 
@@ -824,6 +827,7 @@ Read the matching skill when the task fits:
 | `aiegraph` region API: `no region matches 'layer1.0.conv1'`, a region offloads its sibling too (`move together` / *dragged*), `region="layer1"` vs `offload_check("layer1")` mean different things, `partition` undid an earlier offload, `register_kernel` "contract contradicts" | aiegraphregion |
 | Plug a user-written kernel into a TVM layer (`AIEK_ENTRY`/`AIEK_SPEC`, `--aie-kernel`, `aiekernel check/offload`); an L0xx lint code, calibrate MISMATCH, emulate FAIL, or `rejected at link -- ... routing()` | aieuserkernel |
 | Run/extend the persistent ResNet-18 engine (`resnetengine`: gen_engine.py model mismatch, core memory overflow, ENG FAIL, new layer kind) | resnetengine |
+| resnetengine eager layer-major hangs ~1 run in 3 in a residual layer: `shim_bd_ctrl TIMEOUT ... owing an ack`, input shim with no task; or a few wrong logits | shimctrlpushloss |
 | AIE kernel: +1 errors / constant garbage right after ADDING a code path; statics above `DM_stack` overwritten | aiecorestackoverflow |
 | Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |

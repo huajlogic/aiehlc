@@ -5769,6 +5769,12 @@ AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint
 }
 
 #define RT_SB_PKT_WORDS 4096U
+#if AIE_GEN == 5 && !defined(RT_SB_NO_KEEP_ARMED)
+#define RT_SB_PAD_OFF 0x0007FF30U /* XAIE2PSGBL_PL_MODULE_SPARE_REG: harmless scratch write */
+#define RT_SB_KEEP_ARMED 1
+#else
+#define RT_SB_KEEP_ARMED 0
+#endif
 #define RT_SB_SEG_WORDS ((RT_SB_PKT_WORDS / RT_RES_SHIMROW_MAX_COLS) & ~3U)
 #define RT_SB_NONE RT_CPE_NONE
 
@@ -5780,6 +5786,7 @@ typedef struct {
     __Runtime_CtrlRowFabric *f, *routed;
     uint8_t lo, hi;
     uint32_t ack_nseg;
+    uint32_t last_len[RT_RES_SHIMROW_MAX_COLS]; /* words per column segment of the last kick (diagnostics) */
     rt_sb_seg seg[RT_RES_SHIMROW_MAX_COLS];
     XAie_Backend be;
     const XAie_Backend *real;
@@ -5945,6 +5952,22 @@ static AieRC rt_sb_ack_wait(void) {
         __Runtime_sync_for_cpu(dev, g_sb.resp, g_sb.ack_nseg * sizeof(uint32_t));
         printf("[aie_runtime] shim_bd_ctrl TIMEOUT segs=%u s2mm_pending=%u mm2s_pending=%u resp0=0x%x\n",
                g_sb.ack_nseg, (unsigned)pending, (unsigned)mm2s, g_sb.resp[0]);
+        printf("[aie_runtime] shim_bd_ctrl TIMEOUT detail: resp");
+        for (uint32_t k = 0U; k < g_sb.ack_nseg; k++)
+            printf(" %08x", (unsigned)g_sb.resp[k]);
+        printf(" | seg len");
+        for (uint32_t k = 0U; k < RT_RES_SHIMROW_MAX_COLS; k++)
+            printf(" %u", (unsigned)g_sb.last_len[k]);
+        for (uint8_t c = g_sb.lo; c <= g_sb.hi; c++) {
+            u32 st[4] = {0};
+            for (uint8_t ch = 0U; ch < 2U; ch++) {
+                XAie_DmaGetChannelStatus(dev, XAie_TileLoc(c, 0U), ch, DMA_MM2S, &st[ch]);
+                XAie_DmaGetChannelStatus(dev, XAie_TileLoc(c, 0U), ch, DMA_S2MM, &st[2U + ch]);
+            }
+            printf(" | col%u mm2s %08x %08x s2mm %08x %08x", (unsigned)c, (unsigned)st[0], (unsigned)st[1],
+                   (unsigned)st[2], (unsigned)st[3]);
+        }
+        printf("\n");
         rc = XAIE_ERR;
     }
     RT_PROF_PHASE(PH_BDCFG, t0);
@@ -5988,6 +6011,18 @@ static AieRC rt_sb_kick(void) {
     XAie_LocType spine = XAie_TileLoc(g_sb.f->shim_col, 0U);
     uint32_t ncols = (uint32_t)(g_sb.hi - g_sb.lo) + 1U;
     uint32_t len[RT_RES_SHIMROW_MAX_COLS] = {0}, nseg = 0U, words = 0U;
+#ifdef RT_SB_PAD_OFF
+    /* An empty column segment would break the armed BD chain (one BD per
+     * column, lengths updated in place) and force a full MMIO re-write of
+     * every BD. Pad it with one write to the shim's spare register. */
+    if (g_sb.armed) {
+        const uint32_t zero = 0U;
+        for (uint32_t k = 0U; k < ncols; k++)
+            if (g_sb.seg[k].pw == 0U)
+                (void)rt_cpe_seg_write(&g_sb.seg[k], rt_sb_seg_base(k), RT_SB_SEG_WORDS, acr_shim_row_id((uint8_t)k),
+                                       RT_SB_PAD_OFF, &zero, 1U);
+    }
+#endif
     for (uint32_t k = 0U; k < ncols; k++) {
         len[k] = rt_sb_seg_finish(k);
         nseg += len[k] != 0U;
@@ -5996,6 +6031,7 @@ static AieRC rt_sb_kick(void) {
     rt_sb_reset_segs();
     if (nseg == 0U)
         return XAIE_OK;
+    memcpy(g_sb.last_len, len, sizeof(g_sb.last_len));
     unsigned long long t_sync = RT_PROF_TIC();
     for (uint32_t k = 0U; k < ncols; k++) {
         if (!len[k])
@@ -6008,13 +6044,16 @@ static AieRC rt_sb_kick(void) {
     }
     unsigned long long t_kick = RT_PROF_TIC();
     AieRC rc = XAIE_OK;
+    int keep_armed = 0;
     if (g_sb.armed && nseg == ncols) {
         for (uint32_t k = 0U; rc == XAIE_OK && k < ncols; k++)
             rc = XAie_DmaUpdateBdLen(dev, spine, len[k] * 4U, (u16)(RT_RES_SHIMROW_BD_LO + k));
+        /* addresses and chain untouched: the next commit only updates lengths again */
+        keep_armed = RT_SB_KEEP_ARMED && rc == XAIE_OK;
     } else {
         rc = rt_sb_write_compact(len, nseg);
     }
-    g_sb.armed = 0;
+    g_sb.armed = keep_armed;
     if (rc == XAIE_OK)
         rc = XAie_DmaChannelPushBdToQueue(dev, spine, RT_RES_SHIMROW_CH, DMA_S2MM, RT_RES_SHIMROW_ACK_BD);
     if (rc == XAIE_OK)
@@ -6351,6 +6390,11 @@ static void rt_sb_commit(void) {
 void __Runtime_ctrl_shim_bd_begin(__Runtime_CtrlRowFabric *f) { rt_sb_begin(f); }
 
 void __Runtime_ctrl_shim_bd_commit(void) { rt_sb_commit(); }
+
+/* Block until the last committed shim-BD batch has been applied (its
+ * write-with-return acks are back) -- for callers that must order a later
+ * action after the BDs are live. */
+int __Runtime_ctrl_shim_bd_sync(void) { return rt_sb_ack_wait() == XAIE_OK ? 0 : -1; }
 
 /**
  * Configure DMA buffer descriptor with multi-dimensional addressing.
@@ -7483,8 +7527,14 @@ static struct {
     uint32_t words;
 } s_elf_warm;
 
+static int s_elf_warm_enabled = 1;
+
+/* Warm reload on/off. Off: every ctrl-plane load resends the whole body,
+ * program memory included (resnetengine eager mode: a real per-layer reload). */
+void __Runtime_ctrl_elf_warm_enable(int on) { s_elf_warm_enabled = on != 0; }
+
 static int rt_elf_warm_usable(const __Runtime_CtrlRowFabric *fab, const unsigned char *blob) {
-    return s_elf_warm.ok && s_elf_warm.body && s_elf_warm.blob == blob && s_elf_warm.fab == fab &&
+    return s_elf_warm_enabled && s_elf_warm.ok && s_elf_warm.body && s_elf_warm.blob == blob && s_elf_warm.fab == fab &&
            s_elf_warm.dev == fab->dev && s_elf_warm.gen == g_partition_gen && s_elf_warm.seq == g_elf_load_seq;
 }
 
@@ -7601,6 +7651,40 @@ static AieRC rt_ctrl_load_elf_aot(__Runtime_CtrlRowFabric *fab, const uint8_t *e
     return rc;
 }
 
+/* Encode @elf ONCE into the AOT control-packet blob rt_ctrl_load_elf_aot
+ * replays (header + resets + segments + final write-with-return), so a caller
+ * that reloads the same kernel many times (resnetengine eager mode) pays the
+ * encode once instead of per load. Pair with __Runtime_ctrl_kernel_pkt_set.
+ * Returns NULL if the ELF does not encode for this fabric. */
+void *__Runtime_ctrl_kernel_pkt_build(__Runtime_CtrlRowFabric *fab, const unsigned char *elf, unsigned int *bytes) {
+    if (!fab || !fab->dev || !elf || fab->nrows == 0U || !bytes)
+        return NULL;
+    rt_cpe_dev cpe;
+    rt_ctrl_cpe_dev(fab->dev, &cpe);
+    const int col = fab->rows[0].col_lo, row = fab->rows[0].row;
+    const uint32_t cap =
+        (rt_cpe_count_pkts(&cpe, elf, col, row) + rt_cpe_reset_accesses(&cpe) + 1U) * (2U + RT_CPE_CHUNK_WORDS);
+    rt_cpe_blob_hdr *hdr = (rt_cpe_blob_hdr *)malloc(sizeof(rt_cpe_blob_hdr) + (size_t)cap * sizeof(uint32_t));
+    if (!hdr)
+        return NULL;
+    uint32_t words = 0U, nacc = 0U;
+    if (rt_cpe_encode_body(&cpe, elf, col, row, (uint32_t)ACR_ID_BCAST, 1, (uint32_t *)(hdr + 1), cap, &words, &nacc) !=
+        0) {
+        free(hdr);
+        return NULL;
+    }
+    hdr->magic = RT_CPE_MAGIC;
+    hdr->version = RT_CPE_VERSION;
+    hdr->aie_gen = (uint32_t)AIE_GEN;
+    hdr->fingerprint = rt_cpe_fingerprint(&cpe, (uint32_t)ACR_ID_BCAST);
+    hdr->stream_id = (uint32_t)ACR_ID_BCAST;
+    hdr->nresp = rt_ctrl_fabric_tiles(fab);
+    hdr->body_words = words;
+    hdr->enc_tile = ((uint32_t)col << 16) | (uint32_t)row;
+    *bytes = (unsigned int)(sizeof(rt_cpe_blob_hdr) + (size_t)words * sizeof(uint32_t));
+    return hdr;
+}
+
 static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, int32_t bd_id, int32_t mm2s_ch) {
     if (!fab || !fab->dev || !elf || fab->nrows == 0U)
         return XAIE_INVALID_ARGS;
@@ -7687,6 +7771,12 @@ static struct_kernel_group rt_ctrl_load_kernel_group_nt(XAie_DevInst *dev, __Run
     }
     for (int i = 0; i < n; i++)
         s_kernel_tiles[i] = tiles[i];
+    /* The load's write-with-return responses come back on the spine's S2MM
+     * channel the shim-BD batch (rt_sb) collects its acks on. A batch whose
+     * acks are still outstanding would have this load's responses land in its
+     * ack BD, and every later ack wait would be off by one (shim_bd_ctrl
+     * TIMEOUT cascade). Drain it first. */
+    (void)rt_sb_ack_wait();
     unsigned long long __ke0 = RT_PROF_TIC();
     AieRC rc = rt_ctrl_load_elf(fab, s_active_kernel_elf, bd_id, mm2s_ch);
     RT_PROF_ADD(g_kl_elf_cyc, g_kl_elf_n, __ke0);
