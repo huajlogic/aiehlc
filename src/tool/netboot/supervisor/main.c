@@ -21,6 +21,7 @@
 
 struct nb_state g_nb;
 static struct netif s_netif;
+static XEmacPs *s_emacps; /* polled from the main loop: the supervisor takes no interrupts */
 
 uint64_t nb_now_ms(void) {
     XTime t;
@@ -39,7 +40,7 @@ int nb_kill(const char *why) {
     return rc;
 }
 
-int nb_launch(uint32_t timeout_ms, uint32_t *place_ms, char *msg, size_t msglen) {
+int nb_launch(uint32_t max_run_ms, uint32_t *place_ms, char *msg, size_t msglen) {
     if (!apu_available()) {
         snprintf(msg, msglen, "PLM/IPI unavailable: cannot drive the app core");
         return -10;
@@ -66,7 +67,7 @@ int nb_launch(uint32_t timeout_ms, uint32_t *place_ms, char *msg, size_t msglen)
     snprintf(msg + n0, msglen - n0, patched ? ", _exit -> park" : ", _exit NOT patched (core stays busy after exit)");
     g_nb.entry = entry;
     g_nb.runs++;
-    g_nb.timeout_ms = timeout_ms ? timeout_ms : NB_DEFAULT_TIMEOUT_MS;
+    g_nb.timeout_ms = max_run_ms ? max_run_ms : NB_DEFAULT_TIMEOUT_MS;
     /* Last supervisor line before the app owns the console: anything printed
      * after the wake interleaves with the app's own output on the shared UART. */
     xil_printf("[netboot] run %u: %s, start app core at 0x%llx (watchdog %u ms)\r\n", (unsigned)g_nb.runs, msg,
@@ -86,6 +87,81 @@ int nb_launch(uint32_t timeout_ms, uint32_t *place_ms, char *msg, size_t msglen)
     return 0;
 }
 
+/* The app core as a client sees it: free (never started or stopped), parked
+ * (returned from main through the patched _exit), or busy (running or hung). */
+static uint32_t core_view(void) {
+    if (apu_parked(NULL))
+        return NETBOOT_CORE_PARKED;
+    return apu_busy() ? NETBOOT_CORE_BUSY : NETBOOT_CORE_FREE;
+}
+
+/* How long the current (or last) app has run, its limit and what is left. */
+void nb_fill_ack(struct netboot_ack *ack) {
+    memset(ack, 0, sizeof(*ack));
+    ack->magic = NETBOOT_ACK_MAGIC;
+    ack->state = g_nb.state;
+    ack->core = core_view();
+    ack->max_run_ms = g_nb.timeout_ms;
+    if (g_nb.runs && ack->core == NETBOOT_CORE_BUSY) {
+        uint64_t now = nb_now_ms();
+        ack->run_ms = now > g_nb.run_start_ms ? (uint32_t)(now - g_nb.run_start_ms) : 0;
+        ack->remaining_ms = ack->run_ms < ack->max_run_ms ? ack->max_run_ms - ack->run_ms : 0;
+    }
+    ack->can_stop = (uint32_t)apu_can_stop();
+    ack->runs = g_nb.runs;
+    ack->park_addr = (uint32_t)(uintptr_t)nb_park;
+}
+
+/* Admission of a request whose header just arrived (protocol version >= 2), so
+ * the client learns before sending a 15 MB ELF whether it will be run:
+ *   core free / parked             -> OK
+ *   app within its max_run_ms      -> BUSY, retry after the time it has left
+ *   app past it, no FORCE          -> OVERTIME (resend with FORCE to preempt it)
+ *   app past it, FORCE             -> terminate it (PLM) and OK, or STUCK when
+ *                                     the PDI refuses (palmyra: design section 12,
+ *                                     item 4) -- only a re-bootstrap frees the core
+ * KILL and STATUS are always admitted. */
+int nb_admit(uint32_t cmd, uint32_t flags, struct netboot_ack *ack, char *msg, size_t msglen) {
+    nb_fill_ack(ack);
+    msg[0] = 0;
+    if (cmd != NETBOOT_CMD_LOAD_RUN && cmd != NETBOOT_CMD_RERUN)
+        return ack->verdict = NETBOOT_ACK_OK;
+    if (!apu_available()) {
+        snprintf(msg, msglen, "PLM/IPI unavailable: cannot drive the app core");
+        return ack->verdict = NETBOOT_ACK_REJECT;
+    }
+    if (ack->core != NETBOOT_CORE_BUSY)
+        return ack->verdict = NETBOOT_ACK_OK;
+    if (ack->remaining_ms > 0) {
+        ack->retry_after_ms = ack->remaining_ms + 100U;
+        snprintf(msg, msglen, "app core busy: run %u has run %u ms of its %u ms max, %u ms left", (unsigned)g_nb.runs,
+                 (unsigned)ack->run_ms, (unsigned)ack->max_run_ms, (unsigned)ack->remaining_ms);
+        return ack->verdict = NETBOOT_ACK_BUSY;
+    }
+    if (!(flags & NETBOOT_F_FORCE)) {
+        snprintf(msg, msglen,
+                 "app core busy past its max: run %u has run %u ms of its %u ms max; "
+                 "resend with force to terminate it",
+                 (unsigned)g_nb.runs, (unsigned)ack->run_ms, (unsigned)ack->max_run_ms);
+        return ack->verdict = NETBOOT_ACK_OVERTIME;
+    }
+    uint32_t ran = ack->run_ms;
+    g_nb.state = NETBOOT_ST_RUNNING; /* nb_kill only acts on a running app */
+    if (nb_kill("forced: past its max run time") == 0) {
+        nb_fill_ack(ack);
+        snprintf(msg, msglen, "terminated run %u after %u ms (past its max)", (unsigned)g_nb.runs, (unsigned)ran);
+        return ack->verdict = NETBOOT_ACK_OK;
+    }
+    g_nb.state = NETBOOT_ST_TIMEOUT;
+    nb_fill_ack(ack);
+    snprintf(msg, msglen,
+             "run %u is past its max (%u ms) but this PDI does not let the supervisor stop the app core "
+             "(PLM refuses power-down and reset): free it over JTAG (core 1: stop, rst -proc, pc=park_addr, con; "
+             "apppaltest --netload does it) or re-bootstrap the supervisor",
+             (unsigned)g_nb.runs, (unsigned)ran);
+    return ack->verdict = NETBOOT_ACK_STUCK;
+}
+
 /* NETBOOT_IP etc. arrive as "a,b,c,d" from build.sh; the variadic hop expands
  * them before IP4_ADDR counts its arguments. */
 #define NB_IP4(dst, ...) IP4_ADDR(dst, __VA_ARGS__)
@@ -103,7 +179,14 @@ static int net_init(void) {
         return -1;
     }
     netif_set_default(&s_netif);
-    Xil_ExceptionEnable();
+    /* POLLED, no interrupts (design 7a): the GEM's own interrupt status is
+     * serviced from the main loop (XEmacPs_IntrHandler), and IRQs stay masked
+     * at the CPU. The GIC is shared with the app core and with debuggers: an
+     * xsdb `rst -proc` of the app core was seen to leave GICD_CTLR with both
+     * groups disabled and the GEM interrupt off, which silenced an
+     * interrupt-driven supervisor for good (RX ring full, no ARP reply). */
+    s_emacps = &((xemacpsif_s *)((struct xemac_s *)s_netif.state)->state)->emacps;
+    Xil_ExceptionDisable();
     netif_set_up(&s_netif);
     if (server_init() != 0) {
         xil_printf("[netboot] TCP server init failed\r\n");
@@ -164,17 +247,23 @@ static void timers(uint64_t now) {
  * watchdog a few ms into every run. */
 static void watchdog(void) {
     int32_t rc;
-    if (g_nb.state == NETBOOT_ST_RUNNING && apu_parked(&rc)) {
+    /* also after TIMEOUT: an app that could not be stopped may still finish */
+    if ((g_nb.state == NETBOOT_ST_RUNNING || g_nb.state == NETBOOT_ST_TIMEOUT) && apu_parked(&rc)) {
+        if (g_nb.state == NETBOOT_ST_TIMEOUT)
+            xil_printf("\r\n[netboot] run %u exited after its max run time (%u ms)\r\n", (unsigned)g_nb.runs,
+                       (unsigned)(nb_now_ms() - g_nb.run_start_ms));
         g_nb.state = NETBOOT_ST_EXITED; /* app returned from main and parked */
         return;
     }
     uint64_t now = nb_now_ms();
     if (g_nb.state != NETBOOT_ST_RUNNING || now < g_nb.run_start_ms || now - g_nb.run_start_ms <= g_nb.timeout_ms)
         return;
-    if (nb_kill("watchdog timeout") != 0)
-        xil_printf("[netboot] watchdog: run exceeded %u ms; app core cannot be stopped on this PDI\r\n",
-                   (unsigned)g_nb.timeout_ms);
-    g_nb.state = NETBOOT_ST_TIMEOUT;
+    if (nb_kill("watchdog: past its max run time") != 0) {
+        xil_printf("[netboot] watchdog: run %u exceeded its max %u ms; app core cannot be stopped on this PDI, "
+                   "a forced run will ask for a re-bootstrap\r\n",
+                   (unsigned)g_nb.runs, (unsigned)g_nb.timeout_ms);
+        g_nb.state = NETBOOT_ST_TIMEOUT;
+    }
 }
 
 int main(void) {
@@ -189,6 +278,7 @@ int main(void) {
     for (;;) {
         uint64_t now = nb_now_ms();
         timers(now);
+        XEmacPs_IntrHandler(s_emacps); /* RX/TX completions and errors, polled */
         xemacif_input(&s_netif);
         server_poll();
         watchdog();

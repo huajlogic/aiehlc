@@ -10,7 +10,7 @@ console output stays on the board UART (com0) and is collected by
 ```
 src/tool/netboot/
   build.sh              builds lwIP 2.2 + Xilinx GEM port for the A78 SDT BSP, then netboot.elf
-  netboot_proto.h       wire protocol (64 B request, 48 B reply + text)
+  netboot_proto.h       wire protocol v2: 64 B request, 48 B ack (before the payload), 48 B reply + text
   netload.py            host client: load | rerun | kill | status (stdlib only); direct TCP on PALIP,
                         or --via user@PALIP from the dev box through netboot_proxy.py
   netboot_proxy.py      stdio<->TCP relay that lives on PALIP; netload.py streams through it over ssh
@@ -103,8 +103,52 @@ supervisor and passes `--netload` when it acks. See `src/tool/debug/README.md`,
 "Run deploys through netboot when a supervisor answers".
 
 Flags: `--netload-bootstrap` forces a supervisor reload (use it after rebuilding
-`netboot.elf`); `--netload-ip IP`; `--netload-timeout-ms N` sets the board-side
-watchdog.
+`netboot.elf`); `--netload-ip IP`; `--netload-max-run-ms N` (alias
+`--netload-timeout-ms`) sets this app's max run time, 0 = the supervisor default
+60 s; `--netload-wait S` (default 120) waits for a board busy with a run still
+within its max; `--netload-no-force` refuses to terminate a previous app past its
+max (by default it is forced off, which on palmyra means a re-bootstrap).
+
+## Busy board, max run time, forced runs (protocol v2)
+
+The supervisor answers every request's header with an **ack** before the ELF is
+sent (design section 13), so a client learns in one round trip whether it will
+run and, if not, how long to wait:
+
+```
+[netload] load not run: board busy (core busy, state=running, run 7: 11.2 s of its 60.0 s max, 48.8 s left); retry in 48.9 s (or --wait)
+[netload] load not run: board overtime (... run 2: 11.4 s of its 8.0 s max, past it); resend with --force to terminate it
+[netload] load not run: board stuck (...); re-bootstrap the supervisor to free it
+[netload] status not run: board serving -- another client's request is in progress: retry shortly
+```
+
+| `netload.py` option | meaning |
+|---|---|
+| `--max-run-ms N` (alias `--timeout-ms`) | this run's limit; 0 = board default 60 s |
+| `--force` | terminate an app that is past its limit and run this one |
+| `--wait S` | while busy, retry for up to S s (polls every <= 2 s) |
+| `--proto 1` | talk to a supervisor built before version 2 |
+
+**A stuck app no longer needs a reboot.** For `stuck`, `apppaltest --netload`
+frees core 1 over JTAG instead of re-bootstrapping: xsdb on the lab host runs
+`stop; rst -proc; rwr pc <park_addr>; con` on `Cortex-A78AE #0.1` only, so the
+core restarts into the supervisor's park routine (`park_addr` comes in every
+ack), then the ELF is sent again: ~16-19 s for the whole run instead of ~60 s.
+By hand:
+
+```tcl
+connect -url TCP:<PALIP>:3121
+targets -set -nocase -filter {name =~ "*A78*#0.1*"}
+stop; rst -proc; rwr pc 0x7801a780; con      ;# park_addr from `netload.py status`/the stuck ack
+```
+
+The supervisor is **polled** (no interrupts): that reset leaves the GIC
+disabled, which used to silence it (design section 12 item 9).
+
+Exit codes: 0 ok, 1 refused/failed, 2 no answer, 3 still busy, 4 past its max
+(needs `--force`), 5 stuck (needs a re-bootstrap). An app *within* its limit is
+never preempted. Test app: `src/tool/netboot/test/build.sh <seconds>` builds
+`build/nbspin<seconds>.elf`, which busy-waits that long.
 
 Data path, no scp of the target ELF:
 
@@ -142,7 +186,8 @@ Or on `PALIP` itself (direct TCP):
 
 ```bash
 python3 netload.py status
-python3 netload.py load main.elf --timeout-ms 600000
+python3 netload.py load main.elf --max-run-ms 120000      # this run may take 2 min
+python3 netload.py load main.elf --wait 60 --force        # wait for a busy board, preempt an overdue app
 python3 ~/aiehlc/netboot/netload.py rerun     # same image again, no transfer   (needs a free app core)
 python3 ~/aiehlc/netboot/netload.py kill      # stop the app core               (refused by the palmyra PDI)
 ```

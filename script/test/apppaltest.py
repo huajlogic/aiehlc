@@ -730,19 +730,40 @@ def netboot_stage_supervisor():
 _netload_mod = []
 
 
-def netload_remote(argv, timeout=600, gate=None):
+class _Tee:
+    """stdout for an in-process netload: shown live AND kept for the caller.
+    A busy board makes `load --wait` retry for up to --netload-wait seconds; with
+    the output only buffered, those "busy, N s left -- waiting" lines appeared
+    after the wait, i.e. apppaltest looked hung."""
+
+    def __init__(self, live):
+        import io
+        self.buf, self.live = io.StringIO(), live
+
+    def write(self, text):
+        self.buf.write(text)
+        if self.live:
+            sys.__stdout__.write(text)
+            sys.__stdout__.flush()
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+def netload_remote(argv, timeout=600, gate=None, live=False):
     """Run netload.py's main() in this process and reach the board through
     netboot_proxy.py on the lab host over the multiplexed ssh: the ELF streams
-    through the ssh pipe, nothing is scp'd. Returns (exit status, printed text)."""
+    through the ssh pipe, nothing is scp'd. Returns (exit status, printed text);
+    live=True also prints netload's lines as they come (load: busy waits)."""
     import contextlib
     import importlib.util
-    import io
     if not _netload_mod:
         spec = importlib.util.spec_from_file_location("netload", os.path.join(NETBOOT_LOCAL_DIR, "netload.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         _netload_mod.append(mod)
-    out = io.StringIO()
+    out = _Tee(live)
     extra = ["--via", host, "--proxy", f"{NETBOOT_REMOTE_DIR}/netboot_proxy.py"]
     extra += [x for i in range(1, len(SSH_MUX), 2) for x in ("--ssh-opt", SSH_MUX[i])]
     mod = _netload_mod[0]
@@ -752,7 +773,7 @@ def netload_remote(argv, timeout=600, gate=None):
             rc = mod.main(argv + extra)
     finally:
         mod.send_gate = None
-    return rc, out.getvalue().strip()
+    return rc, out.buf.getvalue().strip()
 
 
 def open_console_fast():
@@ -796,6 +817,43 @@ def drain_until(marker, timeout_s, collected):
     return False
 
 
+def netboot_park_app_core(park_addr):
+    """Free a stuck app core (A78 #0.1) without a re-bootstrap: over JTAG, stop
+    it, reset it, point it at the supervisor's nb_park and let it run. It parks
+    there like an app that returned from main, and the supervisor reuses it.
+    Only core 1 is touched: core 0 keeps the supervisor, which is polled (no
+    interrupts), so the GIC state this reset leaves behind does not affect it.
+    About 5 s against ~50 s for power cycle + device program + supervisor load.
+    Returns True when the commands went through (the caller checks `status`)."""
+    print(f"\n>>> freeing the stuck app core over JTAG (stop, rst -proc, pc=0x{park_addr:x} nb_park, con)...",
+          flush=True)
+    child = None
+    try:
+        child = pexpect.spawn("ssh", [*SSH_MUX, "-tt", host, "/opt/systest/common/bin/systest-client"],
+                              encoding='utf-8', codec_errors='replace', timeout=60, dimensions=(200, 2000))
+        child.expect(r'Systest[#>]', timeout=60)
+        child.sendline(f"source {VITIS_SETTINGS}")
+        child.expect(r'Systest[#>]', timeout=60)
+        child.sendline("xsdb")
+        if child.expect([r'xsdb%', r'command not found', pexpect.TIMEOUT], timeout=30) != 0:
+            child.sendline(XSDB_ALT_PATH)
+            child.expect(r'xsdb%', timeout=60)
+        xsdb_run(child, f"connect -url TCP:{palip}:3121", 60, "connect")
+        xsdb_run(child, 'targets -set -nocase -filter {name =~ "*A78*#0.1*"}', 30, "select app core #0.1")
+        xsdb_run(child, "catch {stop}", 30)
+        xsdb_run(child, "rst -proc", 30, "rst -proc (app core)")
+        xsdb_run(child, f"rwr pc 0x{park_addr:x}", 30, "pc = nb_park")
+        xsdb_run(child, "con", 30, "continue (app core)")
+        xsdb_run(child, "disconnect", 30)
+        return True
+    except (RuntimeError, pexpect.ExceptionPexpect) as e:
+        print(f"[netload] JTAG park of the app core failed: {e}")
+        return False
+    finally:
+        if child is not None:
+            child.close(force=True)
+
+
 def netload_start(args, local_elf, collected):
     """Fast path first: console up, then `load` straight to a resident supervisor.
 
@@ -806,7 +864,11 @@ def netload_start(args, local_elf, collected):
     reopened after programming. Returns (conn1, conn2, console_thread, ok)."""
     ip = args.netload_ip
     ensure_netboot_built()
-    load_argv = ["load", local_elf, "--host", ip, "--timeout-ms", str(args.netload_timeout_ms)]
+    # The supervisor acks before the ELF is sent (protocol v2): busy within its
+    # max -> wait up to --netload-wait; past its max -> --force terminates it
+    # (exit 5 "stuck" when this PDI cannot: the bootstrap below does it).
+    load_argv = ["load", local_elf, "--host", ip, "--max-run-ms", str(args.netload_max_run_ms),
+                 "--wait", str(args.netload_wait)] + ([] if args.netload_no_force else ["--force"])
     if not args.netload_bootstrap:
         # The console attaches while the ELF streams; netload holds back the last
         # 4 KB until it is attached, so the app cannot print before we listen.
@@ -821,20 +883,41 @@ def netload_start(args, local_elf, collected):
                 raise ConnectionError("com0 console did not attach")
 
         t0 = time.time()
-        rc, out = netload_remote(load_argv, gate=console_attached)
+        print(f"[netload] asking the supervisor at {ip} to run {os.path.basename(local_elf)} "
+              f"(waits up to {args.netload_wait:g} s if the board is busy)", flush=True)
+        rc, out = netload_remote(load_argv, gate=console_attached, live=True)
         opener.join(timeout=60)
         if "c" not in box:
             print("\n[ERROR] com0 console did not attach")
             return None, None, None, False
         conn2, th = box["c"]
-        print(out)
         if rc == 0:
             print(f"[netload] streamed {local_elf} through the proxy on {palip} in {time.time() - t0:.2f}s (no scp)")
             return None, conn2, th, True
-        if rc != 2 and "re-bootstrap" not in out:
+        if rc == 3:
+            print(f"\n[ERROR] board still busy after --netload-wait {args.netload_wait:g} s with a run that is "
+                  f"within its max run time; not power-cycling it. Retry later or raise --netload-wait")
+            return None, conn2, th, False
+        if rc == 4:
+            print("\n[ERROR] the previous app ran past its max run time; drop --netload-no-force to terminate it")
+            return None, conn2, th, False
+        if rc not in (2, 5) and "re-bootstrap" not in out:
             return None, conn2, th, False  # a real refusal (bad ELF etc.), not "no supervisor"
+        m = re.search(r"park_addr=0x([0-9a-f]+)", out)
+        if rc == 5 and m and netboot_park_app_core(int(m.group(1), 16)):
+            time.sleep(0.5)
+            st_rc, st = netload_remote(["status", "--host", ip, "--connect-timeout", "3"], timeout=30)
+            if st_rc == 0 and "app core parked" in st:
+                print("[netload] app core parked by JTAG; sending the ELF again", flush=True)
+                rc, out = netload_remote(load_argv, live=True)
+                if rc == 0:
+                    return None, conn2, th, True
+            print(f"[netload] JTAG park did not free the app core ({st.splitlines()[-1] if st else 'no answer'}); "
+                  "falling back to a re-bootstrap", flush=True)
         stop_console(conn2, th)
-        why = f"supervisor not answering at {ip}" if rc == 2 else "app core still busy from the previous run"
+        why = (f"supervisor not answering at {ip}" if rc == 2 else
+               "the previous app is past its max run time and this PDI cannot stop it (forced run)" if rc == 5
+               else "app core still busy from the previous run")
     else:
         why = "--netload-bootstrap"
     print(f"\n>>> {why}: loading the netboot supervisor over JTAG (one-time)...")
@@ -849,8 +932,7 @@ def netload_start(args, local_elf, collected):
     if not drain_until("[netboot] ready", NETBOOT_READY_TIMEOUT_S, collected):
         print(f"\n[ERROR] supervisor did not print '[netboot] ready' within {NETBOOT_READY_TIMEOUT_S}s")
         return conn1, conn2, th, False
-    rc, out = netload_remote(load_argv)
-    print(out)
+    rc, out = netload_remote(load_argv, live=True)
     return conn1, conn2, th, rc == 0
 
 
@@ -909,10 +991,27 @@ Examples:
         help="Reload the supervisor over JTAG even if one answers (supervisor upgrade)"
     )
     parser.add_argument(
+        "--netload-max-run-ms",
         "--netload-timeout-ms",
+        dest="netload_max_run_ms",
         type=int,
-        default=600000,
-        help="Board-side watchdog for the run (--netload only)"
+        default=0,
+        help="Max run time of this app on the board (--netload only); 0 = the supervisor default (60 s). "
+             "Past it the supervisor marks the run timed out, and a later forced run may take the core over"
+    )
+    parser.add_argument(
+        "--netload-wait",
+        type=float,
+        default=120.0,
+        help="If the board is busy with a run still within its max run time, wait up to this many seconds "
+             "for it (--netload only, default 120); the supervisor says how long the run has left"
+    )
+    parser.add_argument(
+        "--netload-no-force",
+        action="store_true",
+        default=False,
+        help="Do not terminate a previous app that ran past its max run time (default: force it off and run "
+             "this ELF; on a PDI that cannot stop the app core that means a re-bootstrap)"
     )
     args = parser.parse_args()
 
@@ -965,9 +1064,11 @@ Examples:
 
         finished = None
         if args.netload:
-            def finished():  # the supervisor saw the app return through its patched _exit
+            def finished():  # the app returned through its patched _exit, or ran past its max run time
                 rc, out = netload_remote(["status", "--host", args.netload_ip, "--connect-timeout", "3"], timeout=30)
-                return rc == 0 and "state=exited" in out
+                if rc == 0 and ("state=watchdog-timeout" in out or "state=killed" in out):
+                    print(f"\n[netload] the supervisor ended the wait: {out.splitlines()[0]}")
+                return rc == 0 and any(f"state={st}" in out for st in ("exited", "watchdog-timeout", "killed"))
         program_done, output_detected = wait_console(collected_output, finished)
 
         # Stop console reader

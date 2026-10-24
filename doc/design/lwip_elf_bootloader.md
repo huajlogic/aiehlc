@@ -316,6 +316,7 @@ Each item below was found on the board, not on paper.
 | 5 | Cluster 0 has two cores `#0.0` / `#0.1`; `PM_DEV_ACPU_0_1` is `#0.1` | xsdb `targets` | as designed |
 | 6 | The bootstrap's `device program` resets the board and drops a com0 session opened before it | first runs lost the console | `apppaltest --netload` opens com0 *after* the bootstrap programming |
 | 7 | The completion marker can straddle two console chunks | `device_teardown done` present, yet "no output for 300 s" | rolling tail buffer in `wait_console` (also fixes the JTAG flow) |
+| 9 | **xsdb `rst -proc` of the app core disables the GIC for everyone.** After `stop; rst -proc` on `Cortex-A78AE #0.1` the core halts in `Reset Catch` as wanted, but `GICD_CTLR` reads `0x30` (both groups off), the GEM interrupt (ID 71) is disabled and pending, and core 0 sits with IRQs masked | an interrupt-driven supervisor went deaf (RX ring full, `rx_status` BNA, no ARP reply) while its main loop kept running | the supervisor is now **polled as section 7a intended**: IRQs masked, `XEmacPs_IntrHandler()` called from the main loop. Same throughput (below), and the JTAG park (section 13) is safe |
 | 8 | lwIP throughput | 15.4 MB ResNet ELF sent in 0.17-0.24 s (**65-94 MB/s**); board receive 134-206 ms; placement 18 ms | JTAG on the same board measured **0.1 MB/s** (~150 s for that ELF) |
 
 Measured end to end (ResNet-18 `main.elf`, KCO, 1 layer on AIE): `netload` round
@@ -324,3 +325,70 @@ trip 1.3 s including the ssh hop. A full `apppaltest.py --netload` run takes
 200 KB JTAG `dow`). The JTAG path for the same ELF is ~150 s of download alone. The app runs on core 1 and prints
 `top1 class=258 logit=12.017338`, `inference 1270.357 ms`, `device_teardown done`
 on com0. That is the same result as a JTAG run.
+
+## 13. Protocol version 2: admission ack, max run time, forced runs (2026-10-23)
+
+Version 1 told a client nothing until the whole request was in: a `LOAD_RUN` to a
+busy app core was refused only after the full ELF (15-26 MB) had crossed, and a
+second connection during a transfer got a TCP reset. Version 2
+(`netboot_proto.h`) adds an **ack** that the supervisor sends as soon as the
+64 B header arrives, before any payload:
+
+```
+host -> board   netboot_req (64 B)       version = 2, flags bit0 = FORCE, max_run_ms
+board -> host   netboot_ack (48 B + msg) verdict, state, core, run_ms, max_run_ms,
+                                         remaining_ms, retry_after_ms, can_stop, runs
+host -> board   payload                  only if verdict == OK
+board -> host   netboot_rep (48 B + msg) unchanged
+```
+
+| verdict | when | client action (`netload.py` exit code) |
+|---|---|---|
+| `OK` | app core free or parked; or a forced run terminated an app past its max | send the ELF (0) |
+| `BUSY` | an app runs within its `max_run_ms` | retry after `retry_after_ms`; `--wait N` polls every <= 2 s (3) |
+| `OVERTIME` | the app ran past its `max_run_ms`, request not forced | resend with `--force` (4) |
+| `STUCK` | forced, but the PLM refuses to stop the app core (palmyra, section 12 item 4) | re-bootstrap; `apppaltest --netload` does it (5) |
+| `SERVING` | another client's request is in progress (one at a time) | retry after 0.5 s (3) |
+| `REJECT` | malformed header | fix the request (1) |
+
+**Max run time.** Each run carries `max_run_ms` (the old `timeout_ms` field);
+0 means `NETBOOT_DEFAULT_MAX_RUN_MS` = **60 s** (was 600 s). Past it the watchdog
+tries to stop the app core; where the PDI refuses, the run is marked
+`watchdog-timeout` and stays busy until it exits or is forced. An app that exits
+after its limit is still detected (`exited`). `apppaltest --netload` stops its
+console wait on `exited`, `killed` or `watchdog-timeout`.
+
+**Forced run.** `FORCE` only preempts an app *past* its limit; an app within its
+limit is never preempted (`BUSY`). The supervisor stops the old app through the
+PLM kill chain (power-down, warm reset, cold reset). On palmyra the PLM refuses
+all three, so the verdict is `STUCK` and the client terminates the app by
+re-bootstrapping (power cycle + `device program`). `can_stop` in the ack says
+which case the board is in (1 yes, 0 refused, 2 not tried yet).
+
+**Freeing a stuck core without a re-bootstrap (JTAG park).** Every ack carries
+`park_addr`, the running supervisor's `nb_park`. For a `STUCK` verdict,
+`apppaltest --netload` opens xsdb on the lab host and, on core 1 only, runs
+`stop; rst -proc; rwr pc <park_addr>; con`: the core restarts out of reset
+straight into the park routine and the supervisor reuses it like any parked
+core (`status` says `app core parked`). Then it re-sends the ELF. That is
+**16-19 s** wall for the whole `apppaltest` run instead of ~60 s with a power
+cycle + `device program`; it falls back to the re-bootstrap if the park fails
+or the supervisor predates `park_addr`. It relies on the polled supervisor
+(section 12 item 9): the reset leaves the GIC disabled. AIE state carries over,
+as with any parked-core reuse; a following ResNet-18 run was bit-exact.
+
+Polled vs interrupt-driven lwIP, 26.4 MB ELF, 5 runs each: board receive
+median 839 ms (810-863) vs 837 ms (828-932); client send median 1.52 s vs
+1.58 s -- no change.
+
+**Compatibility.** The supervisor still serves version-1 requests (no ack). A v2
+client talking to a v1 supervisor gets the v1 error reply, detects it and says
+to re-bootstrap, which `apppaltest --netload` does on its own.
+
+Measured on palmyra with `src/tool/netboot/test/nbspin.c` (busy-waits N s):
+`BUSY` with the exact time left; `OVERTIME` at 11.4 s of an 8 s max; `STUCK` with
+`--force`; `exited` detected after the timeout; `SERVING` for a second client
+while one connection is held mid-header; a v1 client still served;
+`apppaltest --netload` waited 21.7 s for a 20 s app (polling every 2 s) and then
+ran ResNet-18 without a power cycle; with the old app past a 3 s max it forced a
+re-bootstrap and ran ResNet-18 (43 s wall).

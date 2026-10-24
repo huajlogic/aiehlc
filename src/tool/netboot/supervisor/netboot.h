@@ -16,7 +16,7 @@
 #define NB_STAGING_BASE 0x7A200000ULL /* after the 2 MB BD-ring block at 0x7A000000 */
 #define NB_STAGING_SIZE (0x80000000ULL - NB_STAGING_BASE)
 
-#define NB_DEFAULT_TIMEOUT_MS 600000U
+#define NB_DEFAULT_TIMEOUT_MS NETBOOT_DEFAULT_MAX_RUN_MS /* per-run limit when the request says 0 */
 
 /* time.c-free helpers in main.c */
 uint64_t nb_now_ms(void);
@@ -28,6 +28,7 @@ int apu_kill(void);
 int apu_available(void);
 int apu_busy(void); /* app core woken and not stopped since */
 int apu_parked(int32_t *rc); /* finished app sits in park.S, reusable without the PLM */
+int apu_can_stop(void);      /* 1 a stop succeeded, 0 the PLM refused one, 2 none tried yet */
 
 /* park.S: the patched _exit lands here */
 void nb_park(void);
@@ -53,6 +54,12 @@ extern struct nb_state g_nb;
 /* Start (or restart) the staged image on the app core. 0 on success. */
 int nb_launch(uint32_t timeout_ms, uint32_t *place_ms, char *msg, size_t msglen);
 int nb_kill(const char *why);
+
+/* Admission (version >= 2): fill an ack for a request whose header just
+ * arrived; for a forced run past its limit this is where the old app is
+ * terminated. Returns the verdict. */
+int nb_admit(uint32_t cmd, uint32_t flags, struct netboot_ack *ack, char *msg, size_t msglen);
+void nb_fill_ack(struct netboot_ack *ack);
 
 /* server.c */
 int server_init(void);

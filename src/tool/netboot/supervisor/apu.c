@@ -27,6 +27,7 @@ static XIpiPsu s_ipi;
 static int s_ready;
 static int s_powered;        /* woken by us and not stopped since */
 static enum stop_how s_stop; /* how the last kill stopped it */
+static int s_can_stop = 2;   /* 1 a PLM stop worked, 0 the PLM refused one, 2 none tried yet */
 
 int apu_init(void) {
     XIpiPsu_Config *cfg = XIpiPsu_LookupConfig(XPAR_XIPIPSU_0_BASEADDR);
@@ -44,6 +45,8 @@ int apu_init(void) {
 }
 
 int apu_available(void) { return s_ready; }
+
+int apu_can_stop(void) { return s_can_stop; }
 
 /* Shared with park.S (offsets 0/4/8/16 are hard-coded there). */
 struct nb_mbox {
@@ -95,8 +98,10 @@ int apu_kill(void) {
     else {
         xil_printf("[netboot] app core stop REFUSED by PLM: powerdown %d, warm rst %d, cold rst %d\r\n", (int)fp,
                    (int)rw, (int)rc);
+        s_can_stop = 0;
         return -1;
     }
+    s_can_stop = 1;
     xil_printf("[netboot] app core stopped via %s\r\n", s_stop == STOP_POWER      ? "ForcePowerDown"
                                                         : s_stop == STOP_RST_WARM ? "warm reset"
                                                                                   : "cold reset");
