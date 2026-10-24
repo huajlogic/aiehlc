@@ -69,22 +69,36 @@ compile_one_kernel() {
     rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel.o \
           "${BUILD_DIR}"/kernel 2>/dev/null || true
 
-    local prx_file
-    if [ -f "${WORKLOCAL_DIR}/aieml.prx" ]; then
-        prx_file="${WORKLOCAL_DIR}/aieml.prx"
-    else
-        prx_file="aie2ps.prx"
-    fi
-
     cd "${WORKLOCAL_DIR}"
-    source "${AIEHLC_ROOT}/script/kc.sh" \
-        --kernel-cc ./kernel.cc \
-        --func-name "${kernel_func_name}" \
-        --aie-version "${AIE_VERSION:-5}" \
-        --platform "${PLATFORM:-baremetal}" \
-        --debug-output \
-        --output-dir "${BUILD_DIR}" \
-        --prx "${prx_file}"
+
+    if [[ "${USE_LLVM_AIE:-false}" == "true" ]] && [[ -n "${LLVM_AIE_PATH:-}" ]] \
+       && [[ -x "${LLVM_AIE_PATH}/bin/clang++" ]]; then
+        echo "[hostcompile] Using llvm-aie (${LLVM_AIE_PATH})"
+        source "${AIEHLC_ROOT}/script/kc.sh" \
+            --kernel-cc ./kernel.cc \
+            --func-name "${kernel_func_name}" \
+            --aie-version "${AIE_VERSION:-5}" \
+            --platform "${PLATFORM:-baremetal}" \
+            --debug-output \
+            --output-dir "${BUILD_DIR}" \
+            --use-llvm-aie \
+            --ld-script "${WORKLOCAL_DIR}/main.ld.script"
+    else
+        local prx_file
+        if [ -f "${WORKLOCAL_DIR}/aieml.prx" ]; then
+            prx_file="${WORKLOCAL_DIR}/aieml.prx"
+        else
+            prx_file="aie2ps.prx"
+        fi
+        source "${AIEHLC_ROOT}/script/kc.sh" \
+            --kernel-cc ./kernel.cc \
+            --func-name "${kernel_func_name}" \
+            --aie-version "${AIE_VERSION:-5}" \
+            --platform "${PLATFORM:-baremetal}" \
+            --debug-output \
+            --output-dir "${BUILD_DIR}" \
+            --prx "${prx_file}"
+    fi
 }
 
 if [ "${KERNEL_ONLY:-0}" = "1" ]; then
@@ -306,7 +320,7 @@ elif [[ "$aie_version" == "5" ]]; then
     AIELIB_APU_NAME="libxaienginea78.a"
     ARCH_APU_LD="${ARCH_DIR}/cortexa78_0/lscript.ld"
     compiler_cpu_flag="-mcpu=cortex-a78"
-    LINK_EXTRA="-lxiltimer,-lxilstandalone,-lxilpm_ng"
+    LINK_EXTRA="-lxiltimer,-lxilstandalone,-lxilpm"
 else
     echo "Unsupported AIE version: $aie_version"
     exit 1
