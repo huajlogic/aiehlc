@@ -6851,13 +6851,15 @@ struct_ioevent _Runtime_startio_ooo(XAie_DevInst *dev, struct_io io, int32_t bd_
  * Load kernel ELF into tiles
  * Reference: aieml_perf.cc lines 123-125
  */
-#if !defined(__AIESIM__)
 /* Bumped by every kernel-ELF load that is NOT the AOT control-packet path
  * (MMIO loaders, JIT control-packet load). The AOT path's warm reload
  * (rt_elf_warm_*) is valid only while nothing else has written program memory
- * since its own last load, i.e. while this has not moved. */
+ * since its own last load, i.e. while this has not moved. Defined for every
+ * build: __Runtime_load_kernel_elf and the warm-reload check use it in the
+ * simulator build (__AIESIM__) too, only the skip-bss loader below is HW-only. */
 static unsigned g_elf_load_seq;
 
+#if !defined(__AIESIM__)
 static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elfmem) {
     g_elf_load_seq++;
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elfmem;
