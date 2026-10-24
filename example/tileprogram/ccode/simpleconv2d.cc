@@ -502,8 +502,12 @@ int main() {
     //   Model 2 (-DUSE_SPATIAL_HALO): spatial halo — DMA sends raw IFM slabs,
     //                                 kernel does on-chip windowing + matmul.
     printf("\n--- Launching conv2d_spatial (spatial-halo) on AIE ---\n");
+    XTime t_aie_start, t_aie_end;
+    XTime_GetTime(&t_aie_start);
     conv2d_spatial<<<mesh>>>(input, filter, output, M, N, K);
-    // sleep(5);
+    XTime_GetTime(&t_aie_end);
+    double aie_wall_ms = 1.0 * (t_aie_end - t_aie_start) / COUNTS_PER_SECOND * 1000.0;
+    printf("[BENCH] aie_wall_ms=%.3f\n", aie_wall_ms);
 
     // --- Wait and verify ---
     // device.synchronize();

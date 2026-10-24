@@ -289,7 +289,11 @@ XILINX_VITIS_AIETOOLS="$XILINX_VITIS/aietools"
 
 # Ensure Vitis aietools shared libraries (e.g. libLLVM.so.20.1) are discoverable.
 # Vitis 2026.1+ ships a dynamically-linked `opt` that requires this.
-export LD_LIBRARY_PATH="$XILINX_VITIS_AIETOOLS/lib/lnx64.o${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [[ -n "${LLVM_AIE_PATH:-}" && -d "${LLVM_AIE_PATH}/lib" ]]; then
+    export LD_LIBRARY_PATH="${LLVM_AIE_PATH}/lib:$XILINX_VITIS_AIETOOLS/lib/lnx64.o${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+else
+    export LD_LIBRARY_PATH="$XILINX_VITIS_AIETOOLS/lib/lnx64.o${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 # --- Set up include paths ---
 
@@ -367,15 +371,18 @@ compiler_flags_aieml="-aiearch aie-ml $silent_flag +f -p me -P $arch_model_dir_a
 compiler_flags_aie2ps="-aiearch aie2ps $silent_flag +f -p me -P $arch_model_dir_aie2ps +P 4 +Wllvm,-O2,-g,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $KERNEL_LOG_INCLUDE $INCLUDE_PATH"
 
 # llvm-aie compiler flags per AIE version
-LLVM_AIE_INCLUDE_PATH="-I$XILINX_VITIS_AIETOOLS/include \
+LLVM_AIE_STUBS="${AIEHLC_ROOT_DIR}/thirdparty/llvm-aie-stubs"
+LLVM_AIE_INCLUDE_PATH="-I${LLVM_AIE_STUBS} \
+-I$XILINX_VITIS_AIETOOLS/include \
 -I$XILINX_VITIS_AIETOOLS/include/aie_api \
 -I$include_base"
 
 KERNEL_LOG_INCLUDE_LLVM="-include ${AIEHLC_ROOT_DIR}/src/mlir/runtime/kernel_log.h"
 
-compiler_flags_llvm_aie_aie="-include ${LLVM_AIE_PATH}/../llvm-aie-extra.h $KERNEL_LOG_INCLUDE_LLVM -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=10 -D__AIEARCH=10 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
-compiler_flags_llvm_aie_aieml="-include ${LLVM_AIE_PATH}/../llvm-aie-extra.h $KERNEL_LOG_INCLUDE_LLVM -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=20 -D__AIEARCH=20 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
-compiler_flags_llvm_aie_aie2ps="-include ${LLVM_AIE_PATH}/../llvm-aie-extra.h $KERNEL_LOG_INCLUDE_LLVM -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
+LLVM_AIE_EXTRA_H="${AIEHLC_ROOT_DIR}/thirdparty/llvm-aie-extra.h"
+compiler_flags_llvm_aie_aie="-include ${LLVM_AIE_EXTRA_H} $KERNEL_LOG_INCLUDE_LLVM -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=10 -D__AIEARCH=10 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
+compiler_flags_llvm_aie_aieml="-include ${LLVM_AIE_EXTRA_H} $KERNEL_LOG_INCLUDE_LLVM -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=20 -D__AIEARCH=20 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
+compiler_flags_llvm_aie_aie2ps="-include ${LLVM_AIE_EXTRA_H} $KERNEL_LOG_INCLUDE_LLVM -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2ps-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
 
 # Select flags based on AIE version
 extra_chess_flag=""

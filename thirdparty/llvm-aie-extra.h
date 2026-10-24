@@ -6,15 +6,19 @@
 #pragma once
 
 #define chess_duplicate(x) x
+#define chess_copy(x) (x)
+#define chess_storage(...)
+#define chess_flatten_loop
+#define chess_memory_fence()
 
+#if !defined(__AIEARCH__) || __AIEARCH__ != 22
 #include "aiev2intrin.h"
+#else
+#include <aie2psintrin.h>
+#endif
 
 #include <adf/window/window.h>
 // #include <aie_api/adf/window.hpp>
-
-#define chess_memory_fence()
-
-
 
 # if 0
 //#define __regcall
