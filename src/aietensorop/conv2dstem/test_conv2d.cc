@@ -476,7 +476,6 @@ int main() {
     printf("    Data:   the deployed int8 ResNet-18 graph's own layer-01 tensors\n");
 
     // while(1);
-
     // The headers are const .rodata and need no DMA alignment: the weights and
     // params are only ever read on the host (stage_weights_nchwc packs them
     // into the aligned g_wts_bt), and the image is scattered into the aligned
