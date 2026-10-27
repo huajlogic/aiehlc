@@ -901,26 +901,21 @@ void DmaphopProvenanceMapPass::runOnOperation() {
         int64_t k_rounds = 0, m_rounds = 0, n_rounds = 0;
     } modAttrs;
 
-    auto getI64Attr = [&](StringRef name) -> int64_t {
-        if (auto attr = moduleOp->getAttrOfType<IntegerAttr>(name))
-            return attr.getInt();
-        return 0;
-    };
-
     // Tiling scalars: for fullconnect_auto=1 the #routing.tiling op on partitiontensor is
     // the source of truth (tile_m/tile_n, tile_rows/tile_cols, the M/N spatial rounds, and
-    // the K-triple are no longer emitted as module attrs); fall back to the flat module attr
-    // on the fullconnect_auto=0 path (no GEMM tiling op exists there).
+    // the K-triple); on the other paths (no GEMM tiling op) they come from the routing
+    // func's #routing.kernel_tiling.
     routing::GemmTilingScalars ir = routing::readGemmTilingScalars(moduleOp);
-    modAttrs.tile_m = ir.found ? ir.tileM : getI64Attr("routing.tile_m");
-    modAttrs.tile_n = ir.found ? ir.tileN : getI64Attr("routing.tile_n");
-    modAttrs.tile_rows = ir.found ? ir.tileRows : getI64Attr("routing.tile_rows");
-    modAttrs.tile_cols = ir.found ? ir.tileCols : getI64Attr("routing.tile_cols");
-    modAttrs.effective_k = ir.found ? ir.effectiveK : getI64Attr("routing.effective_k");
-    modAttrs.full_k = ir.found ? ir.fullK : getI64Attr("routing.full_k");
-    modAttrs.k_rounds = ir.found ? ir.kRounds : getI64Attr("routing.k_rounds");
-    modAttrs.m_rounds = ir.found ? ir.mRounds : getI64Attr("routing.m_rounds");
-    modAttrs.n_rounds = ir.found ? ir.nRounds : getI64Attr("routing.n_rounds");
+    routing::KernelTilingAttr kt = routing::readKernelTiling(moduleOp);
+    modAttrs.tile_m = ir.found ? ir.tileM : kt.getTileM();
+    modAttrs.tile_n = ir.found ? ir.tileN : kt.getTileN();
+    modAttrs.tile_rows = ir.found ? ir.tileRows : kt.getTileRows();
+    modAttrs.tile_cols = ir.found ? ir.tileCols : kt.getTileCols();
+    modAttrs.effective_k = ir.found ? ir.effectiveK : kt.getEffectiveK();
+    modAttrs.full_k = ir.found ? ir.fullK : kt.getFullK();
+    modAttrs.k_rounds = ir.found ? ir.kRounds : kt.getKRounds();
+    modAttrs.m_rounds = ir.found ? ir.mRounds : kt.getMRounds();
+    modAttrs.n_rounds = ir.found ? ir.nRounds : kt.getNRounds();
 
     // 2. Walk all push/pull ops and collect communication paths
     std::vector<CommPathEntry> entries;

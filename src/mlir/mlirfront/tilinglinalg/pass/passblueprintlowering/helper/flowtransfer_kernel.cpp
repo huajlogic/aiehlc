@@ -140,11 +140,8 @@ LogicalResult emitCoreTileParams(FlowLoweringCtx &c, CoreTileCtx &t, const CoreT
     // is a *different* channel group, not part of this view. The rank-3 conv-halo
     // many_to_one gather is the exclusive signal.
     bool group2ConvOutput = false;
-    {
-        auto moduleOpG2 = op->getParentOfType<ModuleOp>();
-        if (c.transferType == "many_to_one" && c.memrefType.getRank() == 3 && detectConvHalo(moduleOpG2).valid)
-            group2ConvOutput = true;
-    }
+    if (c.transferType == "many_to_one" && c.memrefType.getRank() == 3 && detectConvHalo(d.passState->tensorInfo).valid)
+        group2ConvOutput = true;
     if (c.transferType == "many_to_one" && !group2ConvOutput)
         t.perCoreElements = t.fullPartitionElements / c.numCoreTiles;
     // K-round adjustment: for input flows with kRounds > 1, the kernel
@@ -188,9 +185,9 @@ LogicalResult emitCoreTileParams(FlowLoweringCtx &c, CoreTileCtx &t, const CoreT
             // full per-core partition and get clamped to d.maxPingPongBytes (=4096)
             // — wrong. The kernel still emits one [oh_per_row*ow_t, tile_n] slab
             // per on-core round, so honor the authoritative per-slab round count
-            // carried in "routing.spatial_out_rounds" (= spatialMRounds*spatialNRounds).
-            if (auto outRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds")) {
-                int64_t outRounds = outRoundsAttr.getInt();
+            // carried in #routing.kernel_tiling out_rounds (= spatialMRounds*spatialNRounds).
+            {
+                int64_t outRounds = d.passState->kernelTiling ? d.passState->kernelTiling.getOutRounds() : 0;
                 if (outRounds > outDivisor)
                     outDivisor = outRounds;
             }
@@ -218,26 +215,21 @@ LogicalResult emitCoreTileParams(FlowLoweringCtx &c, CoreTileCtx &t, const CoreT
     // halo slab (halo_slice * raw_wc) in one window buffer for on-chip
     // im2col. The host-side buffer address/size allocation must match the
     // kernel-side window allocation (BUF_SZ_IN), so use the authoritative
-    // slab size carried via "routing.spatial_halo_buf_size" and identify
-    // the IFM port by the per-tensor "tensor_N.halo" attr (N = funcArgIdx).
+    // slab size (the halo's buf_size) and identify the IFM port by the
+    // #routing.halo on the tensor's declaring op (func arg funcArgIdx).
     // This bypasses the maxPingPong clamp (slab must stay contiguous) — kept
     // in lockstep with passblueprinttoschedulekernel.cpp.
     t.hostSpatialHaloPort = false;
     if (c.isInput && c.funcArgIdx >= 0) {
-        auto moduleOpHalo = op->getParentOfType<ModuleOp>();
-        if (moduleOpHalo) {
-            std::string haloAttrName = "tensor_" + std::to_string(c.funcArgIdx) + ".halo";
-            auto haloDict = moduleOpHalo->getAttrOfType<DictionaryAttr>(haloAttrName);
-            auto haloBufAttr = moduleOpHalo->getAttrOfType<IntegerAttr>("routing.spatial_halo_buf_size");
-            if (haloDict && haloBufAttr && haloBufAttr.getInt() > 0) {
-                t.pingPongBufferSize = haloBufAttr.getInt() / t.elementSizeBytes;
-                if (t.pingPongBufferSize <= 0)
-                    t.pingPongBufferSize = 1;
-                // Single contiguous slab transfer per kernel invocation:
-                // one DMA round delivers the whole slab (numIterations==1).
-                t.perCorePerKRound = t.pingPongBufferSize;
-                t.hostSpatialHaloPort = true;
-            }
+        int64_t haloBufSize = routing::spatialHaloBufSize(d.passState->tensorInfo);
+        if (routing::lookupHalo(d.passState->tensorInfo, c.funcArgIdx) && haloBufSize > 0) {
+            t.pingPongBufferSize = haloBufSize / t.elementSizeBytes;
+            if (t.pingPongBufferSize <= 0)
+                t.pingPongBufferSize = 1;
+            // Single contiguous slab transfer per kernel invocation:
+            // one DMA round delivers the whole slab (numIterations==1).
+            t.perCorePerKRound = t.pingPongBufferSize;
+            t.hostSpatialHaloPort = true;
         }
     }
 
@@ -327,17 +319,16 @@ LogicalResult computeCoreIterations(FlowLoweringCtx &c, CoreTileCtx &t, const Co
         }
     }
 
-    // K-contraction split (tensor_N.halo): module-level routing.k_rounds is
-    // absent in this config, so derive the total on-core round count directly
-    // from the per-tensor halo dict. The core S2MM BD chain must re-arm
+    // K-contraction split (#routing.halo k_rounds): the kernel-level k_rounds
+    // is absent in this config, so derive the total on-core round count
+    // directly from the tensor's halo. The core S2MM BD chain must re-arm
     // l2_rounds*k_rounds times (= 16) to match the shim's outerRounds (A2) and
     // the kernel's numRounds (C1). pp_depth>=2 supplies the BD chaining.
     if (c.isInput && c.l2CorePerRoundLen > 0) {
-        if (auto hd = op->getParentOfType<ModuleOp>()->getAttrOfType<DictionaryAttr>(
-                "tensor_" + std::to_string(c.funcArgIdx) + ".halo")) {
-            auto l2A = hd.getAs<IntegerAttr>("l2_rounds");
-            auto kA = hd.getAs<IntegerAttr>("k_rounds");
-            int64_t l2r = l2A ? l2A.getInt() : 1, kr = kA ? kA.getInt() : 1;
+        if (auto hd = routing::lookupHalo(d.passState->tensorInfo, c.funcArgIdx)) {
+            // 0 = level absent, which the old dictionary read as 1.
+            int64_t l2r = hd.getL2Rounds() > 0 ? hd.getL2Rounds() : 1;
+            int64_t kr = hd.getKRounds() > 0 ? hd.getKRounds() : 1;
             int64_t total = (l2r > 0 ? l2r : 1) * (kr > 0 ? kr : 1);
             if (total > 1) {
                 llvm::errs() << "[BlueprintToSchedule] K-split: core numIterations = l2_rounds " << l2r

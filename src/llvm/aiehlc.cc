@@ -40,6 +40,7 @@
 
 #include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
+#include "routingmanager.h"
 
 class AieFrontEnd;
 
@@ -4774,9 +4775,8 @@ public:
                     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
                                                                        mkd.partition, aieGenStr);
 
-                    // Set K-round module attributes for downstream DMA passes
+                    // Record the K-round schedule for downstream DMA passes
                     if (mkd.derivedParams.valid && mkd.derivedParams.kRounds > 1) {
-                        mlir::OpBuilder attrBuilder(&ctx);
                         // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                         // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                         // lets the downstream passes fall through to the pure-K-round path.
@@ -4799,13 +4799,14 @@ public:
                                          << " n_rounds=" << mkd.derivedParams.spatialNRounds << ")\n";
                         } else {
                             // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
-                            // emitted here, so the K-triple must be carried as module attrs.
-                            module->setAttr("routing.effective_k",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
-                            module->setAttr("routing.k_rounds",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
-                            module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
-                            llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
+                            // emitted here, so the K-triple goes on the routing func's
+                            // #routing.kernel_tiling.
+                            routing::KernelTilingFields kt;
+                            kt.effectiveK = mkd.derivedParams.effectiveK;
+                            kt.fullK = mkd.derivedParams.kDim;
+                            kt.kRounds = mkd.derivedParams.kRounds;
+                            routing::mergeKernelTiling(module, kt);
+                            llvm::outs() << "[TilingLinalg] Set K-round kernel_tiling (fullconnect_auto=0, "
                                             "tile_*/m_rounds/n_rounds dropped): effective_k="
                                          << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
                                          << " full_k=" << mkd.derivedParams.kDim << "\n";
@@ -4818,19 +4819,19 @@ public:
                     // Set unconditionally (kRounds may be 1 for conv2d), unlike the
                     // K-round attrs above.
                     if (mkd.derivedParams.valid && mkd.derivedParams.convHaloBufSize > 0) {
-                        mlir::OpBuilder haloAttrBuilder(&ctx);
-                        module->setAttr("routing.spatial_halo_buf_size",
-                                        haloAttrBuilder.getI64IntegerAttr(mkd.derivedParams.convHaloBufSize));
-                        llvm::outs() << "[TilingLinalg] Set spatial_halo_buf_size=" << mkd.derivedParams.convHaloBufSize
-                                     << "\n";
+                        int haloTensors = routing::setHaloBufSize(module, mkd.derivedParams.convHaloBufSize);
+                        llvm::outs() << "[TilingLinalg] Set halo buf_size=" << mkd.derivedParams.convHaloBufSize
+                                     << " on " << haloTensors << " halo tensor(s)\n";
                         // OUTPUT per-slab division count (see single-kernel path for the
                         // rationale): the conv2d_spatial kernel always emits one output
                         // slab per on-core round (spatialMRounds*spatialNRounds) regardless
                         // of fullconnect_auto, so emit the divisor UNCONDITIONALLY.
                         int64_t outRounds = mkd.derivedParams.spatialMRounds * mkd.derivedParams.spatialNRounds;
                         if (outRounds > 1) {
-                            module->setAttr("routing.spatial_out_rounds", haloAttrBuilder.getI64IntegerAttr(outRounds));
-                            llvm::outs() << "[TilingLinalg] Set spatial_out_rounds=" << outRounds << "\n";
+                            routing::KernelTilingFields kt;
+                            kt.outRounds = outRounds;
+                            routing::mergeKernelTiling(module, kt);
+                            llvm::outs() << "[TilingLinalg] Set kernel_tiling out_rounds=" << outRounds << "\n";
                         }
                     }
 
@@ -5451,9 +5452,8 @@ public:
                         singleFullConnectAuto = fcaIt->second;
                 }
 
-                // Set K-round module attributes for downstream DMA passes
+                // Record the K-round schedule for downstream DMA passes
                 if (derivedTilingParams.valid && derivedTilingParams.kRounds > 1) {
-                    mlir::OpBuilder attrBuilder(&ctx);
                     // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                     // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                     // lets the downstream passes fall through to the pure-K-round path.
@@ -5476,12 +5476,14 @@ public:
                                      << " n_rounds=" << derivedTilingParams.spatialNRounds << ")\n";
                     } else {
                         // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
-                        // emitted here, so the K-triple must be carried as module attrs.
-                        module->setAttr("routing.effective_k",
-                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
-                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
-                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
-                        llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
+                        // emitted here, so the K-triple goes on the routing func's
+                        // #routing.kernel_tiling.
+                        routing::KernelTilingFields kt;
+                        kt.effectiveK = derivedTilingParams.effectiveK;
+                        kt.fullK = derivedTilingParams.kDim;
+                        kt.kRounds = derivedTilingParams.kRounds;
+                        routing::mergeKernelTiling(module, kt);
+                        llvm::outs() << "[TilingLinalg] Set K-round kernel_tiling (fullconnect_auto=0, "
                                         "tile_*/m_rounds/n_rounds dropped): effective_k="
                                      << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
                                      << " full_k=" << derivedTilingParams.kDim << "\n";
@@ -5492,11 +5494,9 @@ public:
                 // pass allocates the input window to match the kernel body's buf_sz
                 // (= halo_slice * raw_wc). Set unconditionally (kRounds may be 1).
                 if (derivedTilingParams.valid && derivedTilingParams.convHaloBufSize > 0) {
-                    mlir::OpBuilder haloAttrBuilder(&ctx);
-                    module->setAttr("routing.spatial_halo_buf_size",
-                                    haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.convHaloBufSize));
-                    llvm::outs() << "[TilingLinalg] Set spatial_halo_buf_size=" << derivedTilingParams.convHaloBufSize
-                                 << "\n";
+                    int haloTensors = routing::setHaloBufSize(module, derivedTilingParams.convHaloBufSize);
+                    llvm::outs() << "[TilingLinalg] Set halo buf_size=" << derivedTilingParams.convHaloBufSize << " on "
+                                 << haloTensors << " halo tensor(s)\n";
                     // Spatial-halo conv has kRounds==1, so the K-round attr block above is
                     // skipped and routing.tile_m is never set. Emit ONLY the M-dimension
                     // tiling attrs here so classifyTiling returns Multiple(mRounds) and the
@@ -5507,12 +5507,12 @@ public:
                     // opts out of the M-round repeat entirely.
                     if (singleFullConnectAuto && derivedTilingParams.spatialMRounds > 1 &&
                         derivedTilingParams.tileM > 0 && derivedTilingParams.tileRows > derivedTilingParams.tileM) {
-                        module->setAttr("routing.tile_m", haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.tileM));
-                        module->setAttr("routing.tile_rows",
-                                        haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.tileRows));
-                        module->setAttr("routing.m_rounds",
-                                        haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.spatialMRounds));
-                        llvm::outs() << "[TilingLinalg] Set spatial-halo M-round attrs: tile_m="
+                        routing::KernelTilingFields kt;
+                        kt.tileM = derivedTilingParams.tileM;
+                        kt.tileRows = derivedTilingParams.tileRows;
+                        kt.mRounds = derivedTilingParams.spatialMRounds;
+                        routing::mergeKernelTiling(module, kt);
+                        llvm::outs() << "[TilingLinalg] Set spatial-halo M-round kernel_tiling: tile_m="
                                      << derivedTilingParams.tileM << " tile_rows=" << derivedTilingParams.tileRows
                                      << " m_rounds=" << derivedTilingParams.spatialMRounds << "\n";
                     }
@@ -5528,8 +5528,10 @@ public:
                     {
                         int64_t outRounds = derivedTilingParams.spatialMRounds * derivedTilingParams.spatialNRounds;
                         if (outRounds > 1) {
-                            module->setAttr("routing.spatial_out_rounds", haloAttrBuilder.getI64IntegerAttr(outRounds));
-                            llvm::outs() << "[TilingLinalg] Set spatial_out_rounds=" << outRounds
+                            routing::KernelTilingFields kt;
+                            kt.outRounds = outRounds;
+                            routing::mergeKernelTiling(module, kt);
+                            llvm::outs() << "[TilingLinalg] Set kernel_tiling out_rounds=" << outRounds
                                          << " (spatialMRounds=" << derivedTilingParams.spatialMRounds
                                          << " * spatialNRounds=" << derivedTilingParams.spatialNRounds << ")\n";
                         }

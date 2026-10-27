@@ -76,26 +76,15 @@ void FlowTransferConversion::emitShimTileAndParams(FlowLoweringCtx &c) const {
     c.kAccumL2Step = 0;
     c.kAccumRowPitchElems = 0;
     c.l2CorePerRoundLen = 0;
-    {
-        auto moduleOpHalo = op->getParentOfType<ModuleOp>();
-        if (moduleOpHalo) {
-            int haloArgIdx = traceFlowConfigToFuncArgIndex(c.shimFlowConfig);
-            if (haloArgIdx >= 0) {
-                std::string haloAttrName = "tensor_" + std::to_string(haloArgIdx) + ".halo";
-                if (auto haloDict = moduleOpHalo->getAttrOfType<DictionaryAttr>(haloAttrName)) {
-                    c.isHaloSlab = true;
-                    auto kRoundsA = haloDict.getAs<IntegerAttr>("k_rounds");
-                    if (kRoundsA && kRoundsA.getInt() > 1) {
-                        c.kAccumHaloSlab = true;
-                        if (auto a = haloDict.getAs<IntegerAttr>("l2_rounds"))
-                            c.kAccumL2Rounds = a.getInt();
-                        if (auto a = haloDict.getAs<IntegerAttr>("l2_step"))
-                            c.kAccumL2Step = a.getInt();
-                        if (auto a = haloDict.getAs<IntegerAttr>("row_pitch"))
-                            c.kAccumRowPitchElems = a.getInt();
-                    }
-                }
-            }
+    // The shim's tensor is a halo slab when its declaring op carries a #routing.halo.
+    if (routing::HaloAttr halo =
+            routing::lookupHalo(passState->tensorInfo, traceFlowConfigToFuncArgIndex(c.shimFlowConfig))) {
+        c.isHaloSlab = true;
+        if (halo.getKRounds() > 1) {
+            c.kAccumHaloSlab = true;
+            c.kAccumL2Rounds = halo.getL2Rounds();
+            c.kAccumL2Step = halo.getL2Step();
+            c.kAccumRowPitchElems = halo.getRowPitch();
         }
     }
 }
@@ -124,45 +113,37 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
 
     // Two-level (nested) halo: shrink the per-round shim BD length.
     if (c.isHaloSlab && c.shimIsSender) {
-        auto moduleOpL2 = op->getParentOfType<ModuleOp>();
-        int haloArgIdxL2 = traceFlowConfigToFuncArgIndex(c.shimFlowConfig);
-        if (moduleOpL2 && haloArgIdxL2 >= 0) {
-            std::string haloNameL2 = "tensor_" + std::to_string(haloArgIdxL2) + ".halo";
-            if (auto haloDictL2 = moduleOpL2->getAttrOfType<DictionaryAttr>(haloNameL2)) {
-                auto l2RoundsA = haloDictL2.getAs<IntegerAttr>("l2_rounds");
-                auto l2SliceA = haloDictL2.getAs<IntegerAttr>("l2_slice");
-                auto kSliceA = haloDictL2.getAs<IntegerAttr>("k_slice");
-                auto kRoundsA = haloDictL2.getAs<IntegerAttr>("k_rounds");
-                if (l2RoundsA && l2RoundsA.getInt() > 1 && l2SliceA && l2SliceA.getInt() > 0) {
-                    // Row width = product of all dims after dim 0. Rank-generic: a 2D
-                    // flattened input [H, W*C] gives shape[1]; a genuine 3D input
-                    // [H, W, C] gives W*C — the same contiguous padded row pitch.
-                    int64_t rawWcL2 = 1;
-                    if (memrefType.getRank() >= 2)
-                        for (int64_t di = 1; di < memrefType.getRank(); ++di)
-                            rawWcL2 *= memrefType.getShape()[di];
-                    else if (memrefType.getRank() == 1)
-                        rawWcL2 = memrefType.getShape()[0];
-                    if (kRoundsA && kRoundsA.getInt() > 1 && kSliceA && kSliceA.getInt() > 0) {
-                        c.perTileShimLen = l2SliceA.getInt() * kSliceA.getInt() * kRoundsA.getInt() *
-                                           elementSizeBytesShim; // 19*244*4 = 18544
-                        c.l2CorePerRoundLen = l2SliceA.getInt() * kSliceA.getInt() * elementSizeBytesShim; // 4636
-                    } else {
-                        c.perTileShimLen = l2SliceA.getInt() * rawWcL2 * elementSizeBytesShim; // legacy 17480
-                        c.l2CorePerRoundLen = c.perTileShimLen;
-                    }
-                    llvm::errs() << "[BlueprintToSchedule] L2 halo slab: l2_slice=" << l2SliceA.getInt()
-                                 << " raw_wc=" << rawWcL2 << " k_slice=" << (kSliceA ? kSliceA.getInt() : 0)
-                                 << " k_rounds=" << (kRoundsA ? kRoundsA.getInt() : 0)
-                                 << " perTileShimLen=" << c.perTileShimLen << " (was shimBdLen=" << shimBdLen << ")\n";
+        if (routing::HaloAttr haloL2 =
+                routing::lookupHalo(passState->tensorInfo, traceFlowConfigToFuncArgIndex(c.shimFlowConfig))) {
+            const int64_t l2Rounds = haloL2.getL2Rounds(), l2Slice = haloL2.getL2Slice();
+            const int64_t kSlice = haloL2.getKSlice(), kRounds = haloL2.getKRounds();
+            if (l2Rounds > 1 && l2Slice > 0) {
+                // Row width = product of all dims after dim 0. Rank-generic: a 2D
+                // flattened input [H, W*C] gives shape[1]; a genuine 3D input
+                // [H, W, C] gives W*C — the same contiguous padded row pitch.
+                int64_t rawWcL2 = 1;
+                if (memrefType.getRank() >= 2)
+                    for (int64_t di = 1; di < memrefType.getRank(); ++di)
+                        rawWcL2 *= memrefType.getShape()[di];
+                else if (memrefType.getRank() == 1)
+                    rawWcL2 = memrefType.getShape()[0];
+                if (kRounds > 1 && kSlice > 0) {
+                    c.perTileShimLen = l2Slice * kSlice * kRounds * elementSizeBytesShim; // 19*244*4 = 18544
+                    c.l2CorePerRoundLen = l2Slice * kSlice * elementSizeBytesShim;        // 4636
+                } else {
+                    c.perTileShimLen = l2Slice * rawWcL2 * elementSizeBytesShim; // legacy 17480
+                    c.l2CorePerRoundLen = c.perTileShimLen;
                 }
+                llvm::errs() << "[BlueprintToSchedule] L2 halo slab: l2_slice=" << l2Slice << " raw_wc=" << rawWcL2
+                             << " k_slice=" << kSlice << " k_rounds=" << kRounds
+                             << " perTileShimLen=" << c.perTileShimLen << " (was shimBdLen=" << shimBdLen << ")\n";
             }
         }
     }
 
     // K-round iteration: per-iteration transfer size for iter_wrap>1.
     // Tiling scalars come from passState (read once at pass entry from the
-    // #routing.tiling op, flat-attr fallback). A missing attr previously read as
+    // #routing.tiling op, #routing.kernel_tiling fallback). A missing value reads as
     // 0, matching the struct default, so the value-based guards are equivalent.
     {
         int64_t kRounds = passState->kRounds;
@@ -225,11 +206,8 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
     // split (Part 1), so shimBdLen == ONE core's full output (one channel group).
     // Do NOT re-divide by numCoreTiles (kept in lockstep with flowtransfer_kernel.cpp).
     bool ooGroup2ConvOutput = false;
-    if (c.isManyToOne && memrefType.getRank() == 3) {
-        auto moduleOpG2 = op->getParentOfType<ModuleOp>();
-        if (detectConvHalo(moduleOpG2).valid)
-            ooGroup2ConvOutput = true;
-    }
+    if (c.isManyToOne && memrefType.getRank() == 3 && detectConvHalo(passState->tensorInfo).valid)
+        ooGroup2ConvOutput = true;
     if (c.isManyToOne && !ooGroup2ConvOutput)
         c.ooPerCoreElements = c.ooFullPartitionElements / numCoreTiles;
 
@@ -243,22 +221,16 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
     // pick the mathematically-largest divisor ≤ maxElements (e.g. 3584 for
     // 50176) which does not fall on a kernel slab boundary and desyncs the
     // packet stream from the core sender. Honor the authoritative slab count
-    // carried in "routing.spatial_out_rounds" so shim and core agree exactly.
+    // carried in #routing.kernel_tiling out_rounds so shim and core agree exactly.
     // Kept in lockstep with flowtransfer_kernel.cpp / passblueprinttoschedulekernel.cpp.
     bool ooSpatialOutSlab = false;
     if (c.isManyToOne) {
-        auto moduleOpOut = op->getParentOfType<ModuleOp>();
-        if (moduleOpOut) {
-            if (auto outRoundsAttr = moduleOpOut->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds")) {
-                int64_t outRounds = outRoundsAttr.getInt();
-                if (outRounds > 1 && c.ooPerCoreElements % outRounds == 0) {
-                    c.ooPingPongSize = c.ooPerCoreElements / outRounds;
-                    ooSpatialOutSlab = true;
-                    llvm::errs() << "[BlueprintToSchedule] Spatial-halo output shim: ooPingPongSize="
-                                 << c.ooPingPongSize << " (perCoreElements=" << c.ooPerCoreElements
-                                 << " / out_rounds=" << outRounds << ")\n";
-                }
-            }
+        int64_t outRounds = passState->kernelTiling ? passState->kernelTiling.getOutRounds() : 0;
+        if (outRounds > 1 && c.ooPerCoreElements % outRounds == 0) {
+            c.ooPingPongSize = c.ooPerCoreElements / outRounds;
+            ooSpatialOutSlab = true;
+            llvm::errs() << "[BlueprintToSchedule] Spatial-halo output shim: ooPingPongSize=" << c.ooPingPongSize
+                         << " (perCoreElements=" << c.ooPerCoreElements << " / out_rounds=" << outRounds << ")\n";
         }
     }
     if (!ooSpatialOutSlab && maxPingPongBytes > 0 && c.ooElementSizeBytes > 0) {
@@ -345,7 +317,7 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
         // fullconnect_auto. The conv2d width-split (spatial-halo) path drops
         // tile_m/tile_rows and fullconnect_auto, so it is triggered separately by the
         // presence of a width-split halo on a receiving (S2MM gather) shim channel.
-        ConvHaloGeom convHalo = detectConvHalo(moduleOpGuard);
+        ConvHaloGeom convHalo = detectConvHalo(passState->tensorInfo);
         bool convWidthSplit = convHalo.valid && !c.shimIsSender;
         bool gemm3D = tileM > 0 && tileM < tileRowsVal && !c.shimIsSender && isFullConnectAuto(moduleOpGuard);
 
@@ -645,15 +617,10 @@ void FlowTransferConversion::classifyScheduleMode(FlowLoweringCtx &c) const {
     c.haloL2RoundsForLoop = 0;
     c.haloKRoundsForLoop = 0;
     if (moduleOp && c.shimIsSender) {
-        int haloArgIdxL2 = traceFlowConfigToFuncArgIndex(c.shimFlowConfig);
-        if (haloArgIdxL2 >= 0) {
-            std::string haloNameL2 = "tensor_" + std::to_string(haloArgIdxL2) + ".halo";
-            if (auto haloDictL2 = moduleOp->getAttrOfType<DictionaryAttr>(haloNameL2)) {
-                if (auto a = haloDictL2.getAs<IntegerAttr>("l2_rounds"))
-                    c.haloL2RoundsForLoop = a.getInt();
-                if (auto a = haloDictL2.getAs<IntegerAttr>("k_rounds"))
-                    c.haloKRoundsForLoop = a.getInt();
-            }
+        if (routing::HaloAttr halo =
+                routing::lookupHalo(passState->tensorInfo, traceFlowConfigToFuncArgIndex(c.shimFlowConfig))) {
+            c.haloL2RoundsForLoop = halo.getL2Rounds();
+            c.haloKRoundsForLoop = halo.getKRounds();
         }
     }
     if (c.haloL2RoundsForLoop > 1 || c.haloKRoundsForLoop > 1)
@@ -744,23 +711,16 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
     int64_t haloWRoundsVal = 0;
     if (c.isHaloSlab) {
         int64_t haloStep = 0, haloRowPitch = 0, haloWStep = 0, haloWRounds = 0, haloSlice = 0, haloWSlice = 0;
-        int haloArgIdx = traceFlowConfigToFuncArgIndex(c.shimFlowConfig);
-        if (haloArgIdx >= 0) {
-            std::string haloAttrName = "tensor_" + std::to_string(haloArgIdx) + ".halo";
-            if (auto haloDict = moduleOp->getAttrOfType<DictionaryAttr>(haloAttrName)) {
-                if (auto stepAttr = haloDict.getAs<IntegerAttr>("step"))
-                    haloStep = stepAttr.getInt();
-                if (auto a = haloDict.getAs<IntegerAttr>("row_pitch"))
-                    haloRowPitch = a.getInt();
-                if (auto a = haloDict.getAs<IntegerAttr>("w_step"))
-                    haloWStep = a.getInt();
-                if (auto a = haloDict.getAs<IntegerAttr>("w_rounds"))
-                    haloWRounds = a.getInt();
-                if (auto a = haloDict.getAs<IntegerAttr>("slice"))
-                    haloSlice = a.getInt();
-                if (auto a = haloDict.getAs<IntegerAttr>("w_slice"))
-                    haloWSlice = a.getInt();
-            }
+        // isHaloSlab guarantees the shim tensor's declaring op carries a #routing.halo.
+        routing::HaloAttr halo =
+            routing::lookupHalo(passState->tensorInfo, traceFlowConfigToFuncArgIndex(c.shimFlowConfig));
+        if (halo) {
+            haloStep = halo.getStep();
+            haloRowPitch = halo.getRowPitch();
+            haloWStep = halo.getWStep();
+            haloWRounds = halo.getWRounds();
+            haloSlice = halo.getSlice();
+            haloWSlice = halo.getWSlice();
         }
         // Row width = product of all dims after dim 0. Rank-generic: a 2D
         // flattened input [H, W*C] gives shape[1]; a genuine 3D input [H, W, C]
@@ -773,9 +733,7 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
             rawWc = memrefType.getShape()[0];
         subTileStride = haloStep * rawWc * elemBytes;
         if (haloWRounds > 1 && haloRowPitch > 0 && haloSlice > 0 && haloWSlice > 0) {
-            int64_t bufSize = 0;
-            if (auto b = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_halo_buf_size"))
-                bufSize = b.getInt();
+            int64_t bufSize = routing::spatialHaloBufSize(passState->tensorInfo);
             int64_t chunkWidthElems = bufSize / haloSlice;
             int64_t convC = chunkWidthElems / haloWSlice;
             haloHStrideBytes = haloStep * haloRowPitch * elemBytes;
@@ -788,17 +746,8 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
                          << " (w_step=" << haloWStep << "*C=" << convC << ")\n";
         }
         if (!halo2D) {
-            int64_t kStepB = 0, kRoundsB = 0, kSliceB = 0, l2StepB = 0;
-            if (auto hd = moduleOp->getAttrOfType<DictionaryAttr>("tensor_" + std::to_string(haloArgIdx) + ".halo")) {
-                if (auto a = hd.getAs<IntegerAttr>("k_step"))
-                    kStepB = a.getInt();
-                if (auto a = hd.getAs<IntegerAttr>("k_rounds"))
-                    kRoundsB = a.getInt();
-                if (auto a = hd.getAs<IntegerAttr>("k_slice"))
-                    kSliceB = a.getInt();
-                if (auto a = hd.getAs<IntegerAttr>("l2_step"))
-                    l2StepB = a.getInt();
-            }
+            const int64_t kStepB = halo ? halo.getKStep() : 0, kRoundsB = halo ? halo.getKRounds() : 0;
+            const int64_t kSliceB = halo ? halo.getKSlice() : 0, l2StepB = halo ? halo.getL2Step() : 0;
             if (kRoundsB > 1 && kSliceB > 0 && l2StepB > 0) {
                 haloHStrideBytes = l2StepB * rawWc * elemBytes;
                 haloWStrideBytes = kStepB * elemBytes;
@@ -810,12 +759,7 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
             }
         }
         if (haloWRounds <= 1 && !halo2D) {
-            int64_t haloL2Step = 0;
-            if (auto haloDict =
-                    moduleOp->getAttrOfType<DictionaryAttr>("tensor_" + std::to_string(haloArgIdx) + ".halo")) {
-                if (auto a = haloDict.getAs<IntegerAttr>("l2_step"))
-                    haloL2Step = a.getInt();
-            }
+            const int64_t haloL2Step = halo ? halo.getL2Step() : 0;
             if (c.haloL2RoundsForLoop > 1 && haloL2Step > 0) {
                 subTileStride = haloL2Step * rawWc * elemBytes;
                 llvm::errs() << "[BlueprintToSchedule] L2 halo offset: l2_rounds=" << c.haloL2RoundsForLoop

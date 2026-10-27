@@ -1,12 +1,12 @@
-module attributes {routing.control_packet_mode = 0 : i64, routing.control_plan_dedicated_shim = 0 : i64, routing.control_plan_group_reg_write = 0 : i64, routing.control_plan_op_control_packet = 0 : i64, routing.control_plan_shim_bd_ctrl = 0 : i64, routing.fullconnect_auto = 0 : i64, routing.kernel_config_offload = 0 : i64, routing.output_tile_major = 0 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}, routing.spatial_halo_buf_size = 4636 : i64, routing.spatial_out_rounds = 16 : i64, tensor_0.halo = {k_rounds = 4 : i32, k_slice = 244 : i32, k_step = 224 : i32, l2_rounds = 4 : i32, l2_slice = 19 : i32, l2_step = 14 : i32, ow_t = 28 : i32, row_pitch = 920 : i32, slice = 61 : i32, split_dim = 0 : i32, step = 56 : i32, w_rounds = 4 : i32, w_slice = 61 : i32, w_step = 56 : i32}, tensor_0.layout_transform = "dma_shuffle", tensor_1.layout_transform = "dma_shuffle"} {
-  func.func @main(%arg0: memref<230x230x4xi8>, %arg1: memref<64x7x7x4xi8>, %arg2: memref<112x112x64xi8>) {
+module attributes {routing.control_packet_mode = 0 : i64, routing.control_plan_dedicated_shim = 0 : i64, routing.control_plan_group_reg_write = 0 : i64, routing.control_plan_op_control_packet = 0 : i64, routing.control_plan_shim_bd_ctrl = 0 : i64, routing.fullconnect_auto = 0 : i64, routing.kernel_config_offload = 0 : i64, routing.output_tile_major = 0 : i64} {
+  func.func @main(%arg0: memref<230x230x4xi8>, %arg1: memref<64x7x7x4xi8>, %arg2: memref<112x112x64xi8>) attributes {routing.kernel_tiling = #routing.kernel_tiling<out_rounds = 16>} {
     %0 = routing.routingcreatehwmesh row = 4, col = 4 partition = 3, 6, 0, 6 -> i32
     %1 = bufferization.to_tensor %arg0 : memref<230x230x4xi8>
-    %2 = routing.routingcreatescheduletensor %1 : tensor<230x230x4xi8> shape = [230, 230, 4], dim = 3 -> tensor<230x230x4xi8>
+    %2 = routing.routingcreatescheduletensor %1 : tensor<230x230x4xi8> shape = [230, 230, 4], dim = 3 {halo = #routing.halo<slice = 61, step = 56, split_dim = 0, w_slice = 61, w_step = 56, w_rounds = 4, ow_t = 28, row_pitch = 920, l2_slice = 19, l2_step = 14, l2_rounds = 4, k_slice = 244, k_step = 224, k_rounds = 4, buf_size = 4636>, layout_transform = "dma_shuffle", pp_depth = 2 : i64} -> tensor<230x230x4xi8>
     %3 = bufferization.to_tensor %arg1 : memref<64x7x7x4xi8>
-    %4 = routing.routingcreatescheduletensor %3 : tensor<64x7x7x4xi8> shape = [64, 7, 7, 4], dim = 4 -> tensor<64x7x7x4xi8>
+    %4 = routing.routingcreatescheduletensor %3 : tensor<64x7x7x4xi8> shape = [64, 7, 7, 4], dim = 4 {layout_transform = "dma_shuffle", pp_depth = 2 : i64} -> tensor<64x7x7x4xi8>
     %5 = bufferization.to_tensor %arg2 : memref<112x112x64xi8>
-    %6 = routing.routingcreatescheduletensor %5 : tensor<112x112x64xi8> shape = [112, 112, 64], dim = 3 -> tensor<112x112x64xi8>
+    %6 = routing.routingcreatescheduletensor %5 : tensor<112x112x64xi8> shape = [112, 112, 64], dim = 3 {pp_depth = 2 : i64} -> tensor<112x112x64xi8>
     scf.execute_region {
       %7 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "col" : i32 -> i32
       %8 = routing.partitiontensor %4 : tensor<64x7x7x4xi8> {

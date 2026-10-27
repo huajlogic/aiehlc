@@ -664,6 +664,18 @@ skill **aieuserkernel**.
 3. `DmapToDmaphopPass` — logical → physical hops
 4. `DmaphopTodfscheblueprintPass` — hops → schedule blueprints
 
+**Routing module attributes are control switches only** (`routing.fullconnect_auto`,
+`routing.kernel_config_offload`, `routing.output_tile_major`, `routing.control_*`,
+`routing.iter_policy`). Tiling/data-movement info is a typed attribute on its op:
+`#routing.halo` / `#routing.shim_dma` / `layout_transform` / `pp_depth` on each
+`routingcreatescheduletensor` (copied onto `dfscheblueprint.declare_data` as
+`routing.*`), `#routing.kernel_tiling` on the routing `func.func`, and GEMM
+`#routing.tiling` on `partitiontensor`. Passes read them **at pass entry** via
+`routing::collectTensorRoutingInfo` / `readKernelTiling` / `readGemmTilingScalars`
+into `BlueprintPassState` — never add a `tensor_N.*` or tiling module attr. See
+**[doc/design/routing_ir_tiling_carriers.md](doc/design/routing_ir_tiling_carriers.md)**;
+skill **routingirtilingcarriers**.
+
 **Host path** → `host.cc`:
 
 5. `BlueprintToSchedulePass` → `ScheduleCanonicalizePass` → (`GroupRegWritePass`, opt-in) → `DfscheduleToApiPass` → `RoutingConstantFoldPass` → `CanonicalizerPass` → EmitC → `host.cc`
@@ -805,6 +817,7 @@ Read the matching skill when the task fits:
 | Sim build/run separation | sim-build-run-separation |
 | Sim build (`pr_sim_test.sh`, `-D__AIESIM__`) fails in aie_runtime.c with "use of undeclared identifier" while the HW build is fine | aiesimguardedsymbol |
 | Build fails on missing snap cmake / libz.so / ZLIB::ZLIB; fast single-file compile check | mlirbuildsandbox |
+| Adding/reading tiling or per-tensor DMA info in routing IR (halo, shim_dma, pp_depth, kernel rounds); "where did `tensor_N.halo` / `routing.spatial_out_rounds` go"; value reads 0 inside a conversion pattern | routingirtilingcarriers |
 | A `#pragma` you added is never `Detected` in the aiehlc log and its feature silently does nothing (build still rc=0) — stale `aiehlc` binary | stalepragmabinary |
 | Gen2-only build break: missing `xpseudo_asm_armclang.h`, or `XPAR_CPU_TIMESTAMP_CLK_FREQ` undeclared | bspheadergen2 |
 | hostcompile / missing compile_kernel.sh | hostcompile-entrypoint |

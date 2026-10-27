@@ -450,8 +450,9 @@ ModuleOp routingmanager::ops_testNew(MLIRContext *ctx, int totalN, std::string r
 
         auto denseAttr = DenseElementsAttr::get(tensorType, initValues);
         auto initConstant = builder.create<arith::ConstantOp>(builder.getUnknownLoc(), tensorType, denseAttr);
-        auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType,
-                                                           initConstant.getResult(), vals, dimnum);
+        auto tensor =
+            builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, initConstant.getResult(), vals,
+                                                 dimnum, nullptr, nullptr, nullptr, nullptr);
         return tensor;
     };
 
@@ -641,6 +642,146 @@ routing::GemmTilingScalars routing::readGemmTilingScalars(mlir::ModuleOp moduleO
     });
     return out;
 }
+// Func-arg index of a tensor-declaring op's init operand: step back through
+// single-operand forwarding ops (bufferization.to_tensor) to a func.func entry
+// block argument. -1 when it is not one.
+static int traceDeclToFuncArg(mlir::Value v) {
+    for (int guard = 0; guard < 16 && v; ++guard) {
+        if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+            if (isa_and_nonnull<func::FuncOp>(blockArg.getOwner()->getParentOp()))
+                return static_cast<int>(blockArg.getArgNumber());
+            return -1;
+        }
+        Operation *def = v.getDefiningOp();
+        if (!def || def->getNumOperands() != 1)
+            return -1;
+        v = def->getOperand(0);
+    }
+    return -1;
+}
+
+routing::TensorRoutingInfoMap routing::collectTensorRoutingInfo(mlir::ModuleOp moduleOp) {
+    TensorRoutingInfoMap out;
+    if (!moduleOp)
+        return out;
+    moduleOp.walk([&](Operation *op) {
+        TensorRoutingInfo info;
+        Value init;
+        if (auto decl = dyn_cast<routing::createscheduletensor>(op)) {
+            init = decl.getInitTensor();
+            info.halo = decl.getHaloAttr();
+            info.shimDma = decl.getShimDmaAttr();
+            if (auto lt = decl.getLayoutTransformAttr())
+                info.layoutTransform = lt.getValue();
+            if (auto pp = decl.getPpDepthAttr())
+                info.ppDepth = pp.getInt();
+        } else if (op->getName().getStringRef() == "dfscheblueprint.declare_data" && op->getNumOperands() == 1) {
+            // Matched by name: the routing library does not link the
+            // dfscheblueprint dialect.
+            init = op->getOperand(0);
+            info.halo = op->getAttrOfType<HaloAttr>(kDeclHaloAttr);
+            info.shimDma = op->getAttrOfType<ShimDmaAttr>(kDeclShimDmaAttr);
+            if (auto lt = op->getAttrOfType<StringAttr>(kDeclLayoutTransformAttr))
+                info.layoutTransform = lt.getValue();
+            if (auto pp = op->getAttrOfType<IntegerAttr>(kDeclPpDepthAttr))
+                info.ppDepth = pp.getInt();
+        } else {
+            return;
+        }
+        int argIdx = traceDeclToFuncArg(init);
+        if (argIdx >= 0)
+            out[argIdx] = info;
+    });
+    return out;
+}
+
+const routing::TensorRoutingInfo *routing::lookupTensorRoutingInfo(const TensorRoutingInfoMap &map, int argIdx) {
+    auto it = map.find(argIdx);
+    return it == map.end() ? nullptr : &it->second;
+}
+
+routing::HaloAttr routing::lookupHalo(const TensorRoutingInfoMap &map, int argIdx) {
+    const TensorRoutingInfo *info = lookupTensorRoutingInfo(map, argIdx);
+    return info ? info->halo : HaloAttr();
+}
+
+llvm::SmallVector<int> routing::sortedTensorIndices(const TensorRoutingInfoMap &map) {
+    llvm::SmallVector<int> keys;
+    for (const auto &entry : map)
+        keys.push_back(entry.first);
+    llvm::sort(keys);
+    return keys;
+}
+
+int64_t routing::spatialHaloBufSize(const TensorRoutingInfoMap &map) {
+    for (int idx : sortedTensorIndices(map)) {
+        HaloAttr halo = map.lookup(idx).halo;
+        if (halo && halo.getBufSize() > 0)
+            return halo.getBufSize();
+    }
+    return 0;
+}
+
+int routing::setHaloBufSize(mlir::ModuleOp moduleOp, int64_t bufSize) {
+    int updated = 0;
+    moduleOp.walk([&](routing::createscheduletensor decl) {
+        HaloAttr h = decl.getHaloAttr();
+        if (!h)
+            return;
+        decl.setHaloAttr(HaloAttr::get(h.getContext(), h.getSlice(), h.getStep(), h.getSplitDim(), h.getWSlice(),
+                                       h.getWStep(), h.getWRounds(), h.getOwT(), h.getRowPitch(), h.getL2Slice(),
+                                       h.getL2Step(), h.getL2Rounds(), h.getKSlice(), h.getKStep(), h.getKRounds(),
+                                       bufSize));
+        ++updated;
+    });
+    return updated;
+}
+
+void routing::copyTensorRoutingInfo(routing::createscheduletensor from, mlir::Operation *to) {
+    if (auto a = from.getHaloAttr())
+        to->setAttr(kDeclHaloAttr, a);
+    if (auto a = from.getShimDmaAttr())
+        to->setAttr(kDeclShimDmaAttr, a);
+    if (auto a = from.getLayoutTransformAttr())
+        to->setAttr(kDeclLayoutTransformAttr, a);
+    if (auto a = from.getPpDepthAttr())
+        to->setAttr(kDeclPpDepthAttr, a);
+}
+
+// The routing func is the module's func.func (@main, or @routing on the
+// routing.cc clone); it survives every stage that reads the kernel tiling.
+static func::FuncOp findRoutingFunc(mlir::ModuleOp moduleOp) {
+    func::FuncOp found;
+    moduleOp.walk([&](func::FuncOp f) {
+        if (!found || f->hasAttr(routing::kKernelTilingAttr))
+            found = f;
+    });
+    return found;
+}
+
+routing::KernelTilingAttr routing::readKernelTiling(mlir::ModuleOp moduleOp) {
+    assert(moduleOp && "readKernelTiling needs a module");
+    if (auto f = findRoutingFunc(moduleOp))
+        if (auto kt = f->getAttrOfType<KernelTilingAttr>(kKernelTilingAttr))
+            return kt;
+    return KernelTilingAttr::get(moduleOp.getContext(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+void routing::mergeKernelTiling(mlir::ModuleOp moduleOp, const KernelTilingFields &f) {
+    func::FuncOp func = moduleOp ? findRoutingFunc(moduleOp) : func::FuncOp();
+    if (!func)
+        return;
+    KernelTilingAttr cur = readKernelTiling(moduleOp);
+    auto pick = [](int64_t mine, int64_t old) { return mine != 0 ? mine : old; };
+    func->setAttr(kKernelTilingAttr,
+                  KernelTilingAttr::get(moduleOp.getContext(), pick(f.tileM, cur.getTileM()),
+                                        pick(f.tileRows, cur.getTileRows()), pick(f.mRounds, cur.getMRounds()),
+                                        pick(f.tileN, cur.getTileN()), pick(f.tileCols, cur.getTileCols()),
+                                        pick(f.nRounds, cur.getNRounds()), pick(f.effectiveK, cur.getEffectiveK()),
+                                        pick(f.fullK, cur.getFullK()), pick(f.kRounds, cur.getKRounds()),
+                                        pick(f.outRounds, cur.getOutRounds())));
+}
+
 mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int totalN, bool purefunc) {
         OpBuilder builder(ctx);
         auto location = builder.getUnknownLoc();
@@ -701,7 +842,8 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
             ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
             // 3) I64Attr ($dim).
             IntegerAttr dimnum = builder.getI64IntegerAttr(2);
-            auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(),  subview, vals, dimnum);
+            auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(),  subview, vals, dimnum, nullptr,
+                                                               nullptr, nullptr, nullptr);
             //
             auto hw_row_number = rnum_i32;
             IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is

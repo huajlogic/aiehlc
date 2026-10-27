@@ -510,6 +510,9 @@ struct CreateScheduleTensorConversion : public OpConversionPattern<routing::crea
             tensorType,     // result type (AnyTensor)
             initTensor      // init_tensor input
         );
+        // Carry the tensor's routing descriptors (halo / shim_dma /
+        // layout_transform / pp_depth) to the blueprint and schedule passes.
+        routing::copyTensorRoutingInfo(op, declareDataOp);
         rewriter.replaceOp(op, declareDataOp.getResult());
         return success();
     }
@@ -690,9 +693,12 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
     // runOnOperation). The K-tiling shim-addressing block below consumes these
     // instead of re-reading routing.tile_*/effective_k/full_k module attrs.
     routing::GemmTilingScalars tiling;
+    // Per-tensor descriptors (halo / shim_dma / layout_transform), read at pass
+    // entry from the routing.routingcreatescheduletensor ops this pass replaces.
+    routing::TensorRoutingInfoMap tensorInfo;
 
-    PushOpConversion(MLIRContext *context, routing::GemmTilingScalars tiling)
-        : OpConversionPattern<dmaphop::push>(context), tiling(tiling) {}
+    PushOpConversion(MLIRContext *context, routing::GemmTilingScalars tiling, routing::TensorRoutingInfoMap tensorInfo)
+        : OpConversionPattern<dmaphop::push>(context), tiling(tiling), tensorInfo(std::move(tensorInfo)) {}
 
     LogicalResult matchAndRewrite(dmaphop::push op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -896,50 +902,35 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
 
         if (srcTileType == "shim") {
             auto moduleOp = op->getParentOfType<ModuleOp>();
-            // Per-tensor module attributes (tensor_N.halo, tensor_N.shim_dma,
-            // tensor_N.layout_transform) are keyed by func-arg order (arg0=tensor_0,
-            // arg1=tensor_1, ...). The encounter-order `dataId` assigned above does
-            // NOT match that order (e.g. input B is visited first -> dataId=0 while
-            // it is func arg1 -> tensor_1). Resolve the canonical func-arg index from
-            // the root view and use it for all per-tensor attribute lookups; fall back
-            // to dataId if the root view does not trace to a func argument.
+            // Per-tensor descriptors (halo, shim_dma, layout_transform) sit on the
+            // tensor's declaring op and are keyed by func-arg index. The
+            // encounter-order `dataId` assigned above does NOT match that order (e.g.
+            // input B is visited first -> dataId=0 while it is func arg1). Resolve the
+            // canonical func-arg index from the root view; fall back to dataId if the
+            // root view does not trace to a func argument.
             int32_t tensorIdx = resolveFuncArgIndexForRootView(rootAdaptedView);
             if (tensorIdx < 0)
                 tensorIdx = dataId;
-            // Spatial-halo mode (tensor_N.halo present): the A-tensor is sliced into
+            const routing::TensorRoutingInfo *tensorDesc = routing::lookupTensorRoutingInfo(tensorInfo, tensorIdx);
+            // Spatial-halo mode (#routing.halo present): the A-tensor is sliced into
             // overlapping contiguous row-blocks. Each shim BD stays FLAT (no multi-dim
             // strides); overlap is realized purely through per-tile DDR base offsets
             // computed in ExtractDataConversion. Skip all multi-dim addressing here.
-            bool isHaloTensor = false;
-            if (moduleOp) {
-                std::string haloKey = "tensor_" + std::to_string(tensorIdx) + ".halo";
-                isHaloTensor = moduleOp->getAttrOfType<DictionaryAttr>(haloKey) != nullptr;
-            }
+            routing::HaloAttr haloDesc = tensorDesc ? tensorDesc->halo : routing::HaloAttr();
+            bool isHaloTensor = static_cast<bool>(haloDesc);
             if (moduleOp && !isHaloTensor) {
                 // Check layout_transform: if "core_shuffle", skip DmaTransform strides
                 // (data goes flat to core tiles; the kernel handles reordering).
-                std::string layoutTransformKey = "tensor_" + std::to_string(tensorIdx) + ".layout_transform";
-                auto layoutTransformAttr = moduleOp->getAttrOfType<StringAttr>(layoutTransformKey);
-                bool isCoreShuffle = layoutTransformAttr && layoutTransformAttr.getValue() == "core_shuffle";
-                // Check for user-specified DmaTransform (tensor_N.shim_dma module attribute)
-                // If present and not core_shuffle, use it directly instead of computing K-tiling strides.
-                std::string shimDmaKey = "tensor_" + std::to_string(tensorIdx) + ".shim_dma";
-
-                if (isCoreShuffle) {
+                bool isCoreShuffle = tensorDesc && tensorDesc->layoutTransform == "core_shuffle";
+                if (isCoreShuffle)
                     llvm::errs() << "[ShimMultiDim] layout_transform=core_shuffle for tensor_" << tensorIdx
                                  << ": skipping DmaTransform strides (flat DMA to core)\n";
-                    // Attach core_shuffle hint for the kernel path: if shimDmaAttr has
-                    // strides/wraps, store them as tensor_N.core_shuffle so kernel code
-                    // generation can use the transform description for reordering.
-                    auto coreDmaAttr = moduleOp->getAttrOfType<DictionaryAttr>(shimDmaKey);
-                    if (coreDmaAttr) {
-                        moduleOp->setAttr("tensor_" + std::to_string(tensorIdx) + ".core_shuffle", coreDmaAttr);
-                    }
-                }
-                auto shimDmaAttr = moduleOp->getAttrOfType<DictionaryAttr>(shimDmaKey);
+                // User-specified DmaTransform (#routing.shim_dma): if present and not
+                // core_shuffle, use it directly instead of computing K-tiling strides.
+                routing::ShimDmaAttr shimDmaAttr = tensorDesc ? tensorDesc->shimDma : routing::ShimDmaAttr();
                 if (shimDmaAttr && !isCoreShuffle) {
-                    auto userStrides = shimDmaAttr.getAs<ArrayAttr>("strides");
-                    auto userWraps = shimDmaAttr.getAs<ArrayAttr>("wraps");
+                    ArrayAttr userStrides = shimDmaAttr.getStrides();
+                    ArrayAttr userWraps = shimDmaAttr.getWraps();
                     if (userStrides && userWraps) {
                         // Convert strides from element units to bytes (32-bit word aligned).
                         // The DmaTransform strides are in element counts; the AIEML DMA
@@ -970,7 +961,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                         inputShimDimStrides = rewriter.getI32ArrayAttr(byteStrides);
                         inputShimDimWraps = rewriter.getI32ArrayAttr(adjWraps);
 
-                        llvm::errs() << "[ShimMultiDim] Using user-specified DmaTransform for " << shimDmaKey
+                        llvm::errs() << "[ShimMultiDim] Using user-specified DmaTransform for tensor_" << tensorIdx
+                                     << ".shim_dma"
                                      << " (bytesPerElem=" << bytesPerElem << "): strides=[";
                         for (unsigned si = 0; si < byteStrides.size(); ++si) {
                             if (si > 0)
@@ -1076,9 +1068,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             // Mirrors the K-tiling 2D convention (D0=contiguous run, D1=row pitch),
             // strides in BYTES, wraps in WORDS for D0 / row-count for D1.
             if (moduleOp && isHaloTensor && !inputShimDimStrides) {
-                std::string haloKey = "tensor_" + std::to_string(tensorIdx) + ".halo";
-                auto haloAttr = moduleOp->getAttrOfType<DictionaryAttr>(haloKey);
-                auto wRoundsAttr = haloAttr ? haloAttr.getAs<IntegerAttr>("w_rounds") : nullptr;
+                // Optional halo levels read 0 when absent (see HaloAttr).
+                routing::HaloAttr haloAttr = haloDesc;
                 // Prefer a full 3D D0/D1/D2 BD (the K-accum branch below) whenever the
                 // K (input-channel) contraction is split into k_rounds>1 width-bands.
                 // Both this width-split branch and the K-accum branch are gated on
@@ -1086,21 +1077,18 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 // this 2D branch would otherwise fire first and block the 3D K-accum BD,
                 // pushing the round count into iteration+channel-repeat instead of D2.
                 // Yield to the 3D K-accum branch by skipping here when k_rounds>1.
-                auto kRoundsGuard = haloAttr ? haloAttr.getAs<IntegerAttr>("k_rounds") : nullptr;
-                bool kAccumWins = kRoundsGuard && kRoundsGuard.getInt() > 1;
-                if (wRoundsAttr && wRoundsAttr.getInt() > 1 && !kAccumWins) {
-                    auto rowPitchAttr = haloAttr.getAs<IntegerAttr>("row_pitch");
-                    auto sliceAttr = haloAttr.getAs<IntegerAttr>("slice");
-                    auto bufSizeAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_halo_buf_size");
+                bool kAccumWins = haloAttr.getKRounds() > 1;
+                if (haloAttr.getWRounds() > 1 && !kAccumWins) {
+                    const int64_t bufSize = routing::spatialHaloBufSize(tensorInfo);
                     auto viewType = dyn_cast<RankedTensorType>(viewSplit.getType());
-                    if (rowPitchAttr && sliceAttr && bufSizeAttr && viewType) {
+                    if (haloAttr.getRowPitch() > 0 && haloAttr.getSlice() > 0 && bufSize > 0 && viewType) {
                         unsigned bitWidth = viewType.getElementTypeBitWidth();
                         int64_t elemsPerWord = 32 / bitWidth; // 4 for i8, 2 for i16
                         constexpr int64_t wordBytes = 4;
-                        int64_t haloSlice = sliceAttr.getInt();        // rows per slab (19)
-                        int64_t rowPitchElems = rowPitchAttr.getInt(); // padded row pitch (920)
+                        int64_t haloSlice = haloAttr.getSlice();        // rows per slab (19)
+                        int64_t rowPitchElems = haloAttr.getRowPitch(); // padded row pitch (920)
                         // chunk_width = narrow slab cols*C: bufSize = halo_slice * chunk_width.
-                        int64_t chunkWidthElems = haloSlice > 0 ? bufSizeAttr.getInt() / haloSlice : 0;
+                        int64_t chunkWidthElems = haloSlice > 0 ? bufSize / haloSlice : 0;
                         if (chunkWidthElems > 0 && elemsPerWord > 0) {
                             int64_t chunkW_w = chunkWidthElems / elemsPerWord; // 244/4 = 61
                             int64_t rowPitch_w = rowPitchElems / elemsPerWord; // 920/4 = 230
@@ -1135,24 +1123,19 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             // Mirrors the matmul 3D K-tiling convention. Gate strictly on k_rounds>1 so
             // the w_rounds / pure-L2 / matmul paths stay byte-identical.
             if (moduleOp && isHaloTensor && !inputShimDimStrides) {
-                std::string haloKeyK = "tensor_" + std::to_string(tensorIdx) + ".halo";
-                auto haloAttrK = moduleOp->getAttrOfType<DictionaryAttr>(haloKeyK);
-                auto kRoundsAttr = haloAttrK ? haloAttrK.getAs<IntegerAttr>("k_rounds") : nullptr;
-                if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
-                    auto kSliceAttr = haloAttrK.getAs<IntegerAttr>("k_slice");
-                    auto kStepAttr = haloAttrK.getAs<IntegerAttr>("k_step");
-                    auto l2SliceAttr = haloAttrK.getAs<IntegerAttr>("l2_slice");
-                    auto rowPitchAttrK = haloAttrK.getAs<IntegerAttr>("row_pitch");
+                routing::HaloAttr haloAttrK = haloDesc;
+                if (haloAttrK.getKRounds() > 1) {
                     auto viewTypeK = dyn_cast<RankedTensorType>(viewSplit.getType());
-                    if (kSliceAttr && kStepAttr && l2SliceAttr && rowPitchAttrK && viewTypeK) {
+                    if (haloAttrK.getKSlice() > 0 && haloAttrK.getKStep() > 0 && haloAttrK.getL2Slice() > 0 &&
+                        haloAttrK.getRowPitch() > 0 && viewTypeK) {
                         unsigned bitWidthK = viewTypeK.getElementTypeBitWidth();
                         int64_t elemsPerWordK = 32 / bitWidthK; // 4 for i8, 2 for i16
                         constexpr int64_t wordBytesK = 4;
-                        int64_t kSliceElems = kSliceAttr.getInt();   // 244
-                        int64_t kStepElems = kStepAttr.getInt();     // 224
-                        int64_t l2SliceRows = l2SliceAttr.getInt();  // 19
-                        int64_t rowPitchEl = rowPitchAttrK.getInt(); // 920
-                        int64_t kRounds = kRoundsAttr.getInt();      // 4
+                        int64_t kSliceElems = haloAttrK.getKSlice();  // 244
+                        int64_t kStepElems = haloAttrK.getKStep();    // 224
+                        int64_t l2SliceRows = haloAttrK.getL2Slice(); // 19
+                        int64_t rowPitchEl = haloAttrK.getRowPitch(); // 920
+                        int64_t kRounds = haloAttrK.getKRounds();     // 4
                         if (elemsPerWordK > 0) {
                             int64_t kSlice_w = kSliceElems / elemsPerWordK;  // 244/4 = 61
                             int64_t rowPitch_w = rowPitchEl / elemsPerWordK; // 920/4 = 230
@@ -1226,8 +1209,11 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
 };
 
 struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
-    PullOpConversion(MLIRContext *context) 
-        : OpConversionPattern<dmaphop::pull>(context) {}
+    // Per-tensor descriptors (pp_depth), read at pass entry.
+    routing::TensorRoutingInfoMap tensorInfo;
+
+    PullOpConversion(MLIRContext *context, routing::TensorRoutingInfoMap tensorInfo)
+        : OpConversionPattern<dmaphop::pull>(context), tensorInfo(std::move(tensorInfo)) {}
 
     LogicalResult matchAndRewrite(dmaphop::pull op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -1430,46 +1416,41 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         }
 
         // 4. Create Binds
-        // Look up pp_depth from module attribute for output (Pull) flows.
-        // The pp_depth_map module attribute maps tensor_N -> pp_depth.
-        // For Pull flows (output Gather), we find the matching output tensor.
+        // Look up pp_depth for output (Pull) flows from the output tensor's
+        // declaring op (pass-entry tensorInfo, keyed by func-arg index).
         IntegerAttr ppDepthAttr = nullptr;
-        if (auto moduleOp = op->getParentOfType<ModuleOp>()) {
-            if (auto ppDepthMap = moduleOp->getAttrOfType<DictionaryAttr>("routing.pp_depth_map")) {
-                // Trace rootAdaptedView back through the op chain to find
-                // the func arg index, then look up pp_depth from the map.
-                // Chain: routingextract_data -> partitiontensor ->
-                //        createscheduletensor -> to_tensor -> block arg
-                Value traceVal = rootAdaptedView;
-                for (int step = 0; step < 10 && traceVal; ++step) {
-                    if (auto blockArg = dyn_cast<BlockArgument>(traceVal)) {
-                        // Reached func argument — look up pp_depth
-                        unsigned tensorIdx = blockArg.getArgNumber();
-                        std::string key = "tensor_" + std::to_string(tensorIdx);
-                        if (auto attr = ppDepthMap.getAs<IntegerAttr>(key)) {
-                            ppDepthAttr = attr;
-                            llvm::errs() << "[PullOp] Found pp_depth=" << attr.getInt() << " for tensor_" << tensorIdx
-                                         << "\n";
-                        }
-                        break;
-                    }
-                    Operation *defOp = traceVal.getDefiningOp();
-                    if (!defOp)
-                        break;
-                    if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(defOp))
-                        traceVal = extractSlice.getSource();
-                    else if (auto extractData = dyn_cast<routing::extract_data>(defOp))
-                        traceVal = extractData.getTensor();
-                    else if (auto partTensor = dyn_cast<routing::partitiontensor>(defOp))
-                        traceVal = partTensor.getTensor();
-                    else if (auto schedTensor = dyn_cast<routing::createscheduletensor>(defOp))
-                        traceVal = schedTensor.getInitTensor();
-                    else if (auto toTensor = dyn_cast<bufferization::ToTensorOp>(defOp))
-                        traceVal = toTensor.getMemref();
-                    else
-                        break; // unknown op
+        // Trace rootAdaptedView back through the op chain to find
+        // the func arg index, then look up the tensor's pp_depth.
+        // Chain: routingextract_data -> partitiontensor ->
+        //        createscheduletensor -> to_tensor -> block arg
+        Value traceVal = rootAdaptedView;
+        for (int step = 0; step < 10 && traceVal; ++step) {
+            if (auto blockArg = dyn_cast<BlockArgument>(traceVal)) {
+                // Reached func argument — look up pp_depth
+                unsigned tensorIdx = blockArg.getArgNumber();
+                const routing::TensorRoutingInfo *info =
+                    routing::lookupTensorRoutingInfo(tensorInfo, static_cast<int>(tensorIdx));
+                if (info && info->ppDepth) {
+                    ppDepthAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(*info->ppDepth));
+                    llvm::errs() << "[PullOp] Found pp_depth=" << *info->ppDepth << " for tensor_" << tensorIdx << "\n";
                 }
+                break;
             }
+            Operation *defOp = traceVal.getDefiningOp();
+            if (!defOp)
+                break;
+            if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(defOp))
+                traceVal = extractSlice.getSource();
+            else if (auto extractData = dyn_cast<routing::extract_data>(defOp))
+                traceVal = extractData.getTensor();
+            else if (auto partTensor = dyn_cast<routing::partitiontensor>(defOp))
+                traceVal = partTensor.getTensor();
+            else if (auto schedTensor = dyn_cast<routing::createscheduletensor>(defOp))
+                traceVal = schedTensor.getInitTensor();
+            else if (auto toTensor = dyn_cast<bufferization::ToTensorOp>(defOp))
+                traceVal = toTensor.getMemref();
+            else
+                break; // unknown op
         }
 
         std::string srcBindName = "flow_src_" + std::to_string(opId);
@@ -1617,14 +1598,20 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
     // (its conversion is disabled above), but reading at entry keeps the K-tiling
     // block independent of conversion order and consistent with the other passes.
     routing::GemmTilingScalars gemmTiling;
-    if (auto moduleOp = dyn_cast<ModuleOp>(module))
+    // Per-tensor descriptors are read here too, from the createscheduletensor ops
+    // CreateScheduleTensorConversion is about to replace (it copies them onto the
+    // new declare_data for the later passes).
+    routing::TensorRoutingInfoMap tensorInfo;
+    if (auto moduleOp = dyn_cast<ModuleOp>(module)) {
         gemmTiling = routing::readGemmTilingScalars(moduleOp);
+        tensorInfo = routing::collectTensorRoutingInfo(moduleOp);
+    }
 
     patterns.add<CreateScheduleTensorConversion>(context);
     //patterns.add<PartitionTensorConversion>(context);
     patterns.add<ExtractDataConversion>(context);
-    patterns.add<PushOpConversion>(context, gemmTiling);
-    patterns.add<PullOpConversion>(context);
+    patterns.add<PushOpConversion>(context, gemmTiling, tensorInfo);
+    patterns.add<PullOpConversion>(context, tensorInfo);
 
     target.addIllegalOp<routing::createscheduletensor>();
     //target.addIllegalOp<routing::partitiontensor>();

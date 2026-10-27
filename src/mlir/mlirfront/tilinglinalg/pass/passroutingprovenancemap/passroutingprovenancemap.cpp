@@ -390,22 +390,20 @@ void RoutingProvenanceMapPass::runOnOperation() {
     if (!aieGen.empty())
         jw.keyValue("aie_gen", StringRef(aieGen));
 
-    auto getI64 = [&](StringRef n) -> int64_t {
-        if (auto a = moduleOp->getAttrOfType<IntegerAttr>(n))
-            return a.getInt();
-        return 0;
-    };
+    // Kernel round schedule from the routing func's #routing.kernel_tiling (it
+    // used to be flat module attrs; the JSON key is kept for the debug UI).
+    routing::KernelTilingAttr kt = routing::readKernelTiling(moduleOp);
     jw.key("module_attrs");
     jw.beginObject();
-    jw.keyValue("tile_m", getI64("routing.tile_m"));
-    jw.keyValue("tile_n", getI64("routing.tile_n"));
-    jw.keyValue("tile_rows", getI64("routing.tile_rows"));
-    jw.keyValue("tile_cols", getI64("routing.tile_cols"));
-    jw.keyValue("effective_k", getI64("routing.effective_k"));
-    jw.keyValue("full_k", getI64("routing.full_k"));
-    jw.keyValue("k_rounds", getI64("routing.k_rounds"));
-    jw.keyValue("m_rounds", getI64("routing.m_rounds"));
-    jw.keyValue("n_rounds", getI64("routing.n_rounds"));
+    jw.keyValue("tile_m", kt.getTileM());
+    jw.keyValue("tile_n", kt.getTileN());
+    jw.keyValue("tile_rows", kt.getTileRows());
+    jw.keyValue("tile_cols", kt.getTileCols());
+    jw.keyValue("effective_k", kt.getEffectiveK());
+    jw.keyValue("full_k", kt.getFullK());
+    jw.keyValue("k_rounds", kt.getKRounds());
+    jw.keyValue("m_rounds", kt.getMRounds());
+    jw.keyValue("n_rounds", kt.getNRounds());
     jw.endObject();
 
     int totalConnections = 0;

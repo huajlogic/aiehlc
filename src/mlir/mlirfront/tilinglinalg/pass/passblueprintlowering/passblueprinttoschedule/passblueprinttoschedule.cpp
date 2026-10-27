@@ -300,8 +300,8 @@ void BlueprintToSchedulePass::runOnOperation() {
         return;
     }
 
-    // Cache routing module attributes before conversion (they may be stripped
-    // during applyPartialConversion).
+    // Cache the routing control attributes and the IR-carried tiling before
+    // conversion (both may be stripped during applyPartialConversion).
     {
         auto moduleOp = dyn_cast<ModuleOp>(getOperation());
         if (moduleOp) {
@@ -315,14 +315,21 @@ void BlueprintToSchedulePass::runOnOperation() {
             passState->kernelConfigOffload = getI64("routing.kernel_config_offload") != 0;
             passState->outputTileMajor = getI64("routing.output_tile_major") != 0;
 
-            // Flat module attrs are the fallback source.
-            passState->tileM = getI64("routing.tile_m");
-            passState->tileRows = getI64("routing.tile_rows");
-            passState->tileN = getI64("routing.tile_n");
-            passState->tileCols = getI64("routing.tile_cols");
-            passState->effectiveK = getI64("routing.effective_k");
-            passState->fullK = getI64("routing.full_k");
-            passState->kRounds = getI64("routing.k_rounds");
+            // Per-tensor descriptors and the kernel round schedule live on IR ops
+            // (the declare_data ops / the routing func); read them before the
+            // conversion erases declare_data.
+            passState->tensorInfo = routing::collectTensorRoutingInfo(moduleOp);
+            passState->kernelTiling = routing::readKernelTiling(moduleOp);
+
+            // The routing func's #routing.kernel_tiling is the fallback source
+            // (fullconnect_auto=0 / spatial halo: no #routing.tiling op).
+            passState->tileM = passState->kernelTiling.getTileM();
+            passState->tileRows = passState->kernelTiling.getTileRows();
+            passState->tileN = passState->kernelTiling.getTileN();
+            passState->tileCols = passState->kernelTiling.getTileCols();
+            passState->effectiveK = passState->kernelTiling.getEffectiveK();
+            passState->fullK = passState->kernelTiling.getFullK();
+            passState->kRounds = passState->kernelTiling.getKRounds();
 
             // TilingAttr-primary: for fullconnect_auto=1 source the tiling scalars
             // directly from the routing.partitiontensor #routing.tiling op (still live

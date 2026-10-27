@@ -87,6 +87,10 @@ include_directories(${Clang_INCLUDE_DIRS})
 include_directories(${CLANG_INCLUDE_DIRS})
 include_directories("./src/mlir/mlirfront/")
 include_directories("./src/mlir/mlirfront/tilinglinalg/pass/")
+# routingmanager.h (routing dialect attrs/ops: aiehlc.cc records the kernel
+# tiling and halo slab size on routing IR ops) and its generated .inc files.
+include_directories("./src/mlir/mlirfront/tilinglinalg/routing/")
+include_directories("./src/mlir/mlirfront/tilinglinalg/routing/inc/")
 
 
 #fiind antlr include

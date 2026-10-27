@@ -85,6 +85,12 @@ struct BlueprintPassState {
     // partitiontensor op during conversion. Empty for conv, mirroring the old
     // !isFullConnectAuto Match/1/1 behavior.
     routing::GemmTilingScalars tilingScalars;
+    // Per-tensor routing descriptors (halo / shim_dma / layout_transform /
+    // pp_depth), keyed by func-arg index and read once at pass entry from the
+    // tensor-declaring ops -- conversion erases dfscheblueprint.declare_data.
+    routing::TensorRoutingInfoMap tensorInfo;
+    // The routing func's #routing.kernel_tiling, read at pass entry (null until then).
+    routing::KernelTilingAttr kernelTiling;
     // KERNELCONFIGOFFLOAD (routing.kernel_config_offload): when set, the AIE core
     // self-programs its own incoming (S2MM) DMA from kernel.cc via raw MMIO, so the
     // host must NOT emit the S2MM core-tile DMA chain. emitCoreBufferDma reads this
@@ -219,7 +225,7 @@ struct ConvHaloGeom {
     int64_t l2Rounds = 1; // number of T->B height rounds (e.g. 4); 1 if absent
 };
 // Scan moduleOp attrs for a conv width-split halo. Returns {valid=false} otherwise.
-ConvHaloGeom detectConvHalo(ModuleOp moduleOp);
+ConvHaloGeom detectConvHalo(const routing::TensorRoutingInfoMap &tensorInfo);
 
 OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passState, MemRefType memrefType,
                                                int64_t numCoreTiles, ModuleOp moduleOp, int64_t ooElementSizeBytes,

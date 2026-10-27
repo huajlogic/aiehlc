@@ -439,6 +439,70 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
     ctx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
 }
 
+// Build the #routing.halo of one spatial-halo tensor. Optional levels are left
+// at 0 (= absent) exactly when the old `tensor_N.halo` dictionary omitted them:
+// W fields only with a width split, L2 only with l2Rounds > 1, K only with
+// kRounds > 1, row_pitch with either a W or an L2 split.
+static routing::HaloAttr buildHaloAttr(MLIRContext *ctx, const DmaAddressing &sd) {
+    const bool wSplit = sd.wRounds > 1, l2Split = sd.l2Rounds > 1, kSplit = sd.kRounds > 1;
+    return routing::HaloAttr::get(ctx, sd.haloSlice, sd.haloStep, sd.splitDim, wSplit ? sd.wSlice : 0,
+                                  wSplit ? sd.wStep : 0, wSplit ? sd.wRounds : 0, wSplit ? sd.owT : 0,
+                                  (wSplit || l2Split) ? sd.rowPitch : 0, l2Split ? sd.l2Slice : 0,
+                                  l2Split ? sd.l2Step : 0, l2Split ? sd.l2Rounds : 0, kSplit ? sd.kSlice : 0,
+                                  kSplit ? sd.kStep : 0, kSplit ? sd.kRounds : 0, /*buf_size=*/0);
+}
+
+// User DmaTransform of one non-halo tensor as #routing.shim_dma.
+static routing::ShimDmaAttr buildShimDmaAttr(OpBuilder &builder, const DmaAddressing &sd) {
+    SmallVector<int32_t> strides, wraps;
+    for (auto &[s, w] : sd.dims) {
+        strides.push_back(s);
+        wraps.push_back(w);
+    }
+    ArrayAttr ddrShape;
+    if (!sd.ddrShape.empty()) {
+        SmallVector<int64_t> shape(sd.ddrShape.begin(), sd.ddrShape.end());
+        ddrShape = builder.getI64ArrayAttr(shape);
+    }
+    return routing::ShimDmaAttr::get(builder.getContext(), builder.getI32ArrayAttr(strides),
+                                     builder.getI32ArrayAttr(wraps), sd.iter_step, sd.iter_wrap, ddrShape,
+                                     std::max<int64_t>(sd.tile_m_alignment, 0));
+}
+
+// Attach each tensor's routing descriptors to the op that declares it
+// (routing.routingcreatescheduletensor; index = func arg = tensor index).
+// These used to be the `routing.pp_depth_map` / `tensor_N.{shim_dma,halo,
+// layout_transform}` module attributes.
+static void attachTensorRoutingInfo(OpBuilder &builder, ArrayRef<routing::createscheduletensor> decls,
+                                    const std::vector<TensorParam> &tensors, const SplitModel &splitModel) {
+    MLIRContext *ctx = builder.getContext();
+    for (unsigned i = 0; i < splitModel.tensorSplits.size() && i < decls.size(); ++i) {
+        const auto &split = splitModel.tensorSplits[i];
+        routing::createscheduletensor decl = decls[i];
+        decl.setPpDepthAttr(builder.getI64IntegerAttr(split.pingPong));
+        if (!split.layoutTransform.empty()) {
+            decl.setLayoutTransformAttr(builder.getStringAttr(split.layoutTransform));
+            llvm::outs() << "[TilingLinalg] tensor_" << i << " layout_transform=" << split.layoutTransform << "\n";
+        }
+    }
+    for (unsigned i = 0; i < tensors.size() && i < decls.size(); ++i) {
+        const auto &sd = tensors[i].shimDma;
+        routing::createscheduletensor decl = decls[i];
+        // Spatial-halo mode (mode == 1) uses flat contiguous shim BDs with
+        // overlapping per-tile base offsets, so it carries a halo, never a
+        // multi-dim shim_dma.
+        if (sd.mode == 1) {
+            if (sd.haloSlice <= 0)
+                continue;
+            decl.setHaloAttr(buildHaloAttr(ctx, sd));
+            llvm::outs() << "[TilingLinalg] tensor_" << i << " halo=" << decl.getHaloAttr() << "\n";
+        } else if (!sd.empty()) {
+            decl.setShimDmaAttr(buildShimDmaAttr(builder, sd));
+            llvm::outs() << "[TilingLinalg] tensor_" << i << " shim_dma=" << decl.getShimDmaAttr() << "\n";
+        }
+    }
+}
+
 mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
                                                     const std::vector<TensorParam> &tensors,
                                                     const SplitModel &splitModel, const PartitionDesc &partition,
@@ -476,6 +540,10 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
     // Build all tensor values first
     std::vector<Value> tensorValues;
     std::vector<bool> isInputFlags;
+    // The declaring op of each tensor (index = func arg); its per-tensor routing
+    // descriptors (halo / shim_dma / layout_transform / pp_depth) are attached
+    // below, once the split model is known.
+    std::vector<createscheduletensor> tensorDecls;
     for (unsigned i = 0; i < tensors.size(); ++i) {
         const auto &tp = tensors[i];
 
@@ -498,7 +566,8 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 
         // Feed into createscheduletensor — same as before
         auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(),
-                                                           vals, dimnum);
+                                                           vals, dimnum, nullptr, nullptr, nullptr, nullptr);
+        tensorDecls.push_back(tensor);
         tensorValues.push_back(tensor);
         isInputFlags.push_back(tp.isInput);
     }
@@ -536,125 +605,7 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
     builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(hostFunc);
 
-    // Store per-tensor pp_depth as module attribute so downstream passes can read it.
-    // Format: "routing.pp_depth_map" = { tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32, ... }
-    {
-        NamedAttrList ppDepthEntries;
-        for (unsigned i = 0; i < splitModel.tensorSplits.size(); ++i) {
-            int ppDepth = splitModel.tensorSplits[i].pingPong;
-            std::string key = "tensor_" + std::to_string(i);
-            ppDepthEntries.append(key, builder.getI32IntegerAttr(ppDepth));
-        }
-        m->setAttr("routing.pp_depth_map", DictionaryAttr::get(&ctx, ppDepthEntries));
-    }
-
-    // Store per-tensor shimDma as module attribute so DmaphopTodfscheblueprintPass
-    // can read multi-dim DMA addressing from user-specified DmaTransform.
-    // Format: "tensor_N.shim_dma" = { strides = [...], wraps = [...], iter_step = N, iter_wrap = N,
-    //                                  ddr_shape = [...], tile_m_alignment = N }
-    for (unsigned i = 0; i < tensors.size(); ++i) {
-        // Spatial-halo mode (mode == 1) uses flat contiguous shim BDs with overlapping
-        // per-tile base offsets — it must NOT emit a multi-dim shim_dma attribute.
-        if (tensors[i].shimDma.mode == 1)
-            continue;
-        if (!tensors[i].shimDma.empty()) {
-            NamedAttrList entries;
-            SmallVector<int32_t> strides, wraps;
-            for (auto &[s, w] : tensors[i].shimDma.dims) {
-                strides.push_back(s);
-                wraps.push_back(w);
-            }
-            entries.append("strides", builder.getI32ArrayAttr(strides));
-            entries.append("wraps", builder.getI32ArrayAttr(wraps));
-            entries.append("iter_step", builder.getI32IntegerAttr(tensors[i].shimDma.iter_step));
-            entries.append("iter_wrap", builder.getI32IntegerAttr(tensors[i].shimDma.iter_wrap));
-            // Store ddr_shape if available (for tile_m temporal tiling base address computation)
-            if (!tensors[i].shimDma.ddrShape.empty()) {
-                SmallVector<int64_t> shape(tensors[i].shimDma.ddrShape.begin(), tensors[i].shimDma.ddrShape.end());
-                entries.append("ddr_shape", builder.getI64ArrayAttr(shape));
-            }
-            // Store tile_m_alignment if set (e.g. OW for im2col)
-            if (tensors[i].shimDma.tile_m_alignment > 0) {
-                entries.append("tile_m_alignment", builder.getI32IntegerAttr(tensors[i].shimDma.tile_m_alignment));
-            }
-            m->setAttr("tensor_" + std::to_string(i) + ".shim_dma", DictionaryAttr::get(&ctx, entries));
-            llvm::outs() << "[TilingLinalg] Stored shim_dma for tensor_" << i << ": " << tensors[i].shimDma.dims.size()
-                         << " dims, iter_step=" << tensors[i].shimDma.iter_step
-                         << " iter_wrap=" << tensors[i].shimDma.iter_wrap << "\n";
-        }
-    }
-
-    // Store per-tensor spatial-halo descriptor as module attribute.
-    // Format: "tensor_N.halo" = { slice = <haloSlice>, step = <haloStep>, split_dim = <splitDim> }
-    // DmaphopTodfscheblueprintPass reads this (or the partitiontensor's step attr) to
-    // compute overlapping per-tile DDR base offsets for the flat shim BD.
-    for (unsigned i = 0; i < tensors.size(); ++i) {
-        const auto &sd = tensors[i].shimDma;
-        if (sd.mode == 1 && sd.haloSlice > 0) {
-            NamedAttrList entries;
-            entries.append("slice", builder.getI32IntegerAttr(sd.haloSlice));
-            entries.append("step", builder.getI32IntegerAttr(sd.haloStep));
-            entries.append("split_dim", builder.getI32IntegerAttr(sd.splitDim));
-            // 2D width-split: carry the per-chunk WIDTH geometry so the shim BD
-            // (passdmaphop) and the host round loop (passblueprinttoschedule) can
-            // build the 2D narrow-chunk descriptor + (hc,wc) per-round base offset.
-            // Emitted only when wRounds > 1 so the height-only path is untouched.
-            if (sd.wRounds > 1) {
-                entries.append("w_slice", builder.getI32IntegerAttr(sd.wSlice));
-                entries.append("w_step", builder.getI32IntegerAttr(sd.wStep));
-                entries.append("w_rounds", builder.getI32IntegerAttr(sd.wRounds));
-                entries.append("row_pitch", builder.getI32IntegerAttr(sd.rowPitch));
-                entries.append("ow_t", builder.getI32IntegerAttr(sd.owT));
-            }
-            // 2-level (nested) halo: each L1 tile slice is further chunked into
-            // l2_rounds on-core temporal rounds (l2_slice rows advancing by l2_step
-            // along the split/row dim). Realized downstream via the DMA BD iteration
-            // dimension (iter_step=l2_step*row_pitch, iter_wrap=l2_rounds) plus kernel
-            // rounds. Emitted only when l2Rounds > 1 so the legacy path is untouched.
-            if (sd.l2Rounds > 1) {
-                entries.append("l2_slice", builder.getI32IntegerAttr(sd.l2Slice));
-                entries.append("l2_step", builder.getI32IntegerAttr(sd.l2Step));
-                entries.append("l2_rounds", builder.getI32IntegerAttr(sd.l2Rounds));
-                // row_pitch is required by the iteration-dim BD; ensure it is present
-                // even when there is no W-split (wRounds <= 1).
-                if (sd.wRounds <= 1)
-                    entries.append("row_pitch", builder.getI32IntegerAttr(sd.rowPitch));
-            }
-            // K-contraction accumulate split (independent of the H/row L2 above):
-            // the K dim is chunked into k_rounds on-core accumulate rounds of
-            // k_slice elements advancing by k_step. Emitted only when kRounds > 1
-            // so non-k-accum IR stays byte-identical.
-            if (sd.kRounds > 1) {
-                entries.append("k_slice", builder.getI32IntegerAttr(sd.kSlice));
-                entries.append("k_step", builder.getI32IntegerAttr(sd.kStep));
-                entries.append("k_rounds", builder.getI32IntegerAttr(sd.kRounds));
-            }
-            m->setAttr("tensor_" + std::to_string(i) + ".halo", DictionaryAttr::get(&ctx, entries));
-            llvm::outs() << "[TilingLinalg] Stored halo for tensor_" << i << ": slice=" << sd.haloSlice
-                         << " step=" << sd.haloStep << " split_dim=" << sd.splitDim;
-            if (sd.wRounds > 1)
-                llvm::outs() << " [W-SPLIT w_slice=" << sd.wSlice << " w_step=" << sd.wStep
-                             << " w_rounds=" << sd.wRounds << " row_pitch=" << sd.rowPitch << " ow_t=" << sd.owT << "]";
-            if (sd.l2Rounds > 1)
-                llvm::outs() << " [L2-SPLIT l2_slice=" << sd.l2Slice << " l2_step=" << sd.l2Step
-                             << " l2_rounds=" << sd.l2Rounds << "]";
-            if (sd.kRounds > 1)
-                llvm::outs() << " [K-ACCUM k_slice=" << sd.kSlice << " k_step=" << sd.kStep
-                             << " k_rounds=" << sd.kRounds << "]";
-            llvm::outs() << "\n";
-        }
-    }
-
-    // Store per-tensor layout_transform as module attribute so DmaphopTodfscheblueprintPass
-    // knows whether to apply DmaTransform strides on shim BD (dma_shuffle) or skip them (core_shuffle).
-    // Format: "tensor_N.layout_transform" = "dma_shuffle" | "core_shuffle"
-    for (unsigned i = 0; i < splitModel.tensorSplits.size(); ++i) {
-        const auto &lt = splitModel.tensorSplits[i].layoutTransform;
-        if (!lt.empty()) {
-            m->setAttr("tensor_" + std::to_string(i) + ".layout_transform", builder.getStringAttr(lt));
-            llvm::outs() << "[TilingLinalg] Stored layout_transform for tensor_" << i << ": " << lt << "\n";
-        }
-    }
+    attachTensorRoutingInfo(builder, tensorDecls, tensors, splitModel);
 
     llvm::errs() << m;
     return m;
@@ -873,15 +824,15 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         // bufferSliceBytes = product(tileShape) * elementBytes where tileShape = shape / meshDim.
         // For a conservative check we use maxPingPongBytes as the per-buffer size.
         uint32_t totalBufferBytes = 0;
+        // pp_depth lives on each tensor's declare_data (copied from its
+        // routing.routingcreatescheduletensor).
+        routing::TensorRoutingInfoMap tensorInfo = routing::collectTensorRoutingInfo(module);
         for (const auto &tp : tensors) {
             int ppDepth = 2; // default ping-pong depth
-            // Read pp_depth from module attribute if available
-            if (auto ppMap = module->getAttrOfType<DictionaryAttr>("routing.pp_depth_map")) {
-                unsigned idx = &tp - &tensors[0];
-                std::string key = "tensor_" + std::to_string(idx);
-                if (auto ppAttr = ppMap.getAs<IntegerAttr>(key))
-                    ppDepth = ppAttr.getInt();
-            }
+            const routing::TensorRoutingInfo *info =
+                routing::lookupTensorRoutingInfo(tensorInfo, static_cast<int>(&tp - &tensors[0]));
+            if (info && info->ppDepth)
+                ppDepth = static_cast<int>(*info->ppDepth);
             uint32_t bufSize = (maxPingPongBytes > 0) ? maxPingPongBytes : 4096;
             totalBufferBytes += ppDepth * bufSize;
         }

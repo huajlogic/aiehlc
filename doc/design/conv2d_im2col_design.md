@@ -1,5 +1,7 @@
 # Conv2d Im2col Design for AIEHLC
 
+> **Attribute names superseded (2026-10-27).** The `routing.tile_*` / `*_k` / `*_rounds`, `routing.spatial_*`, `routing.pp_depth_map` and `tensor_N.*` **module** attributes named in this document no longer exist: the routing module carries only control switches, and that information is now a typed attribute on the IR op it describes. See [routing_ir_tiling_carriers.md](routing_ir_tiling_carriers.md).
+
 ## Overview
 
 This document describes how to add Conv2d support to the AIEHLC tilinglinalg pipeline by using the **im2col** (image-to-column) transformation to convert convolution into matrix multiplication (GEMM), then leveraging the existing GEMM pipeline with **DMA-accelerated im2col** via AIE multi-dimensional BD addressing.

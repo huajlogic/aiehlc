@@ -36,6 +36,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
@@ -95,6 +96,62 @@ struct GemmTilingScalars {
 // routing.fullconnect_auto==1; otherwise returns {found=false} so callers fall
 // back to the flat module attrs.
 GemmTilingScalars readGemmTilingScalars(mlir::ModuleOp moduleOp);
+
+// ---------------------------------------------------------------------------
+// Per-tensor routing descriptors, carried by the op that declares the tensor
+// (no longer `tensor_N.*` module attributes):
+//   routing.routingcreatescheduletensor  -- inherent attrs halo/shim_dma/
+//                                           layout_transform/pp_depth
+//   dfscheblueprint.declare_data         -- the same values, copied by
+//                                           DmaphopTodfscheblueprintPass under
+//                                           the `routing.`-prefixed names below
+// Keyed by func-arg index, the canonical tensor index every pass resolves.
+// ---------------------------------------------------------------------------
+inline constexpr llvm::StringLiteral kDeclHaloAttr = "routing.halo";
+inline constexpr llvm::StringLiteral kDeclShimDmaAttr = "routing.shim_dma";
+inline constexpr llvm::StringLiteral kDeclLayoutTransformAttr = "routing.layout_transform";
+inline constexpr llvm::StringLiteral kDeclPpDepthAttr = "routing.pp_depth";
+// Kernel round schedule on the routing func.func (see KernelTilingAttr).
+inline constexpr llvm::StringLiteral kKernelTilingAttr = "routing.kernel_tiling";
+
+struct TensorRoutingInfo {
+    HaloAttr halo;                   // null: not a spatial-halo tensor
+    ShimDmaAttr shimDma;             // null: no user DmaTransform
+    llvm::StringRef layoutTransform; // "" when unset
+    std::optional<int64_t> ppDepth;  // unset when absent
+};
+using TensorRoutingInfoMap = llvm::DenseMap<int, TensorRoutingInfo>;
+
+// Walk the module's tensor-declaring ops and collect their descriptors. Call it
+// at pass entry: conversions erase the declaring op.
+TensorRoutingInfoMap collectTensorRoutingInfo(mlir::ModuleOp moduleOp);
+// Descriptor of func arg `argIdx`, or nullptr.
+const TensorRoutingInfo *lookupTensorRoutingInfo(const TensorRoutingInfoMap &map, int argIdx);
+// The map's func-arg indices in ascending order (DenseMap order is unstable).
+llvm::SmallVector<int> sortedTensorIndices(const TensorRoutingInfoMap &map);
+// The halo of func arg `argIdx`, or null.
+HaloAttr lookupHalo(const TensorRoutingInfoMap &map, int argIdx);
+// The kernel's contiguous halo slab size (HaloAttr buf_size of the halo tensor),
+// 0 when the kernel has no halo input.
+int64_t spatialHaloBufSize(const TensorRoutingInfoMap &map);
+// Record the kernel's contiguous halo slab size on every halo tensor's
+// #routing.halo (buf_size). Returns how many tensors were updated.
+int setHaloBufSize(mlir::ModuleOp moduleOp, int64_t bufSize);
+// Copy a createscheduletensor's descriptors onto the op that replaces it.
+void copyTensorRoutingInfo(routing::createscheduletensor from, mlir::Operation *to);
+
+// The routing func's #routing.kernel_tiling (all-zero attr when absent, so
+// callers read 0 exactly as for a missing module attr).
+KernelTilingAttr readKernelTiling(mlir::ModuleOp moduleOp);
+// Named fields of a #routing.kernel_tiling; 0 = leave unchanged / not set.
+struct KernelTilingFields {
+    int64_t tileM = 0, tileRows = 0, mRounds = 0;
+    int64_t tileN = 0, tileCols = 0, nRounds = 0;
+    int64_t effectiveK = 0, fullK = 0, kRounds = 0;
+    int64_t outRounds = 0;
+};
+// Merge `fields` into the routing func's kernel_tiling (non-zero fields win).
+void mergeKernelTiling(mlir::ModuleOp moduleOp, const KernelTilingFields &fields);
 } // namespace routing
 
 class routingmanager{

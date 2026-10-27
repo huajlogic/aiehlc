@@ -137,12 +137,26 @@ def routing_createhwmesh :routingop<"routingcreatehwmesh"> {
 def routing_createscheduletensor :routingop<"routingcreatescheduletensor"> {
 	let summary = "createscheduletensor";
 	let cppNamespace = "routing";
-	let description = "create a schedule tensor with initial data";
+	let description = [{
+		create a schedule tensor with initial data. The optional attributes
+		describe how THIS tensor is moved (they used to be `tensor_N.*` module
+		attributes keyed by func-arg index):
+		  halo             -- spatial-halo slab descriptor (#routing.halo)
+		  shim_dma         -- user DmaTransform for the shim BD (#routing.shim_dma)
+		  layout_transform -- "dma_shuffle" | "core_shuffle"
+		  pp_depth         -- core buffer ping-pong depth
+		DmaphopTodfscheblueprintPass copies them onto the
+		dfscheblueprint.declare_data that replaces this op, prefixed `routing.`.
+	}];
 
 	let arguments = (ins
 		AnyTensor:$init_tensor,
 		I64ArrayAttr:$shape,
-		I64Attr:$dim
+		I64Attr:$dim,
+		OptionalAttr<HaloAttr>:$halo,
+		OptionalAttr<ShimDmaAttr>:$shim_dma,
+		OptionalAttr<StrAttr>:$layout_transform,
+		OptionalAttr<I64Attr>:$pp_depth
 		);
 
 	let results = (outs

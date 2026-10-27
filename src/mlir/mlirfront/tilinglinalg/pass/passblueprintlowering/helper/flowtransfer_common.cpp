@@ -365,34 +365,20 @@ bool isNOuterPolicy(ModuleOp moduleOp) {
     return false; // default: m_outer_n_inner
 }
 
-// Scan moduleOp attrs for a conv width-split halo. Returns {valid=false} otherwise.
-// The width-split halo is announced by any "tensor_N.halo" dict carrying w_rounds>1,
-// gated on routing.spatial_halo_buf_size>0.
-ConvHaloGeom detectConvHalo(ModuleOp moduleOp) {
+// Find a conv width-split halo among the per-tensor descriptors: the first
+// tensor (ascending func-arg index) whose #routing.halo has w_rounds>1, gated on
+// a non-zero halo slab size. Returns {valid=false} otherwise.
+ConvHaloGeom detectConvHalo(const routing::TensorRoutingInfoMap &tensorInfo) {
     ConvHaloGeom g;
-    if (!moduleOp)
+    if (routing::spatialHaloBufSize(tensorInfo) <= 0)
         return g;
-    int64_t convBufSize = 0;
-    if (auto b = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_halo_buf_size"))
-        convBufSize = b.getInt();
-    if (convBufSize <= 0)
-        return g;
-    for (const NamedAttribute &na : moduleOp->getAttrs()) {
-        if (!na.getName().getValue().ends_with(".halo"))
-            continue;
-        auto hd = dyn_cast<DictionaryAttr>(na.getValue());
-        if (!hd)
-            continue;
-        auto wr = hd.getAs<IntegerAttr>("w_rounds");
-        auto ot = hd.getAs<IntegerAttr>("ow_t");
-        if (wr && wr.getInt() > 1 && ot) {
+    for (int idx : routing::sortedTensorIndices(tensorInfo)) {
+        routing::HaloAttr hd = tensorInfo.lookup(idx).halo;
+        if (hd && hd.getWRounds() > 1) {
             g.valid = true;
-            g.wRounds = wr.getInt();
-            g.owT = ot.getInt();
-            if (auto l2 = hd.getAs<IntegerAttr>("l2_rounds"))
-                g.l2Rounds = l2.getInt();
-            if (g.l2Rounds < 1)
-                g.l2Rounds = 1;
+            g.wRounds = hd.getWRounds();
+            g.owT = hd.getOwT();
+            g.l2Rounds = hd.getL2Rounds() < 1 ? 1 : hd.getL2Rounds();
             break;
         }
     }
@@ -423,7 +409,7 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     // routing.tile_m/tile_rows, so ALL geometry (tileM, mRounds, iter) is derived
     // from the halo attrs. Each core produces an [oh_per_row, OW_T, OC_PER_G] tile
     // scattered into the full [OH, OW, OC] image, across wRounds L->R x l2Rounds T->B.
-    ConvHaloGeom halo = detectConvHalo(moduleOp);
+    ConvHaloGeom halo = detectConvHalo(passState.tensorInfo);
     if (halo.valid && memrefType.getRank() == 3) {
         // === 3D conv output, channel-split (LtoR_Merge) ===
         // Generic gather descriptor: honor the DECLARED dim order in the
@@ -557,9 +543,8 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
             for (int64_t d = 0; d < memrefType.getRank(); ++d)
                 perCoreElems *= memrefType.getDimSize(d);
             int64_t outRounds = wRounds * hChunks;
-            if (auto orAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds"))
-                if (orAttr.getInt() > 0)
-                    outRounds = orAttr.getInt();
+            if (passState.kernelTiling && passState.kernelTiling.getOutRounds() > 0)
+                outRounds = passState.kernelTiling.getOutRounds();
             int64_t slabElems = (outRounds > 0) ? (perCoreElems / outRounds) : perCoreElems;
             int64_t colElems = owT * cPerCore;
             ohPerRow = (colElems > 0) ? (slabElems / colElems) : 1;
@@ -616,9 +601,8 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
             totalElems *= memrefType.getDimSize(d);
         int64_t perCoreElems = (numCoreTiles > 0) ? (totalElems / numCoreTiles) : totalElems;
         int64_t outRounds = haloWRounds * hChunks; // = spatial_out_rounds
-        if (auto orAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds"))
-            if (orAttr.getInt() > 0)
-                outRounds = orAttr.getInt();
+        if (passState.kernelTiling && passState.kernelTiling.getOutRounds() > 0)
+            outRounds = passState.kernelTiling.getOutRounds();
         int64_t slabElems = (outRounds > 0) ? (perCoreElems / outRounds) : perCoreElems;
         int64_t colElems = haloOwT * tileN_sub; // OW_T columns * OC-per-group
         int64_t ohPerRow = (colElems > 0) ? (slabElems / colElems) : 1;
