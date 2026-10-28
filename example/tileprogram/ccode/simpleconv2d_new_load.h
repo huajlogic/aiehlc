@@ -66,6 +66,9 @@
 // HW mesh dimensions
 #define HW_ROWS 4
 #define HW_COLS 4
+// Mesh extents the Mapping splits output axes across (aie::split(axis, MESH_ROW)).
+#define MESH_ROW HW_ROWS
+#define MESH_COL HW_COLS
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Host-side im2col (for verification only — on HW this is done by DMA)

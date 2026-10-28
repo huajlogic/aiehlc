@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 #include "tilinglinalg_pipeline.h"
+#include "aiehlc_opmodel.h"
 
 #include "dmaptodmaphop.h"
 #include "hw/ResourceManager.h"
@@ -229,6 +230,47 @@ static std::string setupPipelineIRDir(const std::string &subdir) {
     }
     std::cout << "IR output directory: " << dir << std::endl;
     return dir;
+}
+
+// Block-load convention (aie_block_io.h) in a __global__(op, map) kernel body:
+//   aie::load_buffer(P, off, shape)  -> aiehlc_load_buffer(P, aiehlc_desc_P, aiehlc_cur_P, pid0, pid1, off, shape)
+//   aie::store_buffer(P, off, shape) -> aiehlc_store_buffer(...)  (same extra arguments)
+//   aie::release(P) / aie::commit(P) -> aiehlc_release(P) / aiehlc_commit(P)
+//   aie::program_id(0|1)             -> this core's mesh row / col, from get_coreid()
+// coreRowBase / coreColBase are the absolute array row / column of mesh (0, 0)
+// (from the dmaphop placement); -1 leaves program_id unresolved, so a missing
+// placement is a kernel compile error rather than a silently wrong id.
+static std::string resolveBlockIoBuiltins(const std::string &body, int coreRowBase, int coreColBase) {
+    std::string out = body;
+    auto replaceAll = [&out](const std::string &from, const std::string &to) {
+        for (size_t pos = 0; (pos = out.find(from, pos)) != std::string::npos; pos += to.size())
+            out.replace(pos, from.size(), to);
+    };
+    for (const char *fn : {"load_buffer", "store_buffer"}) {
+        const std::string from = std::string("aie::") + fn + "(";
+        for (size_t pos = 0; (pos = out.find(from, pos)) != std::string::npos;) {
+            size_t argStart = pos + from.size();
+            size_t comma = out.find(',', argStart);
+            if (comma == std::string::npos)
+                break;
+            std::string port = out.substr(argStart, comma - argStart);
+            while (!port.empty() && std::isspace((unsigned char)port.front()))
+                port.erase(0, 1);
+            while (!port.empty() && std::isspace((unsigned char)port.back()))
+                port.pop_back();
+            std::string to = std::string("aiehlc_") + fn + "(" + port + ", aiehlc_desc_" + port + ", aiehlc_cur_" +
+                             port + ", aie::program_id(0), aie::program_id(1)";
+            out.replace(pos, comma - pos, to);
+            pos += to.size();
+        }
+    }
+    replaceAll("aie::release(", "aiehlc_release(");
+    replaceAll("aie::commit(", "aiehlc_commit(");
+    if (coreRowBase >= 0)
+        replaceAll("aie::program_id(0)", "((int)(get_coreid() & 0x1F) - " + std::to_string(coreRowBase) + ")");
+    if (coreColBase >= 0)
+        replaceAll("aie::program_id(1)", "((int)(get_coreid() >> 16) - " + std::to_string(coreColBase) + ")");
+    return out;
 }
 
 // Resolve IR-sourced builtin calls `<fnName>(<dim>, <portvar>)` in the kernel body
@@ -746,6 +788,21 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
         return false;
+    // Where mesh (0, 0) landed, for aie::program_id in the kernel body: the lowest
+    // core tile row / column of the placement (columns are partition-relative).
+    int coreRowBase = -1, coreColBase = -1;
+    module.walk([&](mlir::Operation *op) {
+        if (op->getName().getStringRef() != "dmaphop.tile")
+            return;
+        auto type = op->getAttrOfType<mlir::StringAttr>("tiletype");
+        auto col = op->getAttrOfType<mlir::IntegerAttr>("col");
+        auto row = op->getAttrOfType<mlir::IntegerAttr>("row");
+        if (!type || type.getValue() != "core" || !col || !row)
+            return;
+        int absCol = (int)col.getInt() + (partStartCol >= 0 ? partStartCol : 0);
+        coreRowBase = coreRowBase < 0 ? (int)row.getInt() : std::min(coreRowBase, (int)row.getInt());
+        coreColBase = coreColBase < 0 ? absCol : std::min(coreColBase, absCol);
+    });
     if (reserveControlPlane)
         finalizeControlPlacement(module, rtopology.getRM(), dataStartCol, ctrlPlacement);
 
@@ -1258,6 +1315,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "  tile_dim d3;\n";
             stream << "  tile_dim d4;\n";
             stream << "};\n";
+            // Op + mapping model types, so a __global__(op, map) source's
+            // constexpr aie::Conv2d / aie::Mapping definitions compile here too.
+            stream << aiehlc_opmodel::opModelPrelude();
             // Conv2dSpace — policy + conv iteration space; ih/iw carry the
             // EXACT input spatial dims (OH/OW derived via forward conv).
             // (0 policy,1 ih,2 iw,3 ic,4 oc,5 kh,6 kw,7 stride,8 pad,9 m).
@@ -1726,6 +1786,7 @@ after_host_emit:
                                                                   portVarNames, perTensorTiling);
             resolvedKernelBody = resolveArgDimBuiltin(resolvedKernelBody, "aie::get_arg_total_rounds_in_dim",
                                                       portVarNames, perTensorRounds);
+            resolvedKernelBody = resolveBlockIoBuiltins(resolvedKernelBody, coreRowBase, coreColBase);
             stream << "// User-provided compute kernel (extracted from __global__ function)\n";
             stream << resolvedKernelBody << "\n";
             std::cout << "Compute kernel (user-provided) written to " << computePath << std::endl;

@@ -41,6 +41,7 @@
 #include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
 #include "routingmanager.h"
+#include "aiehlc_opmodel.h"
 
 class AieFrontEnd;
 
@@ -245,6 +246,71 @@ static std::string userKernelPrologue;
 
 using namespace clang;
 using namespace clang::tooling;
+
+// The "{...}" initializer of an evaluated constexpr value (structs, arrays,
+// integers/enums) -- how an op/mapping value is carried into the kernel TU,
+// which cannot see the host-side declarations.
+static std::string apvalueInit(const clang::APValue &v) {
+    if (v.isInt())
+        return std::to_string(v.getInt().getExtValue());
+    std::string s = "{";
+    if (v.isStruct()) {
+        for (unsigned i = 0; i < v.getStructNumFields(); ++i)
+            s += (i ? ", " : "") + apvalueInit(v.getStructField(i));
+    } else if (v.isArray()) {
+        for (unsigned i = 0; i < v.getArraySize(); ++i) {
+            const clang::APValue &e =
+                i < v.getArrayInitializedElts() ? v.getArrayInitializedElt(i) : v.getArrayFiller();
+            s += (i ? ", " : "") + apvalueInit(e);
+        }
+    }
+    return s + "}";
+}
+
+// The evaluated initializer of the file-scope constexpr `name` of record type
+// `record` (e.g. "Conv2d"), or "" when it is missing or of another type.
+static std::string constexprInit(clang::ASTContext *ctx, const std::string &name, const std::string &record) {
+    if (!ctx)
+        return "";
+    for (auto *d : ctx->getTranslationUnitDecl()->decls()) {
+        auto *vd = clang::dyn_cast<clang::VarDecl>(d);
+        if (!vd || vd->getName() != name)
+            continue;
+        auto *rd = vd->getType()->getAsCXXRecordDecl();
+        if (!rd || rd->getName() != record)
+            return "";
+        const clang::APValue *v = vd->getEvaluatedValue();
+        if (!v) {
+            vd->evaluateValue();
+            v = vd->getEvaluatedValue();
+        }
+        return v ? apvalueInit(*v) : "";
+    }
+    return "";
+}
+
+// __global__(op, map): the kernel-TU declarations an "aieop:" / "aieview:" /
+// "aieblk:" annotation asks for -- the op as a literal struct (the body reads
+// conv.kh), the mapping's block sizes (map.oh_t), and each port's block
+// descriptor for the aie::load_buffer/store_buffer check. Empty when the
+// referenced value is not of the expected type.
+static std::string opDeclForKernel(clang::ASTContext *ctx, const std::string &annotation) {
+    if (annotation.rfind("aieop:", 0) == 0) {
+        std::string var = annotation.substr(6), init = constexprInit(ctx, var, "Conv2d");
+        return init.empty() ? "" : aiehlc_opmodel::kernelOpDecl(var, init);
+    }
+    if (annotation.rfind("aieview:", 0) == 0) {
+        std::string var = annotation.substr(8);
+        std::string init = constexprInit(ctx, aiehlc_opmodel::kernelViewVar(var), "KernelView");
+        return init.empty() ? "" : aiehlc_opmodel::kernelViewDecl(var, init);
+    }
+    if (annotation.rfind("aieblk:", 0) == 0) {
+        std::string port = annotation.substr(7);
+        std::string init = constexprInit(ctx, aiehlc_opmodel::blockDescVar(port), "BlockDesc");
+        return init.empty() ? "" : aiehlc_opmodel::kernelBlockDescDecl(port, init);
+    }
+    return "";
+}
 
 // Populate SplitModel.tensorSplits[i].gemmTiling for the even-mesh GEMM path
 // (fullconnect_auto=1) from the derived M/N/K tiling. Each tensor gets one
@@ -659,6 +725,36 @@ public:
                                 llvm::outs()
                                     << "[TilingLinalg] kernel " << kernelName << " fullconnect_auto=" << (fca ? 1 : 0)
                                     << (found ? " (from " + wantName + ")" : " (default)") << "\n";
+                            }
+
+                            // __global__(op, map): carry the op, the mapping's block sizes and
+                            // the per-port block descriptors into the kernel TU (after the
+                            // aie_block_io.h types they use).
+                            {
+                                std::vector<std::string> opAnnos;
+                                for (auto attr2 : f->attrs())
+                                    if (auto anno2 = clang::dyn_cast<clang::AnnotateAttr>(attr2)) {
+                                        std::string a = anno2->getAnnotation().str();
+                                        if (a.rfind("aieop:", 0) == 0 || a.rfind("aieview:", 0) == 0 ||
+                                            a.rfind("aieblk:", 0) == 0)
+                                            opAnnos.push_back(a);
+                                    }
+                                auto addKernelDecl = [](const std::string &decl) {
+                                    if (std::find(userMacroDefines.begin(), userMacroDefines.end(), decl) ==
+                                        userMacroDefines.end())
+                                        userMacroDefines.push_back(decl);
+                                };
+                                if (!opAnnos.empty())
+                                    addKernelDecl("#include \"aie_block_io.h\"");
+                                for (const std::string &a : opAnnos) {
+                                    std::string decl = opDeclForKernel(Context, a);
+                                    if (decl.empty())
+                                        llvm::errs() << "[aiehlc] WARNING: __global__ " << a
+                                                     << " does not name a constexpr of the expected aie:: type; the "
+                                                        "kernel cannot read it\n";
+                                    else
+                                        addKernelDecl(decl);
+                                }
                             }
 
                             // std::cout << "find global " << f->getNameInfo().getName().getAsString() << std::endl;
@@ -4019,8 +4115,36 @@ public:
                                             policyVar = policyVar.substr(s, e - s + 1);
                                         else
                                             policyVar.clear();
+                                        std::string opVar, mapVar, opPrefix, opAnnotations;
+                                        if (aiehlc_opmodel::parseOpBinding(policyVar, opVar, mapVar)) {
+                                            // __global__(op, map): the ports' aie::IFM/WEIGHTS/OFM
+                                            // tags become aie::derive(role, op, map) GemmSpaces, and
+                                            // a synthesized GlobalPolicy carries the policy.
+                                            size_t bodyBrace = SourceCodeString.find("{", closeParen);
+                                            std::vector<std::pair<std::string, std::string>> ports;
+                                            if (bodyBrace != std::string::npos) {
+                                                std::string params =
+                                                    SourceCodeString.substr(closeParen + 1, bodyBrace - closeParen - 1);
+                                                ports = aiehlc_opmodel::parsePortRoles(params);
+                                                SourceCodeString.replace(
+                                                    closeParen + 1, params.size(),
+                                                    aiehlc_opmodel::rewriteRoleTags(params, opVar, mapVar));
+                                            }
+                                            policyVar = aiehlc_opmodel::opPolicyVar(opVar, mapVar);
+                                            opPrefix = aiehlc_opmodel::opSynthesizedDecls(opVar, mapVar, ports);
+                                            for (const auto &p : ports)
+                                                opAnnotations +=
+                                                    " __attribute__((annotate(\"aieblk:" + p.first + "\")))";
+                                            opAnnotations += " __attribute__((annotate(\"aieview:" + mapVar + "\")))";
+                                            llvm::outs() << "[aiehlc] __global__(" << opVar << ", " << mapVar
+                                                         << "): op + mapping kernel\n";
+                                        }
                                         std::string fullReplacement =
-                                            Replacement + " __attribute__((annotate(\"aiepolicy:" + policyVar + "\")))";
+                                            opPrefix + Replacement +
+                                            " __attribute__((annotate(\"aiepolicy:" + policyVar + "\")))" +
+                                            (opVar.empty() ? std::string()
+                                                           : " __attribute__((annotate(\"aieop:" + opVar + "\")))" +
+                                                                 opAnnotations);
                                         size_t spanLen = (closeParen + 1) - KeywordPos;
                                         SourceCodeString.replace(KeywordPos, spanLen, fullReplacement);
                                         KeywordPos += fullReplacement.size();
@@ -4252,6 +4376,9 @@ public:
                     ret += "  tile_dim d3;\n";
                     ret += "  tile_dim d4;\n";
                     ret += "};\n";
+                    // Op + mapping model (__global__(op, map)): aie::Conv2d,
+                    // aie::Mapping and the constexpr GemmSpace derivation.
+                    ret += aiehlc_opmodel::opModelPrelude();
                     // Conv2dSpace — composes a SpatialPolicy with the conv iteration
                     // space. Field order is contractual: 0 policy, 1 ih, 2 iw,
                     // 3 ic, 4 oc, 5 kh, 6 kw, 7 stride, 8 pad, 9 m. ih/iw carry the
@@ -5070,6 +5197,7 @@ public:
                     stream << "  tile_dim d3;\n";
                     stream << "  tile_dim d4;\n";
                     stream << "};\n";
+                    stream << aiehlc_opmodel::opModelPrelude();
                     // Conv2dSpace — policy + conv iteration space; ih/iw carry the
                     // EXACT input spatial dims (OH/OW derived via forward conv).
                     // (0 policy,1 ih,2 iw,3 ic,4 oc,5 kh,6 kw,7 stride,8 pad,9 m).

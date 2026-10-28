@@ -1,0 +1,276 @@
+# Op + mapping programming model: `__global__(op, map)`
+
+A kernel declares **what it computes** (the operator) and **how it is mapped**
+onto the array (space split, per-core time tiles, hints). Each port names only
+its **data role**. The compiler derives every per-port DMA descriptor.
+
+```cpp
+constexpr aie::Conv2d conv = {.h = 224, .w = 224, .c = 3, .k = 64, .kh = 7, .kw = 7, .stride = 2, .pad = 3};
+constexpr aie::Mapping map = {
+    .space = {aie::split(aie::OH, MESH_ROW), aie::split(aie::OC, MESH_COL)},
+    .time  = {aie::tile(aie::OH, 7), aie::tile(aie::OW, 28)},
+    .hints = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::Dma, .pp_depth = 2,
+              .l1_budget = aie::Bytes{4096}}};
+
+__global__(conv, map) void conv2d_spatial(aie::port<input_window_int8 *, aie::IFM> win_a,
+                                          aie::port<input_window_int8 *, aie::WEIGHTS> win_b,
+                                          aie::port<output_window_int8 *, aie::OFM> win_c) {
+    const int kh = conv.kh, kw = conv.kw, s = conv.stride;          // the op
+    const int c  = aie::get_arg_per_round_size_in_dim(2, win_a);    // what the port loads
+    const int oh_t = aie::get_arg_per_round_size_in_dim(0, win_c);  //   per round
+    ...
+```
+
+`example/tileprogram/ccode/simpleconv2d_new_load.cc` is this model; `simpleconv2d.cc`
+is the same conv written against the per-port model (three hand-computed
+`GemmSpace` descriptors and 28 kernel-visible `#define`s). Both produce **byte-identical** IR (all 28 `ir/dfschedule` +
+`ir/simplerouting` dumps), `kernel.cc`, `routing.cc`, bcf, prx and the host DMA
+program (`host_canonicalized`).
+
+## 1. What is implemented (frontend desugaring)
+
+The model lowers onto the existing per-port path; nothing after the AST changes.
+
+| Piece | Where | What it does |
+|---|---|---|
+| `aie::Conv2d`, `aie::Mapping`, `split`, `tile`, `Axis`, `Role` | `aiehlc_opmodel.h` → `opModelPrelude()` | emitted into all three `aie::` preludes (frontend parse, `aiehlc.cc` stubs, pipeline host stubs) |
+| `aie::derive(role, op, map)` | same, `constexpr` | computes the role's `GemmSpace`: IFM = overlapping halo slabs over mesh rows + on-core OH/OW rounds; WEIGHTS = OC split over mesh cols; OFM = tiled gather |
+| `aie::derive_policy(op, map)` | same | `GlobalPolicy{fullconnect_auto = 0}` |
+| validation | `mapping_check` in `derive` | a mapping the derivation cannot honor (`OH % n`, `rows % t`, `OW % t`, `K % n`) is a **compile error at the port**, with the reason as the note |
+| `__global__(conv, map)` rewrite | `aiehlc.cc` text rewrite | port tags `aie::IFM` → `aie::derive(aie::IFM, conv, map)` (a C++20 class NTTP, read through the existing `APValue` port parser); a synthesized `constexpr aie::GlobalPolicy __aie_policy_conv_map`; `annotate("aieop:conv")` |
+| op visible in the kernel | `opDeclForKernel` (`aiehlc.cc`) | evaluates `conv` and emits `static constexpr aiehlc_conv2d_t conv = {224, ...}` into the kernel TU (outside `namespace aie`, which the AIE API owns there) |
+
+The kernel reads *operator* constants from `conv` and *loaded-data* geometry
+from its ports (`get_arg_per_round_size_in_dim`, resolved to literals from the
+derived `#routing.tiling`). It no longer needs any mirrored `#define`.
+
+## 2. Compiler design for native support
+
+The desugaring proves the model but keeps its knowledge in C++ `constexpr`
+strings. Native support moves it into the compiler, in steps that each keep the
+generated code byte-identical on the existing examples.
+
+### Step A — done: desugar to `GemmSpace` (this change)
+
+Zero backend change; the validation is a C++ constant-evaluation failure.
+
+### Step B — the op and the mapping become IR
+
+```mlir
+func.func @main(...) attributes {
+    routing.op      = #routing.conv2d<h = 224, w = 224, c = 3, k = 64, kh = 7, kw = 7, stride = 2, pad = 3>,
+    routing.mapping = #routing.mapping<space = [#routing.split<oh, mesh_rows>, #routing.split<oc, mesh_cols>],
+                                       time  = [#routing.tile<oh, 7>, #routing.tile<ow, 28>],
+                                       pp_depth = 2, l1_budget = 4096>}
+```
+
+- `aiehlc.cc` reads `conv`/`map` (as it reads `GemmSpace` today) and attaches
+  them to the routing func instead of deriving per-port spaces.
+- A new **`OpMappingToTilingPass`** (first pass of `runPipeline`) owns the
+  derivation in C++: it writes the `#routing.tiling` on each `partitiontensor`,
+  the `#routing.halo` on each `routingcreatescheduletensor`, and
+  `#routing.kernel_tiling` — the carriers of
+  [routing_ir_tiling_carriers.md](routing_ir_tiling_carriers.md). Everything
+  downstream is untouched.
+- Roles bind by **SSA position**, not by tags in a type: the launch
+  `k<<<mesh>>>(input, filter, output)` gives func args 0..2 and the kernel
+  signature gives their roles.
+- `mesh_rows` / `mesh_cols` are symbolic and bound from the launch mesh
+  (`device.partition(..., HW_ROWS, HW_COLS)`), so `MESH_ROW` stops being a
+  user macro that must agree with the launch.
+
+Why a pass and not `constexpr`: real diagnostics (MLIR `emitError` with the
+op/mapping values), the L1 budget check needs the element type and pp depth,
+and autotuning (Step C) needs search, not a closed formula.
+
+### Step C — defaults and autotune
+
+`time` is optional (`// optional: omit -> autotune under l1_budget`). Today an
+omitted tile defaults to "the whole per-core extent", which overflows L1 for
+this conv. The pass enumerates `(oh_t, ow_t)` divisors, prices each with
+`slab_bytes(ih_t, iw_t, c) * pp_depth + out_bytes * pp_depth + weights` against
+`l1_budget`, and picks the largest fitting tile (fewest rounds = fewest BD
+re-arms; cf. `doc/performance/register_write_cost.md`). The choice is printed
+and recorded in `#routing.kernel_tiling`, so it is reproducible.
+
+### Step D — more operators
+
+Each operator is one derivation rule set behind the same `Mapping`:
+
+| op | IFM | WEIGHTS | OFM |
+|---|---|---|---|
+| `Conv2d` (done) | halo slabs | OC split | tiled gather |
+| `Gemm` | M split (row broadcast) | N split (col broadcast) | M×N gather — today's `RowBC`/`ColBC` |
+| `DepthwiseConv2d` | halo slabs, C split | C split | tiled gather |
+| `Pool2d` | halo slabs | — | tiled gather |
+| `Eltwise` | aligned split | — | aligned split |
+
+### Step E — a typed kernel view
+
+Replace string-resolved builtins with a generated per-kernel struct, e.g.
+`conv2d_spatial_geom::ifm.round_shape`, emitted into the kernel TU next to the
+op. The kernel then cannot ask for a dim that does not exist, and a layout
+change is a compile error instead of a silent wrong index.
+
+`GemmSpace` ports remain as the **escape hatch** for mappings the rules do not
+cover; a kernel uses one model or the other.
+
+## 3. Evaluation
+
+**It makes sense, and it is the right level for a user-written AIE kernel** —
+on the condition that the compiler owns validation and the buffer-layout
+contract. Measured on this conv:
+
+| | per-port `GemmSpace` (`simpleconv2d.cc`) | op + mapping (`simpleconv2d_new_load.cc`) |
+|---|---|---|
+| mapping description | 3 hand-derived descriptors (62 lines: halo 61/56, rounds 19/14/4, width 61/56/4, padded 230...) | 2 `split` + 2 `tile` |
+| kernel-side geometry | 28 `#define`s, mirrored by hand so the kernel TU sees them | none; read from `conv` and the ports |
+| change `ow_t` 28 → 14 | `OW_T`, `RowBC_spatial.d2.tile_round`, and `tile_round`/`tile_size`/`stride` of `LtoR_Merge.d2` | `tile(OW, 14)` |
+| a bad split | runs and produces wrong data | compile error naming the constraint |
+| generated host/kernel/routing | — | byte-identical |
+
+What it gets right:
+
+- **One source of truth.** The halo numbers are consequences of
+  `(conv, map)`; writing them by hand is where bugs come from. The `230 / 4`
+  edit to this file is exactly that bug in the new syntax: the padded DDR
+  layout was written into the *operator*, which would pad twice (OH 115). The
+  model makes the distinction explicit — the op is the math, the layout is
+  derived — and the derivation can now check it.
+- **Ports declare data, not DMA.** "This port loads the IFM" is what the
+  kernel author knows; how many BD dims it takes is what the compiler knows.
+- **Mapping is a separate, swappable decision** — the property that makes
+  autotuning and per-target mappings possible (as in Triton's block sizes,
+  IREE/AIR tiling, MLIR-AIE ObjectFIFOs).
+
+Where it is weak, and what to do about it:
+
+1. **The kernel body still bakes in a layout.** It indexes the slab as HWC
+   (`slab[ih * raw_wc + iw * c + ch]`), the filter as `B^T [oc][kh][kw][c]`,
+   and writes HWC output. Nothing ties that to what `derive` produces. Make the
+   role carry the layout (`aie::IFM` ≡ `[ih_t][iw_t][c_align]` row-major per
+   round) and generate the kernel view (Step E); otherwise a derivation change
+   is a silent wrong-index bug.
+2. **Hints can lie.** `im2col = Im2col::Dma` is ignored on the halo path — this
+   kernel does im2col on the core. Hints that a rule does not consume should be
+   rejected, not ignored.
+3. **`MESH_ROW` is a macro that must match the launch mesh** — fixed by Step B.
+4. **Coverage is one operator.** Conv2d with an OH×OC split only; other ops or
+   splits (e.g. OW across mesh cols, IC accumulation) need rules (Step D).
+   Until then `GemmSpace` stays available.
+5. **Less low-level control** than hand-written descriptors — acceptable
+   because the escape hatch stays, and the generated descriptors are visible in
+   `ir/dfschedule/0_initial.mlir`.
+6. **Accumulator width is the kernel's** (`int16_t sum` here, which wraps on
+   real data — see `conv2dstem.cc`, peak 1,023,225). The op does not carry
+   dtypes yet; adding `in/weight/acc/out` dtypes to the op would let the
+   compiler flag it.
+
+**Recommendation:** adopt it as the default way to write single-op kernels,
+proceed with Step B (op/mapping in IR + `OpMappingToTilingPass`) next — it is
+where the remaining weaknesses (diagnostics, mesh binding, autotune, layout
+contract) get fixed — and keep `GemmSpace` as the expert escape hatch.
+
+## 4. Triton block-load convention (`aie::load_buffer` / `aie::store_buffer`)
+
+The kernel body of `simpleconv2d_new_load.cc` is written in Triton's style: each
+core computes *where* its blocks are from its program ids and loop indices,
+in **element coordinates of the whole tensor**, and loads/stores them.
+
+```cpp
+const int pid_h = aie::program_id(0), pid_c = aie::program_id(1);  // tl.program_id
+const int8_t *w = aie::load_buffer(win_b, {pid_c * OC_T, 0, 0, 0}, {OC_T, KH, KW, C});
+for (int i = 0; i < map.oh_per_core / OH_T; i++)
+    for (int j = 0; j < map.ow / OW_T; j++) {
+        const int oh0 = pid_h * map.oh_per_core + i * OH_T, ow0 = j * OW_T;
+        const int8_t *x = aie::load_buffer(win_a, {oh0 * S, ow0 * S, 0}, {IH_T, IW_T, C});
+        int8_t *y = aie::store_buffer(win_c, {oh0, ow0, pid_c * OC_T}, {OH_T, OW_T, OC_T});
+        ... compute y from x, w ...
+        aie::release(win_a); aie::commit(win_c);
+    }
+aie::release(win_b);
+```
+
+`map.*` (block sizes) and `conv.*` are compile-time literals in the kernel TU,
+like Triton's `tl.constexpr` block sizes.
+
+### How it is lowered
+
+| Piece | Where |
+|---|---|
+| `aie::BlockDesc` / `aie::block_desc(role, op, map)` — per-port block shape, per-core base (×`program_id`) and per-round steps, from the same `conv_tiles()` arithmetic as the DMA descriptor | `aiehlc_opmodel.h` |
+| `aie::KernelView` / `kernel_view(op, map)` → kernel-side `map` | same |
+| evaluated into the kernel TU as `aiehlc_desc_<port>` + cursor, and `map` | `aiehlc.cc` (`opDeclForKernel`, `apvalueInit`) |
+| `aie::program_id(0/1)` → `get_coreid()` minus the placement's first core row / column | `tilinglinalg_pipeline.cpp` (`resolveBlockIoBuiltins`, from the `dmaphop.tile` placement) |
+| `aie::load_buffer/store_buffer` → acquire the port's next window **and check** that the requested block is the one the DMA delivers next (klog `BLKE`/`BLKW`/`BLKG`); `release/commit` → release the window | `src/mlir/runtime/aie_block_io.h` |
+
+### Verified
+
+- `simpleconv2d_new_load.cc` (Triton form) → all 28 IR dumps, `kernel.cc`,
+  `routing.cc`, bcf, prx and the host DMA program are **byte-identical** to the
+  hand-written `simpleconv2d.cc`.
+- `simpleconv2ddebug/emu_conv2d_spatial.sh aout/worklocal` runs the
+  **generated** kernel on x86 for all 16 cores with windows that serve blocks
+  exactly as the host shim BDs stream them: **802,816 / 802,816** outputs equal
+  the CPU reference, 0 block-check errors. Not yet run on the board.
+- Swapping the `i`/`j` loops: the check reports all 768 out-of-order blocks —
+  and the output is **still bit-correct**, which is the central point below.
+
+### Evaluation: does the Triton convention make sense on AIE?
+
+**As written, the load does not choose the data — the DMA does.** In Triton,
+`tl.load(ptr + offsets)` *is* the memory access. On the AIE the data is
+streamed by DMA in an order fixed at compile time; the core can only take the
+next window. So `aie::load_buffer(win, offset, shape)` is an **assertion about
+what arrives**, not a request — the swapped-loop experiment proves it (wrong
+offsets, right output). That has three consequences:
+
+1. **Without the check, the offsets are dead text.** Any mismatch between what
+   the kernel believes it holds and what it holds is invisible until the kernel
+   uses the offset (boundary handling, per-position bias, debug prints). The
+   check makes them honest — but it is a *runtime* check, visible only with
+   kernel logging (klog is compiled out by default).
+2. **The kernel duplicates the tiling.** The loop bounds and offset formulas
+   restate what `(conv, map)` already fixed. They can only be *right* by
+   agreeing with it; the user-written version showed how easily they don't
+   (row/col swapped, 61·4·230·4 instead of 56·920, step 19 instead of 14, 58
+   instead of 56, increments before use, no reset, output reusing the input
+   offset, comma-operator shapes).
+3. **It cannot express what the DMA cannot deliver.** Random access, a
+   different visiting order, or a block shape the BDs do not produce cannot be
+   honored — only rejected.
+
+**When it does make sense:** if the compiler **derives the DMA from the loads**
+instead of checking them — the real Triton contract. The offsets in this
+kernel are affine in `(program_id, i, j)` with constant shapes, which is
+exactly what a BD is (base + strides × wraps):
+
+| load | affine form | BD |
+|---|---|---|
+| `x` | `(56·p0 + 14·i, 56·j, 0)`, shape `(19, 61, 4)` | base 51520·p0, D0 4 B×61, D1 920×19, D2 224×4 (j), iter 12880×4 (i) |
+| `y` | `(28·p0 + 7·i, 28·j, 16·p1)`, shape `(7, 28, 16)` | gather BD, same round order |
+| `w` | `(16·p1, 0, 0, 0)`, shape `(16, 7, 7, 4)` | one 3136 B BD at 3136·p1 |
+
+That table is the host program the compiler emits today. So a compiler pass
+that extracts the loop nest + affine offsets (the same analysis MLIR-AIE/AIR
+apply to `affine.load`) could *produce* the tiling from the kernel, making
+`map.time` optional and the loads authoritative. Until that exists, the
+convention is a readable, checked restatement of the mapping — useful for
+humans and debugging, but not a second source of truth.
+
+**Recommendation.**
+
+- Keep the **op + mapping** declaration as the source of truth (Sections 1–3).
+- Keep the **Triton block convention** as the kernel's *view* of its data —
+  it is the clearest way to say what a block is — but make it impossible to
+  disagree with the mapping instead of checked at run time:
+  1. near term: resolve the offsets at compile time — the descriptors are
+     constants and `i`/`j` are the round loop, so the compiler can generate the
+     loop and the offsets (`for (auto [i, j, x, y] : aie::blocks(win_a, win_c))`)
+     rather than the user writing them; a hand-written offset becomes a static
+     check;
+  2. longer term: derive the DMA from the kernel's affine loads (above) and drop
+     `map.time` as a separate input.
+- Either way, `aie::program_id` and the tensor-coordinate block shapes are
+  worth keeping: they make a core's footprint explicit and replace raw byte
+  arithmetic, which is where the sketch's bugs came from.
