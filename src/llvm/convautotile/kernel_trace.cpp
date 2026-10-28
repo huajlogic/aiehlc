@@ -8,6 +8,7 @@
 #include "conv_desugar.h"
 
 #include <algorithm>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -206,14 +207,22 @@ struct Port { const char *name; int rank; int dim[4]; int eb; int out; std::dequ
 static FILE *g_out;
 static int g_p0, g_p1, g_rows, g_cols, g_seed, g_pp;
 struct AnyPtr { void *p; template <class T> operator T *() const { return (T *)p; } };
+} // namespace aiehlc_trace
+namespace aie {
+enum class pad_value { none, zero };
+struct load_opts { int reuse = 0; pad_value pad = pad_value::none; };
+} // namespace aie
+namespace aiehlc_trace {
 #define AIEHLC_E(port, ...) do { fprintf(g_out, "E %d %d %s %d ", g_p0, g_p1, (port).name, (port).n); \
     fprintf(g_out, __VA_ARGS__); fputc('\n', g_out); } while (0)
-static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_list<int> shape, int st) {
+static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_list<int> shape, int st,
+                    aie::load_opts opt = {}) {
+    const int pad = opt.pad == aie::pad_value::zero;
     int o[4] = {0, 0, 0, 0}, s[4] = {0, 0, 0, 0}, ro = 0, rs = 0;
     for (int v : off) { if (ro < 4) o[ro] = v; ro++; }
     for (int v : shape) { if (rs < 4) s[rs] = v; rs++; }
-    fprintf(g_out, "%c %d %d %s %d %d %d %d %d %d %d %d %d %d %d\n", st ? 'S' : 'L', g_p0, g_p1, p.name, p.n,
-            ro, rs, o[0], o[1], o[2], o[3], s[0], s[1], s[2], s[3]);
+    fprintf(g_out, "%c %d %d %s %d %d %d %d %d %d %d %d %d %d %d %d %d\n", st ? 'S' : 'L', g_p0, g_p1, p.name, p.n,
+            ro, rs, o[0], o[1], o[2], o[3], s[0], s[1], s[2], s[3], opt.reuse, pad);
     if (st && !p.out) AIEHLC_E(p, "aie::store_buffer on an input port");
     if (!st && p.out) AIEHLC_E(p, "aie::load_buffer on an output port");
     if (ro != p.rank || rs != p.rank)
@@ -221,8 +230,10 @@ static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_li
     long bytes = p.eb;
     for (int d = 0; d < p.rank && d < 4; d++) {
         if (s[d] <= 0) AIEHLC_E(p, "shape dim %d is %d (must be > 0)", d, s[d]);
-        else if (o[d] < 0 || o[d] + s[d] > p.dim[d])
-            AIEHLC_E(p, "block dim %d covers [%d, %d) outside the tensor extent %d", d, o[d], o[d] + s[d], p.dim[d]);
+        else if ((o[d] < 0 || o[d] + s[d] > p.dim[d]) && !pad)
+            AIEHLC_E(p, "block dim %d covers [%d, %d) outside the tensor extent %d%s", d, o[d], o[d] + s[d], p.dim[d],
+                     p.rank == 3 && d < 2 && !p.out && o[d] + s[d] > 0 && o[d] < p.dim[d]
+                         ? " (a conv border? load it with {.pad = aie::pad_value::zero})" : "");
         bytes *= s[d] > 0 ? s[d] : 1;
     }
     if (bytes > 49152) AIEHLC_E(p, "block is %ld B, larger than the core data memory (49152 B)", bytes);
@@ -240,6 +251,7 @@ static void release(Port &p, int st) {
     if (p.live.empty()) { AIEHLC_E(p, "%s without a block held", st ? "aie::commit" : "aie::release"); return; }
     free(p.live.front());
     p.live.pop_front();
+    fprintf(g_out, "R %d %d %s %d\n", g_p0, g_p1, p.name, p.n);
 }
 static void finish(Port &p) {
     if (!p.live.empty())
@@ -250,8 +262,9 @@ static void finish(Port &p) {
 } // namespace aiehlc_trace
 namespace aie {
 using aiehlc_trace::Port;
-inline aiehlc_trace::AnyPtr load_buffer(Port &p, std::initializer_list<int> o, std::initializer_list<int> s) {
-    return aiehlc_trace::block(p, o, s, 0);
+inline aiehlc_trace::AnyPtr load_buffer(Port &p, std::initializer_list<int> o, std::initializer_list<int> s,
+                                        load_opts opt = {}) {
+    return aiehlc_trace::block(p, o, s, 0, opt);
 }
 inline aiehlc_trace::AnyPtr store_buffer(Port &p, std::initializer_list<int> o, std::initializer_list<int> s) {
     return aiehlc_trace::block(p, o, s, 1);
@@ -347,6 +360,7 @@ struct Event {
     int p0 = 0, p1 = 0, n = 0, ro = 0, rs = 0;
     std::string port, msg;
     int off[4] = {0, 0, 0, 0}, shape[4] = {0, 0, 0, 0};
+    int reuse = 0, pad = 0; // load_opts of an L event
 };
 
 std::vector<Event> parseTrace(const std::string &text) {
@@ -360,12 +374,13 @@ std::vector<Event> parseTrace(const std::string &text) {
         if (ev.kind == 'E') {
             std::getline(ls, ev.msg);
             ev.msg = trim(ev.msg);
-        } else {
+        } else if (ev.kind != 'R') {
             ls >> ev.ro >> ev.rs;
             for (int &v : ev.off)
                 ls >> v;
             for (int &v : ev.shape)
                 ls >> v;
+            ls >> ev.reuse >> ev.pad;
         }
         out.push_back(ev);
     }
@@ -729,6 +744,67 @@ KernelTraceResult traceKernel(const std::string &src, const TraceKernel &k, int 
     return r;
 }
 
+KernelTraceResult traceLogical(const std::string &src, const TraceKernel &k, int rows, int cols,
+                               const std::string &prelude, const std::string &srcName, int pp_depth,
+                               std::map<std::string, PortUse> &use) {
+    KernelTraceResult r;
+    std::vector<Event> events;
+    if (!runHarness(buildHarness(src, k, prelude, srcName), srcName, rows, cols, pp_depth, events, r)) {
+        r.ok = false;
+        return r;
+    }
+    collectHarnessErrors(events, r);
+    // Blocks held per (core, port), oldest first, with the store count when taken.
+    std::map<std::string, std::deque<std::pair<const Event *, long>>> held;
+    std::map<std::pair<int, int>, long> stores;
+    std::set<std::string> reuseReported;
+    for (auto &e : events) {
+        const std::string key = std::to_string(e.p0) + "," + std::to_string(e.p1) + "," + e.port;
+        if (e.kind == 'S')
+            stores[{e.p0, e.p1}]++;
+        if (e.kind == 'L' || e.kind == 'S') {
+            held[key].push_back({&e, stores[{e.p0, e.p1}]});
+            const TracePort *tp = nullptr;
+            for (auto &p : k.ports)
+                if (p.var == e.port)
+                    tp = &p;
+            if (!tp || e.rs != (int)tp->shape.size())
+                continue;
+            PortUse &u = use[e.port];
+            if (u.lo.empty()) {
+                u.lo.assign(e.off, e.off + e.rs);
+                u.hi.assign(e.rs, 0);
+                for (int d = 0; d < e.rs; d++)
+                    u.hi[d] = e.off[d] + e.shape[d];
+            }
+            for (int d = 0; d < e.rs; d++) {
+                u.lo[d] = std::min(u.lo[d], e.off[d]);
+                u.hi[d] = std::max(u.hi[d], e.off[d] + e.shape[d]);
+            }
+            u.padded |= e.pad != 0;
+            const int last = e.rs - 1;
+            u.whole_last &= e.off[last] == 0 && e.shape[last] == tp->shape[last];
+        } else if (e.kind == 'R' && !held[key].empty()) {
+            auto [l, at] = held[key].front();
+            held[key].pop_front();
+            const long used = stores[{e.p0, e.p1}] - at;
+            if (l->kind == 'L' && l->reuse > 0 && used != l->reuse && reuseReported.insert(e.port).second)
+                r.errors.push_back(e.port + " block " + std::to_string(l->n) + " on core (" + std::to_string(e.p0) +
+                                   "," + std::to_string(e.p1) +
+                                   "): load_buffer says {.reuse = " + std::to_string(l->reuse) + "}, but " +
+                                   std::to_string(used) + " output block(s) are stored while it is held");
+        }
+    }
+    r.ok = r.errors.empty();
+    return r;
+}
+
+std::vector<TraceKernel> findPlainKernels(const std::string &src, const std::string &srcDir, std::string &err) {
+    return findKernels(src, sourceMacros(src, srcDir), false, err);
+}
+
+std::string traceDefines(const std::string &src) { return sourceDefines(src); }
+
 namespace {
 
 // Recognize the fits as a spatial-halo conv (OH over mesh rows, OC over mesh
@@ -893,6 +969,7 @@ KernelOnlyResult inferKernelOnly(std::string &src, const std::string &srcDir, co
                                   " stride-" + std::to_string(c.stride) + " conv)";
                 for (auto *p : {ifm, wgt, ofm})
                     compareFit(*p, tr.fits[p->var], expectedFit(p->role, c, d), why, errs);
+                res.derived[k.name] = d;
                 rep << "  => conv " << c.h << "x" << c.w << "x" << c.c << " -> " << d.oh << "x" << d.ow << "x" << c.k
                     << ", kernel " << c.kh << "x" << c.kw << " stride " << c.stride << "; mapping split(OH,"
                     << mesh.first << ") x split(OC," << mesh.second << "), tile(OH," << d.oh_t << ") x tile(OW,"

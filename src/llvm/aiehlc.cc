@@ -43,6 +43,7 @@
 #include "routingmanager.h"
 #include "convautotile/conv_desugar.h"
 #include "convautotile/kernel_trace.h"
+#include "convautotile/kernel_front.h"
 
 class AieFrontEnd;
 
@@ -3847,6 +3848,19 @@ public:
             // aie::shape): derive the DMA layout from the kernel's own
             // load_buffer / store_buffer and rewrite into the (conv, map) form.
             {
+                // Tensor form (aie::in / aie::out of aie::tensor types): lower
+                // to the kernel-only form first (kernel_front.h).
+                convautotile::TensorFormResult tf = convautotile::lowerTensorForm(src, userSourceDir, userSourceName);
+                if (tf.found) {
+                    llvm::outs() << tf.report;
+                    for (auto &n : tf.notes)
+                        llvm::outs() << "[TensorForm] note: " << n << "\n";
+                    if (!tf.ok) {
+                        for (auto &e : tf.errors)
+                            llvm::errs() << "[KernelAnalysis] ERROR: " << e << "\n";
+                        std::exit(1);
+                    }
+                }
                 convautotile::KernelOnlyResult ko = convautotile::inferKernelOnly(src, userSourceDir, userSourceName);
                 if (ko.found) {
                     llvm::outs() << ko.report;

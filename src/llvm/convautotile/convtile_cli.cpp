@@ -19,6 +19,7 @@
  * Exit code: 0 ok, 1 usage / IO error, 2 the model rejected the configuration.
  ******************************************************************************/
 #include "conv_desugar.h"
+#include "kernel_front.h"
 #include "kernel_trace.h"
 
 #include <cstdio>
@@ -58,6 +59,17 @@ static std::string baseOf(const std::string &p) {
 // Kernel analysis: kernel-only sources are traced and their DMA layout
 // inferred; __global__(conv, map) sources are traced against the derivation.
 static int traceCommand(std::string src, const std::string &path, const Overrides &ov, const Target &tgt, bool emit) {
+    TensorFormResult tf = lowerTensorForm(src, dirOf(path), baseOf(path));
+    if (tf.found) {
+        std::cout << tf.report;
+        for (auto &n : tf.notes)
+            std::cout << "note: " << n << "\n";
+        if (!tf.ok) {
+            for (auto &e : tf.errors)
+                std::cout << "ERROR: " << e << "\n";
+            return 2;
+        }
+    }
     KernelOnlyResult ko = inferKernelOnly(src, dirOf(path), baseOf(path));
     if (ko.found) {
         std::cout << ko.report;
@@ -70,7 +82,7 @@ static int traceCommand(std::string src, const std::string &path, const Override
         }
     }
     DesugarResult r = desugarConvMapping(src, dirOf(path), ov, tgt, baseOf(path));
-    if (!r.found && !ko.found) {
+    if (!r.found && !ko.found && !tf.found) {
         std::cerr << path << ": no block-load kernel to analyze\n";
         return 2;
     }

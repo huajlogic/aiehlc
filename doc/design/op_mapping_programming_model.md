@@ -280,7 +280,7 @@ humans and debugging, but not a second source of truth.
 
 ## 5. Kernel analysis: the DMA from the kernel (no `conv`, no `map`)
 
-`example/tileprogram/ccode/simpleconv2dkernel.cc` is the conv2d with **no**
+`example/tileprogram/ccode/simpleconv2dkernel_port.cc` is the conv2d with **no**
 `aie::Conv2d` / `aie::Mapping`. The ports declare only their tensors and the
 kernel states its own tiling:
 
@@ -324,7 +324,7 @@ __global__ void conv2d_spatial(
 5. **Rewrite.** The source becomes `__global__(__aie_conv_<k>, __aie_map_<k>)`
    with synthesized declarations (`aie::shape` stripped,
    `aie::num_programs` folded); the existing desugar and pipeline take it from
-   there. For `simpleconv2dkernel.cc` the result is byte-identical to the
+   there. For `simpleconv2dkernel_port.cc` the result is byte-identical to the
    hand-written `simpleconv2d.cc` (28/28 IR dumps, `kernel.cc`, `routing.cc`,
    bcf, prx, host DMA program); x86 emulation 802,816/802,816.
 
@@ -366,3 +366,72 @@ each bug and checks the diagnostic (13 cases):
 - The schedule must not depend on data (checked).
 - The input tensor is the DDR buffer as the kernel reads it (pre-padded);
   `load_opts{.pad}` from the proposal is not implemented.
+
+## 6. Tensor form: typed tensors, `.pad` / `.reuse`, block views, autotune
+
+`example/tileprogram/ccode/simpleconv2dkernel.cc` is the full proposal: the
+kernel works on the REAL tensors (input `[224, 224, 3]`, no manual border, 3
+channels) and states padding, reuse and tile candidates itself:
+
+```cpp
+using Ifm = aie::tensor<int8_t, 224, 224, 3>;
+template <int OH_T = 7, int OW_T = 28, int OC_T = 16>
+__global__ aie::autotune<OH_T, {7, 14, 28}, OW_T, {14, 28, 56}, OC_T, {16, 32}>
+void conv2d(aie::in<Ifm> x_t, aie::in<Wgt> w_t, aie::out<Ofm> y_t) {
+    auto w = aie::load_buffer(w_t, {pc * OC_T, 0, 0, 0}, {OC_T, KH, KW, C}, {.reuse = ...});
+    for (i ...) for (j ...) {
+        auto x = aie::load_buffer(x_t, {oh0 * S - P, ow0 * S - P, 0}, {IH_T, IW_T, C},
+                                  {.pad = aie::pad_value::zero});
+        auto y = aie::store_buffer(y_t, {oh0, ow0, pc * OC_T}, {OH_T, OW_T, OC_T});
+        ... y(oh, ow, oc) = aie::saturate<int8_t>(acc of x(..) * w(..));
+    }   // x released, y committed here
+}
+... auto in = aie::alloc<Ifm>(); conv2d<<<mesh>>>(in, wt, out);
+```
+
+`lowerTensorForm` (`src/llvm/convautotile/kernel_front.{h,cpp}`) runs first in
+`applyConvAutoTiling` and lowers it to the §5 kernel-only form:
+
+1. **Pass A, kernel coordinates** (`traceLogical`): the body (template values
+   substituted, `Ofm::dim(k)` / `aie::num_programs` folded, `auto v =
+   load_buffer(...)` turned into a block view `v(i, j, c)`, release / commit
+   inserted at the end of the view's scope) is traced like §5. Blocks may leave
+   the tensor only with `{.pad = aie::pad_value::zero}`; `{.reuse = N}` must
+   equal the output blocks stored while the block is held.
+2. **Staged layout**: how far the `.pad` loads reach outside the tensor is the
+   zero border (symmetric when the far side needs no more: 224 → 230); a
+   channel dim that is not 4-byte aligned is padded (3 → 4), which requires
+   whole-channel blocks.
+3. **Pass B, staged layout**: offsets shift by the border, the channel extent
+   becomes the aligned one, ports get `aie::shape<staged>`, and §5's
+   `inferKernelOnly` derives the DMA and checks every block against it.
+4. **Autotune**: every `aie::autotune` combination (or the explicit
+   `conv2d<7, 28, 16><<<mesh>>>` arguments) goes through 1-3 in parallel; the
+   legal one with the lowest convautotile cost estimate is kept, and the report
+   says why each other one was rejected (e.g. `OC_T=32`: `w_t block covers
+   [64, 96) outside the tensor extent 64`).
+5. **Host**: `aie::tensor` / `aie::alloc` (a one-line prelude, so line numbers
+   stay), and each launch stages its inputs (`aiehlc_stage`: zero border +
+   aligned channels) and passes the GEMM `M, N, K`. `auto a = aie::alloc<X>(),
+   b = aie::alloc<Y>();` (two types in one `auto`, ill-formed C++) is split.
+
+Kernel locals named like the desugar's `#define`s (`OH_T`, `OW_T`, `K`, ...)
+are renamed (`OH_T_`). Source lines are preserved, so ASan / compile errors
+name the user's line.
+
+**Verified.** Autotune picks `OH_T=14, OW_T=14` (est. 32.78 ms vs 32.81 ms for
+7x28); `main.elf` builds, and `simpleconv2ddebug/emu_conv2d_tensor.sh` (host
+staging + windows served from the generated `aiehlc_desc_<port>` + the
+example's golden check on the real tensors) passes 802,816/802,816 with 0 block
+errors. Pinned to `conv2d<7, 28, 16>`, `routing.cc`, bcf, prx, 27/28 IR dumps
+and the generated `host_canonicalized` are identical to the hand-written
+`simpleconv2d.cc` build (the 28th differs only in the kernel name).
+
+**Diagnostics** (`kernel_trace_cases.py`, `TENSOR_CASES`): border loaded
+without `.pad`, wrong `.reuse`, load too big, data used without load / after
+release, part of the channels, weights outside the tensor, output not fully
+written, loops swapped.
+
+Limits: one tensor-form kernel per source; roles are inferred (output → OFM,
+rank-4 input → WEIGHTS, rank-3 → IFM); `aie::pad_value::zero` only; channel
+padding of an output is rejected.

@@ -1,6 +1,6 @@
 ---
 name: blockloadkernel
-description: Writing or debugging a Triton-style block-load AIE kernel -- kernel-only (`__global__ void k(aie::port<T, aie::IFM, aie::shape<...>> ...)`, DMA inferred from the kernel) or on top of `__global__(conv, map)` -- with `aie::program_id`, `aie::load_buffer` / `aie::store_buffer` in tensor coordinates, `aie::release` / `aie::commit`. Use for `[KernelAnalysis] ERROR` (too big / too small, outside the tensor, data used without being loaded, use after release, never committed, column-outer loops, schedule depends on data, never stored), Use for "no member named 'program_id' in namespace 'aie'", klog BLKE/BLKW/BLKG, a kernel local clashing with an emitted macro (`OH_T`, `OW_T`, `TILE_*`, `SP_*`, `K`), or to emulate the generated kernel on x86 before a board run.
+description: Writing or debugging a Triton-style block-load AIE kernel -- kernel-only (`__global__ void k(aie::port<T, aie::IFM, aie::shape<...>> ...)`, DMA inferred from the kernel) or on top of `__global__(conv, map)` -- with `aie::program_id`, `aie::load_buffer` / `aie::store_buffer` in tensor coordinates, `aie::release` / `aie::commit`. Tensor form (`aie::in<aie::tensor>`, `.pad`, `.reuse`, `aie::autotune`, `[TensorForm]` report). Use for `[KernelAnalysis] ERROR` (too big / too small, outside the tensor, data used without being loaded, use after release, never committed, column-outer loops, schedule depends on data, never stored), Use for "no member named 'program_id' in namespace 'aie'", klog BLKE/BLKW/BLKG, a kernel local clashing with an emitted macro (`OH_T`, `OW_T`, `TILE_*`, `SP_*`, `K`), or to emulate the generated kernel on x86 before a board run.
 ---
 
 # Triton-style block-load kernels
@@ -37,10 +37,25 @@ convautotile: `doc/design/conv_autotiling.md`).
   every core, fits each port to base/step/rounds, recognizes the spatial-halo
   conv, derives with convautotile, compares exactly, then rewrites the source
   into `__global__(__aie_conv_k, __aie_map_k)`. Example:
-  `example/tileprogram/ccode/simpleconv2dkernel.cc`.
+  `example/tileprogram/ccode/simpleconv2dkernel_port.cc`.
 - Iterate with `build/aiehlc-convtile trace <file.cc>` (seconds) instead of a
   full aiehlc.sh run; `AIEHLC_TRACE_KEEP=1` keeps the harness.
 - A too-small slab is reported as "data used without being loaded" (ASan), not
   as a shape mismatch: the conv compute reads past it first.
 - The body must compile on x86 and the schedule must be data-independent.
 - Regression: `python3 src/llvm/convautotile/unitest/kernel_trace_cases.py build/aiehlc-convtile`.
+
+## Tensor form (aie::in / aie::out, .pad / .reuse, autotune)
+- `simpleconv2dkernel.cc`: `kernel_front.cpp::lowerTensorForm` lowers it to the
+  kernel-only form above (pass A in kernel coordinates, staged layout, pass B).
+  Debug the lowering with `AIEHLC_FRONT_DUMP=/tmp/tf build/aiehlc-convtile trace <file>`
+  (writes `/tmp/tf.<values>.logical.cc` / `.staged.cc` per candidate).
+- With `aie::autotune` a bug shows on EVERY candidate; the report lists each
+  candidate's first error and the ERROR lines are the default's.
+- `[TensorForm] ... rejected: ... (a conv border? ...)`: add `{.pad = aie::pad_value::zero}`.
+- Locals named like desugar `#define`s (`OH_T`, `OW_T`, `K`, `M`, `N`, `TILE_*`)
+  are renamed with a trailing `_` in the generated kernel.
+- End-to-end x86 check of a build: `bash example/tileprogram/ccode/simpleconv2ddebug/emu_conv2d_tensor.sh
+  example/tileprogram/ccode/simpleconv2dkernel.cc aout/worklocal` -> `GOLDEN PASS`.
+- `auto a = aie::alloc<X>(), b = aie::alloc<Y>();` is not valid C++ (two types
+  in one `auto`); the lowering splits it and says so in a note.

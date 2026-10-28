@@ -81,12 +81,33 @@ struct KernelTraceResult {
 KernelTraceResult traceKernel(const std::string &src, const TraceKernel &k, int rows, int cols,
                               const std::string &prelude, const std::string &srcName, int pp_depth = 2);
 
+// What a logical trace (tensor form, kernel coordinates) found per port.
+struct PortUse {
+    std::vector<int> lo, hi; // bounding box of every block, may leave the tensor (.pad)
+    bool padded = false;     // some load asked for {.pad = aie::pad_value::zero}
+    bool whole_last = true;  // every block takes the whole last (channel) dim
+};
+
+// Trace in the kernel's own coordinates: the harness checks (bounds unless
+// .pad, use without load, release / commit, pp_depth, data-dependent schedule)
+// plus {.reuse = N} against the stores made while the block is held. No DMA fit.
+KernelTraceResult traceLogical(const std::string &src, const TraceKernel &k, int rows, int cols,
+                               const std::string &prelude, const std::string &srcName, int pp_depth,
+                               std::map<std::string, PortUse> &use);
+
+// The plain `__global__ <ret> name(aie::port<...> ...)` kernels of a source.
+std::vector<TraceKernel> findPlainKernels(const std::string &src, const std::string &srcDir, std::string &err);
+
+// The object-like #define lines of a source (what its kernel TU sees).
+std::string traceDefines(const std::string &src);
+
 struct KernelOnlyResult {
     bool found = false; // the source has a kernel-only __global__ with aie::shape ports
     bool ok = true;
     std::string error; // first error, with the kernel name
     std::vector<std::string> errors, notes;
     std::string report; // human-readable analysis
+    std::map<std::string, Derived> derived; // per kernel, when the DMA was derived
 };
 
 // Kernel-only sources: analyze, derive, verify, and rewrite `src` into the
