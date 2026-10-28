@@ -14,7 +14,7 @@
 // a load/store does not choose WHAT arrives: it acquires the port's next window
 // and CHECKS that the requested block is the one the DMA delivers there. The
 // expected block comes from the compiler-derived aiehlc_desc_<port> (emitted
-// from aie::block_desc, the same arithmetic as the port's DMA descriptor), so a
+// by convautotile from the same numbers as the port's DMA descriptor), so a
 // mismatch -- a wrong offset, shape, or loop order -- is reported with klog tag
 // "BLKE" instead of silently computing on the wrong data.
 //
@@ -26,7 +26,17 @@
 
 #include <stdint.h>
 
-// Field order matches aie::BlockDesc (aiehlc_opmodel.h).
+// The kernel-side declarations (op, block sizes, one descriptor + cursor per
+// port) are emitted by convautotile::kernelTUDecls from the same Derived
+// numbers the ports' GemmSpace / DMA are built from.
+
+// The op of __global__(conv, map): `conv.kh` etc. in the kernel body.
+struct aiehlc_conv2d_t {
+    int h, w, c, k, kh, kw, stride, pad;
+};
+// Per-port block descriptor: the block a port delivers in round (i, j) on core
+// (p0, p1) is offset[d] = base_p0[d]*p0 + base_p1[d]*p1 + step_i[d]*i +
+// step_j[d]*j, shape[d]; rounds run i outer, j inner (the DMA order).
 struct aiehlc_blk_desc {
     int rank;
     int shape[4];
@@ -37,7 +47,7 @@ struct aiehlc_blk_desc {
     int rounds_i;
     int rounds_j;
 };
-// Field order matches aie::KernelView.
+// `map.oh_t` etc. in the kernel body: the mapping's block sizes.
 struct aiehlc_kernel_view_t {
     int oh, ow, oh_per_core, oc_per_core, oh_t, ow_t, ih_t, iw_t, c_align;
 };

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Build and run the conv2d auto-tiling model unit test (no LLVM needed).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../../../.." && pwd)"
+OUT="${TMPDIR:-/tmp}/convautotile_unitest_$$"
+mkdir -p "$OUT"
+g++ -std=c++17 -O1 -Wall -Wextra -o "$OUT/test_conv_autotile" \
+    "$HERE/test_conv_autotile.cpp" "$HERE/../conv_autotile.cpp" "$HERE/../conv_desugar.cpp"
+"$OUT/test_conv_autotile" "$REPO"
+rc=$?
+rm -rf "$OUT"
+exit $rc

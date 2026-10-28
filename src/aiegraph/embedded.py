@@ -26,7 +26,8 @@ from .errors import AiegraphError
 from .model import Model, copy_into, load
 from .plan import group_by_source, parse_offload
 from .region import Regions, build_regions
-from .report import BuildReport, CheckReport, DetectReport, PartitionPlan, RegionCheck
+from .report import (AIProtoResult, BuildReport, CheckReport, DetectReport, PartitionPlan,
+                     RegionCheck)
 
 __all__ = ["EmbeddedModel", "Layer", "embedded_convert", "convert", "open_workdir", "TARGETS"]
 
@@ -200,6 +201,18 @@ class EmbeddedModel:
         raw = offload(self.workdir, args, build=build, make=make, force=force,
                       image=self.image, verbose=verbose)
         return CheckReport("offload", raw, groups)
+
+    def offload_AI_proto(self, spec, source, *, rounds: int = 3, model: str = None,
+                         claude: str = "claude", timeout_s: float = 1800, out_dir=None,
+                         quiet: bool = False, verbose: bool = False) -> AIProtoResult:
+        """When ``offload_check(spec, source)`` is NOT READY, have ``claude -p`` port
+        *source* to the layer(s) in a copy of its directory, until our own
+        ``offload_check`` says READY (at most *rounds* Claude turns). Returns the new
+        kernel, path-like: ``emod.offload(("layer4", new_kernel))``."""
+        from .aiproto import offload_ai_proto
+        return offload_ai_proto(self, spec, source, rounds=rounds, model=model, claude=claude,
+                                timeout_s=timeout_s, out_dir=out_dir, quiet=quiet,
+                                verbose=verbose)
 
     # ── regions: register / check / assign / partition ───────────────────
 

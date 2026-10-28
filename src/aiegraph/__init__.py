@@ -38,7 +38,8 @@ from .embedded import open_workdir as open  # noqa: A001  (ag.open(workdir))
 from .errors import AiegraphError
 from .model import ZOO, Model, download_model, from_onnx, from_torch, load
 from .region import Region, Regions
-from .report import BuildReport, CheckReport, DetectReport, PartitionPlan, RegionCheck
+from .report import (AIProtoResult, BuildReport, CheckReport, DetectReport, PartitionPlan,
+                     RegionCheck)
 
 __version__ = "0.1.0"
 
@@ -47,7 +48,7 @@ __all__ = ["load", "from_onnx", "from_torch", "download_model", "ZOO", "Model",
            "Region", "Regions", "KernelContract", "RegionCheck", "PartitionPlan",
            "offload_check", "offload", "detect", "lint", "build", "run_local",
            "compile", "guide", "doctor", "setup", "AiegraphError", "CheckReport",
-           "DetectReport", "BuildReport"]
+           "DetectReport", "BuildReport", "AIProtoResult"]
 
 
 # ── module-level forms: act on ag.current() (pyplot-style convenience) ─────

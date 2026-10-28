@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 #include "tilinglinalg_pipeline.h"
-#include "aiehlc_opmodel.h"
 
 #include "dmaptodmaphop.h"
 #include "hw/ResourceManager.h"
@@ -1315,9 +1314,6 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "  tile_dim d3;\n";
             stream << "  tile_dim d4;\n";
             stream << "};\n";
-            // Op + mapping model types, so a __global__(op, map) source's
-            // constexpr aie::Conv2d / aie::Mapping definitions compile here too.
-            stream << aiehlc_opmodel::opModelPrelude();
             // Conv2dSpace — policy + conv iteration space; ih/iw carry the
             // EXACT input spatial dims (OH/OW derived via forward conv).
             // (0 policy,1 ih,2 iw,3 ic,4 oc,5 kh,6 kw,7 stride,8 pad,9 m).

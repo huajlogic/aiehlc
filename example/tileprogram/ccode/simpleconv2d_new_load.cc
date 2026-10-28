@@ -33,34 +33,35 @@ __global__(conv, map) void conv2d_spatial(
     const int pid_c = aie::program_id(1); // mesh col: which OC group
     const int S = conv.stride, KH = conv.kh, KW = conv.kw;
     const int C = map.c_align;                         // 4
-    const int OH_T = map.oh_t, OW_T = map.ow_t;        // 7 x 28 output block
-    const int IH_T = map.ih_t, IW_T = map.iw_t;        // 19 x 61 input block (halo)
-    const int OC_T = map.oc_per_core;                  // 16
+    // Lower-case locals: the desugar also emits OH_T/OW_T/TILE_* kernel #defines.
+    const int oh_t = map.oh_t, ow_t = map.ow_t; // 7 x 28 output block
+    const int ih_t = map.ih_t, iw_t = map.iw_t; // 19 x 61 input block (halo)
+    const int oc_t = map.oc_per_core;           // 16
     const int TAPS = KH * KW * C; // 196 (not K: simpleconv2d_new_load.h #defines K)
 
     // This core's filters: output channels [pid_c*16, +16), all taps.
-    const int8_t *w = aie::load_buffer(win_b, {pid_c * OC_T, 0, 0, 0}, {OC_T, KH, KW, C});
+    const int8_t *w = aie::load_buffer(win_b, {pid_c * oc_t, 0, 0, 0}, {oc_t, KH, KW, C});
 
-    for (int i = 0; i < map.oh_per_core / OH_T; i++) {  // 4 row blocks
-        for (int j = 0; j < map.ow / OW_T; j++) {        // 4 column blocks
-            const int oh0 = pid_h * map.oh_per_core + i * OH_T; // output block origin
-            const int ow0 = j * OW_T;
-            // Its input footprint: rows oh0*S .. +IH_T, cols ow0*S .. +IW_T of the
+    for (int i = 0; i < map.oh_per_core / oh_t; i++) {          // 4 row blocks
+        for (int j = 0; j < map.ow / ow_t; j++) {               // 4 column blocks
+            const int oh0 = pid_h * map.oh_per_core + i * oh_t; // output block origin
+            const int ow0 = j * ow_t;
+            // Its input footprint: rows oh0*S .. +ih_t, cols ow0*S .. +iw_t of the
             // padded input (the halo overlaps the neighbouring blocks).
-            const int8_t *x = aie::load_buffer(win_a, {oh0 * S, ow0 * S, 0}, {IH_T, IW_T, C});
-            int8_t *y = aie::store_buffer(win_c, {oh0, ow0, pid_c * OC_T}, {OH_T, OW_T, OC_T});
+            const int8_t *x = aie::load_buffer(win_a, {oh0 * S, ow0 * S, 0}, {ih_t, iw_t, C});
+            int8_t *y = aie::store_buffer(win_c, {oh0, ow0, pid_c * oc_t}, {oh_t, ow_t, oc_t});
 
-            for (int oh = 0; oh < OH_T; oh++) {
-                for (int ow = 0; ow < OW_T; ow++) {
-                    for (int oc = 0; oc < OC_T; oc++) {
+            for (int oh = 0; oh < oh_t; oh++) {
+                for (int ow = 0; ow < ow_t; ow++) {
+                    for (int oc = 0; oc < oc_t; oc++) {
                         int16_t sum = 0;
                         int kk = 0;
                         for (int kh = 0; kh < KH; kh++)
                             for (int kw = 0; kw < KW; kw++)
                                 for (int c = 0; c < C; c++, kk++)
-                                    sum += (int16_t)x[((oh * S + kh) * IW_T + ow * S + kw) * C + c] *
+                                    sum += (int16_t)x[((oh * S + kh) * iw_t + ow * S + kw) * C + c] *
                                            (int16_t)w[oc * TAPS + kk];
-                        y[(oh * OW_T + ow) * OC_T + oc] = (int8_t)(sum > 127 ? 127 : (sum < -128 ? -128 : sum));
+                        y[(oh * ow_t + ow) * oc_t + oc] = (int8_t)(sum > 127 ? 127 : (sum < -128 ? -128 : sum));
                     }
                 }
             }

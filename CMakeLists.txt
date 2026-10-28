@@ -126,10 +126,17 @@ find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})
 
 include_directories(${MLIR_INCLUDE_DIRS})
 
-set(SOURCE_FILES ./src/llvm/aiehlc.cc)
+set(SOURCE_FILES ./src/llvm/aiehlc.cc
+    ./src/llvm/convautotile/conv_autotile.cpp
+    ./src/llvm/convautotile/conv_desugar.cpp)
 set(mlirfrontend src/mlir/mlirfront/)
 
 add_executable(aiehlc ${SOURCE_FILES})
+target_include_directories(aiehlc PRIVATE ./src/llvm)
+
+# Conv2d auto-tiling model CLI (backend of script/convtune, the AutoTVM tuner).
+add_executable(aiehlc-convtile ./src/llvm/convautotile/convtile_cli.cpp
+    ./src/llvm/convautotile/conv_autotile.cpp ./src/llvm/convautotile/conv_desugar.cpp)
 
 # Strip only for non-debug builds. In Debug / RelWithDebInfo we keep the symbol
 # table + DWARF so gdb (e.g. `source script/aiehlc.sh -gdb ...`) can resolve

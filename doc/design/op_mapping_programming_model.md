@@ -27,32 +27,36 @@ is the same conv written against the per-port model (three hand-computed
 `ir/simplerouting` dumps), `kernel.cc`, `routing.cc`, bcf, prx and the host DMA
 program (`host_canonicalized`).
 
-## 1. What is implemented (frontend desugaring)
+## 1. What is implemented
 
-The model lowers onto the existing per-port path; nothing after the AST changes.
+The derivation is **convautotile** (`src/llvm/convautotile/`, design
+[conv_autotiling.md](conv_autotiling.md)): a source-level desugar that runs
+before every other aiehlc rewrite, comments out `conv` / `map`, emits the three
+derived `GemmSpace`s, a `GlobalPolicy`, and the legacy kernel `#define`s
+(`SP_*`, `OH_T`, `TILE_*`), and rewrites `__global__(conv, map)` and the port
+tags onto them. It also validates the mapping (`[ConvAutoTile] ERROR`),
+autotunes an omitted `time`, and takes tuner overrides (`AIEHLC_CONV_TUNE`,
+`src/frontend/convtune`).
 
-| Piece | Where | What it does |
-|---|---|---|
-| `aie::Conv2d`, `aie::Mapping`, `split`, `tile`, `Axis`, `Role` | `aiehlc_opmodel.h` → `opModelPrelude()` | emitted into all three `aie::` preludes (frontend parse, `aiehlc.cc` stubs, pipeline host stubs) |
-| `aie::derive(role, op, map)` | same, `constexpr` | computes the role's `GemmSpace`: IFM = overlapping halo slabs over mesh rows + on-core OH/OW rounds; WEIGHTS = OC split over mesh cols; OFM = tiled gather |
-| `aie::derive_policy(op, map)` | same | `GlobalPolicy{fullconnect_auto = 0}` |
-| validation | `mapping_check` in `derive` | a mapping the derivation cannot honor (`OH % n`, `rows % t`, `OW % t`, `K % n`) is a **compile error at the port**, with the reason as the note |
-| `__global__(conv, map)` rewrite | `aiehlc.cc` text rewrite | port tags `aie::IFM` → `aie::derive(aie::IFM, conv, map)` (a C++20 class NTTP, read through the existing `APValue` port parser); a synthesized `constexpr aie::GlobalPolicy __aie_policy_conv_map`; `annotate("aieop:conv")` |
-| op visible in the kernel | `opDeclForKernel` (`aiehlc.cc`) | evaluates `conv` and emits `static constexpr aiehlc_conv2d_t conv = {224, ...}` into the kernel TU (outside `namespace aie`, which the AIE API owns there) |
+On top of it, for kernels written in the Triton block style (Section 4):
 
-The kernel reads *operator* constants from `conv` and *loaded-data* geometry
-from its ports (`get_arg_per_round_size_in_dim`, resolved to literals from the
-derived `#routing.tiling`). It no longer needs any mirrored `#define`.
+| Piece | Where |
+|---|---|
+| kernel-TU `conv`, `map` (block sizes) and per-port block descriptors, from convautotile's `Derived` | `convautotile::kernelTUDecls`, appended by `aiehlc.cc` after the `#define` scan |
+| `aie::program_id`, `aie::load_buffer/store_buffer/release/commit` | `tilinglinalg_pipeline.cpp` (`resolveBlockIoBuiltins`) + `src/mlir/runtime/aie_block_io.h` |
+
+Kernel-body locals must not reuse the emitted macro names (`OH_T`, `OW_T`,
+`TILE_*`, `SP_*`) or the example header's `M`/`N`/`K`.
 
 ## 2. Compiler design for native support
 
-The desugaring proves the model but keeps its knowledge in C++ `constexpr`
-strings. Native support moves it into the compiler, in steps that each keep the
+The desugaring proves the model but keeps its knowledge in a source-text rewrite.
+Native support moves it into the compiler, in steps that each keep the
 generated code byte-identical on the existing examples.
 
-### Step A — done: desugar to `GemmSpace` (this change)
+### Step A — done: desugar to `GemmSpace` (convautotile)
 
-Zero backend change; the validation is a C++ constant-evaluation failure.
+Zero backend change; validation and autotune live in the desugar.
 
 ### Step B — the op and the mapping become IR
 
@@ -64,8 +68,8 @@ func.func @main(...) attributes {
                                        pp_depth = 2, l1_budget = 4096>}
 ```
 
-- `aiehlc.cc` reads `conv`/`map` (as it reads `GemmSpace` today) and attaches
-  them to the routing func instead of deriving per-port spaces.
+- convautotile's parsed `Conv2dSpec` / `MappingSpec` are attached to the
+  routing func instead of being rendered as `GemmSpace` text.
 - A new **`OpMappingToTilingPass`** (first pass of `runPipeline`) owns the
   derivation in C++: it writes the `#routing.tiling` on each `partitiontensor`,
   the `#routing.halo` on each `routingcreatescheduletensor`, and
@@ -79,15 +83,16 @@ func.func @main(...) attributes {
   (`device.partition(..., HW_ROWS, HW_COLS)`), so `MESH_ROW` stops being a
   user macro that must agree with the launch.
 
-Why a pass and not `constexpr`: real diagnostics (MLIR `emitError` with the
+Why a pass and not a text desugar: real diagnostics (MLIR `emitError` with the
 op/mapping values), the L1 budget check needs the element type and pp depth,
 and autotuning (Step C) needs search, not a closed formula.
 
-### Step C — defaults and autotune
+### Step C — defaults and autotune (convautotile has it)
 
-`time` is optional (`// optional: omit -> autotune under l1_budget`). Today an
-omitted tile defaults to "the whole per-core extent", which overflows L1 for
-this conv. The pass enumerates `(oh_t, ow_t)` divisors, prices each with
+`time` is optional (`// optional: omit -> autotune under l1_budget`). convautotile
+already enumerates the legal tiles and ranks them with an analytic cost model;
+`src/frontend/convtune` drives AutoTVM over the same space. What remains is to
+move that search into the pass so it can price with IR-level facts. The pass enumerates `(oh_t, ow_t)` divisors, prices each with
 `slab_bytes(ih_t, iw_t, c) * pp_depth + out_bytes * pp_depth + weights` against
 `l1_budget`, and picks the largest fitting tile (fewest rounds = fewest BD
 re-arms; cf. `doc/performance/register_write_cost.md`). The choice is printed
@@ -126,7 +131,7 @@ contract. Measured on this conv:
 | mapping description | 3 hand-derived descriptors (62 lines: halo 61/56, rounds 19/14/4, width 61/56/4, padded 230...) | 2 `split` + 2 `tile` |
 | kernel-side geometry | 28 `#define`s, mirrored by hand so the kernel TU sees them | none; read from `conv` and the ports |
 | change `ow_t` 28 → 14 | `OW_T`, `RowBC_spatial.d2.tile_round`, and `tile_round`/`tile_size`/`stride` of `LtoR_Merge.d2` | `tile(OW, 14)` |
-| a bad split | runs and produces wrong data | compile error naming the constraint |
+| a bad split | runs and produces wrong data | `[ConvAutoTile] ERROR` naming the constraint |
 | generated host/kernel/routing | — | byte-identical |
 
 What it gets right:
@@ -198,9 +203,7 @@ like Triton's `tl.constexpr` block sizes.
 
 | Piece | Where |
 |---|---|
-| `aie::BlockDesc` / `aie::block_desc(role, op, map)` — per-port block shape, per-core base (×`program_id`) and per-round steps, from the same `conv_tiles()` arithmetic as the DMA descriptor | `aiehlc_opmodel.h` |
-| `aie::KernelView` / `kernel_view(op, map)` → kernel-side `map` | same |
-| evaluated into the kernel TU as `aiehlc_desc_<port>` + cursor, and `map` | `aiehlc.cc` (`opDeclForKernel`, `apvalueInit`) |
+| `conv`, `map` (block sizes) and per port `aiehlc_desc_<port>` + cursor — block shape, per-core base (×`program_id`) and per-round steps, from the same convautotile `Derived` numbers as the port's DMA | `convautotile::kernelTUDecls` → kernel TU |
 | `aie::program_id(0/1)` → `get_coreid()` minus the placement's first core row / column | `tilinglinalg_pipeline.cpp` (`resolveBlockIoBuiltins`, from the `dmaphop.tile` placement) |
 | `aie::load_buffer/store_buffer` → acquire the port's next window **and check** that the requested block is the one the DMA delivers next (klog `BLKE`/`BLKW`/`BLKG`); `release/commit` → release the window | `src/mlir/runtime/aie_block_io.h` |
 
