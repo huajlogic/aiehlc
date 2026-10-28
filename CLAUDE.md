@@ -838,6 +838,7 @@ Read the matching skill when the task fits:
 | Vector kernel (aie_api SRS/requantize) off by +1 / data-dependent rounding on HW but exact on host; `control_rnd`/`sync_buffer` at DMb 0x0 in kernel.map | bcfglobalplacement |
 | netboot (`src/tool/netboot`, `apppaltest --netload`): supervisor dies on LOAD_RUN, uploads crawl, "app core busy" / PLM 0x7DB 0x7D2, watchdog fires at launch; board busy / how long to wait / max run time / forcing an overdue app (netload exit 3/4/5); `0x8_0000_0000` mirrors `0x0` on palmyra | netbootsupervisor |
 | `KERNELCONFIGOFFLOAD` + partition start col ≠ 0 hangs; high core columns' MM2S never armed (`get_coreid()` absolute vs plan relative) | kcocoreidpartition |
+| Print values from an AIE kernel (`klog`); klog output never appears; `aie::print_log` (does not exist) | kernelklog |
 | Sim PS.so load segfault | aiesimloaddebug |
 | aiesim live debug register socket | aiesim-debug-socket |
 | HW performance counters | aiehwprofile |
