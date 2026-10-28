@@ -41,6 +41,7 @@
 #include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
 #include "routingmanager.h"
+#include "convautotile/conv_desugar.h"
 
 class AieFrontEnd;
 
@@ -3812,6 +3813,53 @@ public:
             }
         }
 
+        // Lower the declarative conv2d model (aie::Conv2d + aie::Mapping +
+        // aie::port<T, aie::IFM|WEIGHTS|OFM>) into the explicit GemmSpace form
+        // before any other rewrite sees the text (src/llvm/convautotile/). The
+        // derived d1/d2/d3, halo and kernel constants are reported to
+        // aout/conv_autotile.json. AIEHLC_CONV_TUNE (JSON text or @file) overrides
+        // the tunable knobs (time_oh, time_ow, pp_depth, c_align) -- the hook the
+        // AutoTVM tuner (script/convtune) uses. A rejected configuration aborts.
+        void applyConvAutoTiling(std::string &src) {
+            convautotile::Overrides ov;
+            if (const char *env = std::getenv("AIEHLC_CONV_TUNE")) {
+                std::string text = env;
+                if (!text.empty() && text[0] == '@') {
+                    std::ifstream f(text.substr(1));
+                    text.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                }
+                std::string err;
+                if (!convautotile::parseOverridesJson(text, ov, &err)) {
+                    llvm::errs() << "[ConvAutoTile] ERROR: bad AIEHLC_CONV_TUNE: " << err << "\n";
+                    std::exit(1);
+                }
+                if (!err.empty())
+                    llvm::errs() << "[ConvAutoTile] WARNING: " << err << "\n";
+            }
+            convautotile::DesugarResult r = convautotile::desugarConvMapping(src, userSourceDir, ov);
+            if (!r.found)
+                return;
+            std::ofstream rep(AOUT + std::string("conv_autotile.json"));
+            rep << convautotile::reportJson(r);
+            for (auto &w : r.warnings)
+                llvm::errs() << "[ConvAutoTile] WARNING: " << w << "\n";
+            if (!r.ok) {
+                llvm::errs() << "[ConvAutoTile] ERROR: " << r.error << "\n";
+                std::exit(1);
+            }
+            for (auto &k : r.kernels) {
+                const auto &d = k.derived;
+                llvm::outs() << "[ConvAutoTile] " << k.kernel << ": mesh " << d.mesh_rows << "x" << d.mesh_cols
+                             << ", time tile(OH," << d.oh_t << ") x tile(OW," << d.ow_t << ")"
+                             << (d.time_autotuned ? " [autotuned]" : "") << (ov.any() ? " [AIEHLC_CONV_TUNE]" : "")
+                             << ", IFM halo d1 " << d.mesh_slice_h << "/" << d.mesh_step_h << " slice " << d.tile_h
+                             << "/" << d.tile_step_h << "x" << d.h_rounds << ", d2 " << d.tile_w << "/" << d.tile_step_w
+                             << "x" << d.w_rounds << ", L1 " << d.l1_bytes << " B\n";
+                for (auto &n : d.notes)
+                    llvm::outs() << "[ConvAutoTile]   note: " << n << "\n";
+            }
+        }
+
         std::string GetKeyReplaceAndAddInclude(clang::SourceManager &SourceMgr, std::unordered_map<std::string,std::string>& funcMap) {
 			std::string ret;
 			// Get the main file entry
@@ -3883,6 +3931,7 @@ public:
                 //
                 // Headers (`.h`) are left to Clang, as before.
                 inlineSourceIncludes(SourceCodeString);
+                applyConvAutoTiling(SourceCodeString);
 
                 // Collect user #define macros before any rewriting.
                 // Track #if/#else/#endif nesting to skip macros inside

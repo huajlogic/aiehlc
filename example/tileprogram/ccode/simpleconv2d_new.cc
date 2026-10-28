@@ -1,7 +1,7 @@
 #include "simpleconv2d_new.h"
 #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_DMA_ISSUE_COUNT)
 #define USE_SPATIAL_HALO // default
-constexpr aie::Conv2d conv = {.h = 224, .w = 224, .c = 3, .k = 64, .kh = 7, .kw = 7, .stride = 2, .pad = 3};
+constexpr aie::Conv2d conv = {.h = 230, .w = 230, .c = 4, .k = 64, .kh = 7, .kw = 7, .stride = 2, .pad = 3};
 constexpr aie::Mapping map = {
     .space = {aie::split(aie::OH, MESH_ROW),  // mesh rows
               aie::split(aie::OC, MESH_COL)}, // mesh cols
@@ -10,6 +10,26 @@ constexpr aie::Mapping map = {
     .hints = {
         .pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::Dma, .pp_depth = 2, .l1_budget = aie::Bytes{4096}}};
 
+__global__(conv, map) void conv2d_spatial(
+    aie::port<input_window_int8 *, aie::IFM> win_a,     // raw slab [halo_slice, W*C] (derived)
+    aie::port<input_window_int8 *, aie::WEIGHTS> win_b, // filter [K, tile_N]
+    aie::port<output_window_int8 *, aie::OFM> win_c     // output [oh_per_row*OW, tile_N]
+) {
+    int colid = get_coreid() & 0x1F;         // example for column id, adjust as needed
+    int rowid = (get_coreid() >> 16) & 0x7F; // example for row id, adjust as needed
+    char *weight = aie::load_buffer(win_b, 0, (conv.k, conv.c, conv.kh, conv.kw));
+    int core_buffer_offset = rowid * 61 * 4 * 230 * 4;
+    for (int i = 0; i < 4; i++) {
+        core_buffer_offset += 19 * 230 * 4; // advance to the next row in the buffer
+        for (int j = 0; j < 4; j++) {
+            core_buffer_offset += 58 * 4; // advance to the next column in the buffer
+            char *ifm_buffer = aie::load_buffer(win_a, core_buffer_offset, (19, 58, 4));
+            char *local_out = aie::load_buffer(win_c, core_buffer_offset, (19, 58, 64));
+            conv2d(ifm_buffer, weight, local_out); // example function call, replace with actual convolution function
+        }
+    }
+}
+/*
 __global__(conv, map) void conv2d_spatial(
     aie::port<input_window_int8 *, aie::IFM> win_a,     // raw slab [halo_slice, W*C] (derived)
     aie::port<input_window_int8 *, aie::WEIGHTS> win_b, // filter [K, tile_N]
@@ -109,6 +129,7 @@ __global__(conv, map) void conv2d_spatial(
         }
     } // end m_rounds
 }
+    */
 // ═══════════════════════════════════════════════════════════════════════════
 // HOST
 // ═══════════════════════════════════════════════════════════════════════════

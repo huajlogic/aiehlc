@@ -511,6 +511,28 @@ eager (kernel reloaded per layer), eager layer-major (B images per layer). Kerne
 reverted to the 2026-10-20 engine (~1.61 ms/image at B=32): the faster kernels
 (1.364 ms) hang ~1 run in 3 in residual layers (skill **shimctrlpushloss**).
 
+### Declarative conv2d auto-tiling (`aie::Conv2d` + `aie::Mapping`)
+
+`__global__(conv, map) void k(aie::port<T, aie::IFM> a, aie::port<T, aie::WEIGHTS> b, aie::port<T, aie::OFM> c)`
+(`example/tileprogram/ccode/simpleconv2d_new.cc`) replaces three hand-written
+`GemmSpace`s + ~25 mirrored `#define`s. `applyConvAutoTiling()` (`aiehlc.cc`)
+runs the dependency-free model in `src/llvm/convautotile/` on the source text
+**before** every other rewrite and emits exactly the hand-written form, so the
+pipeline is unchanged: for the stem, `routing.cc`/`kernel.cc`/`aieml.bcf` and the
+generated part of `host.cc` are byte-identical to `simpleconv2d.cc`'s build.
+Halo = footprint `(T−1)·S + (K−1)·D + 1`, step `T·S`, applied at the mesh split
+and the on-core `.time` tile; `.time` omitted → picked by the calibrated cost
+model. `MESH_ROW`/`MESH_COL` resolve from `device.partition`. Knobs override via
+`AIEHLC_CONV_TUNE` (`time_oh`, `time_ow`, `pp_depth`, `l1_budget`, `c_align`);
+report in `aout/conv_autotile.json`. Tuning: `PYTHONPATH=src python -m
+frontend.convtune tune <src> --mode analytic|build|board` — a TVM AutoTVM task
+(ConfigSpace = model-legal set via `multi_filter`) searched by
+`XGBTuner(feature_type="knob")`; build/board trials cross-check the pipeline log
+against the model. Two measured pipeline limits are legality rules: OFM/WEIGHTS
+must fit `l1_budget` (else uneven chunking), and `tile(OW, OW)` (one width round)
+is unsupported. Design **[doc/design/conv_autotiling.md](doc/design/conv_autotiling.md)**;
+skill **convautotile**.
+
 ### TVM `--aie-offload` → AIE via BYOC
 
 `deploy_flow.py --aie-offload --aie-layers N` (default 1, the stem) puts layer N
@@ -624,6 +646,12 @@ call-level — `register_kernel` refuses only what the spec contradicts (op fami
 dtype); and `partition()` is the **whole** placement — it resets every AIE row of
 `partition.json` to CPU before offloading, and `optimize_for` has no cost model (it says
 so in the report). Skill **aiegraphregion**.
+
+`emod.offload_AI_proto(layers, kernel, rounds=3)` (`src/aiegraph/aiproto.py`): when
+`offload_check` is NOT READY, `claude -p` ports a flat copy of the kernel dir in
+`<workdir>/aiproto/<layer>_<kernel>/` (prompt on **stdin** -- `--allowedTools`/`--add-dir`
+are variadic and swallow a trailing prompt); aiegraph's own `offload_check` is the
+verdict after every round, failures go back via `--resume`. Tests use a fake `claude`.
 
 ### User kernels: `--aie-kernel` / `frontend.tvmrelay.aiekernel`
 
@@ -783,6 +811,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/debug/troubleshoot_aie_offload_timeout.md](doc/debug/troubleshoot_aie_offload_timeout.md)** — `--aie-offload` main.elf hangs (`ENTER` without `EXIT`, `wait_io TIMEOUT`): reading the deadlock, allconv review, HW bisection (committed stem passes, control-plane WIP hangs standalone too), `AIE_DEBUG_LOG`-gated timeout dump
 - **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` for `aie::SpatialPolicy`
 - **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based spatial op spaces (GemmSpace, Conv2dSpace)
+- **[doc/design/conv_autotiling.md](doc/design/conv_autotiling.md)** — Declarative `aie::Conv2d` + `aie::Mapping`: derived d1/d2/d3 + halo, legality rules (incl. measured pipeline limits), `AIEHLC_CONV_TUNE`, AutoTVM/XGBoost tuner (`src/frontend/convtune`)
 - **[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md)** — Live debug framework design (static view + daemon)
 - **[doc/llvm_mlir_pitfalls.md](doc/llvm_mlir_pitfalls.md)** — Known LLVM/MLIR API pitfalls
 - **[doc/aiedifferentview.md](doc/aiedifferentview.md)** — Memory and lock semantics
@@ -817,6 +846,7 @@ Read the matching skill when the task fits:
 | Sim build/run separation | sim-build-run-separation |
 | Sim build (`pr_sim_test.sh`, `-D__AIESIM__`) fails in aie_runtime.c with "use of undeclared identifier" while the HW build is fine | aiesimguardedsymbol |
 | Build fails on missing snap cmake / libz.so / ZLIB::ZLIB; fast single-file compile check | mlirbuildsandbox |
+| Declarative conv2d (`aie::Conv2d`/`aie::Mapping`): `[ConvAutoTile] ERROR`, `MESH_ROW` unresolved, OFM chunked `numRounds=2 bufferSize=4096`, `M-tile mismatch` with `tile(OW, OW)`, tuning d1/d2/d3 (`AIEHLC_CONV_TUNE`, `frontend.convtune`) | convautotile |
 | Adding/reading tiling or per-tensor DMA info in routing IR (halo, shim_dma, pp_depth, kernel rounds); "where did `tensor_N.halo` / `routing.spatial_out_rounds` go"; value reads 0 inside a conversion pattern | routingirtilingcarriers |
 | A `#pragma` you added is never `Detected` in the aiehlc log and its feature silently does nothing (build still rc=0) — stale `aiehlc` binary | stalepragmabinary |
 | Gen2-only build break: missing `xpseudo_asm_armclang.h`, or `XPAR_CPU_TIMESTAMP_CLK_FREQ` undeclared | bspheadergen2 |

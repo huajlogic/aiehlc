@@ -15,7 +15,8 @@ from pathlib import Path
 
 from .errors import AiegraphError
 
-__all__ = ["CheckReport", "DetectReport", "BuildReport", "RegionCheck", "PartitionPlan"]
+__all__ = ["CheckReport", "DetectReport", "BuildReport", "RegionCheck", "PartitionPlan",
+           "AIProtoResult"]
 
 
 def _gates_line(k: dict, layer: str) -> str:
@@ -242,3 +243,45 @@ class PartitionPlan:
         return "\n".join(lines)
 
     __repr__ = report
+
+
+@dataclass
+class AIProtoResult:
+    """Result of ``offload_AI_proto``: the ported kernel (path-like) and its last check."""
+
+    source: Path                    # the kernel to use: the port, or the original if it was READY
+    layers: list
+    report: CheckReport             # our own offload_check of ``source``
+    rounds: int                     # claude rounds run (0: nothing to port)
+    session: str = None             # claude session id (``claude --resume <id>`` to go on by hand)
+    log: Path = None
+    original: Path = None
+
+    @property
+    def ok(self) -> bool:
+        return self.report.ok
+
+    def __fspath__(self) -> str:
+        return str(self.source)
+
+    def __str__(self) -> str:
+        return str(self.source)
+
+    def raise_for_status(self) -> "AIProtoResult":
+        self.report.raise_for_status()
+        return self
+
+    def __repr__(self) -> str:
+        tag = ",".join(f"layer{i}" for i in self.layers)
+        lines = [f"offload_AI_proto  {'READY' if self.ok else 'NOT READY'}  {tag}  "
+                 f"after {self.rounds} round(s)",
+                 f"  kernel: {self.source}"]
+        if self.original and self.original != self.source:
+            lines.append(f"  from:   {self.original}")
+        lines += ["  " + l for l in repr(self.report).splitlines()]
+        if self.log:
+            lines.append(f"  log:    {self.log}" + (f"  (claude --resume {self.session})"
+                                                   if self.session else ""))
+        lines.append(f"  next: emod.offload(('{tag.split(',')[0]}', new_kernel))" if self.ok else
+                     "  next: read the log, edit the kernel by hand, or run again with rounds=")
+        return "\n".join(lines)
