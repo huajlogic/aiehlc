@@ -21,7 +21,7 @@ REPO = pathlib.Path(__file__).resolve().parents[4]
 CCODE = REPO / "example" / "tileprogram" / "ccode"
 BASE = CCODE / "simpleconv2dkernel_port.cc"
 TENSOR_BASE = CCODE / "simpleconv2dkernel.cc"
-LOAD_T = "auto x = aie::load_buffer(x_t, {oh0 * S - P, ow0 * S - P, 0}, {IH_T, IW_T, C},"
+LOAD_T = "aie::load_buffer(x_t, {oh0 * S - P, ow0 * S - P, 0}, {IH_T, IW_T, C}"
 LOAD_X = "const int8_t *x = aie::load_buffer(win_a, {oh0 * S, ow0 * S, 0}, {ih_t, iw_t, C});"
 
 # (name, [(old, new), ...], expected substring in the output; None = must pass)
@@ -77,7 +77,7 @@ CASES = [
 TENSOR_CASES = [
     ("tensor: baseline (autotuned)", [], None),
     ("tensor: conv border loaded without .pad",
-     [(",\n                                        {.pad = aie::pad_value::zero});", ");")],
+     [(", {.pad = aie::pad_value::zero});", ");")],
      "outside the tensor extent 224 (a conv border? load it with {.pad = aie::pad_value::zero})"),
     ("tensor: wrong .reuse",
      [("{.reuse = OH_CORE / OH_T * Ofm::dim(1) / OW_T}", "{.reuse = OH_CORE / OH_T}")],
@@ -89,7 +89,7 @@ TENSOR_CASES = [
      [("x(oh * S + kh, ow * S + kw, c)", "x(oh * S + kh + 1, ow * S + kw, c)")],
      "data used without being loaded"),
     ("tensor: data used after release",
-     [("              auto y = aie::store_buffer(", "              aie::release(x_t);\n              auto y = aie::store_buffer(")],
+     [("auto y = aie::store_buffer(", "aie::release(x_t);\n            auto y = aie::store_buffer(")],
      "uses a block after aie::release"),
     # A block of 2 of the 3 channels (compute uses only those): the staged
     # layout aligns channels to 4, so blocks must take them all.
