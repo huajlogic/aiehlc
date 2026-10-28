@@ -1,6 +1,6 @@
 ---
 name: blockloadkernel
-description: Writing or debugging a Triton-style block-load AIE kernel on top of the declarative conv2d model (`__global__(conv, map)` + `aie::program_id`, `aie::load_buffer` / `aie::store_buffer` in tensor coordinates, `aie::release` / `aie::commit`). Use for "no member named 'program_id' in namespace 'aie'", klog BLKE/BLKW/BLKG, a kernel local clashing with an emitted macro (`OH_T`, `OW_T`, `TILE_*`, `SP_*`, `K`), or to emulate the generated kernel on x86 before a board run.
+description: Writing or debugging a Triton-style block-load AIE kernel -- kernel-only (`__global__ void k(aie::port<T, aie::IFM, aie::shape<...>> ...)`, DMA inferred from the kernel) or on top of `__global__(conv, map)` -- with `aie::program_id`, `aie::load_buffer` / `aie::store_buffer` in tensor coordinates, `aie::release` / `aie::commit`. Use for `[KernelAnalysis] ERROR` (too big / too small, outside the tensor, data used without being loaded, use after release, never committed, column-outer loops, schedule depends on data, never stored), Use for "no member named 'program_id' in namespace 'aie'", klog BLKE/BLKW/BLKG, a kernel local clashing with an emitted macro (`OH_T`, `OW_T`, `TILE_*`, `SP_*`, `K`), or to emulate the generated kernel on x86 before a board run.
 ---
 
 # Triton-style block-load kernels
@@ -30,3 +30,17 @@ convautotile: `doc/design/conv_autotiling.md`).
 - Emulate before the board:
   `bash example/tileprogram/ccode/simpleconv2ddebug/emu_conv2d_spatial.sh aout/worklocal`
   (802,816 outputs vs the CPU reference, plus the BLKE count).
+
+## Kernel-only kernels (no conv / map)
+- Ports carry the tensor: `aie::port<T, aie::IFM, aie::shape<230, 230, 4>>`.
+  `inferKernelOnly` (kernel_trace.cpp) traces the body on x86 under ASan for
+  every core, fits each port to base/step/rounds, recognizes the spatial-halo
+  conv, derives with convautotile, compares exactly, then rewrites the source
+  into `__global__(__aie_conv_k, __aie_map_k)`. Example:
+  `example/tileprogram/ccode/simpleconv2dkernel.cc`.
+- Iterate with `build/aiehlc-convtile trace <file.cc>` (seconds) instead of a
+  full aiehlc.sh run; `AIEHLC_TRACE_KEEP=1` keeps the harness.
+- A too-small slab is reported as "data used without being loaded" (ASan), not
+  as a shape mismatch: the conv compute reads past it first.
+- The body must compile on x86 and the schedule must be data-independent.
+- Regression: `python3 src/llvm/convautotile/unitest/kernel_trace_cases.py build/aiehlc-convtile`.

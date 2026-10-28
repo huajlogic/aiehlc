@@ -26,7 +26,9 @@
 
 #include "conv_autotile.h"
 
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace convautotile {
@@ -52,8 +54,11 @@ struct DesugarResult {
 
 // Rewrite `src` in place. `srcDir` resolves quoted #include headers so their
 // object-like integer macros can be used inside the initializers.
+// Kernels that use aie::load_buffer / store_buffer are also traced and their
+// blocks verified against the derived DMA (kernel_trace.h); `srcName` names the
+// source in those diagnostics.
 DesugarResult desugarConvMapping(std::string &src, const std::string &srcDir, const Overrides &ov,
-                                 const Target &tgt = Target());
+                                 const Target &tgt = Target(), const std::string &srcName = "kernel.cc");
 
 // Parse just the declarations (no rewrite). Used by the aiehlc-convtile CLI.
 DesugarResult parseConvMapping(const std::string &src, const std::string &srcDir);
@@ -65,6 +70,17 @@ DesugarResult parseConvMapping(const std::string &src, const std::string &srcDir
 // check against. One declaration per entry; aiehlc carries them into the kernel
 // TU next to the #defines.
 std::vector<std::string> kernelTUDecls(const KernelDesugar &k);
+
+// Source-text helpers (shared with kernel_trace.cpp): comments blanked with
+// offsets preserved, bracket matching, whole-token search, the source's
+// object-like integer macros (and its quoted headers'), integer expression
+// evaluation over them, and the launch mesh of `device.partition({..}, R, C)`.
+std::string sourceBlankComments(const std::string &s);
+size_t sourceMatchClose(const std::string &s, size_t open, char o, char c);
+size_t sourceFindToken(const std::string &s, const std::string &word, size_t from);
+std::map<std::string, std::string> sourceMacros(const std::string &src, const std::string &srcDir);
+bool sourceEvalInt(const std::string &expr, const std::map<std::string, std::string> &macros, long &v);
+std::pair<int, int> sourceLaunchMesh(const std::string &src, const std::string &srcDir);
 
 // JSON report for all kernels of a DesugarResult.
 std::string reportJson(const DesugarResult &r);

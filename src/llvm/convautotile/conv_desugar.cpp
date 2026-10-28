@@ -5,6 +5,7 @@
  * Source-level desugaring of aie::Conv2d / aie::Mapping — see conv_desugar.h.
  ******************************************************************************/
 #include "conv_desugar.h"
+#include "kernel_trace.h"
 
 #include <algorithm>
 #include <cctype>
@@ -714,7 +715,8 @@ DesugarResult parseConvMapping(const std::string &src, const std::string &srcDir
     return r;
 }
 
-DesugarResult desugarConvMapping(std::string &src, const std::string &srcDir, const Overrides &ov, const Target &tgt) {
+DesugarResult desugarConvMapping(std::string &src, const std::string &srcDir, const Overrides &ov, const Target &tgt,
+                                 const std::string &srcName) {
     DesugarResult r;
     Parsed P;
     if (!parseAll(src, srcDir, P, r) || !r.ok)
@@ -730,6 +732,22 @@ DesugarResult desugarConvMapping(std::string &src, const std::string &srcDir, co
         if (!k.derived.ok) {
             r.ok = false;
             r.error = k.kernel + ": " + (k.derived.errors.empty() ? "derivation failed" : k.derived.errors[0]);
+            return r;
+        }
+    }
+    // Block-load kernels: their load_buffer / store_buffer must be exactly
+    // what the derived DMA delivers. Kernels inferred by inferKernelOnly were
+    // already traced against this derivation.
+    for (auto &k : r.kernels) {
+        if (k.convVar.compare(0, 11, "__aie_conv_") == 0)
+            continue;
+        std::vector<std::string> errs = verifyKernelBlocks(src, srcDir, srcName, k, r.warnings);
+        if (!errs.empty()) {
+            r.ok = false;
+            r.error = k.kernel + ": the kernel's blocks do not match the DMA derived from " + k.convVar + " + " +
+                      k.mapVar + ":";
+            for (auto &e : errs)
+                r.error += "\n  " + e;
             return r;
         }
     }
@@ -793,6 +811,26 @@ DesugarResult desugarConvMapping(std::string &src, const std::string &srcDir, co
     for (auto &e : edits)
         src.replace(e.begin, e.end - e.begin, e.text);
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// Text helpers shared with kernel_trace.cpp
+// ---------------------------------------------------------------------------
+std::string sourceBlankComments(const std::string &s) { return blankComments(s); }
+size_t sourceMatchClose(const std::string &s, size_t open, char o, char c) { return matchClose(s, open, o, c); }
+size_t sourceFindToken(const std::string &s, const std::string &word, size_t from) { return findToken(s, word, from); }
+std::map<std::string, std::string> sourceMacros(const std::string &src, const std::string &srcDir) {
+    std::map<std::string, std::string> m;
+    collectMacros(src, srcDir, m, 0);
+    return m;
+}
+bool sourceEvalInt(const std::string &expr, const std::map<std::string, std::string> &macros, long &v) {
+    Parser ps(expr, macros);
+    return ps.parseExprOnly(v);
+}
+std::pair<int, int> sourceLaunchMesh(const std::string &src, const std::string &srcDir) {
+    MeshShape ms = findMeshShape(blankComments(src), sourceMacros(src, srcDir));
+    return {ms.rows, ms.cols};
 }
 
 std::vector<std::string> kernelTUDecls(const KernelDesugar &k) {

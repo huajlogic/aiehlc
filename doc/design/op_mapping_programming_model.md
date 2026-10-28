@@ -277,3 +277,92 @@ humans and debugging, but not a second source of truth.
 - Either way, `aie::program_id` and the tensor-coordinate block shapes are
   worth keeping: they make a core's footprint explicit and replace raw byte
   arithmetic, which is where the sketch's bugs came from.
+
+## 5. Kernel analysis: the DMA from the kernel (no `conv`, no `map`)
+
+`example/tileprogram/ccode/simpleconv2dkernel.cc` is the conv2d with **no**
+`aie::Conv2d` / `aie::Mapping`. The ports declare only their tensors and the
+kernel states its own tiling:
+
+```cpp
+__global__ void conv2d_spatial(
+    aie::port<input_window_int8 *, aie::IFM, aie::shape<230, 230, 4>> win_a,
+    aie::port<input_window_int8 *, aie::WEIGHTS, aie::shape<64, 7, 7, 4>> win_b,
+    aie::port<output_window_int8 *, aie::OFM, aie::shape<112, 112, 64>> win_c) {
+    const int KH = 7, KW = 7, S = 2, C = 4, oh_t = 7, ow_t = 28, oc_t = 16;
+    const int pid_h = aie::program_id(0), pid_c = aie::program_id(1);
+    const int8_t *w = aie::load_buffer(win_b, {pid_c * oc_t, 0, 0, 0}, {oc_t, KH, KW, C});
+    for (i ...) for (j ...) {
+        const int8_t *x = aie::load_buffer(win_a, {oh0 * S, ow0 * S, 0}, {ih_t, iw_t, C});
+        int8_t *y = aie::store_buffer(win_c, {oh0, ow0, pid_c * oc_t}, {oh_t, ow_t, oc_t});
+        ... aie::release(win_a); aie::commit(win_c);
+    }
+    aie::release(win_b);
+}
+```
+
+### How the DMA is found (`src/llvm/convautotile/kernel_trace.{h,cpp}`)
+
+1. **Trace.** `applyConvAutoTiling` (aiehlc.cc) first calls
+   `inferKernelOnly`: the kernel body is compiled for x86 with recording stubs
+   (`aie::load_buffer/store_buffer/release/commit/program_id/num_programs`)
+   under AddressSanitizer, with a `#line` map so diagnostics name the user's
+   source line, and run for every core of the launch mesh
+   (`device.partition(..., R, C)`), twice with different data.
+2. **Fit.** Each port's block sequence becomes
+   `offset = base_p0*p0 + base_p1*p1 + step_i*i + step_j*j`, rounds i outer /
+   j inner, one shape -- the form of a DMA buffer descriptor. Per-core starts
+   must be affine in `program_id` and start at the tensor origin.
+3. **Recognize.** The fits are read as a spatial-halo conv: OH band per mesh
+   row (`base_p0`), OC group per mesh col (`base_p1`), output tile =
+   time tile, stride = input step / output step, kernel window = the weight
+   block, halo = overlap of consecutive input blocks.
+4. **Derive + compare.** That `(conv, map)` goes through convautotile's
+   `derive()` (so the DMA is the proven one), and every port's fit must equal
+   the derived blocks exactly -- too big / too small (per dimension), per-core
+   offsets, rounds, steps.
+5. **Rewrite.** The source becomes `__global__(__aie_conv_<k>, __aie_map_<k>)`
+   with synthesized declarations (`aie::shape` stripped,
+   `aie::num_programs` folded); the existing desugar and pipeline take it from
+   there. For `simpleconv2dkernel.cc` the result is byte-identical to the
+   hand-written `simpleconv2d.cc` (28/28 IR dumps, `kernel.cc`, `routing.cc`,
+   bcf, prx, host DMA program); x86 emulation 802,816/802,816.
+
+`__global__(conv, map)` kernels that use `load_buffer` get the same trace,
+compared against their declared mapping (`verifyKernelBlocks`, from
+`desugarConvMapping`).
+
+### What the verifier rejects
+
+`src/llvm/convautotile/unitest/kernel_trace_cases.py` mutates the example into
+each bug and checks the diagnostic (13 cases):
+
+| Bug | Diagnostic |
+|---|---|
+| load bigger than the DMA block | `block (20,61,4) is too big in dim 0 (rows): it takes 20, the DMA block is 19 (a 7x28 output tile of a 7x7 stride-2 conv)` |
+| load smaller than the conv footprint | `accesses memory outside the block ... at case.cc:57 on core (0,0): data used without being loaded` |
+| index past the loaded block | same, at the reading line |
+| use after `aie::release` | `uses a block after aie::release / aie::commit at case.cc:58` |
+| offset outside the tensor (`pid_c * oc_t * 20`) | `win_b block 0 on core (0,1): block dim 0 covers [320, 336) outside the tensor extent 64` |
+| block never committed / released | `16 block(s) still held at kernel end: never committed (the next DMA round would deadlock)` |
+| more than `pp_depth` blocks held | `takes a block while 2 of this port are still held (pp_depth 2)` |
+| loops swapped | `blocks are visited column-outer ...; the DMA streams output rows in the outer loop -- swap the two loops` |
+| data-dependent schedule | `the load/store schedule depends on the data: win_a block 1 on core (0,0) differs between two inputs` |
+| output not fully written | `200704 output element(s) are never stored, first (0,84,0)` (overlaps likewise) |
+| port never used | `win_b (WEIGHTS) is never loaded (aie::load_buffer)` |
+| store on an input port / load on an output | `aie::store_buffer on an input port` |
+| block over the core memory | `block is 211600 B, larger than the core data memory (49152 B)` |
+
+`aiehlc-convtile trace <src.cc> [--emit]` runs the analysis standalone
+(`AIEHLC_TRACE_KEEP=1` keeps the generated harness).
+
+### Limits
+
+- Recognition covers the spatial-halo conv family the backend implements
+  (OH over mesh rows, OC over mesh cols, OH x OW time tiles). Other block
+  patterns are traced and checked but reported as not recognized.
+- The kernel body must compile on x86 (scalar C++; AIE-API vector code needs
+  the AIE API x86 simulation headers in the harness -- not wired yet).
+- The schedule must not depend on data (checked).
+- The input tensor is the DDR buffer as the kernel reads it (pre-padded);
+  `load_opts{.pad}` from the proposal is not implemented.

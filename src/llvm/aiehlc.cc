@@ -42,6 +42,7 @@
 #include "tilinglinalg_pipeline.h"
 #include "routingmanager.h"
 #include "convautotile/conv_desugar.h"
+#include "convautotile/kernel_trace.h"
 
 class AieFrontEnd;
 
@@ -213,6 +214,7 @@ static std::vector<TraceTileSpec> parsedTraceTiles;
 // so the build aborts with a clear error instead of silently mis-tracing.
 static bool parsedTraceFatal = false;
 static std::string userSourceDir; // directory containing the original user source file
+static std::string userSourceName;    // base name of the user source file (kernel-analysis diagnostics)
 static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
 static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
 static std::vector<std::string> kernel_name_list;
@@ -3841,7 +3843,24 @@ public:
                     llvm::errs() << "[ConvAutoTile] WARNING: " << err << "\n";
             }
             convKernelDecls.clear();
-            convautotile::DesugarResult r = convautotile::desugarConvMapping(src, userSourceDir, ov);
+            // Kernel-only sources (no aie::Conv2d / aie::Mapping; ports carry
+            // aie::shape): derive the DMA layout from the kernel's own
+            // load_buffer / store_buffer and rewrite into the (conv, map) form.
+            {
+                convautotile::KernelOnlyResult ko = convautotile::inferKernelOnly(src, userSourceDir, userSourceName);
+                if (ko.found) {
+                    llvm::outs() << ko.report;
+                    for (auto &n : ko.notes)
+                        llvm::outs() << "[KernelAnalysis] note: " << n << "\n";
+                    if (!ko.ok) {
+                        for (auto &e : ko.errors.empty() ? std::vector<std::string>{ko.error} : ko.errors)
+                            llvm::errs() << "[KernelAnalysis] ERROR: " << e << "\n";
+                        std::exit(1);
+                    }
+                }
+            }
+            convautotile::DesugarResult r =
+                convautotile::desugarConvMapping(src, userSourceDir, ov, convautotile::Target(), userSourceName);
             if (!r.found)
                 return;
             std::ofstream rep(AOUT + std::string("conv_autotile.json"));
@@ -3885,6 +3904,7 @@ public:
                         userSourceDir = fnStr.substr(0, lastSlash);
                     else
                         userSourceDir = ".";
+                    userSourceName = lastSlash == std::string::npos ? fnStr : fnStr.substr(lastSlash + 1);
                 }
 
                 // Print or use the file name as needed
