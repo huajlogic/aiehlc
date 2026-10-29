@@ -8,6 +8,9 @@
     aiegraph setup                                attach (or build) TVM 0.16, then doctor
     aiegraph convert resnet18 [--calib a.jpg ...] [--workdir D]
     aiegraph layers   [--workdir D]               the layer table
+    aiegraph interface                            the kernel-file format (no model needed)
+    aiegraph interface layer1 [--region R] [--entry NAME] [--write DIR] [--workdir D]
+                                                  one layer's interface: args, AIEK_SPEC, templates
     aiegraph detect   KERNEL.cc [--workdir D]
     aiegraph check    "layer1=KERNEL.cc" [--workdir D]
     aiegraph offload  "layer1=KERNEL.cc" [--workdir D] [--make]
@@ -55,6 +58,12 @@ def main(argv=None) -> int:
     sub.choices["offload"].add_argument("--no-build", action="store_true")
     sub.choices["build"].add_argument("--local", action="store_true",
                                       help="also build main_local.elf (x86)")
+    p = sub.add_parser("interface")
+    p.add_argument("layer", nargs="?", default=None, help="TVM layer (layer1, 4, ...); omit for the format")
+    p.add_argument("--region", default=None, help="an ONNX region name instead of a layer")
+    p.add_argument("--entry", default=None, help="entry / kernel name (default aiek_layerNN)")
+    p.add_argument("--write", default=None, metavar="DIR", help="write <entry>.cc and <entry>_ref.c templates")
+    p.add_argument("--workdir", default=None)
     p = sub.add_parser("compile")
     p.add_argument("model")
     p.add_argument("target", choices=["cpu", "a78", "x86", "aie"])
@@ -85,7 +94,17 @@ def main(argv=None) -> int:
                               build=not args.no_build, verbose=args.verbose)
             print(emod)
             return 0
+        if args.cmd == "interface" and args.layer is None and args.region is None:
+            print(ag.offload_interface())
+            return 0
         emod = _emod(args)
+        if args.cmd == "interface":
+            itf = emod.offload_interface(args.layer, region=args.region, entry=args.entry)
+            print(itf)
+            if args.write:
+                for one in (itf if isinstance(itf, ag.Interfaces) else [itf]):
+                    one.write(args.write)
+            return 0
         if args.cmd == "layers":
             print(emod)
             return 0

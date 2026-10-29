@@ -61,6 +61,11 @@ so **offloading a layer offloads every call of it**, and every call is checked.
 
 ## 2. The C contract — `include/aie_user_kernel.h`
 
+Start from the layer: `aiegraph interface layer4 --write my_kernels/` (or
+`emod.offload_interface("layer4").write(...)`) prints that layer's arguments
+with their roles, a proven `AIEK_SPEC`, and writes the entry + reference
+templates this section describes. `aiegraph interface` alone prints the format.
+
 A user kernel is **one aiehlc source in library mode** (no `main()`): your
 `__global__` kernel and its `kernel<<<mesh>>>(...)` launch, exactly as in
 `src/aietensorop/conv2dstem/conv2dstem.cc`, plus three things from the header.

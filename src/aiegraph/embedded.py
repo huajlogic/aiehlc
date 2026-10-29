@@ -179,6 +179,15 @@ class EmbeddedModel:
                 for src, layers in groups.items()]
         return groups, args
 
+    def offload_interface(self, layer=None, *, region=None, entry: str = None):
+        """What a kernel file must contain to replace a layer: its arguments in
+        TVM call order (kind, dtype, shape, role, value facts), a proven
+        ``AIEK_SPEC`` and templates (``.write(dir)``). ``layer`` uses the TVM
+        layer numbering of ``offload_check``; ``region=`` an ONNX region name.
+        No argument: the general kernel-file format."""
+        from .interface import interface_for
+        return interface_for(self, layer, region, entry)
+
     def offload_check(self, spec, source=None, verbose: bool = False) -> CheckReport:
         """lint + detect + calibrate + whole-network emulate, all on x86.
         ``offload_check("layer1", "k.cc")`` or any spec ``offload`` takes."""
