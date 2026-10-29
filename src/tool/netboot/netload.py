@@ -277,8 +277,9 @@ def main(argv=None):
         print(_ack_line(a.cmd, r))
         if r["msg"]:
             print(f"[netload] board: {r['msg']}")
-        if r["verdict"] == "stuck" and r.get("park_addr"):
+        if r["verdict"] in ("stuck", "busy", "overtime") and r.get("park_addr"):
             # a debugger can free the app core without a re-bootstrap: core 1 stop, rst -proc, pc=<this>, con
+            # (apppaltest --netload does it for "stuck", and for "busy" with --netload-force-now)
             print(f"[netload] park_addr=0x{r['park_addr']:x}")
         return EXIT_FOR.get(r["verdict"], 1)
     if r.get("ack_msg"):

@@ -108,6 +108,11 @@ Flags: `--netload-bootstrap` forces a supervisor reload (use it after rebuilding
 60 s; `--netload-wait S` (default 120) waits for a board busy with a run still
 within its max; `--netload-no-force` refuses to terminate a previous app past its
 max (by default it is forced off, which on palmyra means a re-bootstrap).
+`--netload-force-now` does not wait at all: a run still within its max is taken
+over at once -- the app core is parked over JTAG (stop, `rst -proc`, pc =
+`nb_park` from the busy ack's `park_addr`, `con`) and this ELF is sent; if the
+park fails it falls back to a re-bootstrap. It kills whatever is running,
+including another user's run.
 
 ## Busy board, max run time, forced runs (protocol v2)
 
