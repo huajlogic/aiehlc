@@ -17,6 +17,10 @@
 #include <sstream>
 #include <unistd.h>
 
+#ifndef AIEHLC_SOURCE_DIR // the repo root (CMake), for the AIE API x86 emulation header
+#define AIEHLC_SOURCE_DIR "."
+#endif
+
 namespace convautotile {
 
 namespace {
@@ -202,6 +206,7 @@ const char *kHarnessRuntime = R"HARNESS(
 #include <cstring>
 #include <deque>
 #include <initializer_list>
+#include <sanitizer/asan_interface.h>
 namespace aiehlc_trace {
 struct Port { const char *name; int rank; int dim[4]; int eb; int out; std::deque<void *> live; int n; };
 static FILE *g_out;
@@ -239,17 +244,27 @@ static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_li
     if (bytes > 49152) AIEHLC_E(p, "block is %ld B, larger than the core data memory (49152 B)", bytes);
     if ((int)p.live.size() >= g_pp)
         AIEHLC_E(p, "takes a block while %d of this port are still held (pp_depth %d): release first", (int)p.live.size(), g_pp);
-    unsigned char *m = (unsigned char *)malloc(bytes > 0 ? bytes : 1);
+    // Like a DMA window on the core: 32-byte aligned and NOT 64-byte aligned,
+    // with ASan guarding both ends of exactly `bytes`.
+    void *raw = nullptr;
+    if (posix_memalign(&raw, 64, (bytes > 0 ? bytes : 1) + 32)) abort();
+    ASAN_POISON_MEMORY_REGION(raw, 32);
+    unsigned char *m = (unsigned char *)raw + 32;
     for (long i = 0; i < bytes; i++) m[i] = (unsigned char)(i * 31 + g_seed * 97 + p.n * 7);
     p.live.push_back(m);
     p.n++;
     return {m};
 }
+static void unblock(void *m) {
+    void *raw = (unsigned char *)m - 32;
+    ASAN_UNPOISON_MEMORY_REGION(raw, 32);
+    free(raw);
+}
 static void release(Port &p, int st) {
     if (st && !p.out) AIEHLC_E(p, "aie::commit on an input port (use aie::release)");
     if (!st && p.out) AIEHLC_E(p, "aie::release on an output port (use aie::commit)");
     if (p.live.empty()) { AIEHLC_E(p, "%s without a block held", st ? "aie::commit" : "aie::release"); return; }
-    free(p.live.front());
+    unblock(p.live.front());
     p.live.pop_front();
     fprintf(g_out, "R %d %d %s %d\n", g_p0, g_p1, p.name, p.n);
 }
@@ -257,7 +272,7 @@ static void finish(Port &p) {
     if (!p.live.empty())
         AIEHLC_E(p, "%d block(s) still held at kernel end: never %s (the next DMA round would deadlock)",
                  (int)p.live.size(), p.out ? "committed" : "released");
-    while (!p.live.empty()) { free(p.live.front()); p.live.pop_front(); }
+    while (!p.live.empty()) { unblock(p.live.front()); p.live.pop_front(); }
 }
 } // namespace aiehlc_trace
 namespace aie {
@@ -275,6 +290,10 @@ inline int program_id(int a) { return a == 0 ? aiehlc_trace::g_p0 : aiehlc_trace
 inline int num_programs(int a) { return a == 0 ? aiehlc_trace::g_rows : aiehlc_trace::g_cols; }
 } // namespace aie
 static inline unsigned get_coreid() { return ((unsigned)aiehlc_trace::g_p1 << 16) | (unsigned)aiehlc_trace::g_p0; }
+// Vector kernels: the AIE API subset, emulated per element (ASan sees every
+// byte a vector load touches); misaligned vector accesses become diagnostics.
+#define AIEHLC_EMU_REPORT(msg) fprintf(aiehlc_trace::g_out, "E %d %d vector 0 %s\n", aiehlc_trace::g_p0, aiehlc_trace::g_p1, msg)
+#include AIEHLC_EMU_HEADER
 static inline void klog(const char *, int) {}
 )HARNESS";
 
@@ -402,7 +421,8 @@ bool runHarness(const std::string &harness, const std::string &srcName, int rows
     }
     const char *cxx = std::getenv("CXX");
     std::string cc = std::string(cxx && *cxx ? cxx : "g++") +
-                     " -std=c++20 -O1 -g -w -fsanitize=address -fno-omit-frame-pointer -o " + dir + "/h " + dir +
+                     " -std=c++20 -O1 -g -w -fsanitize=address -fno-omit-frame-pointer " + "-DAIEHLC_EMU_HEADER='\"" +
+                     std::string(AIEHLC_SOURCE_DIR) + "/src/mlir/runtime/aie_api_x86emu.h\"' -o " + dir + "/h " + dir +
                      "/harness.cc > " + dir + "/cc.log 2>&1";
     if (std::system(cc.c_str()) != 0) {
         std::string log = readAll(dir + "/cc.log");
@@ -480,9 +500,10 @@ void collectHarnessErrors(const std::vector<Event> &events, KernelTraceResult &r
     for (auto &key : order) {
         const Event *e = seen[key].first;
         int cnt = seen[key].second;
-        r.errors.push_back(e->port + " block " + std::to_string(e->n) + " on core (" + std::to_string(e->p0) + "," +
-                           std::to_string(e->p1) + "): " + e->msg +
-                           (cnt > 1 ? " [" + std::to_string(cnt) + " occurrences]" : ""));
+        r.errors.push_back(
+            (e->port == "vector" ? std::string("vector access") : e->port + " block " + std::to_string(e->n)) +
+            " on core (" + std::to_string(e->p0) + "," + std::to_string(e->p1) + "): " + e->msg +
+            (cnt > 1 ? " [" + std::to_string(cnt) + " occurrences]" : ""));
     }
 }
 

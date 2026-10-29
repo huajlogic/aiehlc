@@ -1,6 +1,6 @@
 ---
 name: blockloadkernel
-description: Writing or debugging a Triton-style block-load AIE kernel -- kernel-only (`__global__ void k(aie::port<T, aie::IFM, aie::shape<...>> ...)`, DMA inferred from the kernel) or on top of `__global__(conv, map)` -- with `aie::program_id`, `aie::load_buffer` / `aie::store_buffer` in tensor coordinates, `aie::release` / `aie::commit`. Tensor form (`aie::in<aie::tensor>`, `.pad`, `.reuse`, `aie::autotune`, `[TensorForm]` report). Use for `[KernelAnalysis] ERROR` (too big / too small, outside the tensor, data used without being loaded, use after release, never committed, column-outer loops, schedule depends on data, never stored), Use for "no member named 'program_id' in namespace 'aie'", klog BLKE/BLKW/BLKG, a kernel local clashing with an emitted macro (`OH_T`, `OW_T`, `TILE_*`, `SP_*`, `K`), or to emulate the generated kernel on x86 before a board run.
+description: Writing or debugging a Triton-style block-load AIE kernel -- kernel-only (`__global__ void k(aie::port<T, aie::IFM, aie::shape<...>> ...)`, DMA inferred from the kernel) or on top of `__global__(conv, map)` -- with `aie::program_id`, `aie::load_buffer` / `aie::store_buffer` in tensor coordinates, `aie::release` / `aie::commit`. Tensor form (`aie::in<aie::tensor>`, `.pad`, `.reuse`, `aie::autotune`, `[TensorForm]` report). Vector kernels (`aie::mmul` traced through `aie_api_x86emu.h`). Use for `[KernelAnalysis] ERROR` (too big / too small, outside the tensor, data used without being loaded, use after release, never committed, column-outer loops, schedule depends on data, never stored), Use for "no member named 'program_id' in namespace 'aie'", klog BLKE/BLKW/BLKG, a kernel local clashing with an emitted macro (`OH_T`, `OW_T`, `TILE_*`, `SP_*`, `K`), or to emulate the generated kernel on x86 before a board run.
 ---
 
 # Triton-style block-load kernels
@@ -59,3 +59,20 @@ convautotile: `doc/design/conv_autotiling.md`).
   example/tileprogram/ccode/simpleconv2dkernel.cc aout/worklocal` -> `GOLDEN PASS`.
 - `auto a = aie::alloc<X>(), b = aie::alloc<Y>();` is not valid C++ (two types
   in one `auto`); the lowering splits it and says so in a note.
+
+## Vector kernels (aie::mmul) under the kernel analysis
+- The trace compiles the body with g++: AIE API calls come from
+  `src/mlir/runtime/aie_api_x86emu.h` (per-element emulation). A call it lacks
+  is "does not compile for tracing" -- add it there, matching the AIE API docs.
+- `acc32` / `acc64` are GLOBAL tags (`aie::accum<acc32, 64>`); `aie::acc32`
+  fails in xchesscc AND in the emulation.
+- DMA windows are only 32-byte aligned: `aie::load_v<64>` / `store_v` of 64
+  bytes on a window is reported (`needs a 64-byte aligned address`); use
+  `load_unaligned_v<64>(p, 4)` or 32-byte halves.
+- A 64-byte A-tile load must not run past the block even if the extra lanes
+  meet zero weights (ASan reports it, and on the last slab row it reads past
+  the buffer): shift the last K-block back and zero those B rows
+  (`simpleconv2dkernel_port.cc`, off = 20).
+- End to end on x86: `emu_conv2d_spatial.sh aout/worklocal` (includes the
+  emulation). Cycles: `kernel.lst` -- count bundles vs VMAC between
+  `.begin_of_loop` / `.end_of_loop`.

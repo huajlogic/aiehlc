@@ -435,3 +435,54 @@ written, loops swapped.
 Limits: one tensor-form kernel per source; roles are inferred (output → OFM,
 rank-4 input → WEIGHTS, rank-3 → IFM); `aie::pad_value::zero` only; channel
 padding of an output is rejected.
+
+## 7. Vector kernels and the AIE API x86 emulation
+
+`example/tileprogram/ccode/simpleconv2dkernel_port.cc` computes with
+`aie::mmul<8, 8, 8, int8_t, int8_t>` instead of scalar loops. Its block-load
+contract (`load_buffer` / `store_buffer` blocks, loop order) is unchanged, so
+the derived DMA, `routing.cc`, bcf, prx, `host.cc` and all 28 IR dumps are
+identical to the scalar build; only the kernel code differs.
+
+**Mapping the conv onto mmul.** C [8 output cols x 8 channels] += A [8 cols x
+8 K] * B [8 K x 8 channels]. Stride 2 x 4 channels makes the 7 taps x 4
+channels of output column `ow` in kernel row `kh` the 28 contiguous slab bytes
+at `(oh*S + kh)*244 + ow*8`, so an A tile is ONE unaligned 64-byte load (no
+im2col copy). K per kernel row = 4 blocks of 8: bytes 0-7, 8-15, 16-23 and
+20-27 -- the last block starts 4 bytes early so no load runs past the
+244-byte row (or the block); its first 4 B rows are zero. Weights are packed
+once per launch into `Bp[kh][kb][nb]` B tiles and the weight window is
+released right away. Output columns per pass: M-blocks {0, 8} and {16, 20}
+(20-23 written twice with identical values) x 2 N-blocks of 8 channels, so
+every B load feeds two MACs; the two N-blocks are interleaved with
+`interleave_zip` into 128 contiguous output bytes and stored as 32-byte
+vectors (DMA windows are only 32-byte aligned). `saturation_mode::saturate`
+makes the int8 narrowing equal to the scalar clamp (bit-exact: |sum| <= 588).
+
+**Measured / scheduled.** The kh loop pipelines at one `VMAC` per bundle
+(kernel.lst: 15 bundles, 15 VMAC). Scalar: 89 bundles per 28 MACs, ~650
+cycles per output, ~32.6 M cycles per core per launch.
+
+**Tracing vector code** (`src/mlir/runtime/aie_api_x86emu.h`). The kernel
+analysis compiles the body with g++ under ASan, where the real AIE API has no
+implementation (its native mode needs chess). The header emulates the subset
+the kernels use per element -- `aie::vector`, `aie::accum<acc32|acc64>`,
+`aie::mmul` (row-major A/B/C, acc32 wraps), `load_v` / `load_unaligned_v` /
+`store_v`, `zeros`, `concat`, `shuffle_down_fill`, `interleave_zip`,
+`bit_and`, `add`, and the SRS rounding / saturation modes -- so:
+
+- ASan sees every byte a vector load touches: a 64-byte load that runs past
+  the block is "data used without being loaded" at its source line;
+- `load_v` / `store_v` need the vector-size alignment (capped at 64) and
+  `load_unaligned_v` its `aligned_elems`; the harness allocates blocks 32-byte
+  but not 64-byte aligned (like DMA windows on the core, ASan-poisoned on both
+  sides), so `aie::load_v<64>` on a window is reported with the line and the
+  fix;
+- anything outside the subset is a compile error in the harness -- extend
+  the header. The accumulator tags are global (`acc32`), as in the AIE API,
+  so the emulation rejects `aie::acc32` just like xchesscc.
+
+The same header drives `simpleconv2ddebug/emu_conv2d_spatial.sh` (the
+generated kernel on x86, windows 32-byte aligned): the vector build passes
+802,816/802,816 with 0 block errors. `kernel_trace_cases.py` adds two vector
+cases (unshifted last K-block, aligned 64-byte load on a window).

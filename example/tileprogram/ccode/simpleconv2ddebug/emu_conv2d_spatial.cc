@@ -6,14 +6,19 @@
 // 920) and the output blocks are scattered like the gather DMA, so a PASS means
 // kernel + derived tiling agree before any board run. BLKE counts the
 // aie::load_buffer/store_buffer block-check failures (aie_block_io.h).
+// Vector kernels run on the AIE API x86 emulation (aie_api_x86emu.h); the
+// windows are 32-byte but not 64-byte aligned, like DMA buffers on the core,
+// so a vector access the hardware cannot do is reported.
 //
 //   source script/aiehlc.sh --aie-version 5 --runtime-source-file \
 //       ./example/tileprogram/ccode/simpleconv2d_new_load.cc       # -> aout/worklocal/
 //   bash example/tileprogram/ccode/simpleconv2ddebug/emu_conv2d_spatial.sh aout/worklocal
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
+#include "aie_api_x86emu.h"
 static int g_blke = 0, g_core_row = 0, g_core_col = 0;
 static void klog(const char *tag, int v) {
     if (!strcmp(tag, "BLKE")) {
@@ -23,13 +28,25 @@ static void klog(const char *tag, int v) {
     }
 }
 static unsigned get_coreid() { return ((unsigned)(3 + g_core_col) << 16) | (unsigned)(3 + g_core_row); }
+// A DMA buffer: 32-byte aligned, deliberately not 64-byte aligned.
+struct WinBuf {
+    void *raw = nullptr;
+    int8_t *p = nullptr;
+    explicit WinBuf(size_t n) {
+        if (posix_memalign(&raw, 64, n + 32))
+            abort();
+        p = (int8_t *)raw + 32;
+    }
+    ~WinBuf() { free(raw); }
+    int8_t *data() { return p; }
+};
 struct input_window_int8 {
-    std::vector<int8_t> buf;
+    WinBuf buf;
     int (*fill)(int8_t *, int);
     int round;
 };
 struct output_window_int8 {
-    std::vector<int8_t> buf;
+    WinBuf buf;
     void (*drain)(const int8_t *, int);
     int round;
 };
@@ -87,8 +104,8 @@ int main() {
                                  1);
     for (g_core_row = 0; g_core_row < 4; g_core_row++)
         for (g_core_col = 0; g_core_col < 4; g_core_col++) {
-            input_window_int8 a{std::vector<int8_t>(4636), fill_a, 0}, b{std::vector<int8_t>(3136), fill_b, 0};
-            output_window_int8 c{std::vector<int8_t>(3136), drain_c, 0};
+            input_window_int8 a{WinBuf(4636), fill_a, 0}, b{WinBuf(3136), fill_b, 0};
+            output_window_int8 c{WinBuf(3136), drain_c, 0};
             conv2d_spatial(&a, &b, &c);
         }
     std::vector<int8_t> ref(OUTPUT_H * OUTPUT_W * NUM_FILTERS);

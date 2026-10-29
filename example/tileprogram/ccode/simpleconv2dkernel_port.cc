@@ -30,12 +30,41 @@ __global__ void conv2d_spatial(aie::port<input_window_int8 *, aie::IFM, aie::sha
     const int iw_t = (ow_t - 1) * S + KW;           // 61
     const int oh_core = 112 / aie::num_programs(0); // 28 output rows per mesh row
     const int TAPS = KH * KW * C;                   // 196
+    const int ROW = iw_t * C;                       // 244 bytes per slab row
+    const int pid_h = aie::program_id(0);           // mesh row: which OH band
+    const int pid_c = aie::program_id(1);           // mesh col: which OC group
 
-    const int pid_h = aie::program_id(0); // mesh row: which OH band
-    const int pid_c = aie::program_id(1); // mesh col: which OC group
+    // Vector compute: aie::mmul<8, 8, 8> (int8 x int8, 32-bit accumulators),
+    //   C [8 output cols x 8 channels] += A [8 output cols x 8 K] * B [8 K x 8 channels].
+    // Per kernel row kh, the 7 taps x 4 channels of output column ow are the 28
+    // CONTIGUOUS slab bytes at (oh*S + kh)*ROW + ow*S*C (stride 2 x 4 channels =
+    // 8 bytes per column), so the A tile of 8 consecutive columns and K-block kb
+    // is ONE 64-byte load and im2col costs nothing. K per kernel row = 4 blocks
+    // of 8: bytes 0-7, 8-15, 16-23 and 20-27 -- the last block starts 4 bytes
+    // early so no load runs past the 244-byte row (or the block); its first 4
+    // rows of B are zero, so taps 20-23 are not counted twice.
+    // Output columns per pass: M-blocks {0, 8} and {16, 20} (20-23 are written
+    // twice with identical values), times 2 N-blocks of 8 channels.
+    using MM = aie::mmul<8, 8, 8, int8_t, int8_t>;
+    aie::set_saturation(aie::saturation_mode::saturate); // int8 results clamp like the scalar reference
 
-    // This core's filters: output channels [pid_c*16, +16), all taps.
+    // This core's filters: output channels [pid_c*16, +16), all taps, packed
+    // once into B tiles Bp[kh][kb][nb] (8 K x 8 channels, row-major).
     const int8_t *w = aie::load_buffer(win_b, {pid_c * oc_t, 0, 0, 0}, {oc_t, KH, KW, C});
+    // const int8_t *w = aie::load_buffer(win_b, {pid_c * oc_t*10, 0, 0, 0}, {oc_t, KH, KW, C});//for bug test
+    alignas(64) int8_t Bp[7 * 4 * 2 * 64];
+    for (int kh = 0; kh < KH; kh++)
+        for (int kb = 0; kb < 4; kb++)
+            for (int nb = 0; nb < 2; nb++)
+                for (int k = 0; k < 8; k++)
+                    for (int n = 0; n < 8; n++) {
+                        const int byte = kb < 3 ? kb * 8 + k : 20 + k; // tap byte within kernel row kh
+                        const bool live = kb < 3 || k >= 4;
+                        Bp[(((kh * 4 + kb) * 2 + nb) * 8 + k) * 8 + n] =
+                            live ? w[(nb * 8 + n) * TAPS + kh * KW * C + byte] : (int8_t)0;
+                    }
+    aie::release(win_b);
+    const aie::accum<acc32, 64> zero = aie::zeros<acc32, 64>();
 
     for (int i = 0; i < oh_core / oh_t; i++) {          // 4 row blocks
         for (int j = 0; j < 112 / ow_t; j++) {          // 4 column blocks
@@ -46,16 +75,38 @@ __global__ void conv2d_spatial(aie::port<input_window_int8 *, aie::IFM, aie::sha
             int8_t *y = aie::store_buffer(win_c, {oh0, ow0, pid_c * oc_t}, {oh_t, ow_t, oc_t});
 
             for (int oh = 0; oh < oh_t; oh++) {
-                for (int ow = 0; ow < ow_t; ow++) {
-                    for (int oc = 0; oc < oc_t; oc++) {
-                        int16_t sum = 0;
-                        int kk = 0;
-                        for (int kh = 0; kh < KH; kh++)
-                            for (int kw = 0; kw < KW; kw++)
-                                for (int c = 0; c < C; c++, kk++)
-                                    sum += (int16_t)x[((oh * S + kh) * iw_t + ow * S + kw) * C + c] *
-                                           (int16_t)w[oc * TAPS + kk];
-                        y[(oh * ow_t + ow) * oc_t + oc] = (int8_t)(sum > 127 ? 127 : (sum < -128 ? -128 : sum));
+                for (int pass = 0; pass < 2; pass++) {
+                    const int owA = pass * 16, owB = pass * 16 + (pass ? 4 : 8); // M-block first columns
+                    MM cA0(zero), cA1(zero), cB0(zero), cB1(zero);
+                    for (int kh = 0; kh < KH; kh++)
+                        chess_prepare_for_pipelining chess_loop_range(7, 7) {
+                            const int8_t *r = x + (oh * S + kh) * ROW;
+                            const int8_t *bk = Bp + kh * 4 * 2 * 64;
+                            for (int kb = 0; kb < 4; kb++)
+                                chess_unroll_loop() {
+                                    const int off = kb < 3 ? kb * 8 : 20;
+                                    const aie::vector<int8_t, 64> aA = aie::load_unaligned_v<64>(r + owA * 8 + off, 4);
+                                    const aie::vector<int8_t, 64> aB = aie::load_unaligned_v<64>(r + owB * 8 + off, 4);
+                                    const aie::vector<int8_t, 64> b0 = aie::load_v<64>(bk + (kb * 2 + 0) * 64);
+                                    const aie::vector<int8_t, 64> b1 = aie::load_v<64>(bk + (kb * 2 + 1) * 64);
+                                    cA0.mac(aA, b0);
+                                    cA1.mac(aA, b1);
+                                    cB0.mac(aB, b0);
+                                    cB1.mac(aB, b1);
+                                }
+                        }
+                    // 8 columns x 16 channels = 128 contiguous output bytes:
+                    // interleave the two N-blocks 8 channels at a time.
+                    const int owc[2] = {owA, owB};
+                    const MM *acc[2][2] = {{&cA0, &cA1}, {&cB0, &cB1}};
+                    for (int m = 0; m < 2; m++) {
+                        const auto z =
+                            aie::interleave_zip(acc[m][0]->to_vector<int8_t>(0), acc[m][1]->to_vector<int8_t>(0), 8);
+                        int8_t *o = y + (oh * ow_t + owc[m]) * oc_t; // 32-byte aligned (window base is)
+                        aie::store_v(o, z.first.extract<32>(0));
+                        aie::store_v(o + 32, z.first.extract<32>(1));
+                        aie::store_v(o + 64, z.second.extract<32>(0));
+                        aie::store_v(o + 96, z.second.extract<32>(1));
                     }
                 }
             }
@@ -63,7 +114,6 @@ __global__ void conv2d_spatial(aie::port<input_window_int8 *, aie::IFM, aie::sha
             aie::commit(win_c);
         }
     }
-    aie::release(win_b);
 }
 // ═══════════════════════════════════════════════════════════════════════════
 // HOST
