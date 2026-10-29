@@ -2321,13 +2321,12 @@ void __Runtime_read_kernel_log(XAie_DevInst *dev, XAie_LocType tile) {
 
     int32_t wi = buf[0];
     if (wi <= 0 || wi > 511) {
-        AIEHLC_LOG(
-            printf("[kernel_log] tile(%u,%u): no log (write_index=%d)\n", (unsigned)tile.Col, (unsigned)tile.Row, wi););
+        printf("[kernel_log] tile(%u,%u): no log (write_index=%d)\n", (unsigned)tile.Col, (unsigned)tile.Row, wi);
         return;
     }
 
     int num_entries = wi / 2;
-    AIEHLC_LOG(printf("[kernel_log] tile(%u,%u): %d entries\n", (unsigned)tile.Col, (unsigned)tile.Row, num_entries););
+    printf("[kernel_log] tile(%u,%u): %d entries\n", (unsigned)tile.Col, (unsigned)tile.Row, num_entries);
 
     for (int i = 0; i < wi; i += 2) {
         int32_t tag_raw = buf[i + 1];
@@ -2338,8 +2337,14 @@ void __Runtime_read_kernel_log(XAie_DevInst *dev, XAie_LocType tile) {
         tag[2] = (char)((tag_raw >> 8) & 0xFF);
         tag[3] = (char)(tag_raw & 0xFF);
         tag[4] = '\0';
-        AIEHLC_LOG(printf("  [%d] %s = %d (0x%08x)\n", i / 2, tag, val, (unsigned)val););
+        printf("  [%d] %s = %d (0x%08x)\n", i / 2, tag, val, (unsigned)val);
     }
+}
+
+void __Runtime_read_kernel_logs(XAie_DevInst *dev, const uint8_t *cols, const uint8_t *rows, uint32_t n) {
+    printf("[kernel_log] ===== Kernel Log (DM offset 0x%X, %u core tiles) =====\n", KLOG_DM_OFFSET, (unsigned)n);
+    for (uint32_t i = 0; i < n; i++)
+        __Runtime_read_kernel_log(dev, XAie_TileLoc(cols[i], rows[i]));
 }
 
 /* ---------------------------------------------------------------------------
