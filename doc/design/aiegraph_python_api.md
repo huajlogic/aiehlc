@@ -519,7 +519,10 @@ layers it fits -- so prototype and gates cannot disagree.
 `conv2dstem_uk.cc` architecture -- `<entry>_kernel` (kernel-only form: staged
 shapes, mesh split, block loop; compute TODO), `<entry>_run` (every TVM
 argument; buffers, partition, launch; staging / unpacking TODO), the entry and
-the spec -- and `<entry>_ref.c` (layouts spelled out; the op TODO). The tile
+the spec -- and `<entry>_ref.c`: complete (int32 conv + TVM's requantize,
+bit-exact; `require=range(-30,32)` on the shift) when the layer has the fused
+conv + requantize signature, so `offload_check` is READY on the written files;
+otherwise a frame with the op as TODO. The tile
 is the fewest-rounds candidate that passes the core-memory rules
 (conv_autotiling.md "Legality") AND `build/aiehlc-convtile trace` on the
 generated file, so the DMA derivation is known to succeed; both ResNet-18

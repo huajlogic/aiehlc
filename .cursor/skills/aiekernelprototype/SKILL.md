@@ -27,5 +27,10 @@ tutorial `doc/tutorial_aiegraph.md` §4b.
   against every call (`verified: ... N/N call(s)`); a failure there is a
   generator bug. `require=zero` only for constants zero in EVERY call.
 - Kernel frames: TVM NCHWc conv2d. Other ops: entry + spec skeleton.
+- `_ref.c` is generated COMPLETE for the fused conv + requantize signature
+  (`_is_requant`: roles zp/bias/zp/mult/shift, arg 6 all zero), so
+  `write("./")` + `offload_check("./aiek_layerNN.cc")` is READY as written
+  (verified layers 1 and 4). `ref=-4` in calibrate = a reference still at its
+  `return AIEK_ERR_KERNEL;` placeholder (or files regenerated over an edit).
 - Shapes are concrete; for one kernel over several geometries turn dims into
   NAMEs by hand and re-run `detect`.

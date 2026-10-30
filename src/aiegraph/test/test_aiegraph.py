@@ -341,6 +341,8 @@ def test_offload_prototype_layer_is_proven(tmp_path):
                  "device.partition(", "AIEK_ENTRY(aiek_layer01)", "TODO(compute)"):
         assert part in src, part
     assert "kernel + host + entry backbone" in itf.generator
+    # conv + requantize: the reference is complete, so offload_check passes as written
+    assert itf.requant and "TODO" not in itf.reference_source() and "return AIEK_OK;" in itf.reference_source()
     files = itf.write(tmp_path)
     assert {p.name for p in files} == {"aiek_layer01.cc", "aiek_layer01_ref.c"}
     assert not [f for f in ag.lint(tmp_path / "aiek_layer01.cc").findings if f.level == "error"]

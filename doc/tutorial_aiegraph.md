@@ -219,9 +219,13 @@ to the layer -- what is the layer's is done, what is the algorithm's is yours:
 | `aiek_layer04_run(...)` (`conv2d_stem_nchwc`'s role) | every TVM argument in call order, typed; staging buffers; mesh partition + launch | `TODO(stage input / weights / parameters)`, `TODO(unpack output)` |
 | `AIEK_ENTRY(aiek_layer04)` | all arguments -> `aiek_layer04_run` | -- |
 | `AIEK_SPEC(aiek_layer04, ...)` | proven against every call | -- |
-| `aiek_layer04_ref.c` | arguments, TVM layouts spelled out | the op, bit-exact |
+| `aiek_layer04_ref.c` | arguments, TVM layouts; for the conv + requantize layers of these int8 networks the **whole reference** (bit-exact) | the op, for any other layer |
 
-Until the TODOs are filled `_run` returns -1 and the entry `AIEK_ERR_KERNEL`.
+So `proto.write("./")` then `emod.offload_check("./aiek_layer04.cc")` is READY
+as written (calibrate BIT-EXACT, whole-network emulation identical): the
+reference is the layer's math, i.e. the spec of what your AIE code must
+compute. Until the `.cc` TODOs are filled `_run` returns -1 and the entry
+`AIEK_ERR_KERNEL`, so `offload` builds but the board run reports the error.
 The backbone builds as is (`aiehlc.sh` -> `libaiek_layer04.a`; verified for
 ResNet-18 layers 1 and 4) and lints clean. For each argument the report shows
 `in` / `param` / `out`, dtype, shape, the role the layer's own TVM C gives it
