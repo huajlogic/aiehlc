@@ -504,17 +504,25 @@ part of starting a kernel (argument order, the two zero-points) is generated.
 * Never: anything that runs on a board.
 
 
-## Offload interface (`ag.offload_interface`, implemented)
+## Offload prototype (`ag.offload_prototype`, implemented)
 
-`src/aiegraph/interface.py`. No argument: the kernel-file format
-(`KernelFormat`). With a TVM layer or `region=`: an `OffloadInterface` built from
+`src/aiegraph/prototype.py`. No argument: the kernel-file format
+(`KernelFormat`). With a TVM layer or `region=`: an `OffloadPrototype` built from
 `aiekernel.graph` (args in call order), `network_md.param_role` (roles from the
 layer's generated C) and the constants (value facts over every call; all-zero
 -> `require=zero`). The generated `AIEK_SPEC` is parsed with
 `aiekernel.spec.parse_specs` and matched with `aiekernel.match.match_call`
 against every call before it is returned, and `detect_layers` lists the other
-layers it fits -- so interface and gates cannot disagree. `write(dir)` emits
-`<entry>.cc` (entry + spec; AIE kernel and launch left to the user, entry
-returns `AIEK_ERR_KERNEL` until filled) and `<entry>_ref.c`; it refuses to
-overwrite. Shapes are concrete (one TVM symbol = one geometry); a multi-layer
-kernel generalizes dims to NAMEs by hand. CLI: `aiegraph interface`.
+layers it fits -- so prototype and gates cannot disagree.
+
+`write(dir)` emits a **backbone** (refuses to overwrite): `<entry>.cc` with the
+`conv2dstem_uk.cc` architecture -- `<entry>_kernel` (kernel-only form: staged
+shapes, mesh split, block loop; compute TODO), `<entry>_run` (every TVM
+argument; buffers, partition, launch; staging / unpacking TODO), the entry and
+the spec -- and `<entry>_ref.c` (layouts spelled out; the op TODO). The tile
+is the fewest-rounds candidate that passes the core-memory rules
+(conv_autotiling.md "Legality") AND `build/aiehlc-convtile trace` on the
+generated file, so the DMA derivation is known to succeed; both ResNet-18
+layers tried (1 and 4) build to `libaiek_layerNN.a` as generated. Only a 4x4
+mesh: 4x8 crashes the pipeline (`DmapToDmaphop`). Shapes are concrete; a
+multi-layer kernel generalizes dims to NAMEs by hand. CLI: `aiegraph prototype`.

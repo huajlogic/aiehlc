@@ -96,9 +96,15 @@ part of `host.cc` are **byte-identical** to the hand-written file's build.
 | `ifm + wgt + ofm + 320 ≤ 32768 − 1024` | reference kernels copy each window to the stack (`_stack DM_stack 0x8000`; 11200 B measured in `kernel.calltree` for 7×28); skill **aiecorestackoverflow** |
 | `tw < OW` (≥ 2 width rounds) | `w_rounds = 1` takes the legacy path → `conv spatial-halo M-tile mismatch` |
 | OFM tile and WEIGHTS ≤ `l1_budget` | non-halo ports are clamped to `l1_budget` (`maxPingPongBytes`) and chunked into `ceil(bytes/l1_budget)` rounds of `l1_budget` — uneven, overruns. The halo IFM is exempt. |
+| `pp_depth · l1_budget · 3 ≤ 49152` | the pipeline's own check (`Memory budget exceeded! ... maxPingPongBytes=… numTensors=3`) sizes every tensor's buffers at `l1_budget` |
+| `2·(ifm + wgt + ofm) + 3072 ≤ 32768` | link: `CoreMemAllocator(0x78000, 0x8000)` -- the port buffers get a 32 KB region (the other 32 KB is `DM_stack`), the last 2 KB of it is the `klog` ring, statics share it; `kernel.cc` declares ping **and** pong for every window at any `pp_depth`. Past it: `could not find free space for SpaceSymbol buf_in_ping_0 in memory DMb` (skill **dmbufferregion**) |
 
-The last two were found by building derived tilings, not by reading code; the
-tuner re-checks them on every build (§5).
+The `tw < OW` and `l1_budget` rules were found by building derived tilings, the
+last two by building `offload_prototype` backbones for ResNet-18 layer 4
+(64 -> 64, 3x3); the tuner re-checks them on every build (§5). Kernel-only
+sources (§5 of op_mapping_programming_model.md) get `l1_budget` sized to the
+kernel's own weight / output blocks (>= 4 KB) and `pp_depth = 1` when double
+buffering cannot pass the pipeline check.
 
 ### Cost model
 

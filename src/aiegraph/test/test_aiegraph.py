@@ -316,26 +316,34 @@ def test_ai_proto_gives_up_after_rounds(fake_claude, tmp_path):
         res.raise_for_status()
 
 
-# ── offload_interface ───────────────────────────────────────────────────────
+# ── offload_prototype ───────────────────────────────────────────────────────
 
-def test_offload_interface_format_needs_no_model():
-    fmt = ag.offload_interface()
+def test_offload_prototype_format_needs_no_model():
+    fmt = ag.offload_prototype()
     assert isinstance(fmt, ag.KernelFormat)
     for word in ("AIEK_ENTRY", "AIEK_SPEC", "AIEK_REFERENCE", "TVM call order", "require="):
         assert word in fmt
 
 
 @deployed
-def test_offload_interface_layer_is_proven(tmp_path):
+def test_offload_prototype_layer_is_proven(tmp_path):
     emod = ag.open(DEPLOY)
-    itf = emod.offload_interface("layer1")
+    itf = emod.offload_prototype("layer1")
     assert [a.kind for a in itf.args][0] == "in" and itf.args[-1].kind == "out"
     assert "matches 1/1 call(s)" in itf.verified
     # the stem's second zero-point and unused param are all zero -> require=zero
     assert sum(1 for a in itf.args if a.requires == ("zero",)) == 2
     assert "AIEK_SPEC(aiek_layer01," in itf.spec()
+    # the backbone: kernel frame + host run function + entry, compute left as TODO
+    src = itf.kernel_source()
+    for part in ("__global__ void aiek_layer01_kernel(", "aie::shape<AK_H, AK_W, AK_CA>",
+                 "aie::load_buffer(x_t", "aie::store_buffer(y_t", "int aiek_layer01_run(",
+                 "device.partition(", "AIEK_ENTRY(aiek_layer01)", "TODO(compute)"):
+        assert part in src, part
+    assert "kernel + host + entry backbone" in itf.generator
     files = itf.write(tmp_path)
     assert {p.name for p in files} == {"aiek_layer01.cc", "aiek_layer01_ref.c"}
+    assert not [f for f in ag.lint(tmp_path / "aiek_layer01.cc").findings if f.level == "error"]
     with pytest.raises(ag.AiegraphError, match="already exist"):
         itf.write(tmp_path)
     # what detect sees in the written file is the same signature
@@ -344,6 +352,6 @@ def test_offload_interface_layer_is_proven(tmp_path):
 
 
 @deployed
-def test_offload_interface_multi_call_layer():
-    itf = ag.open(DEPLOY).offload_interface(4)
+def test_offload_prototype_multi_call_layer():
+    itf = ag.open(DEPLOY).offload_prototype(4)
     assert len(itf.calls) == 2 and "matches 2/2 call(s)" in itf.verified

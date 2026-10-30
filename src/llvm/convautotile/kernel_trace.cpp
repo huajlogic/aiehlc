@@ -886,7 +886,20 @@ bool recognizeConv(const TracePort &ifm, const TracePort &wgt, const TracePort &
     m.space_rows = {Axis::OH, rows};
     m.space_cols = {Axis::OC, cols};
     m.time = {{Axis::OH, oh_t}, {Axis::OW, ow_t}};
-    (void)fw;
+    // Non-halo port buffers are sized by hints.l1_budget (else chunked
+    // unevenly): give them room for the blocks the kernel itself loads. The
+    // core-memory / stack checks of derive() still bound the total; kernels
+    // whose blocks fit the 4 KB default keep it (and their exact DMA).
+    const long wgtBytes = (long)fw.shape[0] * fw.shape[1] * fw.shape[2] * fw.shape[3] * wgt.elem_bytes;
+    const long ofmBytes = (long)oh_t * ow_t * oc_t * ofm.elem_bytes;
+    const long need = std::max(wgtBytes, ofmBytes);
+    if (need > m.hints.l1_budget)
+        m.hints.l1_budget = (int)((need + 255) / 256 * 256);
+    // The pipeline sizes all 3 tensors' buffers at l1_budget, pp_depth deep:
+    // single-buffer when double buffering cannot fit (DMA and compute then
+    // alternate instead of overlapping -- correct, slower).
+    if ((long)m.hints.pp_depth * m.hints.l1_budget * 3 > 49152 && (long)m.hints.l1_budget * 3 <= 49152)
+        m.hints.pp_depth = 1;
     return true;
 }
 

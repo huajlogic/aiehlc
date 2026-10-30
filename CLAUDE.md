@@ -647,11 +647,15 @@ dtype); and `partition()` is the **whole** placement — it resets every AIE row
 `partition.json` to CPU before offloading, and `optimize_for` has no cost model (it says
 so in the report). Skill **aiegraphregion**.
 
-`ag.offload_interface()` / `emod.offload_interface("layer1" | region=...)`
-(`src/aiegraph/interface.py`): the kernel-file format, or one layer's exact
-interface -- args in TVM call order with roles and value facts, an `AIEK_SPEC`
-proven against every call by `aiekernel.match`, `.write(dir)` entry + reference
-templates; CLI `aiegraph interface`.
+`ag.offload_prototype()` / `emod.offload_prototype("layer1" | region=...)`
+(`src/aiegraph/prototype.py`): the kernel-file format, or one layer's
+**backbone** -- args in TVM call order with roles and value facts, an
+`AIEK_SPEC` proven against every call by `aiekernel.match`, and `.write(dir)`
+`<entry>.cc` in the `conv2dstem_uk.cc` architecture (aiehlc kernel frame with
+the layer's ports, mesh split and DMA-legal block loop; host `<entry>_run` with
+every argument, buffers and launch; entry; spec) + `<entry>_ref.c`; compute,
+staging and parameters are `TODO`s for the user. It builds as generated
+(`libaiek_layer04.a`). CLI `aiegraph prototype`.
 
 `emod.offload_AI_proto(layers, kernel, rounds=3)` (`src/aiegraph/aiproto.py`): when
 `offload_check` is NOT READY, `claude -p` ports a flat copy of the kernel dir in
@@ -878,7 +882,8 @@ Read the matching skill when the task fits:
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |
 | `pip install -e .` / `import aiegraph`: TVM 0.16 not found or provisioning unexpectedly, `no aiehlc checkout`, `exists and was not written by aiegraph`, stale results after changing model/calib, packaging `frontend` namespace | aiegraphinstall |
 | `aiegraph` region API: `no region matches 'layer1.0.conv1'`, a region offloads its sibling too (`move together` / *dragged*), `region="layer1"` vs `offload_check("layer1")` mean different things, `partition` undid an earlier offload, `register_kernel` "contract contradicts" | aiegraphregion |
-| What a kernel file for a layer must contain: args in TVM call order, roles, AIEK_SPEC, templates (`ag.offload_interface`, `aiegraph interface`) | aiekernelinterface |
+| A kernel-file backbone for a layer: args in TVM call order, roles, AIEK_SPEC, kernel frame + host run + entry (`ag.offload_prototype`, `aiegraph prototype`) | aiekernelprototype |
+| Kernel link fails `could not find free space for SpaceSymbol buf_in_ping_0 in memory DMb`; TilingLinalg `Memory budget exceeded! ... maxPingPongBytes` | dmbufferregion |
 | Plug a user-written kernel into a TVM layer (`AIEK_ENTRY`/`AIEK_SPEC`, `--aie-kernel`, `aiekernel check/offload`); an L0xx lint code, calibrate MISMATCH, emulate FAIL, or `rejected at link -- ... routing()` | aieuserkernel |
 | Run/extend the persistent ResNet-18 engine (`resnetengine`: gen_engine.py model mismatch, core memory overflow, ENG FAIL, new layer kind) | resnetengine |
 | resnetengine eager layer-major hangs ~1 run in 3 in a residual layer: `shim_bd_ctrl TIMEOUT ... owing an ack`, input shim with no task; or a few wrong logits | shimctrlpushloss |

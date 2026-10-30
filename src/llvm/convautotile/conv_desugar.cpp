@@ -876,9 +876,17 @@ std::string reportJson(const DesugarResult &r) {
     auto str = [](const std::string &s) {
         std::string o = "\"";
         for (char c : s) {
-            if (c == '"' || c == '\\')
-                o += '\\';
-            o += c;
+            if (c == '\n')
+                o += "\\n"; // multi-line messages (kernel analysis) stay valid JSON
+            else if (c == '\t')
+                o += "\\t";
+            else if ((unsigned char)c < 0x20)
+                o += ' ';
+            else {
+                if (c == '"' || c == '\\')
+                    o += '\\';
+                o += c;
+            }
         }
         return o + "\"";
     };

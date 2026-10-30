@@ -114,7 +114,9 @@ TENSOR_CASES = [
     ("tensor: loop order swapped",
      [("for (int i = 0; i < OH_CORE / OH_T; i++)", "@OUTER@"),
       ("for (int j = 0; j < Ofm::dim(1) / OW_T; j++)", "for (int i = 0; i < OH_CORE / OH_T; i++)"),
-      ("@OUTER@", "for (int j = 0; j < Ofm::dim(1) / OW_T; j++)")],
+      ("@OUTER@", "for (int j = 0; j < Ofm::dim(1) / OW_T; j++)"),
+      # pinned: with one row round (OH_T=28) the swapped order is harmless
+      ("conv2d<<<mesh>>>", "conv2d<7, 28, 16><<<mesh>>>")],
      "visited column-outer"),
 ]
 

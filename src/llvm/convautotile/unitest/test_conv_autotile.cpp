@@ -132,7 +132,10 @@ static void testFootprintRule() {
     c.h = 56, c.w = 56, c.c = 64, c.k = 64, c.kh = 3, c.kw = 3, c.stride = 1, c.pad = 1;
     MappingSpec m = stemMap(7, 14);
     m.hints.l1_budget = 16384; // 3x3x64 filters x 16 oc = 9216 B
-    Derived d = derive(c, m);
+    Target big;                // geometry only: lift the core-memory budgets
+    big.data_mem_budget = 1 << 20;
+    big.buffer_region = 1 << 20;
+    Derived d = derive(c, m, big);
     CHECK(d.ok);
     CHECK_EQ(d.oh, 56);
     CHECK_EQ(d.oh_mesh, 14);
@@ -145,7 +148,7 @@ static void testFootprintRule() {
     // Dilation 2 widens the window to (K-1)*D+1 = 5.
     c.dilation = 2;
     c.pad = 2;
-    d = derive(c, m);
+    d = derive(c, m, big);
     CHECK(d.ok);
     CHECK_EQ(d.tile_h, 11);
 }
@@ -182,6 +185,7 @@ static void testRejections() {
     CHECK(!d.errors.empty() && d.errors[0].find("stack") != std::string::npos);
     Target noStack;
     noStack.stack_budget = 0;
+    noStack.buffer_region = 1 << 20; // isolate the stack rule (ping + pong alone would not link)
     CHECK(derive(stem(), m1, noStack).ok);
 }
 
@@ -229,7 +233,10 @@ static void testAutotuneAndOverrides() {
     CHECK(!d.ok);
     CHECK(parseOverridesJson("{\"time_oh\": 14, \"time_ow\": 28, \"l1_budget\": 8192}", ov, &err));
     d = derive(stem(), stemMap(7, 28), Target(), ov);
-    CHECK(d.ok);
+    // 2 x (8052 + 3136 + 6272) B of ping + pong buffers does not fit the 32 KB
+    // buffer region (CoreMemAllocator 0x78000 + 0x8000): fails at link, at any
+    // pp_depth (kernel.cc declares both). The derived geometry is still filled.
+    CHECK(!d.ok);
     CHECK_EQ(d.ofm.l1_budget, 8192);
     CHECK_EQ(d.tile_h, 33);
     CHECK_EQ(d.ifm.d[0].l2_rounds, 2);
