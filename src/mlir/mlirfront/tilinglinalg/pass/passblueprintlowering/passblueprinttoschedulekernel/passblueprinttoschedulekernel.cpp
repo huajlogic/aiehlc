@@ -676,11 +676,11 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
 
 // Forward declarations for functions used in generateDSKernelReceiver
 static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolRefAttr target);
-static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
-                                                        Type defaultElementType, int64_t defaultBufferSize,
-                                                        int32_t defaultVectorWidth, double bufferRatio,
-                                                        int64_t maxPingPongBytes,
-                                                        const routing::GemmTilingScalars &tiling);
+static SmallVector<KernelParamInfo>
+analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr, Type defaultElementType,
+                    int64_t defaultBufferSize, int32_t defaultVectorWidth, double bufferRatio, int64_t maxPingPongBytes,
+                    const routing::GemmTilingScalars &tiling, const routing::TensorRoutingInfoMap &tensorInfo,
+                    routing::KernelTilingAttr kernelTiling);
 
 // Generate dfschedule.dskernel_receiver function (legacy style)
 // This is kept for backward compatibility and will call generateKernelModule internally
@@ -695,7 +695,9 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
                                      StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
                                      uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex,
                                      KernelResourceManager &resourceMgr, double bufferRatio, int64_t maxPingPongBytes,
-                                     const routing::GemmTilingScalars &tiling, bool kernelConfigOffload) {
+                                     const routing::GemmTilingScalars &tiling, bool kernelConfigOffload,
+                                     const routing::TensorRoutingInfoMap &tensorInfo,
+                                     routing::KernelTilingAttr kernelTiling) {
 
     // Build kernel generation parameters
     KernelGenParams params;
@@ -718,8 +720,9 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
     // Dynamically analyze flow_transfer operations to determine kernel parameters
     // Walk from the module root to collect all shim<->core data flows
     Operation *rootOp = getModuleOp(insertBeforeOp);
-    params.kernelParams = analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize,
-                                              params.vectorWidth, bufferRatio, maxPingPongBytes, tiling);
+    params.kernelParams =
+        analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize, params.vectorWidth, bufferRatio,
+                            maxPingPongBytes, tiling, tensorInfo, kernelTiling);
 
     // Update params.bufferSize to the max of all per-window sizes
     // (used for kernel_config_def's backward-compat BUF_SZ global define)
@@ -827,11 +830,11 @@ findFlowTransferFor(dfscheblueprint::FlowConfigOp flowConfig, Operation *rootOp,
 // - shim -> core: Input parameter
 // - core -> shim: Output parameter
 // - No flow_transfer or core -> core: Skip (not a kernel parameter)
-static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
-                                                        Type defaultElementType, int64_t defaultBufferSize,
-                                                        int32_t defaultVectorWidth, double bufferRatio,
-                                                        int64_t maxPingPongBytes,
-                                                        const routing::GemmTilingScalars &tiling) {
+static SmallVector<KernelParamInfo>
+analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr, Type defaultElementType,
+                    int64_t defaultBufferSize, int32_t defaultVectorWidth, double bufferRatio, int64_t maxPingPongBytes,
+                    const routing::GemmTilingScalars &tiling, const routing::TensorRoutingInfoMap &tensorInfo,
+                    routing::KernelTilingAttr kernelTiling) {
 
     SmallVector<KernelParamInfo> params;
 
@@ -970,13 +973,10 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                         // output window at the full per-core partition (clamped to 4096).
                         // The conv2d_spatial kernel still writes one [oh_per_row*ow_t, tile_n]
                         // slab per on-core round, so honor the authoritative per-slab count
-                        // in "routing.spatial_out_rounds" (= spatialMRounds*spatialNRounds).
+                        // in #routing.kernel_tiling out_rounds (= spatialMRounds*spatialNRounds).
                         // Kept in lockstep with the host flowtransfer_kernel.cpp output path.
-                        if (auto outRoundsAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds")) {
-                            int64_t outRounds = outRoundsAttr.getInt();
-                            if (outRounds > outDivisor)
-                                outDivisor = outRounds;
-                        }
+                        if (kernelTiling && kernelTiling.getOutRounds() > outDivisor)
+                            outDivisor = kernelTiling.getOutRounds();
                         if (outDivisor > 1) {
                             perCoreSizeForBuf = perCoreSize / outDivisor;
                         }
@@ -1010,63 +1010,49 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 // and needs the WHOLE contiguous halo slab (halo_slice * raw_wc) in a
                 // single window buffer. The GEMM flow-view partition size above does
                 // not reflect this slab, so the window allocation must use the
-                // authoritative slab size carried via "routing.spatial_halo_buf_size".
-                // Identify the spatial-halo IFM port by the per-tensor "tensor_N.halo"
-                // attribute (N = funcArgIndex). This override bypasses the maxPingPong
+                // authoritative slab size (the halo's buf_size). Identify the
+                // spatial-halo IFM port by the #routing.halo on the tensor's declaring
+                // op (func arg funcArgIndex). This override bypasses the maxPingPong
                 // clamp because the slab must stay contiguous for windowing.
                 bool isSpatialHaloPort = false;
                 int64_t l2RoundsKernel = 0; // >1 ⇒ two-level (nested) halo IFM port
-                if (paramInfo.isInput && paramInfo.funcArgIndex >= 0) {
-                    auto moduleOpHalo = declareDataOp->getParentOfType<ModuleOp>();
-                    if (moduleOpHalo) {
-                        std::string haloAttrName = "tensor_" + std::to_string(paramInfo.funcArgIndex) + ".halo";
-                        auto haloDict = moduleOpHalo->getAttrOfType<DictionaryAttr>(haloAttrName);
-                        auto haloBufAttr = moduleOpHalo->getAttrOfType<IntegerAttr>("routing.spatial_halo_buf_size");
-                        if (haloDict && haloBufAttr && haloBufAttr.getInt() > 0) {
-                            pingPongBufSize = haloBufAttr.getInt();
-                            isSpatialHaloPort = true;
-                            // Two-level (nested) halo: when l2_rounds>1 the kernel
-                            // receives the slab in l2_rounds shifted windows of
-                            // l2_slice*raw_wc each (instead of one full halo_slice slab).
-                            // Note: routing.spatial_halo_buf_size already carries the
-                            // per-round (l2_slice*raw_wc) size because aiehlc.cc sizes
-                            // the A-port bufferSize from l2_slice when L2 is active; we
-                            // only need the round multiplier here.
-                            if (auto a = haloDict.getAs<IntegerAttr>("l2_rounds"))
-                                l2RoundsKernel = a.getInt();
-                        }
-                    }
+                routing::HaloAttr portHalo =
+                    paramInfo.isInput ? routing::lookupHalo(tensorInfo, paramInfo.funcArgIndex) : routing::HaloAttr();
+                const int64_t haloBufSize = routing::spatialHaloBufSize(tensorInfo);
+                if (portHalo && haloBufSize > 0) {
+                    pingPongBufSize = haloBufSize;
+                    isSpatialHaloPort = true;
+                    // Two-level (nested) halo: when l2_rounds>1 the kernel
+                    // receives the slab in l2_rounds shifted windows of
+                    // l2_slice*raw_wc each (instead of one full halo_slice slab).
+                    // Note: buf_size already carries the per-round
+                    // (l2_slice*raw_wc) size because aiehlc.cc sizes the A-port
+                    // bufferSize from l2_slice when L2 is active; we only need the
+                    // round multiplier here.
+                    l2RoundsKernel = portHalo.getL2Rounds();
                 }
 
-                // K-contraction split halo IFM (tensor_N.halo k_rounds>1): unlike the
-                // single-slab spatial-halo path above, this config has NO
-                // routing.spatial_halo_buf_size. The kernel receives the IFM as
+                // K-contraction split halo IFM (#routing.halo k_rounds>1): unlike the
+                // single-slab spatial-halo path above, this config has no halo
+                // buf_size. The kernel receives the IFM as
                 // l2_rounds*k_rounds windows, each a [l2_slice rows x k_slice width-elems]
                 // band. Per-window buffer = l2_slice*k_slice elements; numRounds =
                 // l2_rounds*k_rounds. pp_depth stays >=2 (do NOT set singleBuffer) so the
                 // window double-buffers across rounds — kept in lockstep with host B2/B3.
                 bool isKSplitHaloPort = false;
                 int64_t kSplitNumRounds = 0;
-                if (!isSpatialHaloPort && paramInfo.isInput && paramInfo.funcArgIndex >= 0) {
-                    auto moduleOpK = declareDataOp->getParentOfType<ModuleOp>();
-                    if (moduleOpK) {
-                        std::string haloAttrName = "tensor_" + std::to_string(paramInfo.funcArgIndex) + ".halo";
-                        if (auto haloDict = moduleOpK->getAttrOfType<DictionaryAttr>(haloAttrName)) {
-                            auto l2SliceA = haloDict.getAs<IntegerAttr>("l2_slice");
-                            auto kSliceA = haloDict.getAs<IntegerAttr>("k_slice");
-                            auto l2RoundsA = haloDict.getAs<IntegerAttr>("l2_rounds");
-                            auto kRoundsA = haloDict.getAs<IntegerAttr>("k_rounds");
-                            if (kRoundsA && kRoundsA.getInt() > 1 && kSliceA && kSliceA.getInt() > 0 && l2SliceA &&
-                                l2SliceA.getInt() > 0) {
-                                pingPongBufSize = l2SliceA.getInt() * kSliceA.getInt(); // 19*244 = 4636 elements
-                                int64_t l2r = l2RoundsA ? l2RoundsA.getInt() : 1;
-                                kSplitNumRounds = (l2r > 0 ? l2r : 1) * kRoundsA.getInt(); // 4*4 = 16
-                                isKSplitHaloPort = true;
-                                llvm::errs()
-                                    << "[BlueprintToScheduleKernel] K-split halo IFM: bufSize=" << pingPongBufSize
-                                    << " (l2_slice*k_slice) numRounds=" << kSplitNumRounds << " (l2_rounds*k_rounds)\n";
-                            }
-                        }
+                if (!isSpatialHaloPort && portHalo) {
+                    const int64_t l2Slice = portHalo.getL2Slice(), kSlice = portHalo.getKSlice();
+                    const int64_t kRounds = portHalo.getKRounds();
+                    if (kRounds > 1 && kSlice > 0 && l2Slice > 0) {
+                        pingPongBufSize = l2Slice * kSlice; // 19*244 = 4636 elements
+                        // 0 = L2 level absent, which the old dictionary read as 1.
+                        int64_t l2r = portHalo.getL2Rounds();
+                        kSplitNumRounds = (l2r > 0 ? l2r : 1) * kRounds; // 4*4 = 16
+                        isKSplitHaloPort = true;
+                        llvm::errs() << "[BlueprintToScheduleKernel] K-split halo IFM: bufSize=" << pingPongBufSize
+                                     << " (l2_slice*k_slice) numRounds=" << kSplitNumRounds
+                                     << " (l2_rounds*k_rounds)\n";
                     }
                 }
 
@@ -1127,11 +1113,8 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                         // so mRounds collapses to 1; use the authoritative per-slab round
                         // count so the output window arms once per kernel slab (16), matching
                         // the per-slab buffer size divided above. In lockstep with the host.
-                        if (auto outRoundsAttr = moduleOp3->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds")) {
-                            int64_t outRounds = outRoundsAttr.getInt();
-                            if (outRounds > mRounds)
-                                mRounds = outRounds;
-                        }
+                        if (kernelTiling && kernelTiling.getOutRounds() > mRounds)
+                            mRounds = kernelTiling.getOutRounds();
                         if (mRounds > 1) {
                             llvm::errs() << "[BlueprintToScheduleKernel] M-round: output numRounds "
                                          << paramInfo.numRounds << " * mRounds " << mRounds << " = "
@@ -1380,7 +1363,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         if (!hasDSKernelReceiver(op.getOperation(), kernelName)) {
             generateDSKernelReceiver(rewriter, loc, op.getOperation(), kernelName, kernelTensorType, bufferLen,
                                      basePacketId, coreChannel, flowIndex, resourceMgr, bufferRatio, maxPingPongBytes,
-                                     tiling, kernelConfigOffload);
+                                     tiling, kernelConfigOffload, passState->tensorInfo, passState->kernelTiling);
         }
 
         // --- Core tile DMA config (KERNELCONFIGOFFLOAD only) ---
@@ -1552,13 +1535,16 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
             return attr ? attr.getInt() : 0;
         };
         kernelConfigOffload = getI64("routing.kernel_config_offload") != 0;
-        tiling.tileM = getI64("routing.tile_m");
-        tiling.tileRows = getI64("routing.tile_rows");
-        tiling.tileN = getI64("routing.tile_n");
-        tiling.tileCols = getI64("routing.tile_cols");
-        tiling.effectiveK = getI64("routing.effective_k");
-        tiling.fullK = getI64("routing.full_k");
-        tiling.kRounds = getI64("routing.k_rounds");
+        // No #routing.tiling op (fullconnect_auto=0 / spatial halo): the routing
+        // func's #routing.kernel_tiling is the source.
+        routing::KernelTilingAttr kt = routing::readKernelTiling(moduleOp);
+        tiling.tileM = kt.getTileM();
+        tiling.tileRows = kt.getTileRows();
+        tiling.tileN = kt.getTileN();
+        tiling.tileCols = kt.getTileCols();
+        tiling.effectiveK = kt.getEffectiveK();
+        tiling.fullK = kt.getFullK();
+        tiling.kRounds = kt.getKRounds();
         routing::GemmTilingScalars ir = routing::readGemmTilingScalars(moduleOp);
         if (ir.found)
             tiling = ir;
@@ -1574,6 +1560,13 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     //     every tile and emits nothing.
     // Built only under offload; the non-offload kernel path never calls the emitter.
     auto kernelPassState = std::make_shared<blueprint_sched::BlueprintPassState>();
+    // Per-tensor descriptors and the kernel round schedule, read from the IR
+    // before conversion erases declare_data. Needed on every path (halo window
+    // sizing), not only under offload.
+    if (auto moduleOp = dyn_cast<ModuleOp>(getOperation())) {
+        kernelPassState->tensorInfo = routing::collectTensorRoutingInfo(moduleOp);
+        kernelPassState->kernelTiling = routing::readKernelTiling(moduleOp);
+    }
     if (kernelConfigOffload) {
         if (failed(blueprint_sched::preprocessConstantToMemref(getOperation(), kernelPassState))) {
             signalPassFailure();

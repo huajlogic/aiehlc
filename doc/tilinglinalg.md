@@ -46,7 +46,7 @@ Models data movement over an abstract mesh with partitioning and broadcast/gathe
 | Op | Purpose |
 |----|---------|
 | `createhwmesh` | Create HW mesh (row, col) |
-| `createscheduletensor` | Create schedule tensor with init data |
+| `createscheduletensor` | Create schedule tensor with init data; carries the tensor's `halo` / `shim_dma` / `layout_transform` / `pp_depth` |
 | `partitionmesh` | Partition mesh along axis |
 | `partitiontensor` | Partition tensor (splitnum, splitdim, hw_axis_owner, replicate_on) |
 | `extract_data` | Extract data slice from partitioned tensor |
@@ -61,8 +61,18 @@ Models data movement over an abstract mesh with partitioning and broadcast/gathe
 | `yield` | Terminator for routing regions |
 
 **Types**: `tilearray`, `dataio`
-**Attrs**: `TileRangeAttr(rowNum, colNum)`, `TileRangeArrayAttr`
+**Attrs**: `TileRangeAttr(rowNum, colNum)`, `TileRangeArrayAttr`, `PartitionAttr`,
+`TilingAttr`/`DimAttr`/`LevelAttr` (GEMM tiling on `partitiontensor`),
+`HaloAttr` / `ShimDmaAttr` (per tensor, on `createscheduletensor`),
+`KernelTilingAttr` (`routing.kernel_tiling` on the routing `func.func`)
 **Interface**: `TileInterface` — `getTileBase()` for base address
+
+**The module attributes are control switches only** (`routing.fullconnect_auto`,
+`routing.kernel_config_offload`, `routing.output_tile_major`, `routing.control_*`,
+`routing.iter_policy`). Tiling and data-movement descriptors are typed attributes
+on the op they describe, read once at pass entry through
+`routing::collectTensorRoutingInfo` / `readKernelTiling` / `readGemmTilingScalars`.
+See [design/routing_ir_tiling_carriers.md](design/routing_ir_tiling_carriers.md).
 
 ### 2.2 dmap — Logical Dataflow Streams
 
@@ -230,7 +240,8 @@ Physical stream switch and shim port configuration. Used only for `routing.cc`
 
 - `push` → `ConfigOp` + `TileGroupOp` + `DeclareDataOp` + `FlowConfigOp` + `FlowTransferOp` (one_to_many)
 - `pull` → same structure (many_to_one)
-- `createscheduletensor` → `DeclareDataOp`
+- `createscheduletensor` → `DeclareDataOp`, copying its per-tensor descriptors as
+  `routing.halo` / `routing.shim_dma` / `routing.layout_transform` / `routing.pp_depth`
 - Erases: `tile`, `port`, `create_hop`, `create_path`, `alloc_buffer`, `sync`
 
 ### 3.5 BlueprintToSchedulePass (host)

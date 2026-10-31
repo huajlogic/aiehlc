@@ -198,6 +198,60 @@ emod = ag.compile(m, "aie", {"layer1": "a.cc"}, calib=["dog.jpg", "cat.jpg"], st
 `strict=True` (default) raises at the first failed gate; `strict=False` keeps
 failing layers on the A78 and leaves the report in `emod.offload_report`.
 
+## 4b. Before writing a kernel: what interface must it follow?
+
+```python
+print(ag.offload_interface())                   # the file format: AIEK_ENTRY / AIEK_SPEC / reference / rules
+itf = emod.offload_interface("layer4")          # TVM layer 4 (or region="layer1.0.conv1")
+print(itf)                                      # args[] in call order, roles, value facts, AIEK_SPEC
+itf.write("my_kernels/")                        # aiek_layer04.cc (entry + spec) + aiek_layer04_ref.c
+```
+
+For each argument: `in` / `param` / `out`, dtype, shape, the role the layer's
+own TVM C gives it (weight, bias, zero-point, requant multiplier / shift,
+unused), and facts over every call of the layer (`all zero`, `values in
+[lo, hi]`). An all-zero constant gets `require=zero` -- the stem's second
+zero-point and its unused param, as `conv2dstem_uk.cc` writes by hand. The
+spec is not a guess: it is parsed with the real grammar and matched against
+every call (`verified: ... matches 2/2 call(s)`), so `detect` accepts the
+written file; other layers the same spec fits are listed. The templates
+compile and lint clean; the entry returns `AIEK_ERR_KERNEL` until you fill it.
+CLI: `aiegraph interface [layer1] [--region R] [--entry NAME] [--write DIR]`.
+
+## 4a. When a check says NOT READY: let Claude port the kernel
+
+```python
+kernel = "src/aietensorop/conv2dstem/conv2dstem_uk.cc"     # a 7x7/2 stem kernel
+print(emod.offload_check("layer4", kernel))                # NOT READY: stopped at detect ...
+new_kernel = emod.offload_AI_proto("layer4", kernel)       # claude -p ports it
+print(emod.offload(("layer4", new_kernel)))                # path-like: use it like any source
+```
+
+`offload_AI_proto` runs `offload_check` first and returns the kernel unchanged if
+it is already READY. Otherwise it copies the kernel's directory (flat) to
+`<workdir>/aiproto/layer4_<kernel>/`, renames the entry to `<kernel>_l4.cc`, and
+runs `claude -p` there with the layer's TVM C, the refusal and
+`doc/tutorial_userkernel.md`. Claude may read anything but edit only that
+directory, and the one command it may run is `aiegraph check`. After each round
+**aiegraph runs `offload_check` itself** -- Claude's word is not the verdict -- and
+sends any remaining failure back to the same session, for up to `rounds=3`.
+
+| argument | default | |
+|---|---|---|
+| `rounds` | 3 | Claude turns, each followed by our own `offload_check` |
+| `model` | Claude Code's default | `--model` for `claude` |
+| `claude` | `"claude"` | the CLI (must be logged in: `claude -p hi`) |
+| `timeout_s` | 1800 | per round |
+| `out_dir` | `<workdir>/aiproto/<layer>_<kernel>` | wiped and re-staged on every call |
+| `quiet` | False | hide the live `[claude] Edit: ...` progress lines |
+
+The result has `.ok`, `.source`, `.report` (the last `CheckReport`), `.rounds`,
+`.log` (prompt + raw event stream) and `.session` (`claude --resume <id>` to carry
+on by hand); `raise_for_status()` raises when it is not READY. The original kernel
+and the model are never modified. READY means bit-exact on x86 against TVM, as for
+any kernel; it does not prove that aiehlc compiles it for AIE2PS -- `offload()`
+(needs Vitis) is that gate.
+
 ## 5. Reference
 
 | call | does |
@@ -206,9 +260,12 @@ failing layers on the A78 and leaves the report in `emod.offload_report`.
 | `ag.embedded_convert(m, target="a78", calib=None, image=None, workdir=None)` | int8 + per-layer C + A78 driver; cached by model hash + options |
 | `ag.open(workdir)` | adopt an existing `deploy_flow.py` tree |
 | `emod.layers`, `emod.layer(ref)`, `emod.resolve(ref)` | layers; `ref` = `"layer1"`, `1`, `"layer4-9"`, `"conv3x3*"`, `"call[08]"`, a list |
+| `ag.offload_interface()` | the kernel-file format and rules (no model needed) |
+| `emod.offload_interface(layer, region=None, entry=None)` | what a kernel for that layer must contain: args in TVM call order (kind, dtype, shape, role, value facts), an `AIEK_SPEC` proven against every call, `.spec()`, `.write(dir)` templates (section 4b) |
 | `emod.detect(kernel)` | which layers fit |
 | `emod.offload_check(spec)` | x86 gates; never writes outside `<workdir>/aiek/` |
 | `emod.offload(spec, build=True, make=False, force=False)` | + aiehlc build + link gate + driver swap |
+| `emod.offload_AI_proto(layers, kernel, rounds=3, model=None)` | NOT READY → `claude -p` ports a copy until `offload_check` is READY (section 4a) |
 | `emod.run_local()` | build and run `main_local.elf` on x86 |
 | `ag.convert(m, target)` / `m.convert(target)` | `embedded_convert` by its short name |
 | `module.regions`, `module.regions.find(ref)` | model ops by name; `ref` = `"conv1"`, `"layer1.0.conv1"`, `"layer1"` (all under it), `"layer2.*.conv1"`, `"call[08]"` |

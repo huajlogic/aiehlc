@@ -1,5 +1,7 @@
 # Kernel Call IR Integration: From User C++ to AIE Execution
 
+> **Attribute names superseded (2026-10-27).** The `routing.tile_*` / `*_k` / `*_rounds`, `routing.spatial_*`, `routing.pp_depth_map` and `tensor_N.*` **module** attributes named in this document no longer exist: the routing module carries only control switches, and that information is now a typed attribute on the IR op it describes. See [routing_ir_tiling_carriers.md](routing_ir_tiling_carriers.md).
+
 ## Overview
 
 This document describes how user-written kernel code travels from a C++ source file through the aiehlc compiler and MLIR pipeline to become executable code running on AIE cores. The process has four key phases:

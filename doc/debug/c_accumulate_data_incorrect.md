@@ -1,5 +1,7 @@
 # Debug Analysis: C-Accumulate Data Incorrect — SHIM DMA BD Len and Channel Repeat Count
 
+> **Attribute names superseded (2026-10-27).** The `routing.tile_*` / `*_k` / `*_rounds`, `routing.spatial_*`, `routing.pp_depth_map` and `tensor_N.*` **module** attributes named in this document no longer exist: the routing module carries only control switches, and that information is now a typed attribute on the IR op it describes. See [routing_ir_tiling_carriers.md](../design/routing_ir_tiling_carriers.md).
+
 **Date:** 2026-05-27
 **Symptom:** 129 output mismatches out of 65536; SHIM DMA advances by 4 bytes (1 word) between k-rounds instead of 64 bytes (16 words); kr=0 correct but kr=1,2,3 read wrong column positions
 **Root Cause:** Two bugs in SHIM BD iteration config: (1) BD `len` was set to the full partition size instead of per-iteration size, (2) channel repeat count was `1` instead of `iter_wrap`. With `len=16384` and D0/D1 describing only a 4096-byte pattern, the DMA read beyond the defined pattern producing undefined addressing.

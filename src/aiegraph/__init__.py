@@ -17,6 +17,10 @@
     print(module.partition(fallback="cpu").report())
     module.build(target="a78", output="resnet18_a78")  # main.elf (never runs it)
 
+    print(ag.offload_interface())                      # the kernel-file format
+    itf = module.offload_interface("layer1")           # one layer: args, AIEK_SPEC, templates
+    itf.write("my_kernels/")
+
     module = ag.compile("resnet18", "aie", "layer1=src/aietensorop/conv2dstem/conv2dstem_uk.cc")
 
 The layer-index API (``offload_check("layer1", k.cc)``, ``offload``) still works;
@@ -36,9 +40,11 @@ from .contract import KernelContract
 from .embedded import EmbeddedModel, Layer, convert, current, embedded_convert
 from .embedded import open_workdir as open  # noqa: A001  (ag.open(workdir))
 from .errors import AiegraphError
+from .interface import Interfaces, KernelFormat, OffloadInterface
 from .model import ZOO, Model, download_model, from_onnx, from_torch, load
 from .region import Region, Regions
-from .report import BuildReport, CheckReport, DetectReport, PartitionPlan, RegionCheck
+from .report import (AIProtoResult, BuildReport, CheckReport, DetectReport, PartitionPlan,
+                     RegionCheck)
 
 __version__ = "0.1.0"
 
@@ -47,7 +53,8 @@ __all__ = ["load", "from_onnx", "from_torch", "download_model", "ZOO", "Model",
            "Region", "Regions", "KernelContract", "RegionCheck", "PartitionPlan",
            "offload_check", "offload", "detect", "lint", "build", "run_local",
            "compile", "guide", "doctor", "setup", "AiegraphError", "CheckReport",
-           "DetectReport", "BuildReport"]
+           "DetectReport", "BuildReport", "AIProtoResult", "offload_interface",
+           "OffloadInterface", "Interfaces", "KernelFormat"]
 
 
 # ── module-level forms: act on ag.current() (pyplot-style convenience) ─────
@@ -60,6 +67,19 @@ def offload_check(spec, source=None, **kw) -> CheckReport:
 def offload(spec, source=None, **kw) -> CheckReport:
     """``ag.offload(("layer1", "k.cc"))`` on the current model."""
     return current().offload(spec, source, **kw)
+
+
+def offload_interface(layer=None, *, region=None, entry: str = None):
+    """What a kernel file must look like to be offloaded.
+
+    ``ag.offload_interface()`` -- the kernel-file format and rules (no model).
+    ``ag.offload_interface("layer1")`` / ``(region="conv1")`` -- that layer of the
+    current model: arguments in TVM call order with kind/dtype/shape/role, a ready
+    ``AIEK_SPEC`` proven against every call, and templates (``.write(dir)``)."""
+    if layer is None and region is None:
+        from .interface import kernel_format
+        return kernel_format()
+    return current().offload_interface(layer, region=region, entry=entry)
 
 
 def detect(source) -> DetectReport:

@@ -1,5 +1,7 @@
 # Design: Composition-based Spatial Op Spaces (GemmSpace + Conv2dSpace)
 
+> **Attribute names superseded (2026-10-27).** The `routing.tile_*` / `*_k` / `*_rounds`, `routing.spatial_*`, `routing.pp_depth_map` and `tensor_N.*` **module** attributes named in this document no longer exist: the routing module carries only control switches, and that information is now a typed attribute on the IR op it describes. See [routing_ir_tiling_carriers.md](routing_ir_tiling_carriers.md).
+
 ## Status
 Implemented. Refactors the "fat" `aie::SpatialPolicy` (which baked the GEMM
 iteration space `tile_dim m/n/k` directly into the generic policy) into a

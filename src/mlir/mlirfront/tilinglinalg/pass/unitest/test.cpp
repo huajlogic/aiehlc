@@ -1059,24 +1059,26 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors, splitModel);
     }
 
-    // Set routing module attributes for M/N sub-tiling (matching simplematmul2.cc)
-    // These are normally set by aiehlc.cc from SpatialPolicy, but buildRoutingIR
-    // doesn't set them. For 64x64 matmul on 4x4 mesh with tile_m=8, tile_k=16:
+    // Set the kernel round schedule (#routing.kernel_tiling on the routing func)
+    // for M/N sub-tiling (matching simplematmul2.cc). aiehlc.cc normally records
+    // it from SpatialPolicy, but buildRoutingIR doesn't. For 64x64 matmul on 4x4 mesh with tile_m=8, tile_k=16:
     //   tileRows = 64/4 = 16, tileCols = 64/4 = 16
     //   tileM = 8 (sub-tile), tileN = 8 (sub-tile)
     //   effectiveK = 16, fullK = 64, kRounds = 4
     //   mRounds = tileRows/tileM = 2, nRounds = tileCols/tileN = 2
     if (irFilepath.empty()) {
         mlir::OpBuilder attrB(&ctx);
-        module->setAttr("routing.tile_m", attrB.getI64IntegerAttr(8));
-        module->setAttr("routing.tile_rows", attrB.getI64IntegerAttr(16));
-        module->setAttr("routing.tile_n", attrB.getI64IntegerAttr(8));
-        module->setAttr("routing.tile_cols", attrB.getI64IntegerAttr(16));
-        module->setAttr("routing.effective_k", attrB.getI64IntegerAttr(16));
-        module->setAttr("routing.full_k", attrB.getI64IntegerAttr(64));
-        module->setAttr("routing.k_rounds", attrB.getI64IntegerAttr(4));
-        module->setAttr("routing.m_rounds", attrB.getI64IntegerAttr(2));
-        module->setAttr("routing.n_rounds", attrB.getI64IntegerAttr(2));
+        routing::KernelTilingFields kt;
+        kt.tileM = 8;
+        kt.tileRows = 16;
+        kt.tileN = 8;
+        kt.tileCols = 16;
+        kt.effectiveK = 16;
+        kt.fullK = 64;
+        kt.kRounds = 4;
+        kt.mRounds = 2;
+        kt.nRounds = 2;
+        routing::mergeKernelTiling(module, kt);
         module->setAttr("routing.iter_policy", attrB.getStringAttr("m_outer_n_inner"));
     }
 
@@ -1401,11 +1403,11 @@ void testConv2d() {
     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors, SplitModel::gemm());
 
     // Verify module attribute was set
-    auto shimDmaAttr = module->getAttrOfType<DictionaryAttr>("tensor_0.shim_dma");
+    routing::ShimDmaAttr shimDmaAttr = routing::collectTensorRoutingInfo(module).lookup(0).shimDma;
     if (shimDmaAttr) {
-        std::cout << "PASS: tensor_0.shim_dma module attribute present" << std::endl;
-        auto strides = shimDmaAttr.getAs<ArrayAttr>("strides");
-        auto wraps = shimDmaAttr.getAs<ArrayAttr>("wraps");
+        std::cout << "PASS: tensor_0 carries #routing.shim_dma" << std::endl;
+        auto strides = shimDmaAttr.getStrides();
+        auto wraps = shimDmaAttr.getWraps();
         if (strides && wraps) {
             std::cout << "  strides=[";
             for (unsigned i = 0; i < strides.size(); ++i) {
@@ -1421,20 +1423,17 @@ void testConv2d() {
             }
             std::cout << "]" << std::endl;
         }
-        auto iterStep = shimDmaAttr.getAs<IntegerAttr>("iter_step");
-        auto iterWrap = shimDmaAttr.getAs<IntegerAttr>("iter_wrap");
-        if (iterStep && iterWrap) {
-            std::cout << "  iter_step=" << iterStep.getInt() << " iter_wrap=" << iterWrap.getInt() << std::endl;
-        }
+        std::cout << "  iter_step=" << shimDmaAttr.getIterStep() << " iter_wrap=" << shimDmaAttr.getIterWrap()
+                  << std::endl;
     } else {
-        std::cerr << "FAIL: tensor_0.shim_dma module attribute NOT found" << std::endl;
+        std::cerr << "FAIL: tensor_0 has no #routing.shim_dma" << std::endl;
         return;
     }
 
     // Verify tensor_1 (B) does NOT have shim_dma
-    auto shimDmaB = module->getAttrOfType<DictionaryAttr>("tensor_1.shim_dma");
+    routing::ShimDmaAttr shimDmaB = routing::collectTensorRoutingInfo(module).lookup(1).shimDma;
     if (!shimDmaB) {
-        std::cout << "PASS: tensor_1 (flat) has no shim_dma attribute" << std::endl;
+        std::cout << "PASS: tensor_1 (flat) has no #routing.shim_dma" << std::endl;
     } else {
         std::cerr << "FAIL: tensor_1 should not have shim_dma" << std::endl;
     }
@@ -1555,55 +1554,50 @@ void testConv2dSpatial() {
     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, R, 1, tensors, sm);
     // module.dump();
     // return;
-    //  Verify tensor_0.halo module attribute was set
-    auto haloAttr = module->getAttrOfType<DictionaryAttr>("tensor_0.halo");
+    //  Verify tensor_0 carries #routing.halo on its routingcreatescheduletensor
+    routing::HaloAttr haloAttr = routing::collectTensorRoutingInfo(module).lookup(0).halo;
     if (haloAttr) {
-        std::cout << "PASS: tensor_0.halo module attribute present" << std::endl;
-        if (auto slice = haloAttr.getAs<IntegerAttr>("slice"))
-            std::cout << "  slice=" << slice.getInt() << std::endl;
-        if (auto step = haloAttr.getAs<IntegerAttr>("step"))
-            std::cout << "  step=" << step.getInt() << std::endl;
-        if (auto sd = haloAttr.getAs<IntegerAttr>("split_dim"))
-            std::cout << "  split_dim=" << sd.getInt() << std::endl;
+        std::cout << "PASS: tensor_0 carries #routing.halo" << std::endl;
+        std::cout << "  slice=" << haloAttr.getSlice() << std::endl;
+        std::cout << "  step=" << haloAttr.getStep() << std::endl;
+        std::cout << "  split_dim=" << haloAttr.getSplitDim() << std::endl;
         // Two-level (nested) halo L2 attrs.
-        auto l2SliceA = haloAttr.getAs<IntegerAttr>("l2_slice");
-        auto l2StepA = haloAttr.getAs<IntegerAttr>("l2_step");
-        auto l2RoundsA = haloAttr.getAs<IntegerAttr>("l2_rounds");
-        if (l2SliceA && l2StepA && l2RoundsA) {
-            std::cout << "  l2_slice=" << l2SliceA.getInt() << " l2_step=" << l2StepA.getInt()
-                      << " l2_rounds=" << l2RoundsA.getInt() << std::endl;
-            if (l2SliceA.getInt() == l2_slice && l2StepA.getInt() == l2_step && l2RoundsA.getInt() == l2_rounds)
-                std::cout << "PASS: tensor_0.halo carries correct L2 (nested) attrs" << std::endl;
+        const int64_t l2SliceA = haloAttr.getL2Slice();
+        const int64_t l2StepA = haloAttr.getL2Step();
+        const int64_t l2RoundsA = haloAttr.getL2Rounds();
+        if (l2SliceA > 0 && l2StepA > 0 && l2RoundsA > 0) {
+            std::cout << "  l2_slice=" << l2SliceA << " l2_step=" << l2StepA << " l2_rounds=" << l2RoundsA << std::endl;
+            if (l2SliceA == l2_slice && l2StepA == l2_step && l2RoundsA == l2_rounds)
+                std::cout << "PASS: tensor_0 #routing.halo carries correct L2 (nested) attrs" << std::endl;
             else
-                std::cerr << "FAIL: tensor_0.halo L2 attrs mismatch (expected l2_slice=" << l2_slice
+                std::cerr << "FAIL: tensor_0 #routing.halo L2 attrs mismatch (expected l2_slice=" << l2_slice
                           << " l2_step=" << l2_step << " l2_rounds=" << l2_rounds << ")" << std::endl;
         } else {
-            std::cerr << "FAIL: tensor_0.halo missing L2 (l2_slice/l2_step/l2_rounds) attrs" << std::endl;
+            std::cerr << "FAIL: tensor_0 #routing.halo missing L2 (l2_slice/l2_step/l2_rounds) attrs" << std::endl;
         }
         // K-contraction accumulate attrs (independent of the H/row L2 above).
-        auto kSliceA = haloAttr.getAs<IntegerAttr>("k_slice");
-        auto kStepA = haloAttr.getAs<IntegerAttr>("k_step");
-        auto kRoundsA = haloAttr.getAs<IntegerAttr>("k_rounds");
-        if (kSliceA && kStepA && kRoundsA) {
-            std::cout << "  k_slice=" << kSliceA.getInt() << " k_step=" << kStepA.getInt()
-                      << " k_rounds=" << kRoundsA.getInt() << std::endl;
-            if (kSliceA.getInt() == k_slice && kStepA.getInt() == k_step && kRoundsA.getInt() == k_rounds)
-                std::cout << "PASS: tensor_0.halo carries correct K-accum attrs" << std::endl;
+        const int64_t kSliceA = haloAttr.getKSlice();
+        const int64_t kStepA = haloAttr.getKStep();
+        const int64_t kRoundsA = haloAttr.getKRounds();
+        if (kSliceA > 0 && kStepA > 0 && kRoundsA > 0) {
+            std::cout << "  k_slice=" << kSliceA << " k_step=" << kStepA << " k_rounds=" << kRoundsA << std::endl;
+            if (kSliceA == k_slice && kStepA == k_step && kRoundsA == k_rounds)
+                std::cout << "PASS: tensor_0 #routing.halo carries correct K-accum attrs" << std::endl;
             else
-                std::cerr << "FAIL: tensor_0.halo K-accum attrs mismatch (expected k_slice=" << k_slice
+                std::cerr << "FAIL: tensor_0 #routing.halo K-accum attrs mismatch (expected k_slice=" << k_slice
                           << " k_step=" << k_step << " k_rounds=" << k_rounds << ")" << std::endl;
         } else {
-            std::cerr << "FAIL: tensor_0.halo missing K-accum (k_slice/k_step/k_rounds) attrs" << std::endl;
+            std::cerr << "FAIL: tensor_0 #routing.halo missing K-accum (k_slice/k_step/k_rounds) attrs" << std::endl;
         }
     } else {
-        std::cerr << "FAIL: tensor_0.halo module attribute NOT found" << std::endl;
+        std::cerr << "FAIL: tensor_0 has no #routing.halo" << std::endl;
         return;
     }
 
     // Verify tensor_0 does NOT have a multi-dim shim_dma (must stay FLAT)
-    auto shimDmaA = module->getAttrOfType<DictionaryAttr>("tensor_0.shim_dma");
+    routing::ShimDmaAttr shimDmaA = routing::collectTensorRoutingInfo(module).lookup(0).shimDma;
     if (!shimDmaA) {
-        std::cout << "PASS: tensor_0 (spatial-halo) has NO shim_dma attribute (flat BD)" << std::endl;
+        std::cout << "PASS: tensor_0 (spatial-halo) has NO #routing.shim_dma (flat BD)" << std::endl;
     } else {
         std::cerr << "FAIL: spatial-halo tensor_0 should not have shim_dma (would force multi-dim BD)" << std::endl;
     }
@@ -1696,11 +1690,11 @@ void testDilatedConv2d() {
     TilingLinalgPipeline::registerDialects(ctx);
     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors, SplitModel::gemm());
 
-    auto shimDmaAttr = module->getAttrOfType<DictionaryAttr>("tensor_0.shim_dma");
+    routing::ShimDmaAttr shimDmaAttr = routing::collectTensorRoutingInfo(module).lookup(0).shimDma;
     if (shimDmaAttr) {
-        std::cout << "PASS: tensor_0.shim_dma module attribute present" << std::endl;
-        auto strides = shimDmaAttr.getAs<ArrayAttr>("strides");
-        auto wraps = shimDmaAttr.getAs<ArrayAttr>("wraps");
+        std::cout << "PASS: tensor_0 carries #routing.shim_dma" << std::endl;
+        auto strides = shimDmaAttr.getStrides();
+        auto wraps = shimDmaAttr.getWraps();
         if (strides && wraps) {
             std::cout << "  strides=[";
             for (unsigned i = 0; i < strides.size(); ++i) {
@@ -1717,7 +1711,7 @@ void testDilatedConv2d() {
             std::cout << "]" << std::endl;
         }
     } else {
-        std::cerr << "FAIL: tensor_0.shim_dma module attribute NOT found" << std::endl;
+        std::cerr << "FAIL: tensor_0 has no #routing.shim_dma" << std::endl;
         pass = false;
     }
 
@@ -1804,11 +1798,11 @@ void testPool() {
     TilingLinalgPipeline::registerDialects(ctx);
     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors, SplitModel::gemm());
 
-    auto shimDmaAttr = module->getAttrOfType<DictionaryAttr>("tensor_0.shim_dma");
+    routing::ShimDmaAttr shimDmaAttr = routing::collectTensorRoutingInfo(module).lookup(0).shimDma;
     if (shimDmaAttr) {
-        std::cout << "PASS: tensor_0.shim_dma module attribute present" << std::endl;
+        std::cout << "PASS: tensor_0 carries #routing.shim_dma" << std::endl;
     } else {
-        std::cerr << "FAIL: tensor_0.shim_dma module attribute NOT found" << std::endl;
+        std::cerr << "FAIL: tensor_0 has no #routing.shim_dma" << std::endl;
         pass = false;
     }
 
@@ -1891,11 +1885,11 @@ void testDepthwiseConv2d() {
     TilingLinalgPipeline::registerDialects(ctx);
     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors, SplitModel::gemm());
 
-    auto shimDmaAttr = module->getAttrOfType<DictionaryAttr>("tensor_0.shim_dma");
+    routing::ShimDmaAttr shimDmaAttr = routing::collectTensorRoutingInfo(module).lookup(0).shimDma;
     if (shimDmaAttr) {
-        std::cout << "PASS: tensor_0.shim_dma module attribute present" << std::endl;
-        auto strides = shimDmaAttr.getAs<ArrayAttr>("strides");
-        auto wraps = shimDmaAttr.getAs<ArrayAttr>("wraps");
+        std::cout << "PASS: tensor_0 carries #routing.shim_dma" << std::endl;
+        auto strides = shimDmaAttr.getStrides();
+        auto wraps = shimDmaAttr.getWraps();
         if (strides && wraps) {
             std::cout << "  strides=[";
             for (unsigned i = 0; i < strides.size(); ++i) {
@@ -1912,7 +1906,7 @@ void testDepthwiseConv2d() {
             std::cout << "]" << std::endl;
         }
     } else {
-        std::cerr << "FAIL: tensor_0.shim_dma module attribute NOT found" << std::endl;
+        std::cerr << "FAIL: tensor_0 has no #routing.shim_dma" << std::endl;
         pass = false;
     }
 

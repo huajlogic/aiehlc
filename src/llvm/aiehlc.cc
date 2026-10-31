@@ -40,6 +40,10 @@
 
 #include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
+#include "routingmanager.h"
+#include "convautotile/conv_desugar.h"
+#include "convautotile/kernel_trace.h"
+#include "convautotile/kernel_front.h"
 
 class AieFrontEnd;
 
@@ -211,6 +215,7 @@ static std::vector<TraceTileSpec> parsedTraceTiles;
 // so the build aborts with a clear error instead of silently mis-tracing.
 static bool parsedTraceFatal = false;
 static std::string userSourceDir; // directory containing the original user source file
+static std::string userSourceName;    // base name of the user source file (kernel-analysis diagnostics)
 static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
 static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
 static std::vector<std::string> kernel_name_list;
@@ -224,6 +229,10 @@ static std::string userKernelBody;     // raw source text of __global__ function
 static std::string userKernelFuncName; // kernel function name from __global__ (last kernel, backward compat)
 static std::unordered_map<std::string, std::string> globalKernelBodies; // per-kernel: name -> cleaned body text
 static std::vector<std::string> userMacroDefines; // #define lines from user source
+// Kernel-TU declarations from the conv auto-tiling desugar (op, block sizes,
+// per-port block descriptors: convautotile::kernelTUDecls). Appended to
+// userMacroDefines after the #define scan, which rebuilds that list.
+static std::vector<std::string> convKernelDecls;
 
 // File-scope code the user wants carried verbatim into the generated kernel,
 // delimited in the source by:
@@ -3811,6 +3820,87 @@ public:
             }
         }
 
+        // Lower the declarative conv2d model (aie::Conv2d + aie::Mapping +
+        // aie::port<T, aie::IFM|WEIGHTS|OFM>) into the explicit GemmSpace form
+        // before any other rewrite sees the text (src/llvm/convautotile/). The
+        // derived d1/d2/d3, halo and kernel constants are reported to
+        // aout/conv_autotile.json. AIEHLC_CONV_TUNE (JSON text or @file) overrides
+        // the tunable knobs (time_oh, time_ow, pp_depth, c_align) -- the hook the
+        // AutoTVM tuner (script/convtune) uses. A rejected configuration aborts.
+        void applyConvAutoTiling(std::string &src) {
+            convautotile::Overrides ov;
+            if (const char *env = std::getenv("AIEHLC_CONV_TUNE")) {
+                std::string text = env;
+                if (!text.empty() && text[0] == '@') {
+                    std::ifstream f(text.substr(1));
+                    text.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                }
+                std::string err;
+                if (!convautotile::parseOverridesJson(text, ov, &err)) {
+                    llvm::errs() << "[ConvAutoTile] ERROR: bad AIEHLC_CONV_TUNE: " << err << "\n";
+                    std::exit(1);
+                }
+                if (!err.empty())
+                    llvm::errs() << "[ConvAutoTile] WARNING: " << err << "\n";
+            }
+            convKernelDecls.clear();
+            // Kernel-only sources (no aie::Conv2d / aie::Mapping; ports carry
+            // aie::shape): derive the DMA layout from the kernel's own
+            // load_buffer / store_buffer and rewrite into the (conv, map) form.
+            {
+                // Tensor form (aie::in / aie::out of aie::tensor types): lower
+                // to the kernel-only form first (kernel_front.h).
+                convautotile::TensorFormResult tf = convautotile::lowerTensorForm(src, userSourceDir, userSourceName);
+                if (tf.found) {
+                    llvm::outs() << tf.report;
+                    for (auto &n : tf.notes)
+                        llvm::outs() << "[TensorForm] note: " << n << "\n";
+                    if (!tf.ok) {
+                        for (auto &e : tf.errors)
+                            llvm::errs() << "[KernelAnalysis] ERROR: " << e << "\n";
+                        std::exit(1);
+                    }
+                }
+                convautotile::KernelOnlyResult ko = convautotile::inferKernelOnly(src, userSourceDir, userSourceName);
+                if (ko.found) {
+                    llvm::outs() << ko.report;
+                    for (auto &n : ko.notes)
+                        llvm::outs() << "[KernelAnalysis] note: " << n << "\n";
+                    if (!ko.ok) {
+                        for (auto &e : ko.errors.empty() ? std::vector<std::string>{ko.error} : ko.errors)
+                            llvm::errs() << "[KernelAnalysis] ERROR: " << e << "\n";
+                        std::exit(1);
+                    }
+                }
+            }
+            convautotile::DesugarResult r =
+                convautotile::desugarConvMapping(src, userSourceDir, ov, convautotile::Target(), userSourceName);
+            if (!r.found)
+                return;
+            std::ofstream rep(AOUT + std::string("conv_autotile.json"));
+            rep << convautotile::reportJson(r);
+            for (auto &w : r.warnings)
+                llvm::errs() << "[ConvAutoTile] WARNING: " << w << "\n";
+            if (!r.ok) {
+                llvm::errs() << "[ConvAutoTile] ERROR: " << r.error << "\n";
+                std::exit(1);
+            }
+            for (auto &k : r.kernels) {
+                const auto &d = k.derived;
+                llvm::outs() << "[ConvAutoTile] " << k.kernel << ": mesh " << d.mesh_rows << "x" << d.mesh_cols
+                             << ", time tile(OH," << d.oh_t << ") x tile(OW," << d.ow_t << ")"
+                             << (d.time_autotuned ? " [autotuned]" : "") << (ov.any() ? " [AIEHLC_CONV_TUNE]" : "")
+                             << ", IFM halo d1 " << d.mesh_slice_h << "/" << d.mesh_step_h << " slice " << d.tile_h
+                             << "/" << d.tile_step_h << "x" << d.h_rounds << ", d2 " << d.tile_w << "/" << d.tile_step_w
+                             << "x" << d.w_rounds << ", L1 " << d.l1_bytes << " B\n";
+                for (auto &n : d.notes)
+                    llvm::outs() << "[ConvAutoTile]   note: " << n << "\n";
+                for (auto &decl : convautotile::kernelTUDecls(k))
+                    if (std::find(convKernelDecls.begin(), convKernelDecls.end(), decl) == convKernelDecls.end())
+                        convKernelDecls.push_back(decl);
+            }
+        }
+
         std::string GetKeyReplaceAndAddInclude(clang::SourceManager &SourceMgr, std::unordered_map<std::string,std::string>& funcMap) {
 			std::string ret;
 			// Get the main file entry
@@ -3828,6 +3918,7 @@ public:
                         userSourceDir = fnStr.substr(0, lastSlash);
                     else
                         userSourceDir = ".";
+                    userSourceName = lastSlash == std::string::npos ? fnStr : fnStr.substr(lastSlash + 1);
                 }
 
                 // Print or use the file name as needed
@@ -3882,6 +3973,7 @@ public:
                 //
                 // Headers (`.h`) are left to Clang, as before.
                 inlineSourceIncludes(SourceCodeString);
+                applyConvAutoTiling(SourceCodeString);
 
                 // Collect user #define macros before any rewriting.
                 // Track #if/#else/#endif nesting to skip macros inside
@@ -3964,6 +4056,8 @@ public:
                             }
                         }
                     }
+                    // After the user's #defines so the kernel TU sees them first.
+                    userMacroDefines.insert(userMacroDefines.end(), convKernelDecls.begin(), convKernelDecls.end());
                 }
 
                 size_t KeywordPos = 0;
@@ -4774,9 +4868,8 @@ public:
                     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
                                                                        mkd.partition, aieGenStr);
 
-                    // Set K-round module attributes for downstream DMA passes
+                    // Record the K-round schedule for downstream DMA passes
                     if (mkd.derivedParams.valid && mkd.derivedParams.kRounds > 1) {
-                        mlir::OpBuilder attrBuilder(&ctx);
                         // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                         // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                         // lets the downstream passes fall through to the pure-K-round path.
@@ -4799,13 +4892,14 @@ public:
                                          << " n_rounds=" << mkd.derivedParams.spatialNRounds << ")\n";
                         } else {
                             // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
-                            // emitted here, so the K-triple must be carried as module attrs.
-                            module->setAttr("routing.effective_k",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
-                            module->setAttr("routing.k_rounds",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
-                            module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
-                            llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
+                            // emitted here, so the K-triple goes on the routing func's
+                            // #routing.kernel_tiling.
+                            routing::KernelTilingFields kt;
+                            kt.effectiveK = mkd.derivedParams.effectiveK;
+                            kt.fullK = mkd.derivedParams.kDim;
+                            kt.kRounds = mkd.derivedParams.kRounds;
+                            routing::mergeKernelTiling(module, kt);
+                            llvm::outs() << "[TilingLinalg] Set K-round kernel_tiling (fullconnect_auto=0, "
                                             "tile_*/m_rounds/n_rounds dropped): effective_k="
                                          << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
                                          << " full_k=" << mkd.derivedParams.kDim << "\n";
@@ -4818,19 +4912,19 @@ public:
                     // Set unconditionally (kRounds may be 1 for conv2d), unlike the
                     // K-round attrs above.
                     if (mkd.derivedParams.valid && mkd.derivedParams.convHaloBufSize > 0) {
-                        mlir::OpBuilder haloAttrBuilder(&ctx);
-                        module->setAttr("routing.spatial_halo_buf_size",
-                                        haloAttrBuilder.getI64IntegerAttr(mkd.derivedParams.convHaloBufSize));
-                        llvm::outs() << "[TilingLinalg] Set spatial_halo_buf_size=" << mkd.derivedParams.convHaloBufSize
-                                     << "\n";
+                        int haloTensors = routing::setHaloBufSize(module, mkd.derivedParams.convHaloBufSize);
+                        llvm::outs() << "[TilingLinalg] Set halo buf_size=" << mkd.derivedParams.convHaloBufSize
+                                     << " on " << haloTensors << " halo tensor(s)\n";
                         // OUTPUT per-slab division count (see single-kernel path for the
                         // rationale): the conv2d_spatial kernel always emits one output
                         // slab per on-core round (spatialMRounds*spatialNRounds) regardless
                         // of fullconnect_auto, so emit the divisor UNCONDITIONALLY.
                         int64_t outRounds = mkd.derivedParams.spatialMRounds * mkd.derivedParams.spatialNRounds;
                         if (outRounds > 1) {
-                            module->setAttr("routing.spatial_out_rounds", haloAttrBuilder.getI64IntegerAttr(outRounds));
-                            llvm::outs() << "[TilingLinalg] Set spatial_out_rounds=" << outRounds << "\n";
+                            routing::KernelTilingFields kt;
+                            kt.outRounds = outRounds;
+                            routing::mergeKernelTiling(module, kt);
+                            llvm::outs() << "[TilingLinalg] Set kernel_tiling out_rounds=" << outRounds << "\n";
                         }
                     }
 
@@ -5451,9 +5545,8 @@ public:
                         singleFullConnectAuto = fcaIt->second;
                 }
 
-                // Set K-round module attributes for downstream DMA passes
+                // Record the K-round schedule for downstream DMA passes
                 if (derivedTilingParams.valid && derivedTilingParams.kRounds > 1) {
-                    mlir::OpBuilder attrBuilder(&ctx);
                     // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                     // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                     // lets the downstream passes fall through to the pure-K-round path.
@@ -5476,12 +5569,14 @@ public:
                                      << " n_rounds=" << derivedTilingParams.spatialNRounds << ")\n";
                     } else {
                         // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
-                        // emitted here, so the K-triple must be carried as module attrs.
-                        module->setAttr("routing.effective_k",
-                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
-                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
-                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
-                        llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
+                        // emitted here, so the K-triple goes on the routing func's
+                        // #routing.kernel_tiling.
+                        routing::KernelTilingFields kt;
+                        kt.effectiveK = derivedTilingParams.effectiveK;
+                        kt.fullK = derivedTilingParams.kDim;
+                        kt.kRounds = derivedTilingParams.kRounds;
+                        routing::mergeKernelTiling(module, kt);
+                        llvm::outs() << "[TilingLinalg] Set K-round kernel_tiling (fullconnect_auto=0, "
                                         "tile_*/m_rounds/n_rounds dropped): effective_k="
                                      << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
                                      << " full_k=" << derivedTilingParams.kDim << "\n";
@@ -5492,11 +5587,9 @@ public:
                 // pass allocates the input window to match the kernel body's buf_sz
                 // (= halo_slice * raw_wc). Set unconditionally (kRounds may be 1).
                 if (derivedTilingParams.valid && derivedTilingParams.convHaloBufSize > 0) {
-                    mlir::OpBuilder haloAttrBuilder(&ctx);
-                    module->setAttr("routing.spatial_halo_buf_size",
-                                    haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.convHaloBufSize));
-                    llvm::outs() << "[TilingLinalg] Set spatial_halo_buf_size=" << derivedTilingParams.convHaloBufSize
-                                 << "\n";
+                    int haloTensors = routing::setHaloBufSize(module, derivedTilingParams.convHaloBufSize);
+                    llvm::outs() << "[TilingLinalg] Set halo buf_size=" << derivedTilingParams.convHaloBufSize << " on "
+                                 << haloTensors << " halo tensor(s)\n";
                     // Spatial-halo conv has kRounds==1, so the K-round attr block above is
                     // skipped and routing.tile_m is never set. Emit ONLY the M-dimension
                     // tiling attrs here so classifyTiling returns Multiple(mRounds) and the
@@ -5507,12 +5600,12 @@ public:
                     // opts out of the M-round repeat entirely.
                     if (singleFullConnectAuto && derivedTilingParams.spatialMRounds > 1 &&
                         derivedTilingParams.tileM > 0 && derivedTilingParams.tileRows > derivedTilingParams.tileM) {
-                        module->setAttr("routing.tile_m", haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.tileM));
-                        module->setAttr("routing.tile_rows",
-                                        haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.tileRows));
-                        module->setAttr("routing.m_rounds",
-                                        haloAttrBuilder.getI64IntegerAttr(derivedTilingParams.spatialMRounds));
-                        llvm::outs() << "[TilingLinalg] Set spatial-halo M-round attrs: tile_m="
+                        routing::KernelTilingFields kt;
+                        kt.tileM = derivedTilingParams.tileM;
+                        kt.tileRows = derivedTilingParams.tileRows;
+                        kt.mRounds = derivedTilingParams.spatialMRounds;
+                        routing::mergeKernelTiling(module, kt);
+                        llvm::outs() << "[TilingLinalg] Set spatial-halo M-round kernel_tiling: tile_m="
                                      << derivedTilingParams.tileM << " tile_rows=" << derivedTilingParams.tileRows
                                      << " m_rounds=" << derivedTilingParams.spatialMRounds << "\n";
                     }
@@ -5528,8 +5621,10 @@ public:
                     {
                         int64_t outRounds = derivedTilingParams.spatialMRounds * derivedTilingParams.spatialNRounds;
                         if (outRounds > 1) {
-                            module->setAttr("routing.spatial_out_rounds", haloAttrBuilder.getI64IntegerAttr(outRounds));
-                            llvm::outs() << "[TilingLinalg] Set spatial_out_rounds=" << outRounds
+                            routing::KernelTilingFields kt;
+                            kt.outRounds = outRounds;
+                            routing::mergeKernelTiling(module, kt);
+                            llvm::outs() << "[TilingLinalg] Set kernel_tiling out_rounds=" << outRounds
                                          << " (spatialMRounds=" << derivedTilingParams.spatialMRounds
                                          << " * spatialNRounds=" << derivedTilingParams.spatialNRounds << ")\n";
                         }

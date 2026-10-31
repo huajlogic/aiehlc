@@ -1,5 +1,7 @@
 # Deprecate Global Module Tiling Attributes — Single-Source `#routing.tiling` Op Implementation Plan
 
+> **Attribute names superseded (2026-10-27).** The `routing.tile_*` / `*_k` / `*_rounds`, `routing.spatial_*`, `routing.pp_depth_map` and `tensor_N.*` **module** attributes named in this document no longer exist: the routing module carries only control switches, and that information is now a typed attribute on the IR op it describes. See [routing_ir_tiling_carriers.md](../../doc/design/routing_ir_tiling_carriers.md).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make the `#routing.tiling` attribute on the `routing.partitiontensor` op the single source of truth for all GEMM/conv tiling geometry, and delete the nine global `routing.tile_*/*_rounds/*_k` module attributes (both their emission in `aiehlc.cc` and every `getAttrOfType` read across the passes).

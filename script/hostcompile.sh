@@ -321,7 +321,13 @@ elif [[ "$aie_version" == "5" ]]; then
     AIELIB_APU_NAME="libxaienginea78.a"
     ARCH_APU_LD="${ARCH_DIR}/cortexa78_0/lscript.ld"
     compiler_cpu_flag="-mcpu=cortex-a78"
-    LINK_EXTRA="-lxiltimer,-lxilstandalone,-lxilpm"
+    # The xilpm client is libxilpm_ng.a in newer BSPs and libxilpm.a in older
+    # ones; link whichever this BSP actually ships.
+    XILPM_LIB="xilpm_ng"
+    if [ ! -f "${ARCH_APU_ALIB}/libxilpm_ng.a" ] && [ ! -f "${ALIB_LIB_DIR}/libxilpm_ng.a" ]; then
+        XILPM_LIB="xilpm"
+    fi
+    LINK_EXTRA="-lxiltimer,-lxilstandalone,-l${XILPM_LIB}"
 else
     echo "Unsupported AIE version: $aie_version"
     exit 1

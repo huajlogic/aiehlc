@@ -867,8 +867,11 @@ def netload_start(args, local_elf, collected):
     # The supervisor acks before the ELF is sent (protocol v2): busy within its
     # max -> wait up to --netload-wait; past its max -> --force terminates it
     # (exit 5 "stuck" when this PDI cannot: the bootstrap below does it).
+    # --netload-force-now: no waiting; a run still within its max is taken over below.
+    force_now = args.netload_force_now
     load_argv = ["load", local_elf, "--host", ip, "--max-run-ms", str(args.netload_max_run_ms),
-                 "--wait", str(args.netload_wait)] + ([] if args.netload_no_force else ["--force"])
+                 "--wait", "0" if force_now else str(args.netload_wait)] + \
+        ([] if args.netload_no_force and not force_now else ["--force"])
     if not args.netload_bootstrap:
         # The console attaches while the ELF streams; netload holds back the last
         # 4 KB until it is attached, so the app cannot print before we listen.
@@ -883,8 +886,9 @@ def netload_start(args, local_elf, collected):
                 raise ConnectionError("com0 console did not attach")
 
         t0 = time.time()
-        print(f"[netload] asking the supervisor at {ip} to run {os.path.basename(local_elf)} "
-              f"(waits up to {args.netload_wait:g} s if the board is busy)", flush=True)
+        print(f"[netload] asking the supervisor at {ip} to run {os.path.basename(local_elf)} " +
+              ("(force now: a running app is taken over)" if force_now
+               else f"(waits up to {args.netload_wait:g} s if the board is busy)"), flush=True)
         rc, out = netload_remote(load_argv, gate=console_attached, live=True)
         opener.join(timeout=60)
         if "c" not in box:
@@ -894,17 +898,20 @@ def netload_start(args, local_elf, collected):
         if rc == 0:
             print(f"[netload] streamed {local_elf} through the proxy on {palip} in {time.time() - t0:.2f}s (no scp)")
             return None, conn2, th, True
-        if rc == 3:
+        if rc == 3 and not force_now:
             print(f"\n[ERROR] board still busy after --netload-wait {args.netload_wait:g} s with a run that is "
                   f"within its max run time; not power-cycling it. Retry later or raise --netload-wait")
             return None, conn2, th, False
         if rc == 4:
             print("\n[ERROR] the previous app ran past its max run time; drop --netload-no-force to terminate it")
             return None, conn2, th, False
-        if rc not in (2, 5) and "re-bootstrap" not in out:
+        if rc not in (2, 5) and not (rc == 3 and force_now) and "re-bootstrap" not in out:
             return None, conn2, th, False  # a real refusal (bad ELF etc.), not "no supervisor"
         m = re.search(r"park_addr=0x([0-9a-f]+)", out)
-        if rc == 5 and m and netboot_park_app_core(int(m.group(1), 16)):
+        if rc == 3:
+            print("[netload] --netload-force-now: the board is running another app within its max run time; "
+                  "taking the app core over", flush=True)
+        if rc in (3, 5) and m and netboot_park_app_core(int(m.group(1), 16)):
             time.sleep(0.5)
             st_rc, st = netload_remote(["status", "--host", ip, "--connect-timeout", "3"], timeout=30)
             if st_rc == 0 and "app core parked" in st:
@@ -917,6 +924,7 @@ def netload_start(args, local_elf, collected):
         stop_console(conn2, th)
         why = (f"supervisor not answering at {ip}" if rc == 2 else
                "the previous app is past its max run time and this PDI cannot stop it (forced run)" if rc == 5
+               else "--netload-force-now: the running app could not be parked over JTAG" if rc == 3
                else "app core still busy from the previous run")
     else:
         why = "--netload-bootstrap"
@@ -1005,6 +1013,14 @@ Examples:
         default=120.0,
         help="If the board is busy with a run still within its max run time, wait up to this many seconds "
              "for it (--netload only, default 120); the supervisor says how long the run has left"
+    )
+    parser.add_argument(
+        "--netload-force-now",
+        action="store_true",
+        default=False,
+        help="Run this ELF immediately (--netload only): do not wait for a run still within its max run time -- "
+             "free the app core over JTAG (stop, rst -proc, park; ~5-17 s) and send this ELF, falling back to a "
+             "supervisor re-bootstrap if that fails. Kills whatever is running, including another user's run"
     )
     parser.add_argument(
         "--netload-no-force",

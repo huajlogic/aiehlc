@@ -72,6 +72,11 @@ XAie_DevInst *getOrCreateDeviceInstance(void);
 /* When set, enable informational runtime log output (AIEHLC_LOG).
  * Usage: #pragma aie_debug_level(AIE_DEBUG_LOG) */
 #define AIE_DEBUG_LOG (1 << 9)
+/* Kernel klog (#pragma aie_debug_level(AIE_KERNEL_CONFIG_TRACE)): kc.sh compiles
+ * klog() into the kernel, and the host prints every launched core's klog region
+ * after the launch. Without AIE_DEBUG_LOG that is the ONLY dump printed; with it,
+ * the klog is part of the full AieRt_DebugSnapshot instead. */
+#define AIE_DEBUG_FLAG_KERNEL_CONFIG_TRACE (1 << 10)
 #define AIE_DEBUG_HAS_FLAG(v, flag) (((v) & (flag)) != 0)
 extern int g_runtime_debug_level;
 
@@ -80,6 +85,7 @@ extern int g_runtime_debug_level;
  * Errors/failures print unconditionally regardless of this flag.
  * Usage:  AIEHLC_LOG(printf("...", args)); */
 #define AIEHLC_LOG_ENABLED() AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_LOG)
+#define AIEHLC_KLOG_ENABLED() AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_KERNEL_CONFIG_TRACE)
 /* clang-format off */
 #define AIEHLC_LOG(stmt) do { if (AIEHLC_LOG_ENABLED()) { stmt; } } while (0)
 /* clang-format on */
@@ -419,8 +425,11 @@ inline void __Runtime_wait(struct_event ev) { __Runtime_wait_event(g_DevInst, ev
 inline void __Runtime_wait(struct_ioevent ev) { __Runtime_wait_io(g_DevInst, ev); }
 #endif
 
-// Kernel log reader (reads log entries from core tile data memory)
+// Kernel log reader (reads log entries from core tile data memory). Prints
+// unconditionally -- calling it is the request.
 void __Runtime_read_kernel_log(XAie_DevInst *dev, XAie_LocType tile);
+// Same for n core tiles given as parallel (col, row) arrays.
+void __Runtime_read_kernel_logs(XAie_DevInst *dev, const uint8_t *cols, const uint8_t *rows, uint32_t n);
 
 // ---------------------------------------------------------------------------
 // Performance counter APIs for core tile memory module

@@ -502,3 +502,19 @@ part of starting a kernel (argument order, the two zero-points) is generated.
 * Golden: `deploy_flow.py` CLI after the M0 refactor is byte-identical on
   `layers-golden/`.
 * Never: anything that runs on a board.
+
+
+## Offload interface (`ag.offload_interface`, implemented)
+
+`src/aiegraph/interface.py`. No argument: the kernel-file format
+(`KernelFormat`). With a TVM layer or `region=`: an `OffloadInterface` built from
+`aiekernel.graph` (args in call order), `network_md.param_role` (roles from the
+layer's generated C) and the constants (value facts over every call; all-zero
+-> `require=zero`). The generated `AIEK_SPEC` is parsed with
+`aiekernel.spec.parse_specs` and matched with `aiekernel.match.match_call`
+against every call before it is returned, and `detect_layers` lists the other
+layers it fits -- so interface and gates cannot disagree. `write(dir)` emits
+`<entry>.cc` (entry + spec; AIE kernel and launch left to the user, entry
+returns `AIEK_ERR_KERNEL` until filled) and `<entry>_ref.c`; it refuses to
+overwrite. Shapes are concrete (one TVM symbol = one geometry); a multi-layer
+kernel generalizes dims to NAMEs by hand. CLI: `aiegraph interface`.

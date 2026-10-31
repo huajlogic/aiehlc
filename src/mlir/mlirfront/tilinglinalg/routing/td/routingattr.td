@@ -53,23 +53,81 @@ def TileRangeArrayAttr : routingattr<"TileRangeArray"> {
   let assemblyFormat = "`{` $items `}`";
 }
 
+// Spatial-halo (overlapping slab) descriptor of ONE tensor, carried on the op
+// that declares it (routing.routingcreatescheduletensor, then
+// dfscheblueprint.declare_data). Replaces the old `tensor_N.halo` module
+// dictionary plus `routing.spatial_halo_buf_size`. Every optional field
+// defaults to 0 = "level absent" (the struct format omits it on print), which
+// is exactly how readers treated a missing dictionary key.
 def HaloAttr : routingattr<"Halo"> {
   let mnemonic = "halo";
   let summary = "spatial overlapping (halo) tile distribution descriptor";
   let cppNamespace = "routing";
   let parameters = (ins
-    "int32_t":$sliceSize,   // L1 rows each tile owns (overlapping slice)
-    "int32_t":$step,        // L1 stride between consecutive tile slices
-    "int32_t":$overlap,     // sliceSize - step (shared halo rows)
-    // L2 (nested) halo; defaults => no nested level (legacy single-level path)
-    DefaultValuedParameter<"int32_t", "0">:$l2Slice,
-    DefaultValuedParameter<"int32_t", "0">:$l2Step,
-    DefaultValuedParameter<"int32_t", "1">:$l2Rounds,
-    // K-contraction accumulate split (independent of the H/row L2 halo above);
-    // defaults => no K-accum split (struct-format omits default values on print)
-    DefaultValuedParameter<"int32_t", "0">:$kSlice,
-    DefaultValuedParameter<"int32_t", "0">:$kStep,
-    DefaultValuedParameter<"int32_t", "1">:$kRounds
+    "int64_t":$slice,       // L1 rows each mesh tile owns (overlapping slice)
+    "int64_t":$step,        // L1 stride between consecutive tile slices
+    "int64_t":$split_dim,   // tensor dim the slices walk
+    // 2D width split: per-chunk width geometry (0 => height-only)
+    DefaultValuedParameter<"int64_t", "0">:$w_slice,
+    DefaultValuedParameter<"int64_t", "0">:$w_step,
+    DefaultValuedParameter<"int64_t", "0">:$w_rounds,
+    DefaultValuedParameter<"int64_t", "0">:$ow_t,
+    // padded DDR row pitch in elements (set with a W or L2 split)
+    DefaultValuedParameter<"int64_t", "0">:$row_pitch,
+    // L2 (nested) on-core temporal rounds along split_dim
+    DefaultValuedParameter<"int64_t", "0">:$l2_slice,
+    DefaultValuedParameter<"int64_t", "0">:$l2_step,
+    DefaultValuedParameter<"int64_t", "0">:$l2_rounds,
+    // K-contraction accumulate split (independent of the L2 split)
+    DefaultValuedParameter<"int64_t", "0">:$k_slice,
+    DefaultValuedParameter<"int64_t", "0">:$k_step,
+    DefaultValuedParameter<"int64_t", "0">:$k_rounds,
+    // contiguous per-round IFM slab the kernel window holds, in elements
+    DefaultValuedParameter<"int64_t", "0">:$buf_size
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+// User DmaTransform for ONE tensor's shim BD (element strides/wraps plus the
+// BD iteration dim). Replaces the old `tensor_N.shim_dma` module dictionary.
+def ShimDmaAttr : routingattr<"ShimDma"> {
+  let mnemonic = "shim_dma";
+  let summary = "user-specified multi-dim shim DMA addressing of one tensor";
+  let cppNamespace = "routing";
+  let parameters = (ins
+    "::mlir::ArrayAttr":$strides,    // i32 element strides, innermost first
+    "::mlir::ArrayAttr":$wraps,      // i32 wraps, same order
+    "int64_t":$iter_step,
+    "int64_t":$iter_wrap,
+    OptionalParameter<"::mlir::ArrayAttr">:$ddr_shape,  // i64 DDR shape (tile_m base math)
+    DefaultValuedParameter<"int64_t", "0">:$tile_m_alignment
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+// Kernel-level on-core round schedule that is not a property of any single
+// tensor. Carried on the routing func (`routing.kernel_tiling`), which lives
+// through every stage. Replaces the flat `routing.{tile_m,tile_rows,m_rounds,
+// tile_n,tile_cols,n_rounds,effective_k,full_k,k_rounds,spatial_out_rounds}`
+// module attrs on the paths that have no #routing.tiling op
+// (fullconnect_auto=0, spatial halo). 0 = not set, matching the old
+// "attr absent" reads.
+def KernelTilingAttr : routingattr<"KernelTiling"> {
+  let mnemonic = "kernel_tiling";
+  let summary = "kernel on-core round schedule";
+  let cppNamespace = "routing";
+  let parameters = (ins
+    DefaultValuedParameter<"int64_t", "0">:$tile_m,
+    DefaultValuedParameter<"int64_t", "0">:$tile_rows,
+    DefaultValuedParameter<"int64_t", "0">:$m_rounds,
+    DefaultValuedParameter<"int64_t", "0">:$tile_n,
+    DefaultValuedParameter<"int64_t", "0">:$tile_cols,
+    DefaultValuedParameter<"int64_t", "0">:$n_rounds,
+    DefaultValuedParameter<"int64_t", "0">:$effective_k,
+    DefaultValuedParameter<"int64_t", "0">:$full_k,
+    DefaultValuedParameter<"int64_t", "0">:$k_rounds,
+    // output slabs per core per launch (spatialMRounds * spatialNRounds)
+    DefaultValuedParameter<"int64_t", "0">:$out_rounds
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }

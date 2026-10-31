@@ -252,3 +252,98 @@ def test_check_offload_by_region_read_only():
     with pytest.raises(ag.AiegraphError, match="backend="):
         emod.assign(region="conv1", backend="gpu")
     assert (DEPLOY / "layers" / "partition.json").read_text() == part
+
+
+# ── offload_AI_proto, with a stand-in for `claude -p` ──────────────────────
+
+_FAKE_CLAUDE = r'''#!{py}
+import json, os, pathlib, shutil, sys
+cwd = pathlib.Path.cwd()
+with open(cwd / "fake_calls.txt", "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+assert sys.stdin.read().strip(), "the prompt comes on stdin"
+if os.environ.get("FAKE_CLAUDE_MODE") == "port":
+    (entry,) = [p for p in cwd.iterdir() if p.stem.endswith("_l4")]
+    shutil.copy({conv3!r}, entry)
+print(json.dumps({{"type": "assistant", "message": {{"content": [
+    {{"type": "tool_use", "name": "Edit", "input": {{"file_path": "x.cc"}}}}]}}}}))
+print(json.dumps({{"type": "result", "session_id": "s-1", "result": "done"}}))
+'''
+
+
+@pytest.fixture
+def fake_claude(tmp_path):
+    exe = tmp_path / "bin" / "claude"
+    exe.parent.mkdir()
+    exe.write_text(_FAKE_CLAUDE.format(py=sys.executable, conv3=str(CONV3)))
+    exe.chmod(0o755)
+    return str(exe)
+
+
+@deployed
+def test_ai_proto_ready_kernel_is_returned_as_is(fake_claude, tmp_path):
+    emod = ag.open(DEPLOY)
+    res = emod.offload_AI_proto("layer1", STEM, claude=fake_claude, out_dir=tmp_path / "p")
+    assert res.ok and res.rounds == 0 and Path(res) == STEM
+    assert not (tmp_path / "p").exists()
+
+
+@deployed
+def test_ai_proto_ports_and_verifies(fake_claude, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "port")
+    emod = ag.open(DEPLOY)
+    before = STEM.read_bytes()
+    res = emod.offload_AI_proto("layer4", STEM, claude=fake_claude, out_dir=tmp_path / "p")
+    assert res.ok and res.rounds == 1 and res.layers == [4], res
+    assert Path(res).parent == tmp_path / "p" and Path(res).name == "conv2dstem_uk_l4.cc"
+    assert (tmp_path / "p" / "conv2dstem.cc").is_file()          # the dir was staged flat
+    assert STEM.read_bytes() == before
+    assert emod.offload_check("layer4", res).ok                    # path-like
+    argv = json.loads((tmp_path / "p" / "fake_calls.txt").read_text().splitlines()[0])
+    tools = argv[argv.index("--allowedTools") + 1]
+    assert f"Edit(/{tmp_path / 'p'}/**)" in tools and "-m aiegraph check" in tools
+
+
+@deployed
+def test_ai_proto_gives_up_after_rounds(fake_claude, tmp_path):
+    emod = ag.open(DEPLOY)
+    res = emod.offload_AI_proto("layer4", STEM, claude=fake_claude, out_dir=tmp_path / "p",
+                                rounds=2)
+    assert not res.ok and res.rounds == 2 and "NOT READY" in repr(res)
+    calls = (tmp_path / "p" / "fake_calls.txt").read_text().splitlines()
+    assert "--resume" not in calls[0] and '"--resume", "s-1"' in calls[1]
+    with pytest.raises(ag.AiegraphError):
+        res.raise_for_status()
+
+
+# ── offload_interface ───────────────────────────────────────────────────────
+
+def test_offload_interface_format_needs_no_model():
+    fmt = ag.offload_interface()
+    assert isinstance(fmt, ag.KernelFormat)
+    for word in ("AIEK_ENTRY", "AIEK_SPEC", "AIEK_REFERENCE", "TVM call order", "require="):
+        assert word in fmt
+
+
+@deployed
+def test_offload_interface_layer_is_proven(tmp_path):
+    emod = ag.open(DEPLOY)
+    itf = emod.offload_interface("layer1")
+    assert [a.kind for a in itf.args][0] == "in" and itf.args[-1].kind == "out"
+    assert "matches 1/1 call(s)" in itf.verified
+    # the stem's second zero-point and unused param are all zero -> require=zero
+    assert sum(1 for a in itf.args if a.requires == ("zero",)) == 2
+    assert "AIEK_SPEC(aiek_layer01," in itf.spec()
+    files = itf.write(tmp_path)
+    assert {p.name for p in files} == {"aiek_layer01.cc", "aiek_layer01_ref.c"}
+    with pytest.raises(ag.AiegraphError, match="already exist"):
+        itf.write(tmp_path)
+    # what detect sees in the written file is the same signature
+    rep = emod.detect(tmp_path / "aiek_layer01.cc")
+    assert 1 in rep.matches
+
+
+@deployed
+def test_offload_interface_multi_call_layer():
+    itf = ag.open(DEPLOY).offload_interface(4)
+    assert len(itf.calls) == 2 and "matches 2/2 call(s)" in itf.verified

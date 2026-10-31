@@ -87,6 +87,10 @@ include_directories(${Clang_INCLUDE_DIRS})
 include_directories(${CLANG_INCLUDE_DIRS})
 include_directories("./src/mlir/mlirfront/")
 include_directories("./src/mlir/mlirfront/tilinglinalg/pass/")
+# routingmanager.h (routing dialect attrs/ops: aiehlc.cc records the kernel
+# tiling and halo slab size on routing IR ops) and its generated .inc files.
+include_directories("./src/mlir/mlirfront/tilinglinalg/routing/")
+include_directories("./src/mlir/mlirfront/tilinglinalg/routing/inc/")
 
 
 #fiind antlr include
@@ -122,10 +126,24 @@ find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})
 
 include_directories(${MLIR_INCLUDE_DIRS})
 
-set(SOURCE_FILES ./src/llvm/aiehlc.cc)
+set(SOURCE_FILES ./src/llvm/aiehlc.cc
+    ./src/llvm/convautotile/conv_autotile.cpp
+    ./src/llvm/convautotile/conv_desugar.cpp
+    ./src/llvm/convautotile/kernel_trace.cpp
+    ./src/llvm/convautotile/kernel_front.cpp)
 set(mlirfrontend src/mlir/mlirfront/)
 
 add_executable(aiehlc ${SOURCE_FILES})
+target_include_directories(aiehlc PRIVATE ./src/llvm)
+target_compile_definitions(aiehlc PRIVATE AIEHLC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+# Conv2d auto-tiling model CLI (backend of script/convtune, the AutoTVM tuner).
+add_executable(aiehlc-convtile ./src/llvm/convautotile/convtile_cli.cpp
+    ./src/llvm/convautotile/conv_autotile.cpp ./src/llvm/convautotile/conv_desugar.cpp
+    ./src/llvm/convautotile/kernel_trace.cpp
+    ./src/llvm/convautotile/kernel_front.cpp)
+
+target_compile_definitions(aiehlc-convtile PRIVATE AIEHLC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
 # Strip only for non-debug builds. In Debug / RelWithDebInfo we keep the symbol
 # table + DWARF so gdb (e.g. `source script/aiehlc.sh -gdb ...`) can resolve

@@ -7,6 +7,7 @@
 // KERNELCONFIGOFFLOAD: the core-tile DMA plan the host path publishes when it
 // stops emitting core create_io (ResourceMgr::coreOffloadPlan).
 #include "hw/ResourceManager.h"
+#include "routingmanager.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -361,48 +362,22 @@ void DfscheduleProvenanceMapPass::runOnOperation() {
             return;
     }
 
-    // === Extract module attributes ===
+    // === Tiling scalars ===
     int64_t tileM = 0, tileN = 0, effectiveK = 0, fullK = 0;
     int64_t kRounds = 0, mRounds = 0, nRounds = 0;
-    // tile_m/tile_n: prefer the value threaded in from the pipeline (derived from the
-    // #routing.tiling op before conversion, since the routing dialect/op is gone on this
-    // host module). A zero threaded value means fullconnect_auto=0 (no tiling op) → fall
-    // back to the flat module attr.
-    if (ctorTileM)
-        tileM = ctorTileM;
-    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.tile_m"))
-        tileM = attr.getInt();
-    if (ctorTileN)
-        tileN = ctorTileN;
-    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.tile_n"))
-        tileN = attr.getInt();
-    // K-triple: prefer the value threaded in from the pipeline (derived from the
-    // #routing.tiling op before conversion, since the routing dialect/op is gone on this
-    // host module). A zero threaded value means fullconnect_auto=0 (no tiling op) → fall
-    // back to the flat module attr.
-    if (ctorEffectiveK)
-        effectiveK = ctorEffectiveK;
-    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.effective_k"))
-        effectiveK = attr.getInt();
-    if (ctorFullK)
-        fullK = ctorFullK;
-    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.full_k"))
-        fullK = attr.getInt();
-    if (ctorKRounds)
-        kRounds = ctorKRounds;
-    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.k_rounds"))
-        kRounds = attr.getInt();
-    // M/N spatial rounds: prefer the pipeline-threaded value (derived from the #routing.tiling
-    // op before conversion). A zero threaded value means fullconnect_auto=0 (no GEMM tiling op)
-    // → fall back to the flat module attr (e.g. the spatial-halo conv path still emits it).
-    if (ctorMRounds)
-        mRounds = ctorMRounds;
-    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.m_rounds"))
-        mRounds = attr.getInt();
-    if (ctorNRounds)
-        nRounds = ctorNRounds;
-    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.n_rounds"))
-        nRounds = attr.getInt();
+    // Prefer the values threaded in from the pipeline (read from the
+    // #routing.tiling op before conversion; the routing ops are gone on this host
+    // module). A zero threaded value means there is no GEMM tiling op
+    // (fullconnect_auto=0, spatial halo): fall back to the routing func's
+    // #routing.kernel_tiling, which survives every stage.
+    routing::KernelTilingAttr kt = routing::readKernelTiling(module);
+    tileM = ctorTileM ? ctorTileM : kt.getTileM();
+    tileN = ctorTileN ? ctorTileN : kt.getTileN();
+    effectiveK = ctorEffectiveK ? ctorEffectiveK : kt.getEffectiveK();
+    fullK = ctorFullK ? ctorFullK : kt.getFullK();
+    kRounds = ctorKRounds ? ctorKRounds : kt.getKRounds();
+    mRounds = ctorMRounds ? ctorMRounds : kt.getMRounds();
+    nRounds = ctorNRounds ? ctorNRounds : kt.getNRounds();
 
     // === Find host block ===
     HostBlockOp hostBlock;

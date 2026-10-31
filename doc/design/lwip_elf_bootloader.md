@@ -392,3 +392,10 @@ while one connection is held mid-header; a v1 client still served;
 `apppaltest --netload` waited 21.7 s for a 20 s app (polling every 2 s) and then
 ran ResNet-18 without a power cycle; with the old app past a 3 s max it forced a
 re-bootstrap and ran ResNet-18 (43 s wall).
+
+**Taking over a run within its max (`apppaltest --netload-force-now`).** The
+supervisor never preempts a run inside its max run time. The client does: it
+asks with `--wait 0 --force`; on `busy` it parks the app core over JTAG with the
+ack's `park_addr` -- the same path as `stuck` -- confirms `app core parked`
+with `status`, and resends; a failed park falls back to a re-bootstrap.
+`netload.py` prints `park_addr` for `busy` and `overtime` acks as well.

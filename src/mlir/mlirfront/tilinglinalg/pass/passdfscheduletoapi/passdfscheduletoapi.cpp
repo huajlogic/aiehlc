@@ -2323,6 +2323,24 @@ static void emitDebugSnapshotVerbatim(OpBuilder &rewriter, Location loc, const C
     rewriter.create<emitc::VerbatimOp>(loc, "}");
 }
 
+/// Helper: emit the klog-only dump. AIE_KERNEL_CONFIG_TRACE without AIE_DEBUG_LOG
+/// prints just the launched cores' kernel logs; with AIE_DEBUG_LOG the snapshot
+/// above already includes them, so this block stays silent.
+static void emitKernelLogVerbatim(OpBuilder &rewriter, Location loc, const ConversionState &state) {
+    std::string cols, rows;
+    for (auto &t : state.debugTiles) {
+        cols += (cols.empty() ? "" : ", ") + std::to_string(t.col);
+        rows += (rows.empty() ? "" : ", ") + std::to_string(t.row);
+    }
+    rewriter.create<emitc::VerbatimOp>(loc, "/* Kernel klog only (AIE_KERNEL_CONFIG_TRACE without AIE_DEBUG_LOG) */");
+    rewriter.create<emitc::VerbatimOp>(loc, "if (AIEHLC_KLOG_ENABLED() && !AIEHLC_LOG_ENABLED()) {");
+    rewriter.create<emitc::VerbatimOp>(loc, "  uint8_t _klog_cols[] = {" + cols + "};");
+    rewriter.create<emitc::VerbatimOp>(loc, "  uint8_t _klog_rows[] = {" + rows + "};");
+    rewriter.create<emitc::VerbatimOp>(loc, "  __Runtime_read_kernel_logs(dev, _klog_cols, _klog_rows, " +
+                                                std::to_string(state.debugTiles.size()) + ");");
+    rewriter.create<emitc::VerbatimOp>(loc, "}");
+}
+
 /// Outer pattern for dfschedule.host -> emitc.func (simple shell only)
 /// The inner ops are already converted by the host inner pattern phase
 struct HostOpOuterPattern : public ConversionPattern {
@@ -2391,9 +2409,9 @@ struct HostOpOuterPattern : public ConversionPattern {
         if (state.enableDebug && !state.debugIos.empty()) {
             emitDebugSnapshotVerbatim(rewriter, loc, state);
         }
-
-        // Kernel log reading is handled by __Runtime_auto_teardown() in
-        // aie_runtime.c (destructor), no need to emit it in host.cc.
+        if (state.enableDebug && !state.debugTiles.empty()) {
+            emitKernelLogVerbatim(rewriter, loc, state);
+        }
 
         rewriter.create<emitc::ReturnOp>(loc, Value{});
 
