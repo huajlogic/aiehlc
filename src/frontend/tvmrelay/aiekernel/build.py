@@ -17,6 +17,9 @@ Compile only. Nothing here talks to a board.
    re-archive with ``hostcompile.sh`` (``aie_layer_lib.build_archive``).
    ``build/host.o`` is deleted first: ``hostcompile.sh`` skips any object that
    already exists, so the adapters would otherwise silently not be compiled.
+   ``build/kernel.o`` is KEPT: install changes only host.cc, and
+   ``compile_one_kernel`` reuses the object while ``build/kernel.stamp``
+   (kernel.cc, bcf, prx, kc.sh) matches -- no second xchesscc run.
 3. **isolate** -- merge the archive's own objects (``host.o``, ``routing.o``,
    ``kernel*.o``) with ``ld -r`` and make every global LOCAL except the
    adapters, the entry, the spec's ``export`` lines, and the RUNTIME HOOKS --
