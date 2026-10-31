@@ -315,8 +315,10 @@ aiegraph compile resnet18 aie "layer1=src/aietensorop/conv2dstem/conv2dstem_uk.c
 
 * Image classifiers with a `float32[1,3,224,224]` input (ImageNet preprocessing).
   Other inputs are refused at `load` with that reason.
-* One aiehlc library per ELF (the runtime has one `routing()`): offloading layers
-  to two different kernel *sources* is rejected at the link gate. Several layers
-  of one kernel are fine.
+* Several kernel *sources* in one ELF need libraries built by the current aiehlc
+  (per-library routing; `print(emod)` keeps both layers on `aie:`). A library
+  from an older aiehlc still owns the global `routing()` and is displaced by the
+  next offload. Switching between libraries re-initializes the partition per
+  launch.
 * PyTorch goes through ONNX export; the native PT2E → MLIR path is a later milestone.
 * Board runs are yours: copy `main.elf` over (`script/test/apppaltest.py`).

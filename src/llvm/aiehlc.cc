@@ -4546,6 +4546,13 @@ public:
                     ret += "struct XAie_DevInst;\n";
                     ret += "extern \"C\" XAie_DevInst *__Runtime_init_mesh_partition(int meshId, int startCol, int "
                            "numCols);\n";
+                    ret += "extern \"C\" XAie_DevInst *__Runtime_init_mesh_partition_with(int meshId, int startCol, "
+                           "int numCols, void (*route)(XAie_DevInst *));\n";
+                    // This library's stream-switch setup (routing.cc), passed to the runtime
+                    // explicitly so several aiehlc libraries -- each with routing() made local
+                    // by aiekernel's isolation -- can share one ELF. Weak: a host-only build
+                    // has no routing.cc; the runtime then uses the global routing().
+                    ret += "void routing(XAie_DevInst *dev) __attribute__((weak));\n";
                     ret += "extern \"C\" XAie_DevInst *__Runtime_get_partition_dev(int meshId);\n";
                     ret += "extern \"C\" void *__Runtime_alloc_buffer(XAie_DevInst *dev, __SIZE_TYPE__ size_bytes);\n";
                     ret += "extern \"C\" void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);\n";
@@ -4564,13 +4571,13 @@ public:
                     ret += "    XAie_DevInst* _dev = nullptr;\n";
                     ret += "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
                     ret += "        int meshId = nextMeshId++;\n";
-                    ret += "        _dev = __Runtime_init_mesh_partition(meshId, p.startCol, p.endCol - p.startCol + "
-                           "1);\n";
+                    ret += "        _dev = __Runtime_init_mesh_partition_with(meshId, p.startCol, p.endCol - "
+                           "p.startCol + 1, routing);\n";
                     ret += "        return aieMesh{rows, cols, p, meshId};\n";
                     ret += "    }\n";
                     ret += "    aieMesh partition(int rows, int cols) {\n";
                     ret += "        int meshId = nextMeshId++;\n";
-                    ret += "        _dev = __Runtime_init_mesh_partition(meshId, 0, cols);\n";
+                    ret += "        _dev = __Runtime_init_mesh_partition_with(meshId, 0, cols, routing);\n";
                     ret += "        return aieMesh{rows, cols, {0, cols - 1, 0, rows - 1}, meshId};\n";
                     ret += "    }\n";
                     ret += "    void* alloc(__SIZE_TYPE__ size) { return __Runtime_alloc_buffer(_dev, size); }\n";
@@ -5328,18 +5335,23 @@ public:
                     stream << "    aiePartition partition;\n";
                     stream << "    int meshId;\n";
                     stream << "};\n";
+                    // This library's stream-switch setup (routing.cc), passed to the runtime
+                    // explicitly: with routing() made local per library (aiekernel isolation),
+                    // several aiehlc libraries can share one ELF. Weak: a host-only build has
+                    // no routing.cc, and the runtime then falls back to the global routing().
+                    stream << "void routing(XAie_DevInst* dev) __attribute__((weak));\n";
                     stream << "struct aieArray {\n";
                     stream << "    int nextMeshId = 0;\n";
                     stream << "    XAie_DevInst* _dev = nullptr;\n";
                     stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
                     stream << "        int meshId = nextMeshId++;\n";
-                    stream << "        _dev = __Runtime_init_mesh_partition(meshId, p.startCol, p.endCol - p.startCol "
-                              "+ 1);\n";
+                    stream << "        _dev = __Runtime_init_mesh_partition_with(meshId, p.startCol, p.endCol - "
+                              "p.startCol + 1, routing);\n";
                     stream << "        return aieMesh{rows, cols, p, meshId};\n";
                     stream << "    }\n";
                     stream << "    aieMesh partition(int rows, int cols) {\n";
                     stream << "        int meshId = nextMeshId++;\n";
-                    stream << "        _dev = __Runtime_init_mesh_partition(meshId, 0, cols);\n";
+                    stream << "        _dev = __Runtime_init_mesh_partition_with(meshId, 0, cols, routing);\n";
                     stream << "        return aieMesh{rows, cols, {0, cols - 1, 0, rows - 1}, meshId};\n";
                     stream << "    }\n";
                     stream << "    void* alloc(size_t size) { return __Runtime_alloc_buffer(_dev, size); }\n";

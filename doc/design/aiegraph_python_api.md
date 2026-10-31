@@ -254,9 +254,10 @@ new placement column (`cpu` / `aie:<kernel>`), and then `emod.build()` links
 `main.elf`. Rules the report states up front rather than at link time:
 
 * a layer offloads all of its calls (layer4 is called twice; both swap);
-* **one aiehlc library per ELF** (the runtime's single `routing()`): a plan
-  naming two different kernel *sources* is rejected at plan time with that
-  reason and the hint "put both kernels in one source";
+* several kernel *sources* share one ELF through per-library routing (each
+  library hands its `routing()` to `__Runtime_init_mesh_partition_with`, which
+  re-initializes a partition another library set up); a library from an older
+  aiehlc, which still owns the global `routing()`, is displaced instead;
 * without Vitis the build is skipped and the report says so; `offload_check`
   is still fully useful.
 

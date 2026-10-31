@@ -685,12 +685,19 @@ skips existing objects), **link**. Then `partition.json` (`backend:
 aiehlc-user`) and `arm_build.aie_entries` swap the call, as for the stem.
 Verified: stem (`conv2dstem_uk.cc`) bit-exact + logits identical, built, isolated,
 `main.elf` linked; `example/userkernel/conv3x3_requant_ref.c` (reference-only)
-matches 7 layers / 8 calls, all bit-exact, logits identical. **One aiehlc
-library per ELF:** `__Runtime_routing_init` calls ONE global `routing()` and
-partition init is cached per `meshId`, so `isolate_archive` localizes everything
-except adapters, entry and the runtime hooks (kept *strong* so a second library
-collides instead of silently running with the first one's routing) and the link
-gate rejects later kernels. Tutorial: **[doc/tutorial_userkernel.md](doc/tutorial_userkernel.md)**;
+matches 7 layers / 8 calls, all bit-exact, logits identical. **Several aiehlc
+libraries per ELF (per-library routing):** the generated `aieArray::partition`
+passes the library's own `routing` to `__Runtime_init_mesh_partition_with`; the
+runtime's partition registry remembers which routing set up each `meshId` and
+tears down + re-initializes it when another library launches there (the global
+`routing()` reference is now weak). `isolate_archive` localizes `routing` for
+such libraries, so `offload("layer1", a.cc)` + `offload("layer4", b.cc)` keep
+both on the AIE and `main.elf` links both (verified: two local `routing`s).
+A library from an older aiehlc (calls the old `__Runtime_init_mesh_partition`)
+keeps a strong global `routing` and is displaced by the next offload, as
+before; `partition.json` says `superseded ...`. The aiehlc build cache is keyed
+on the `build/aiehlc` binary too, so such libraries rebuild. Not yet run on a
+board: switching libraries re-initializes the partition per launch. Tutorial: **[doc/tutorial_userkernel.md](doc/tutorial_userkernel.md)**;
 skill **aieuserkernel**.
 
 ### Pass Pipeline
@@ -883,6 +890,7 @@ Read the matching skill when the task fits:
 | `pip install -e .` / `import aiegraph`: TVM 0.16 not found or provisioning unexpectedly, `no aiehlc checkout`, `exists and was not written by aiegraph`, stale results after changing model/calib, packaging `frontend` namespace | aiegraphinstall |
 | `aiegraph` region API: `no region matches 'layer1.0.conv1'`, a region offloads its sibling too (`move together` / *dragged*), `region="layer1"` vs `offload_check("layer1")` mean different things, `partition` undid an earlier offload, `register_kernel` "contract contradicts" | aiegraphregion |
 | A kernel-file backbone for a layer: args in TVM call order, roles, AIEK_SPEC, kernel frame + host run + entry (`ag.offload_prototype`, `aiegraph prototype`) | aiekernelprototype |
+| Two user-kernel offloads and only the last stays on the AIE (`superseded ... one aiehlc library per ELF`), `routing` defined twice at link; several aiehlc libraries in one ELF | multiaiehlclibrary |
 | Kernel link fails `could not find free space for SpaceSymbol buf_in_ping_0 in memory DMb`; TilingLinalg `Memory budget exceeded! ... maxPingPongBytes` | dmbufferregion |
 | Plug a user-written kernel into a TVM layer (`AIEK_ENTRY`/`AIEK_SPEC`, `--aie-kernel`, `aiekernel check/offload`); an L0xx lint code, calibrate MISMATCH, emulate FAIL, or `rejected at link -- ... routing()` | aieuserkernel |
 | Run/extend the persistent ResNet-18 engine (`resnetengine`: gen_engine.py model mismatch, core memory overflow, ENG FAIL, new layer kind) | resnetengine |

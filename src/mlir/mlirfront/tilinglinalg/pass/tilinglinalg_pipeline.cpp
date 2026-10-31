@@ -1480,17 +1480,25 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "    aiePartition partition;\n";
             stream << "    int meshId;\n";
             stream << "};\n";
+            // This library's stream-switch setup (routing.cc), passed to the runtime
+            // explicitly so several aiehlc libraries -- each with routing() made
+            // local by aiekernel's isolation -- share one ELF: the runtime
+            // re-initializes a partition another library's routing set up. Weak: a
+            // host-only build has no routing.cc and falls back to the global one.
+            stream << "void routing(XAie_DevInst* dev) __attribute__((weak));\n";
             stream << "struct aieArray {\n";
             stream << "    int nextMeshId = 0;\n";
             stream << "    XAie_DevInst* _dev = nullptr;\n";
             stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
             stream << "        int meshId = nextMeshId++;\n";
-            stream << "        _dev = __Runtime_init_mesh_partition(meshId, p.startCol, p.endCol - p.startCol + 1);\n";
+            stream
+                << "        _dev = __Runtime_init_mesh_partition_with(meshId, p.startCol, p.endCol - p.startCol + 1, "
+                   "routing);\n";
             stream << "        return aieMesh{rows, cols, p, meshId};\n";
             stream << "    }\n";
             stream << "    aieMesh partition(int rows, int cols) {\n";
             stream << "        int meshId = nextMeshId++;\n";
-            stream << "        _dev = __Runtime_init_mesh_partition(meshId, 0, cols);\n";
+            stream << "        _dev = __Runtime_init_mesh_partition_with(meshId, 0, cols, routing);\n";
             stream << "        return aieMesh{rows, cols, {0, cols - 1, 0, rows - 1}, meshId};\n";
             stream << "    }\n";
             stream << "    void* alloc(size_t size) { return __Runtime_alloc_buffer(_dev, size); }\n";

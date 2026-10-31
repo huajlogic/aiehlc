@@ -419,13 +419,18 @@ constraints shape it:
   should be concrete (lint L027 warns otherwise). Layer 04's two calls share a
   geometry and are covered by one build; layers 09/14/… are not the same
   geometry.
-* **One aiehlc library per ELF.** The runtime calls a single global
-  `routing()` (`__Runtime_routing_init`) and caches partition init per
-  `meshId`, so two independently built libraries cannot both be right in one
-  program. `offload` keeps the first kernel and rejects the rest at the `link`
-  gate with that reason; it also displaces an `--aie-offload` stem library
-  when a user kernel builds. To cover several geometries in one ELF, put the
-  kernels in one source (one library) or offload them in separate builds.
+* **Several libraries per ELF (per-library routing).** Each library the
+  current aiehlc builds passes its own `routing()` to the runtime
+  (`__Runtime_init_mesh_partition_with`, from the generated
+  `aieArray::partition`), and `isolate_archive` makes that `routing` local.
+  The runtime remembers which routing set up each `meshId`; when another
+  library launches on it, it tears the partition down and re-initializes it
+  with that library's routing (the per-launch `aieDim` path already does this).
+  So `offload("layer1", a.cc)` then `offload("layer4", b.cc)` keeps both on the
+  AIE, and `main.elf` links both. A library built by an older aiehlc (it calls
+  the old `__Runtime_init_mesh_partition`; e.g. an `--aie-offload` stem library)
+  still owns the global `routing()`: it is displaced when a user kernel
+  builds, as before. Switching libraries costs a partition re-init per launch.
 
 ---
 
