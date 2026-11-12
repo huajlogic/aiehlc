@@ -157,6 +157,11 @@ static unsigned long long g_ctrl_plan_cyc = 0ULL, g_sync_dev_cyc = 0ULL;
  * array's register state (rt_plan_cache below) is valid only within one
  * generation: a re-init resets the stream switches it describes. */
 static unsigned g_partition_gen = 1U;
+/* Bumped by everything that may change AIE program memory OTHER than the
+ * skip-bss MMIO loader's own writes (partition init/teardown, aie-rt
+ * XAie_LoadElfMem, control-packet ELF loads). AIEHLC_PM_WARM_SKIP trusts a
+ * tile's resident program only while this has not moved. */
+static unsigned g_pm_foreign_seq;
 static unsigned int g_ctrl_plan_n = 0U, g_sync_dev_n = 0U;
 static unsigned long long g_pmap_print_cyc = 0ULL;
 static unsigned int g_pmap_print_n = 0U;
@@ -3173,6 +3178,7 @@ static AieRC __Runtime_partition_initialize(XAie_DevInst *dev) {
     return XAIE_OK;
 #else
     g_ctrl_high_throughput_ready = 0;
+    g_pm_foreign_seq++;
 #if AIE_GEN == 5
     if (g_ctrl_high_throughput) {
         XAie_PartInitOpts opts;
@@ -3234,6 +3240,7 @@ AieRC __Runtime_device_teardown(XAie_DevInst *dev) {
         printf("[aie_runtime] device_teardown SKIPPED (DISABLE_PARTITIONTEARDOWN flag set)\n");
         return XAIE_OK;
     }
+    g_pm_foreign_seq++;
     AieRC RC = XAie_PartitionTeardown(dev);
     AIEHLC_LOG(printf("[aie_runtime] device_teardown done rc=%d\n", (int)RC););
     return RC;
@@ -7184,6 +7191,72 @@ static int __Runtime_pm_write_wide(XAie_DevInst *dev, XAie_LocType loc, const un
 }
 #endif
 
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+/* Experimental (-DAIEHLC_PM_WARM_SKIP=1): on a relaunch, do not rewrite a
+ * tile's program memory if this loader itself last wrote the SAME ELF blob
+ * (pointer) into that tile, on the same device, in the same partition
+ * generation, and no foreign PM writer (g_pm_foreign_seq) ran since. The AIE
+ * core cannot write its own program memory, and core reset does not clear it.
+ * Data segments and every non-port .bss are still rewritten on each launch.
+ * -DAIEHLC_PM_WARM_SKIP_VERIFY=1 reads every skipped word back and prints the
+ * mismatch count (UART: do not time that build). */
+#define RT_PM_WARM_SLOTS 64
+static struct {
+    const unsigned char *elf;
+    XAie_DevInst *dev;
+    unsigned gen, fseq;
+    u8 col, row, ok;
+} s_pm_warm[RT_PM_WARM_SLOTS];
+static unsigned g_pm_warm_skipped_segs, g_pm_warm_cold_loads;
+
+static int rt_pm_warm_slot(XAie_LocType loc) {
+    int free_slot = -1;
+    for (int i = 0; i < RT_PM_WARM_SLOTS; i++) {
+        if (s_pm_warm[i].ok && s_pm_warm[i].col == loc.Col && s_pm_warm[i].row == loc.Row)
+            return i;
+        if (!s_pm_warm[i].ok && free_slot < 0)
+            free_slot = i;
+    }
+    return free_slot;
+}
+static int rt_pm_warm_resident(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elf) {
+    int i = rt_pm_warm_slot(loc);
+    return i >= 0 && s_pm_warm[i].ok && s_pm_warm[i].elf == elf && s_pm_warm[i].dev == dev &&
+           s_pm_warm[i].gen == g_partition_gen && s_pm_warm[i].fseq == g_pm_foreign_seq;
+}
+static void rt_pm_warm_record(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elf, int ok) {
+    int i = rt_pm_warm_slot(loc);
+    if (i < 0)
+        return; /* table full: never skip for this tile */
+    s_pm_warm[i].elf = elf;
+    s_pm_warm[i].dev = dev;
+    s_pm_warm[i].gen = g_partition_gen;
+    s_pm_warm[i].fseq = g_pm_foreign_seq;
+    s_pm_warm[i].col = (u8)loc.Col;
+    s_pm_warm[i].row = (u8)loc.Row;
+    s_pm_warm[i].ok = (u8)(ok != 0);
+}
+static int rt_pm_is_pm_seg(XAie_DevInst *dev, const Elf32_Phdr *phdr) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    return phdr->p_filesz != 0U && phdr->p_paddr < cm->ProgMemSize && phdr->p_paddr + phdr->p_memsz <= cm->ProgMemSize;
+}
+#if defined(AIEHLC_PM_WARM_SKIP_VERIFY) && AIEHLC_PM_WARM_SKIP_VERIFY
+static void rt_pm_warm_verify(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *src, const Elf32_Phdr *phdr) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    const u32 nwords = phdr->p_filesz / 4U; /* full words that came from the file */
+    u32 bad = 0;
+    for (u32 i = 0; i < nwords; i++) {
+        u32 exp, got = 0xdeadbeefU;
+        memcpy(&exp, src + 4U * i, 4U);
+        XAie_Read32(dev, XAie_GetTileAddr(dev, loc.Row, loc.Col) + cm->ProgMemHostOffset + phdr->p_paddr + 4U * i, &got);
+        bad += (got != exp);
+    }
+    printf("[aie_runtime] pm-warm-skip verify tile(%u,%u) pm 0x%x+%u words: %u mismatched\n", loc.Col, loc.Row,
+           phdr->p_paddr, nwords, bad);
+}
+#endif
+#endif
+
 /* mode 1: skip every zero-filled (.bss-only) segment (unsafe if the kernel
  *         reads a zero-initialised static before writing it).
  * mode 2: skip only .bss segments made entirely of DMA port buffers; all other
@@ -7193,6 +7266,12 @@ static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc
     g_elf_load_seq++;
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elfmem;
     u32 skipped = 0, loaded = 0, skipped_bytes = 0, zfill_bytes = 0;
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+    const int pm_warm = rt_pm_warm_resident(dev, loc, elfmem);
+    if (!pm_warm)
+        g_pm_warm_cold_loads++;
+    rt_pm_warm_record(dev, loc, elfmem, 0); /* invalid while PM is being (re)written */
+#endif
     for (u32 ph = 0; ph < ehdr->e_phnum; ph++) {
         const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elfmem + ehdr->e_phoff + (u64)ph * sizeof(Elf32_Phdr));
         if (phdr->p_type != (u32)PT_LOAD)
@@ -7203,6 +7282,15 @@ static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc
             skipped_bytes += phdr->p_memsz;
             continue;
         }
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+        if (pm_warm && rt_pm_is_pm_seg(dev, phdr)) {
+            g_pm_warm_skipped_segs++;
+#if defined(AIEHLC_PM_WARM_SKIP_VERIFY) && AIEHLC_PM_WARM_SKIP_VERIFY
+            rt_pm_warm_verify(dev, loc, elfmem + phdr->p_offset, phdr);
+#endif
+            continue;
+        }
+#endif
         if (phdr->p_memsz > phdr->p_filesz)
             zfill_bytes += phdr->p_memsz - phdr->p_filesz;
         if (phdr->p_filesz == 0U && __Runtime_dm_zero_wide(dev, loc, phdr->p_paddr, phdr->p_memsz)) {
@@ -7218,9 +7306,16 @@ static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc
             return rc;
         loaded++;
     }
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+    rt_pm_warm_record(dev, loc, elfmem, 1); /* every PM segment is now this ELF's */
+#endif
     AIEHLC_LOG(printf("[aie_runtime] skip-bss(mode %d) load: %u segs loaded (%u B zero-filled), %u bss segs skipped "
                       "(%u B)\n",
                       mode, loaded, zfill_bytes, skipped, skipped_bytes));
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+    AIEHLC_LOG(printf("[aie_runtime] pm-warm-skip tile(%u,%u): %s (total %u PM segs skipped, %u cold loads)\n", loc.Col,
+                      loc.Row, pm_warm ? "warm" : "cold", g_pm_warm_skipped_segs, g_pm_warm_cold_loads));
+#endif
     return XAIE_OK;
 }
 #endif
@@ -7257,6 +7352,7 @@ static void __Runtime_load_kernel_elf(XAie_DevInst *dev, XAie_LocType loc, unsig
         return;
     }
 #endif
+    g_pm_foreign_seq++;
     XAie_LoadElfMem(dev, loc, elfmem);
 }
 
@@ -8048,6 +8144,7 @@ void *__Runtime_ctrl_kernel_pkt_build(__Runtime_CtrlRowFabric *fab, const unsign
 static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, int32_t bd_id, int32_t mm2s_ch) {
     if (!fab || !fab->dev || !elf || fab->nrows == 0U)
         return XAIE_INVALID_ARGS;
+    g_pm_foreign_seq++;
     XAie_LocType loc = XAie_TileLoc(fab->rows[0].col_lo, fab->rows[0].row);
     if (g_ctrl_high_throughput_ready && s_active_kernel_pkt) {
         AieRC arc = rt_ctrl_load_elf_aot(fab, elf, loc, bd_id, mm2s_ch);
