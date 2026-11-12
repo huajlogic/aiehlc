@@ -161,7 +161,12 @@ static unsigned g_partition_gen = 1U;
  * skip-bss MMIO loader's own writes (partition init/teardown, aie-rt
  * XAie_LoadElfMem, control-packet ELF loads). AIEHLC_PM_WARM_SKIP trusts a
  * tile's resident program only while this has not moved. */
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
 static unsigned g_pm_foreign_seq;
+#define AIEHLC_PM_FOREIGN_BUMP() (g_pm_foreign_seq++)
+#else
+#define AIEHLC_PM_FOREIGN_BUMP() ((void)0) /* default build: no trace in the runtime */
+#endif
 static unsigned int g_ctrl_plan_n = 0U, g_sync_dev_n = 0U;
 static unsigned long long g_pmap_print_cyc = 0ULL;
 static unsigned int g_pmap_print_n = 0U;
@@ -3178,7 +3183,7 @@ static AieRC __Runtime_partition_initialize(XAie_DevInst *dev) {
     return XAIE_OK;
 #else
     g_ctrl_high_throughput_ready = 0;
-    g_pm_foreign_seq++;
+    AIEHLC_PM_FOREIGN_BUMP();
 #if AIE_GEN == 5
     if (g_ctrl_high_throughput) {
         XAie_PartInitOpts opts;
@@ -3240,7 +3245,7 @@ AieRC __Runtime_device_teardown(XAie_DevInst *dev) {
         printf("[aie_runtime] device_teardown SKIPPED (DISABLE_PARTITIONTEARDOWN flag set)\n");
         return XAIE_OK;
     }
-    g_pm_foreign_seq++;
+    AIEHLC_PM_FOREIGN_BUMP();
     AieRC RC = XAie_PartitionTeardown(dev);
     AIEHLC_LOG(printf("[aie_runtime] device_teardown done rc=%d\n", (int)RC););
     return RC;
@@ -7352,7 +7357,7 @@ static void __Runtime_load_kernel_elf(XAie_DevInst *dev, XAie_LocType loc, unsig
         return;
     }
 #endif
-    g_pm_foreign_seq++;
+    AIEHLC_PM_FOREIGN_BUMP();
     XAie_LoadElfMem(dev, loc, elfmem);
 }
 
@@ -8144,7 +8149,7 @@ void *__Runtime_ctrl_kernel_pkt_build(__Runtime_CtrlRowFabric *fab, const unsign
 static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, int32_t bd_id, int32_t mm2s_ch) {
     if (!fab || !fab->dev || !elf || fab->nrows == 0U)
         return XAIE_INVALID_ARGS;
-    g_pm_foreign_seq++;
+    AIEHLC_PM_FOREIGN_BUMP();
     XAie_LocType loc = XAie_TileLoc(fab->rows[0].col_lo, fab->rows[0].row);
     if (g_ctrl_high_throughput_ready && s_active_kernel_pkt) {
         AieRC arc = rt_ctrl_load_elf_aot(fab, elf, loc, bd_id, mm2s_ch);
