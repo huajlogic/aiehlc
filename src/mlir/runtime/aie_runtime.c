@@ -7268,13 +7268,14 @@ static uint32_t rt_ctrl_elf_count_pkts(XAie_DevInst *dev, const uint8_t *elf, XA
     uint32_t npkt = 0U;
     for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
         const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elf + ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize);
-        if (phdr->p_type != (uint32_t)PT_LOAD || phdr->p_filesz == 0U)
+        const uint32_t len = rt_cpe_seg_load_len(elf, phdr);
+        if (len == 0U)
             continue;
         uint32_t tile_addr = 0U;
         if (rt_ctrl_elf_target(dev, loc, phdr->p_paddr, &tile_addr) != XAIE_OK ||
             tile_addr == RT_CTRL_ELF_SKIP_ADDR)
             continue;
-        npkt += (phdr->p_filesz + (uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS - 1U) /
+        npkt += (len + (uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS - 1U) /
                 ((uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS);
     }
     return npkt;
@@ -7317,22 +7318,23 @@ static AieRC rt_ctrl_elf_core_reset(XAie_DevInst *dev, uint32_t *pkt, uint32_t m
 
 static inline uint32_t rt_ctrl_odd_parity_bit(uint32_t v) { return (uint32_t)(!__builtin_parity(v)) << 31U; }
 
-static AieRC rt_ctrl_elf_fill_seg_packed(const uint8_t *src, uint32_t filesz, uint32_t tile_addr, uint32_t *pkt,
-                                         uint32_t capacity, uint32_t *acc, uint32_t *payload_words,
+/* Writes @len bytes at @tile_addr: @filesz bytes from @src, then zeros (.bss tail). */
+static AieRC rt_ctrl_elf_fill_seg_packed(const uint8_t *src, uint32_t filesz, uint32_t len, uint32_t tile_addr,
+                                         uint32_t *pkt, uint32_t capacity, uint32_t *acc, uint32_t *payload_words,
                                          uint32_t *last_addr, uint32_t *last_value) {
     const uint32_t pkt_hdr = (uint32_t)ACR_ID_BCAST | rt_ctrl_odd_parity_bit((uint32_t)ACR_ID_BCAST);
     uint32_t pw = *payload_words;
     uint32_t off = 0U;
     uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
     uint32_t nwords = 0U;
-    for (; off < filesz; off += (uint32_t)sizeof(words)) {
-        uint32_t chunk = filesz - off < (uint32_t)sizeof(words) ? filesz - off : (uint32_t)sizeof(words);
+    for (; off < len; off += (uint32_t)sizeof(words)) {
+        uint32_t chunk = len - off < (uint32_t)sizeof(words) ? len - off : (uint32_t)sizeof(words);
         nwords = (chunk + 3U) / 4U;
         if (pw + 2U + nwords > capacity)
             return XAIE_ERR;
-        if (chunk < (uint32_t)sizeof(words))
-            memset(words, 0, sizeof(words));
-        memcpy(words, src + off, chunk);
+        memset(words, 0, sizeof(words));
+        if (off < filesz)
+            memcpy(words, src + off, filesz - off < chunk ? filesz - off : chunk);
         uint32_t ctrl = (((nwords - 1U) & 0x3U) << 20U) | ((tile_addr + off) & 0xFFFFFU);
         pkt[pw] = pkt_hdr;
         pkt[pw + 1U] = ctrl | rt_ctrl_odd_parity_bit(ctrl);
@@ -7390,7 +7392,8 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const __Runtime_CtrlRowFabric *
         return reset_rc;
     for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
         const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elf + ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize);
-        if (phdr->p_type != (uint32_t)PT_LOAD || phdr->p_filesz == 0U)
+        const uint32_t len = rt_cpe_seg_load_len(elf, phdr);
+        if (len == 0U)
             continue;
         uint32_t tile_addr = 0U;
         AieRC rc = rt_ctrl_elf_target(dev, loc, phdr->p_paddr, &tile_addr);
@@ -7399,7 +7402,7 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const __Runtime_CtrlRowFabric *
         if (tile_addr == RT_CTRL_ELF_SKIP_ADDR)
             continue;
         if (packed) {
-            rc = rt_ctrl_elf_fill_seg_packed(elf + phdr->p_offset, phdr->p_filesz, tile_addr, pkt,
+            rc = rt_ctrl_elf_fill_seg_packed(elf + phdr->p_offset, phdr->p_filesz, len, tile_addr, pkt,
                                              max_acc * RT_CTRL_ELF_PKT_STRIDE, &acc, &payload_words, &last_addr,
                                              &last_value);
             if (rc != XAIE_OK)
@@ -7407,14 +7410,17 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const __Runtime_CtrlRowFabric *
             continue;
         }
         uint32_t byte_off = 0U;
-        while (byte_off < phdr->p_filesz) {
+        while (byte_off < len) {
             uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
-            uint32_t chunk_bytes = phdr->p_filesz - byte_off;
+            uint32_t chunk_bytes = len - byte_off;
             if (chunk_bytes > sizeof(words))
                 chunk_bytes = sizeof(words);
             uint32_t nwords = (chunk_bytes + 3U) / 4U;
             memset(words, 0, sizeof(words));
-            memcpy(words, elf + phdr->p_offset + byte_off, chunk_bytes);
+            if (byte_off < phdr->p_filesz) {
+                uint32_t nfile = phdr->p_filesz - byte_off;
+                memcpy(words, elf + phdr->p_offset + byte_off, nfile < chunk_bytes ? nfile : chunk_bytes);
+            }
             rc = rt_ctrl_elf_put(pkt, max_acc, packed, &acc, &payload_words, tile_addr + byte_off, words, nwords);
             if (rc != XAIE_OK)
                 return rc;
