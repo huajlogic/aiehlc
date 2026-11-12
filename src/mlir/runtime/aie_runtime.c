@@ -3066,9 +3066,79 @@ void __Runtime_platform_init(void) {
     // Xil_ICacheDisable();
 }
 
+/* ---------------------------------------------------------------------------
+ * Opt-in posted MMIO writes to the AIE array (-DAIEHLC_AIE_MMIO_POSTED=1).
+ * The A78 bare-metal BSP maps the AIE window (0x200_0000_0000, 1 GiB L1
+ * blocks) as 0x409 = Device-nGnRnE: every Xil_Out32 waits for the write
+ * response from the array. Linux ioremap() uses Device-nGnRE. Remapping the
+ * blocks to 0x40D (nGnRE, XN kept) lets writes complete early; order is kept
+ * (nR), reads still wait. Only blocks that are nGnRnE/nGnRE are touched.
+ * Analysis: jane/knowledge/2026-11-10-a78-aie-window-ngnrne-posted-writes.md.
+ * ----------------------------------------------------------------------- */
+#if defined(AIEHLC_AIE_MMIO_POSTED) && AIEHLC_AIE_MMIO_POSTED && !defined(__AIESIM__) && !defined(__linux__)
+#include "xil_mmu.h"
+#ifdef __cplusplus
+extern "C" INTPTR MMUTableL1;
+#else
+extern INTPTR MMUTableL1;
+#endif
+static void __Runtime_aie_mmio_posted(void) {
+    const uint64_t blk = 1ULL << 30, lowmask = 0xFFFULL, xn = 3ULL << 53;
+    const uint64_t base = (uint64_t)XAIE_BASE_ADDR;
+    const uint64_t size = ((uint64_t)XAIE_NUM_COLS << XAIE_COL_SHIFT);
+    int changed = 0, bad = 0;
+    for (uint64_t a = base & ~(blk - 1); a < base + size; a += blk) {
+        volatile INTPTR *e = &MMUTableL1 + (a / blk);
+        const uint64_t d = (uint64_t)*e;
+        if ((d & lowmask) == 0x40DULL)
+            continue;
+        if ((d & lowmask) != 0x409ULL) {
+            bad++;
+            continue;
+        }
+        Xil_SetTlbAttributes((UINTPTR)a, (d & xn) | 0x40DULL);
+        if (((uint64_t)*e & lowmask) == 0x40DULL)
+            changed++;
+        else
+            bad++;
+    }
+    printf("[aie_runtime] mmio-posted: AIE window 0x%llx+0x%llx -> Device-nGnRE, %d block(s) remapped, %d refused\n",
+           (unsigned long long)base, (unsigned long long)size, changed, bad);
+    {
+        /* Is the table we patched the one the MMU walks, at the EL we run in? */
+        uint64_t el, ttbr = 0, sctlr = 0;
+        __asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
+        el = (el >> 2) & 3;
+        if (el == 3) {
+            __asm__ volatile("mrs %0, ttbr0_el3" : "=r"(ttbr));
+            __asm__ volatile("mrs %0, sctlr_el3" : "=r"(sctlr));
+        } else if (el == 2) {
+            __asm__ volatile("mrs %0, ttbr0_el2" : "=r"(ttbr));
+            __asm__ volatile("mrs %0, sctlr_el2" : "=r"(sctlr));
+        } else if (el == 1) {
+            __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr));
+            __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+        }
+        extern INTPTR MMUTableL0;
+        const volatile uint64_t *l0 = (const volatile uint64_t *)(uintptr_t)(ttbr & 0x0000FFFFFFFFF000ULL);
+        const uint64_t l0e = l0 ? l0[base >> 39] : 0;
+        printf("[aie_runtime] mmio-posted: EL%llu sctlr=0x%llx ttbr0=0x%llx &MMUTableL0=%p &MMUTableL1=%p "
+               "active L0[%llu]=0x%llx\n",
+               (unsigned long long)el, (unsigned long long)sctlr, (unsigned long long)ttbr, (void *)&MMUTableL0,
+               (void *)&MMUTableL1, (unsigned long long)(base >> 39), (unsigned long long)l0e);
+        /* Timed burst: 4096 posted writes + dsb to the shim tile's (col 0) data-less
+         * register space would be unsafe here (array not yet initialized), so only the
+         * table walk is checked; the kload phase timer is the A/B metric. */
+    }
+}
+#else
+static void __Runtime_aie_mmio_posted(void) {}
+#endif
+
 void __Runtime_init(void) {
     AIEHLC_LOG(printf("[aie_runtime] __Runtime_init--\n"););
     __Runtime_platform_init();
+    __Runtime_aie_mmio_posted();
     __rt_pmccntr_enable();
 
     AIEHLC_LOG(printf("[aie_runtime] _init OK\n"));
@@ -7014,6 +7084,54 @@ static int __Runtime_elf_range_is_port_bufs(const unsigned char *elfmem, u32 lo,
     return 1;
 }
 
+#if defined(AIEHLC_ZFILL_WIDE) && AIEHLC_ZFILL_WIDE && defined(__aarch64__)
+/* Experimental (-DAIEHLC_ZFILL_WIDE=1): zero a .bss segment of the tile's OWN
+ * data memory (core view 0x70000..0x7FFFF on a non-checkerboard device) with
+ * 128-bit stores instead of aie-rt's one 32-bit Xil_Out32 per word. Returns 0
+ * (caller falls back to aie-rt) for anything else. With
+ * -DAIEHLC_ZFILL_WIDE_VERIFY=1 the first 64 calls read every word back. */
+static int __Runtime_dm_zero_wide(XAie_DevInst *dev, XAie_LocType loc, u32 paddr, u32 size) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    const XAie_MemMod *mm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].MemMod;
+    const u32 dms = cm->DataMemSize, off = paddr & (dms - 1U);
+    if (cm->IsCheckerBoard || paddr < cm->DataMemAddr || (paddr - cm->DataMemAddr) / dms != 3U ||
+        off + size > dms || ((paddr | size) & 3U))
+        return 0;
+    const u64 tile = dev->BaseAddr + ((u64)loc.Col << dev->DevProp.ColShift) + ((u64)loc.Row << dev->DevProp.RowShift);
+    uintptr_t a = (uintptr_t)(tile + mm->MemAddr + off), end = a + size;
+    while ((a & 15U) && a < end) {
+        *(volatile u32 *)a = 0U;
+        a += 4U;
+    }
+    __asm__ volatile("movi v31.16b, #0" ::: "v31");
+    for (; a + 16U <= end; a += 16U)
+        __asm__ volatile("str q31, [%0]" ::"r"(a) : "memory");
+    for (; a < end; a += 4U)
+        *(volatile u32 *)a = 0U;
+#if defined(AIEHLC_ZFILL_WIDE_VERIFY) && AIEHLC_ZFILL_WIDE_VERIFY
+    static unsigned s_verified;
+    if (s_verified < 64U) {
+        s_verified++;
+        __asm__ volatile("dsb sy" ::: "memory");
+        u32 nz = 0;
+        for (u32 o = 0; o < size; o += 4U) {
+            u32 w = 0xdeadbeefU;
+            XAie_DataMemRdWord(dev, loc, off + o, &w);
+            nz += (w != 0U);
+        }
+        printf("[aie_runtime] zfill-wide verify tile(%u,%u) 0x%x+0x%x: %u nonzero words\n", loc.Col, loc.Row, paddr,
+               size, nz);
+    }
+#endif
+    return 1;
+}
+#else
+static int __Runtime_dm_zero_wide(XAie_DevInst *dev, XAie_LocType loc, u32 paddr, u32 size) {
+    (void)dev, (void)loc, (void)paddr, (void)size;
+    return 0;
+}
+#endif
+
 /* mode 1: skip every zero-filled (.bss-only) segment (unsafe if the kernel
  *         reads a zero-initialised static before writing it).
  * mode 2: skip only .bss segments made entirely of DMA port buffers; all other
@@ -7035,6 +7153,10 @@ static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc
         }
         if (phdr->p_memsz > phdr->p_filesz)
             zfill_bytes += phdr->p_memsz - phdr->p_filesz;
+        if (phdr->p_filesz == 0U && __Runtime_dm_zero_wide(dev, loc, phdr->p_paddr, phdr->p_memsz)) {
+            loaded++;
+            continue;
+        }
         AieRC rc = XAie_LoadElfSection(dev, loc, elfmem + phdr->p_offset, phdr);
         if (rc != XAIE_OK)
             return rc;
