@@ -7132,6 +7132,58 @@ static int __Runtime_dm_zero_wide(XAie_DevInst *dev, XAie_LocType loc, u32 paddr
 }
 #endif
 
+#if defined(AIEHLC_PMLOAD_WIDE) && AIEHLC_PMLOAD_WIDE && defined(__aarch64__)
+/* Experimental (-DAIEHLC_PMLOAD_WIDE=1): write a program-memory segment with
+ * 128-bit stores instead of aie-rt's one 32-bit write per word (each AXI
+ * transaction to the array costs ~650 ns regardless of width). Writes exactly
+ * the words aie-rt would (ceil(p_memsz/4), reading past the segment like
+ * _XAie_LoadProgMemSection). Returns 0 (caller falls back to aie-rt) if the
+ * segment is not a PM segment or the target is not 16-byte aligned. With
+ * -DAIEHLC_PMLOAD_WIDE_VERIFY=1 the first 64 calls read every word back. */
+static int __Runtime_pm_write_wide(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *src,
+                                   const Elf32_Phdr *phdr) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    if (phdr->p_paddr >= cm->ProgMemSize || phdr->p_paddr + phdr->p_memsz > cm->ProgMemSize ||
+        (phdr->p_paddr & 15U))
+        return 0;
+    const u64 tile = dev->BaseAddr + ((u64)loc.Col << dev->DevProp.ColShift) + ((u64)loc.Row << dev->DevProp.RowShift);
+    const uintptr_t base = (uintptr_t)(tile + cm->ProgMemHostOffset + phdr->p_paddr);
+    const u32 nwords = (phdr->p_memsz + 3U) / 4U;
+    u32 w = 0;
+    for (; w + 4U <= nwords; w += 4U) {
+        __asm__ volatile("ldr q30, [%0]\n\tstr q30, [%1]" ::"r"(src + 4U * w), "r"(base + 4U * w) : "v30", "memory");
+    }
+    for (; w < nwords; w++) {
+        u32 v;
+        memcpy(&v, src + 4U * w, 4U);
+        *(volatile u32 *)(base + 4U * w) = v;
+    }
+#if defined(AIEHLC_PMLOAD_WIDE_VERIFY) && AIEHLC_PMLOAD_WIDE_VERIFY
+    static unsigned s_verified;
+    if (s_verified < 64U) {
+        s_verified++;
+        __asm__ volatile("dsb sy" ::: "memory");
+        u32 bad = 0;
+        for (u32 i = 0; i < nwords; i++) {
+            u32 exp, got = 0xdeadbeefU;
+            memcpy(&exp, src + 4U * i, 4U);
+            XAie_Read32(dev, XAie_GetTileAddr(dev, loc.Row, loc.Col) + cm->ProgMemHostOffset + phdr->p_paddr + 4U * i, &got);
+            bad += (got != exp);
+        }
+        printf("[aie_runtime] pmload-wide verify tile(%u,%u) pm 0x%x+%u words: %u mismatched\n", loc.Col, loc.Row,
+               phdr->p_paddr, nwords, bad);
+    }
+#endif
+    return 1;
+}
+#else
+static int __Runtime_pm_write_wide(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *src,
+                                   const Elf32_Phdr *phdr) {
+    (void)dev, (void)loc, (void)src, (void)phdr;
+    return 0;
+}
+#endif
+
 /* mode 1: skip every zero-filled (.bss-only) segment (unsafe if the kernel
  *         reads a zero-initialised static before writing it).
  * mode 2: skip only .bss segments made entirely of DMA port buffers; all other
@@ -7154,6 +7206,10 @@ static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc
         if (phdr->p_memsz > phdr->p_filesz)
             zfill_bytes += phdr->p_memsz - phdr->p_filesz;
         if (phdr->p_filesz == 0U && __Runtime_dm_zero_wide(dev, loc, phdr->p_paddr, phdr->p_memsz)) {
+            loaded++;
+            continue;
+        }
+        if (phdr->p_filesz != 0U && __Runtime_pm_write_wide(dev, loc, elfmem + phdr->p_offset, phdr)) {
             loaded++;
             continue;
         }
