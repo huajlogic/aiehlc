@@ -2385,8 +2385,14 @@ def write_readme(build: Path, summary: dict, layers: int = 0,
 def build_arm_elf(out_dir, repo_root=None, c_name="resnet18.c",
                   run_make: bool = True, jobs: int = 0, image=None,
                   local: bool = False, local_run: bool = True,
-                  verbose: bool = True, make_vars: dict = None) -> dict:
+                  verbose: bool = True, make_vars: dict = None,
+                  main_c=None, extra_sources=(), extra_cflags: str = "") -> dict:
     """Generate the sources + Makefile, then run ``make`` to link ``main.elf``.
+
+    ``main_c`` (text) replaces the generated classifier ``main.c``;
+    ``extra_sources`` (paths: .c compiled and linked, anything else copied next
+    to them, e.g. headers) and ``extra_cflags`` go into the same build. For
+    non-classifier graphs (aiegraph-unet-multiinput).
 
     Python only *generates*; ``make`` does the building, so the same Makefile
     the flow used is the one a person re-runs by hand. ``run_make=False``
@@ -2442,6 +2448,21 @@ def build_arm_elf(out_dir, repo_root=None, c_name="resnet18.c",
     # per-layer sources are already on disk when the Makefile is written.
     makefile = write_makefile(build, repo_root, out_dir / c_name,
                               layers_dir=out_dir / "layers", verbose=verbose)
+    if main_c is not None:
+        (build / "main.c").write_text(main_c)
+    extra_c = []
+    for src in extra_sources or ():
+        src = Path(src)
+        shutil.copyfile(src, build / src.name)
+        if src.suffix == ".c":
+            extra_c.append(src.name)
+    if extra_c or extra_cflags:
+        mk = makefile.read_text()
+        old = "SRCS := $(KERNELS) graph_driver.c tvm_runtime_shim.c main.c"
+        assert old in mk, "Makefile template changed: SRCS line not found"
+        mk = mk.replace(old, old + "".join(" " + c for c in extra_c)
+                        + (f"\nCFLAGS += {extra_cflags}" if extra_cflags else ""), 1)
+        makefile.write_text(mk)
     summary["makefile"] = str(makefile)
     summary["layer_objects"] = len(layer_sources(out_dir / "layers"))
     if verbose:

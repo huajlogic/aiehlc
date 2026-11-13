@@ -411,6 +411,31 @@ def prefold_onnx(model_path: Path, verbose: bool = True) -> Path:
     return folded
 
 
+def graph_input_shapes(model) -> dict:
+    """``{name: shape}`` for every non-initializer graph input (aiegraph-unet-multiinput).
+
+    Static dims are taken from the ONNX file; a dynamic leading dim becomes 1.
+    Falls back to ``{INPUT_NAME: INPUT_SHAPE}`` for an input with no shape info.
+    """
+    inits = {i.name for i in model.graph.initializer}
+    out = {}
+    for i in model.graph.input:
+        if i.name in inits:
+            continue
+        dims = [d.dim_value if d.dim_value else None
+                for d in i.type.tensor_type.shape.dim]
+        if not dims:
+            out[i.name] = list(INPUT_SHAPE)
+            continue
+        if dims[0] is None:
+            dims[0] = 1
+        if any(d is None for d in dims):
+            out[i.name] = list(INPUT_SHAPE) if i.name == INPUT_NAME else dims
+        else:
+            out[i.name] = dims
+    return out
+
+
 def import_relay(model_path: Path, verbose: bool = True):
     """ONNX -> Relay. Returns ``(mod, params)``.
 
@@ -424,7 +449,7 @@ def import_relay(model_path: Path, verbose: bool = True):
 
     model = onnx.load(str(model_path))
     mod, params = relay.frontend.from_onnx(
-        model, shape={INPUT_NAME: INPUT_SHAPE}, freeze_params=True
+        model, shape=graph_input_shapes(model), freeze_params=True
     )
     mod = relay.transform.InferType()(mod)
     if verbose:

@@ -55,6 +55,7 @@ class Model:
     input_shape: list = field(default_factory=list)
     output_shape: list = field(default_factory=list)
     ops: dict = field(default_factory=dict)
+    input_shapes: dict = field(default_factory=dict)   # name -> shape, every graph input
 
     @property
     def sha(self) -> str:
@@ -96,22 +97,28 @@ def _normalize(path: Path, name: str, source: str) -> Model:
                                  "ag.from_torch(module, example_inputs=...)")
     inits = {i.name for i in proto.graph.initializer}
     inputs = [i for i in proto.graph.input if i.name not in inits]
-    if len(inputs) != 1:
-        raise AiegraphError("load", f"{name} has {len(inputs)} graph inputs, the flow "
-                            f"takes exactly one image tensor")
+    if not inputs:
+        raise AiegraphError("load", f"{name} has no graph inputs")
+    # aiegraph-unet-multiinput: N inputs, any static shape. A dynamic leading
+    # (batch) dim becomes 1; any other dynamic dim is refused by name, since the
+    # flow compiles one static graph.
+    input_shapes = {}
+    for i in inputs:
+        s = _dims(i)
+        if s and (s[0] in ("?", 0) or isinstance(s[0], str)):
+            s = [1] + s[1:]                        # dynamic batch -> 1
+        bad = [d for d in s[1:] if not isinstance(d, int) or d <= 0]
+        if bad:
+            raise AiegraphError("load", f"{name}: input {i.name} has dynamic dims {s}",
+                                hint="export the model with static shapes")
+        input_shapes[i.name] = s
     inp = inputs[0]
-    shape = _dims(inp)
-    if shape and shape[0] in ("?", 0) or (shape and isinstance(shape[0], str)):
-        shape = [1] + shape[1:]                    # dynamic batch -> 1
-    if shape != INPUT_SHAPE:
-        raise AiegraphError("load", f"{name}: input {inp.name} is {shape}, the flow "
-                            f"supports image classifiers with input {INPUT_SHAPE}",
-                            hint="export the model at batch 1, 3x224x224")
+    shape = input_shapes[inp.name]
     ops = {}
     for node in proto.graph.node:
         ops[node.op_type] = ops.get(node.op_type, 0) + 1
     out_shape = _dims(proto.graph.output[0]) if proto.graph.output else []
-    if inp.name != INPUT_NAME:
+    if len(inputs) == 1 and inp.name != INPUT_NAME:
         old = inp.name
         inp.name = INPUT_NAME
         for node in proto.graph.node:
@@ -122,8 +129,11 @@ def _normalize(path: Path, name: str, source: str) -> Model:
         path = cache_dir() / "models" / f"{name}.data.onnx"
         path.parent.mkdir(parents=True, exist_ok=True)
         onnx.save(proto, str(path))
+    if len(inputs) == 1:
+        input_shapes = {INPUT_NAME: shape}
     return Model(name=name, onnx_path=Path(path).resolve(), source=source,
-                 input_shape=INPUT_SHAPE, output_shape=out_shape, ops=ops)
+                 input_shape=shape, output_shape=out_shape, ops=ops,
+                 input_shapes=input_shapes)
 
 
 def _fetch(name: str) -> Path:
