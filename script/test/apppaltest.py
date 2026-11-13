@@ -1095,6 +1095,9 @@ def netload_start(args, local_elf, collected):
     load_argv = ["load", local_elf, "--host", ip, "--max-run-ms", str(args.netload_max_run_ms),
                  "--wait", "0" if force_now else str(args.netload_wait)] + \
         ([] if args.netload_no_force and not force_now else ["--force"])
+    # A streamed ELF (bf16 weights) is placed as it arrives: the reply can take longer than 60 s.
+    reply_timeout = getattr(args, "netload_reply_timeout", 60.0)
+    load_argv += ["--reply-timeout", str(reply_timeout)]
     if not args.netload_bootstrap:
         # The console attaches while the ELF streams; netload holds back the last
         # 4 KB until it is attached, so the app cannot print before we listen.
@@ -1117,7 +1120,7 @@ def netload_start(args, local_elf, collected):
         print(f"[netload] asking the supervisor at {ip} to run {os.path.basename(local_elf)} " +
               ("(force now: a running app is taken over)" if force_now
                else f"(waits up to {args.netload_wait:g} s if the board is busy)"), flush=True)
-        rc, out = netload_remote(load_argv, gate=console_attached, live=True)
+        rc, out = netload_remote(load_argv, timeout=max(600, reply_timeout + 120), gate=console_attached, live=True)
         opener.join(timeout=60)
         if "c" not in box and rc != 2:
             print(f"\n[ERROR] {CONSOLE_PORT} console did not attach ({box.get('err', 'timeout')})")
@@ -1268,6 +1271,13 @@ Examples:
         default=0,
         help="Max run time of this app on the board (--netload only); 0 = the supervisor default (60 s). "
              "Past it the supervisor marks the run timed out, and a later forced run may take the core over"
+    )
+    parser.add_argument(
+        "--netload-reply-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds netload waits for the supervisor's reply after the ELF is sent (--netload only, default 60); "
+             "raise it for a large streamed ELF (bf16 weights) whose placement outlasts the default"
     )
     parser.add_argument(
         "--netload-wait",
