@@ -7213,6 +7213,15 @@ static struct {
     u8 col, row, ok;
 } s_pm_warm[RT_PM_WARM_SLOTS];
 static unsigned g_pm_warm_skipped_segs, g_pm_warm_cold_loads;
+/* Host-side stats (C linkage): per-tile PM segments skipped and per-tile cold
+ * (program-memory written) loads since boot. A caller that samples cold_loads
+ * around one launch knows whether that launch (re)loaded the kernel. */
+extern "C" void __Runtime_pm_warm_stats(unsigned *skipped_segs, unsigned *cold_tile_loads) {
+    if (skipped_segs)
+        *skipped_segs = g_pm_warm_skipped_segs;
+    if (cold_tile_loads)
+        *cold_tile_loads = g_pm_warm_cold_loads;
+}
 
 static int rt_pm_warm_slot(XAie_LocType loc) {
     int free_slot = -1;
