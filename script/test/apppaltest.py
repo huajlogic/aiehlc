@@ -1560,7 +1560,15 @@ def _main(args):
                 if rc == 0 and ("state=watchdog-timeout" in out or "state=killed" in out):
                     print(f"\n[netload] the supervisor ended the wait: {out.splitlines()[0]}")
                 return rc == 0 and any(f"state={st}" in out for st in ("exited", "watchdog-timeout", "killed"))
-        program_done, output_detected = wait_console(collected_output, finished)
+        max_wait = None
+        if args.netload:
+            max_wait = args.netload_max_run_ms / 1000.0 + 120  # watchdog + margin for the status probe
+        if max_wait:
+            # the supervisor watchdog bounds a silent run; don't let --stall-secs cut it first
+            with devwatch.quiet(max_wait, "netload app run (supervisor watchdog bounds it)"):
+                program_done, output_detected = wait_console(collected_output, finished, max_wait)
+        else:
+            program_done, output_detected = wait_console(collected_output, finished, max_wait)
 
         # Stop console reader
         log.debug("\nmain: signaling console_reader thread to stop...")
@@ -1663,7 +1671,7 @@ def jtag_start(args, remote_elf_path):
     return conn1, conn2, None
 
 
-def wait_console(collected_output, finished=None):
+def wait_console(collected_output, finished=None, max_wait=None):
     """Echo com0 output until the program completes, goes quiet, or MAX_WAIT.
 
     Returns (program_done, output_detected).
@@ -1676,6 +1684,12 @@ def wait_console(collected_output, finished=None):
     """
     MAX_WAIT = 600        # absolute maximum wait (seconds)
     NO_OUTPUT_TIMEOUT = 300  # abort if no output for this long (debug snapshot reads many regs)
+    if max_wait is not None and max_wait > MAX_WAIT:
+        # --netload: the supervisor watchdog (--netload-max-run-ms) bounds the run and
+        # `finished()` reports its end, so a long silent graph_run must not be cut at
+        # 600 s / 300 s quiet.
+        MAX_WAIT = int(max_wait)
+        NO_OUTPUT_TIMEOUT = int(max_wait)
     POLL_INTERVAL = 0.05  # check queue every N seconds
 
     print(f"\n>>> Waiting for console output (max {MAX_WAIT}s, no-output timeout {NO_OUTPUT_TIMEOUT}s)...")
