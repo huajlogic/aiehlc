@@ -40,8 +40,19 @@ echo "[streamload] work dir ${W}, old loader from ${OLD_REV}"
 
 # ---------------------------------------------------------------- build
 mkdir -p "${W}/old"
-git -C "${REPO}" show "${OLD_REV}:src/tool/netboot/supervisor/elfload.c" >"${W}/old/elfload.c" || fail "git show old elfload.c"
-git -C "${REPO}" show "${OLD_REV}:src/tool/netboot/supervisor/netboot.h" >"${W}/old/netboot.h" || fail "git show old netboot.h"
+# Old loader: take it from git when this user may read the repo; otherwise (e.g. the
+# checker runs as another uid -> "dubious ownership") use the vendored copy of ed72954,
+# whose content is pinned by SHA256SUMS so it cannot silently drift.
+REF="${HERE}/ref_ed72954"
+OLD_SRC=git
+for f in elfload.c netboot.h; do
+    if ! git -c safe.directory='*' -C "${REPO}" show "${OLD_REV}:src/tool/netboot/supervisor/${f}" >"${W}/old/${f}" 2>/dev/null; then
+        OLD_SRC=vendored
+        cp "${REF}/${f}" "${W}/old/${f}" || fail "no old ${f} (git and vendored both failed)"
+    fi
+done
+( cd "${W}/old" && sha256sum -c --quiet "${REF}/SHA256SUMS" ) || fail "old loader does not match ed72954 SHA256SUMS"
+echo "[streamload] old loader source: ${OLD_SRC}"
 # the old loader writes physical addresses directly: point them into the 2 GB block
 sed -i -e 's/(uint8_t \*)(uintptr_t)ph\[i\]\.p_paddr/(nb_host_mem + ph[i].p_paddr)/' \
     -e 's/(uint8_t \*)(uintptr_t)lo;/(nb_host_mem + lo);/' \
