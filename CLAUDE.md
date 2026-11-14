@@ -679,7 +679,15 @@ so in the report). Skill **aiegraphregion**.
 the layer's ports, mesh split and DMA-legal block loop; host `<entry>_run` with
 every argument, buffers and launch; entry; spec) + `<entry>_ref.c`; compute,
 staging and parameters are `TODO`s for the user. It builds as generated
-(`libaiek_layer04.a`). CLI `aiegraph prototype`.
+(`libaiek_layer04.a`). `.write` also emits **`test_<entry>.cc`**: `main()` +
+`#include "<entry>.cc"` (aiehlc splices it → an ELF), every tensor bound in TVM
+call order, the entry called `AIEKT_ITERS` (5) times, each **timed** (first call
+apart, min/mean/max of the repeats, GOPS, `--profiling` PMU split, `PERF SUMMARY`
+line), one `TEST PASS/FAIL` line. With the deploy's
+`make TRACE=1` dumps it writes `<entry>_test_data.h` and copies the layer's
+`lNN_*_in/out.h` flat beside it → golden check against TVM's own output; without
+them a smoke test on seeded synthetic tensors. Build it with an **absolute**
+`--runtime-source-file`. `test=False` / `--no-test` skips it. CLI `aiegraph prototype`.
 
 `ag.convert` starts FRESH: a reused (cached) conversion gets every earlier
 offload reset to the CPU (`emod.offload_reset(layers=None)`, driver
@@ -691,6 +699,18 @@ as it is, `force=True` re-converts.
 `<workdir>/aiproto/<layer>_<kernel>/` (prompt on **stdin** -- `--allowedTools`/`--add-dir`
 are variadic and swallow a trailing prompt); aiegraph's own `offload_check` is the
 verdict after every round, failures go back via `--resume`. Tests use a fake `claude`.
+
+`emod.ai_offload_prototype(layer, rounds=3, build=True)` (`src/aiegraph/aiprototype.py`):
+`offload_prototype(layer).write()` into `<workdir>/aiproto/layerNN_prototype/` (old dir moved
+aside), then `claude -p` fills the TODOs, judged after each round by
+`emod.prototype_check` / `aiegraph protocheck`: **todo** (no `TODO(`/`TODO:` marker),
+**kemu**, **trace** (`aiehlc-convtile trace`), **check** (`offload_check`), then **build**
+(aiehlc on `test_<entry>.cc`). **`offload_check` cannot judge the kernel**: its calibrate/emulate
+run `_ref.c`, so an unfilled backbone is READY. `kemu` (`src/aiegraph/kemu.py`) runs the
+kernel AND host code on x86 under ASan: ports are views of the launch's host buffers,
+`load_buffer` gathers the real block into an exact-size allocation, `commit` scatters it,
+`<<<mesh>>>` runs every core, and the outputs are byte-compared with TVM's `make TRACE=1` dump
+(else `<entry>_ref` on synthetic tensors). Skill **aioffloadprototype**.
 
 ### User kernels: `--aie-kernel` / `frontend.tvmrelay.aiekernel`
 
@@ -938,6 +958,7 @@ Read the matching skill when the task fits:
 | `pip install -e .` / `import aiegraph`: TVM 0.16 not found or provisioning unexpectedly, `no aiehlc checkout`, `exists and was not written by aiegraph`, stale results after changing model/calib, packaging `frontend` namespace | aiegraphinstall |
 | `aiegraph` region API: `no region matches 'layer1.0.conv1'`, a region offloads its sibling too (`move together` / *dragged*), `region="layer1"` vs `offload_check("layer1")` mean different things, `partition` undid an earlier offload, `register_kernel` "contract contradicts" | aiegraphregion |
 | A kernel-file backbone for a layer: args in TVM call order, roles, AIEK_SPEC, kernel frame + host run + entry (`ag.offload_prototype`, `aiegraph prototype`) | aiekernelprototype |
+| Let Claude fill a backbone's TODOs (`ai_offload_prototype`, `aiegraph aiprototype`); `prototype_check` / `kemu` FAIL; an unfilled backbone that `offload_check` calls READY | aioffloadprototype |
 | Two user-kernel offloads and only the last stays on the AIE (`superseded ... one aiehlc library per ELF`), `routing` defined twice at link; several aiehlc libraries in one ELF | multiaiehlclibrary |
 | Kernel link fails `could not find free space for SpaceSymbol buf_in_ping_0 in memory DMb`; TilingLinalg `Memory budget exceeded! ... maxPingPongBytes` | dmbufferregion |
 | Plug a user-written kernel into a TVM layer (`AIEK_ENTRY`/`AIEK_SPEC`, `--aie-kernel`, `aiekernel check/offload`); an L0xx lint code, calibrate MISMATCH, emulate FAIL, or `rejected at link -- ... routing()` | aieuserkernel |
