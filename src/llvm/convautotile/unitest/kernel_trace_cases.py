@@ -202,6 +202,15 @@ DATAFLOW_CASES = [
      "aie::store_buffer takes only {.depth}"),
 ]
 
+# The same options on the spatial-halo conv (simpleconv2dkernel_port_opts.cc).
+CONVOPTS_BASE = CCODE / "simpleconv2dkernel_port_opts.cc"
+CONVOPTS_CASES = [
+    ("convopts: baseline (.resident weights, .depth = 2 slab / output)", [], None),
+    ("convopts: .depth = 1 on the halo slab",
+     [("{ih_t, iw_t, C}, {.depth = 2}", "{ih_t, iw_t, C}, {.depth = 1}")],
+     "is not supported on a spatial-halo (conv) kernel yet"),
+]
+
 # Hand-written GemmSpaces + block loads (verifySpaceKernels): each side may be
 # wrong, and the conflict names the GemmSpace field.
 SLICE = ".slice_tiling = {.tile_size = 19, .stride = 14, .rounds = 4}"
@@ -262,6 +271,7 @@ def main():
     cases = [(n, e, x, BASE) for n, e, x in CASES] + [(n, e, x, TENSOR_BASE) for n, e, x in TENSOR_CASES]
     cases += [(n, e, x, GEMM_BASE) for n, e, x in GEMM_CASES]
     cases += [(n, e, x, DATAFLOW_BASE) for n, e, x in DATAFLOW_CASES]
+    cases += [(n, e, x, CONVOPTS_BASE) for n, e, x in CONVOPTS_CASES]
     cases += [(n, e, x, SPACE_BASE) for n, e, x in SPACE_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]

@@ -1164,7 +1164,8 @@ Derived convCrossCheck(const TraceKernel &k, KernelTraceResult &tr, const std::v
         return none; // a conv-like kernel the conv derivation would tile differently: routing alone decides
     const PortSpace *want[3] = {&d.ifm, &d.weights, &d.ofm};
     for (size_t i = 0; i < k.ports.size() && i < spaces.size(); i++) {
-        const PortSpace &w = k.ports[i].role == "IFM" ? *want[0] : k.ports[i].role == "WEIGHTS" ? *want[1] : *want[2];
+        PortSpace w = k.ports[i].role == "IFM" ? *want[0] : k.ports[i].role == "WEIGHTS" ? *want[1] : *want[2];
+        w.pp_depth = spaces[i].pp_depth; // the port's {.depth / .resident}: a scheduling choice, not the tiling
         if (emitGemmSpace(spaces[i], "x") != emitGemmSpace(w, "x"))
             errs.push_back(k.ports[i].var + ": the routed carrier differs from the spatial-halo conv derivation of " +
                            "the same blocks (internal error):\n" + emitGemmSpace(spaces[i], "routed") +
@@ -1251,6 +1252,11 @@ KernelOnlyResult inferKernelOnly(std::string &src, const std::string &srcDir, co
         RoutingHints hints;
         if (errs.empty()) {
             hints = routingHints(plan);
+            for (auto &rp : plan.ports)
+                if (plan.halo && rp.opts.depth == 1)
+                    errs.push_back(rp.var + " (" + rp.role + "): {.depth = 1} is not supported on a spatial-halo " +
+                                   "(conv) kernel yet -- its window lowering is ping-pong; use {.depth = 2}, or " +
+                                   "{.resident = true} for a block taken once");
             const std::string mem = checkPortBuffers(plan, hints);
             if (!mem.empty())
                 errs.push_back(mem);

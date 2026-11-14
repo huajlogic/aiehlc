@@ -56,6 +56,13 @@ Trace (`checkBlockOpts`) -> `KernelOnlyResult::blocks` -> aiehlc
 - Never rebuild `build/aiehlc` while an `aiehlc.sh` build is running; the
   queued builds then mix compilers.
 
+## Spatial-halo conv
+`simpleconv2dkernel_port_opts.cc`: `.resident` weights (followed on
+`fullconnect_auto = 0` too: one buffer, sent once), `.depth = 2` slab/output.
+`.depth = 1` on a halo port is an error; `.tile` is 2-D only. Before the fix
+any option on a conv gave `the routed carrier differs from the spatial-halo
+conv derivation ... (internal error)` (pp_depth was compared).
+
 ## Board
 palmyra 213 (2026-11-11): `simplegemm_dataflow.cc` GOLDEN PASS (524,288), 79.55 ms
 per launch; `--profiling`: kload 96.5 %, bdcfg 2.3 %, wait_io 1.2 % -- the

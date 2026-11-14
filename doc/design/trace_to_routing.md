@@ -230,6 +230,17 @@ work is ~1 % (< 1 ms); the launch is the kernel ELF reload -- 3 KB of text but
 call. That, not the dataflow, is the next lever (warm reload / control-packet
 kernel load, as conv2dstem does).
 
+**Spatial-halo conv (2026-11-14).** The same options on a conv kernel:
+`example/tileprogram/ccode/simpleconv2dkernel_port_opts.cc` (59 lines,
+`simpleconv2dkernel_port_less.cc` + `{.resident = true}` weights, `{.depth = 2}`
+slab and output). On `fullconnect_auto = 0` only a `.resident` input is
+checked / followed (`resolveKernelBlock`): the weights get one 3136 B buffer,
+sent once. The conv cross-check (`convCrossCheck`) ignores the port's
+`pp_depth` (a scheduling choice, like `spaceDiff`); `{.depth = 1}` on a halo
+port is an analysis error (its window lowering is ping-pong). `.tile` needs a
+2-D block, so it does not apply to the 3-D slab. palmyra 213: `PASS: 0
+mismatches out of 802816`, 85.8 ms; `simpleconv2dkernel_port.cc` byte-identical.
+
 ## Next steps
 
 1. ~~Full aiehlc build / byte-identity~~ (done above). Per-port core-memory
