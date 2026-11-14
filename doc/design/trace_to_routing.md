@@ -149,10 +149,91 @@ checked and rendered text equal), `kernel_trace_cases.py` 27/27. Full rebuild +
 `aiehlc.sh --aie-version 5` on new_load: `main.elf`; `routing.cc`, `kernel.cc`,
 `aieml.bcf`, `aieml.prx` byte-identical to the build before this change.
 
+## Dataflow options: `.depth` / `.resident` / `.tile` (2026-11-11)
+
+A kernel-only kernel may pass options to its block calls (all optional; the
+default is the compiler's derivation as before):
+
+```cpp
+const int8_t *w = aie::load_buffer(b, {pn * 64, 0}, {64, 256}, {.resident = true});
+const int8_t *x = aie::load_buffer(a, {r0, 0}, {16, 256}, {.depth = 2, .tile = {8, 8}});
+int8_t *y = aie::store_buffer(c, {r0, pn * 64}, {16, 64}, {.depth = 2});
+```
+
+| Option | Meaning | Checked by the trace |
+|---|---|---|
+| `.depth = 1 \| 2` | this port's core buffers (single / ping-pong); a single buffer with several rounds re-arms by chaining its BD to itself | 1 or 2; at most that many blocks held |
+| `.resident = true` | one block per core, held for the whole launch, ONE buffer; the DMA sends it once, not with every round of the other ports | exactly one block per core; no `.depth = 2` |
+| `.tile = {tr, tc}` | loads only, 2-D blocks: the shim DMA delivers the block panel-major (tc-wide column panels, each with all rows), so every tr x tc tile is contiguous -- tile (a, b) at `(b * rows / tr + a) * tr * tc`. Three shim BD dims: d0 one tile row, d1 the rows (row pitch), d2 the panels | divides the block; tile row and tensor row multiples of 4 B (the DMA moves words) |
+
+Designated initializers go in the order `.reuse, .pad, .depth, .resident, .tile`.
+On the core the options are dropped (`dropBlockOptions` in
+`resolveBlockIoBuiltins`): they configure the DMA and the analysis, a block is
+still just the next window. Every block of a port must pass the same options.
+Example: `example/tileprogram/ccode/simplegemm_dataflow.cc` (256x256x256 x 8
+panels in one launch, `aie::mmul<8,8,8>`, B host-packed in mmul order because
+an int8 transpose is not a DMA operation).
+
+**How it reaches the DMA.** The kernel analysis records each port's traced
+block (`KernelOnlyResult::blocks`: the kernel's tensor shape, the fit, the
+options); aiehlc hands it to the pipeline (`TensorParam::kernelBlock`) and
+`attachTensorRoutingInfo` puts it on the tensor as `#routing.kernel_block`
+(routing_ir_tiling_carriers.md). `.depth` / `.resident` also set the port's own
+GemmSpace `pp_depth` (`RoutingPort::ppDepth`). The blueprint lowering resolves
+the attribute once per port, in `blueprint_sched::resolveKernelBlock`, from the
+attribute alone -- host (`flowtransfer_host.cpp` `applyKernelBlockShim`,
+`flowtransfer_kernel.cpp`) and kernel (`passblueprinttoschedulekernel.cpp`) make
+the same decision:
+
+- **check** -- every GEMM-path port (`fullconnect_auto = 1`, no halo): the final
+  core window and round count must be the kernel's block and block count, else
+  `error: ... the core window is N elements x R round(s) per launch, but the
+  kernel's blocks (#routing.kernel_block) are ...`. Before, a disagreement built
+  rc=0 and hung on the board.
+- **follow** -- an input on that path whose blocks are row-contiguous (cover
+  every dim after the first): one shim BD per kernel block at the block's own DDR
+  offset (`step_i * i + step_j * j`), one core window per block, the port's own
+  `pp_depth`, `.tile` dims; an input taken once is sent once, outside the round
+  loop. The GEMM model cannot express either case: it re-sends B with every M
+  round, and with full K (`kRounds == 1`) it kept A's core window and shim BD at
+  the whole 64-row partition (16 KB per round, no per-round offset).
+  The old K-chunked blocks (`simplegemm_kernel_port.cc`, `{16, 64}` of a 256-wide
+  tensor) are not row-contiguous: they keep the GEMM schedule, byte-identical.
+
+Two more front-end changes go with it. A dim that is mesh-split AND walked by an
+on-core loop in back-to-back blocks (GEMM M strips: `rows/4@512 + j32x16@16`) is
+rendered as one flat tile list (`tile_round` = mesh parts x rounds) -- the form
+the GEMM schedule reads -- instead of `slice_tiling`, which only the halo path
+reads (`RoutingDim::flatLoop`). And the non-halo memory rule now counts what
+`kernel.cc` declares (`RoutingPort::declaredBytes`: ping AND pong for every
+window, except a single-buffered followed input) against the 32 KB buffer region
+less 3 KB (skill dmbufferregion), not 48 KB; ports without options drop to one
+buffer when that is what fits, and a set that cannot fit is an analysis error
+(`checkPortBuffers`) instead of a chess link error.
+
+Verified: `simplegemm_kernel_port.cc`, `simpleconv2dkernel_port.cc`,
+`simplematmul2.cc` give byte-identical `kernel.cc` / `routing.cc` / `host.cc` /
+bcf / prx before and after; unit `test_trace_routing` (strip rendering, per-port
+depth, buffer rule) and `kernel_trace_cases.py` DATAFLOW_CASES (each option's
+error); `simplegemm_dataflow.cc` bit-exact on x86 (kemu-style emulation with the
+panel-major gather, 524,288 outputs). Skill **gemmdataflowoptions**.
+
+**Board (palmyra 213, 2026-11-11, `apppaltest.py --netload`).**
+`simplegemm_dataflow.cc`: `GOLDEN PASS: all 524288 output elements match`,
+79.55 ms per launch (first call 79.94 ms), 3.37 GOPS for 8 x 256^3 -- the
+followed A strips (panel-major `.tile` BD, ping-pong) and the once-sent,
+single-buffered B work on hardware. `simplegemm_kernel_port.cc` from the same
+compiler: `PASS`, 18.46 ms (as before) for 64x64x256. The `--profiling` split of
+one launch: **kload 96.5 %**, bdcfg 2.3 %, wait_io 1.2 %, i.e. the DMA + mmul
+work is ~1 % (< 1 ms); the launch is the kernel ELF reload -- 3 KB of text but
+26.6 KB of BSS (the port buffers) per core, written over the config bus on every
+call. That, not the dataflow, is the next lever (warm reload / control-packet
+kernel load, as conv2dstem does).
+
 ## Next steps
 
-1. ~~Full aiehlc build / byte-identity~~ (done above). Still open: generic
-   per-port core-memory / stack checks for non-conv plans.
+1. ~~Full aiehlc build / byte-identity~~ (done above). Per-port core-memory
+   check for non-conv plans: done (`checkPortBuffers`, above). Still open: stack.
 2. ~~`__global__(conv, map)` cross-check~~ (done below).
 3. GEMM kernel-only example (`simplematmul2` in load_buffer form) through
    the fullconnect path; GlobalPolicy chosen from the plan (halo ->

@@ -45,6 +45,10 @@ convautotile: `doc/design/conv_autotiling.md`).
 - The body must compile on x86 and the schedule must be data-independent.
 - Regression: `python3 src/llvm/convautotile/unitest/kernel_trace_cases.py build/aiehlc-convtile`.
 
+## Dataflow options
+`{.depth = 1|2, .resident = true, .tile = {tr, tc}}` on load_buffer (`.depth`
+on store_buffer): skill **gemmdataflowoptions** (`simplegemm_dataflow.cc`).
+
 ## Hand-written GemmSpaces + block loads
 - `__global__(policy) void k(aie::port<T, MySpace> p, ...)` with
   `aie::load_buffer` in the body (`simpleconv2dkernel_space.cc`). Before

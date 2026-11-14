@@ -513,6 +513,28 @@ eager (kernel reloaded per layer), eager layer-major (B images per layer). Kerne
 reverted to the 2026-10-20 engine (~1.61 ms/image at B=32): the faster kernels
 (1.364 ms) hang ~1 run in 3 in residual layers (skill **shimctrlpushloss**).
 
+### Dataflow options on kernel-only kernels (`.depth` / `.resident` / `.tile`)
+
+`aie::load_buffer(p, off, shape, {.depth = 1|2, .resident = true, .tile = {tr, tc}})`
+(`store_buffer` takes `.depth`) steer the DMA the compiler derives from a
+kernel-only kernel; all optional, default = the derivation as before.
+`.resident`: one block per core, held all launch, one buffer, sent once.
+`.tile`: the shim delivers a 2-D block **panel-major** (tc-wide panels of all
+rows) so every tr x tc tile is contiguous -- 3 shim BD dims; an int8 transpose is
+not a DMA operation, so a GEMM B is host-packed. Example
+`example/tileprogram/ccode/simplegemm_dataflow.cc` (256^3 x 8 panels per launch,
+`aie::mmul<8,8,8>`, `PERF SUMMARY` + bit-exact check). The traced blocks travel
+as `#routing.kernel_block`; `blueprint_sched::resolveKernelBlock` makes host and
+kernel lowering **check** every GEMM-path port's window/rounds against it (a
+mismatch is a build error, it used to hang) and **follow** it for row-contiguous
+inputs (full-K strips, a once-loaded B -- the GEMM model can express neither).
+Old kernels stay byte-identical. Board: GOLDEN PASS (524,288), 79.55 ms per
+launch, of which `--profiling` puts 96.5 % in kload (per-call ELF + 26.6 KB
+buffer-BSS reload) and 1.2 % in wait_io -- the next lever is the launch, not
+the dataflow. Port buffers get **32 KB**, not 48
+(`checkPortBuffers`). Design: `doc/design/trace_to_routing.md` "Dataflow
+options"; skill **gemmdataflowoptions**.
+
 ### Declarative conv2d auto-tiling (`aie::Conv2d` + `aie::Mapping`)
 
 `__global__(conv, map) void k(aie::port<T, aie::IFM> a, aie::port<T, aie::WEIGHTS> b, aie::port<T, aie::OFM> c)`
@@ -731,7 +753,8 @@ silently -- and remember the kernel body is not in the IR. Design
 `routing.iter_policy`). Tiling/data-movement info is a typed attribute on its op:
 `#routing.halo` / `#routing.shim_dma` / `layout_transform` / `pp_depth` on each
 `routingcreatescheduletensor` (copied onto `dfscheblueprint.declare_data` as
-`routing.*`), `#routing.kernel_tiling` on the routing `func.func`, and GEMM
+`routing.*`; a kernel-only port also carries `#routing.kernel_block`, its traced
+blocks), `#routing.kernel_tiling` on the routing `func.func`, and GEMM
 `#routing.tiling` on `partitiontensor`. Passes read them **at pass entry** via
 `routing::collectTensorRoutingInfo` / `readKernelTiling` / `readGemmTilingScalars`
 into `BlueprintPassState` — never add a `tensor_N.*` or tiling module attr. See
@@ -910,6 +933,7 @@ Read the matching skill when the task fits:
 | `run_test.sh` check 3: no `aie/` under the offloaded layer; `--aiegraph` lifts 0 convs under int8 (`non-4D shapes`); may `--aie-offload` change `layers/` vs golden | aieoffloadaiegraph |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |
 | Misspelled `#include` reported as `` `HW_ROWS` ... no #define `` instead of `file not found`; kernel-only kernel: `kernel analysis needs the launch mesh: no device.partition(...)` though the call exists (mesh macros behind `#include <x.h>`); xchesscc `no matching function for call to 'aiehlc_load_buffer'` (window port by value, missing `*`); adding an early source-level diagnostic | kernelanalysisdiagnostics |
+| Kernel-only `{.depth / .resident / .tile}` options; `the core window is N elements x R round(s) ... but the kernel's blocks (#routing.kernel_block) are`; `the port buffers take N B of core memory`; a GEMM with B loaded once / full-K A strips; kernel macro under `#ifndef` undeclared | gemmdataflowoptions |
 | `data used without being loaded` and WHICH constant causes it (`oc_t = 15` vs loops walking 16); `cause (static analysis)` / `out-of-block access (static analysis)` lines; extending `kernel_static.cpp` | blockstaticbounds |
 | `pip install -e .` / `import aiegraph`: TVM 0.16 not found or provisioning unexpectedly, `no aiehlc checkout`, `exists and was not written by aiegraph`, stale results after changing model/calib, packaging `frontend` namespace | aiegraphinstall |
 | `aiegraph` region API: `no region matches 'layer1.0.conv1'`, a region offloads its sibling too (`move together` / *dragged*), `region="layer1"` vs `offload_check("layer1")` mean different things, `partition` undid an earlier offload, `register_kernel` "contract contradicts" | aiegraphregion |
