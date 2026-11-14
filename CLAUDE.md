@@ -764,7 +764,11 @@ file, so an edited IR continues through the whole pipeline; a round trip is
 byte-identical (`script/test/routing_ir_roundtrip.sh`, GEMM + conv). Python:
 `aiebackend.routing_ir.RoutingIR` (typed view, edits, `lint()`, in-process `check()`,
 `build()`). Gate on `lint()` too -- the pipeline accepts some illegal tilings
-silently -- and remember the kernel body is not in the IR. Design
+silently -- and remember the kernel body is not in the IR. `AIEHLC_DMAPHOP_IR_IN` re-enters at
+dmaphop (round trip byte-identical; edits not yet safe -- other flows' stream routes
+get re-paired). Every tiling build ends with `script/test/flowcheck.py`, which
+simulates routing.cc against the dmaphop dataflows and prints `flowcheck: OK` or
+the flows that miss / leak (RoutingHWVerify does not see those). Design
 **[doc/design/routing_ir_reentry.md](doc/design/routing_ir_reentry.md)**; skill
 **routingirreentry**.
 
@@ -904,6 +908,7 @@ Read the matching skill when the task fits:
 | Embedded LLM context loss on retarget | debugui-llm-reset |
 | Debug UI grid: every tile red border + ⚠ "supply/demand mismatch" on every launch | flowbalancebroadcast |
 | Debug UI grid: big blank column on the left of the AIE array (data plane starts at col 1, e.g. `{2,6}` control-plane partition) | debuguigridleftgap |
+| Dump a lab board's AIE registers / core PM+DM / memtile DM (`script/aiedump.py palmyra_local\|vek385-N`); a column reads all `0x00000002`; which registers must never be read (`lock_request` = acquire) | aiedump |
 | Static XAie API verify (routing.cc, host.cc) | xaieapiverify |
 | Routing debug (IR → generated code) | routinghwdebug |
 | DMA BD verify in host.cc | dmabdverify |
@@ -931,7 +936,10 @@ Read the matching skill when the task fits:
 | GEMM / non-conv block-load kernel (kernel-only `aie::shape` or hand-written 2-D GemmSpace) builds and traces OK but hangs in `wait_io TIMEOUT ... dir=0`, or only mesh column 0 is right; `Tensor param: a [16x16]`; B offset `subview[16, 0] [64, 64]` | gemmblockloadhang |
 | Spatial-halo conv hangs (`wait_io TIMEOUT`) though kernel analysis passed: `out_rounds` ≠ kernel rounds (e.g. 98 for a 14x16x16 tile), tiny core output window; or `[TilingLinalg] ERROR: ... the kernel's blocks give ..` | convoutroundsdoublecount |
 | Triton-style block-load kernel (`aie::program_id`, `aie::load_buffer` / `store_buffer` in tensor coordinates, `aie::release` / `commit`): `no member named 'program_id' in namespace 'aie'`, klog `BLKE`, wrong offsets but correct output, emulating the generated kernel on x86; hand-written `aie::GemmSpace` ports + `load_buffer` (`(GemmSpace X) .d1... = A, the kernel's blocks give B`) | blockloadkernel |
-| Edit the routing IR and feed it back (`AIEHLC_ROUTING_IR_IN`, `aiebackend.routing_ir`: view / set_level / lint / check / build), round-trip test, an IR edit that does nothing or is silently accepted although illegal | routingirreentry |
+| Kernel-only `{.depth / .resident / .tile}` options; `the core window is N elements x R round(s) ... but the kernel's blocks (#routing.kernel_block) are`; `the port buffers take N B of core memory`; a GEMM with B loaded once / full-K A strips; kernel macro under `#ifndef` undeclared | gemmdataflowoptions |
+| Misspelled `#include` reported as `` `HW_ROWS` ... no #define `` instead of `file not found`; kernel-only kernel: `kernel analysis needs the launch mesh: no device.partition(...)` though the call exists (mesh macros behind `#include <x.h>`); xchesscc `no matching function for call to 'aiehlc_load_buffer'` (window port by value, missing `*`); adding an early source-level diagnostic | kernelanalysisdiagnostics |
+| `data used without being loaded` and WHICH constant causes it (`oc_t = 15` vs loops walking 16); `cause (static analysis)` / `out-of-block access (static analysis)` lines; extending `kernel_static.cpp` | blockstaticbounds |
+| Edit the routing / dmaphop IR and feed it back (`AIEHLC_ROUTING_IR_IN`, `AIEHLC_DMAPHOP_IR_IN`, `aiebackend.routing_ir`: view / set_level / lint / check / build), round-trip test, an IR edit that does nothing or is silently accepted although illegal; `flowcheck FAILED` / `FLOWCHECK ERROR ... does not reach / also reaches` after a build | routingirreentry |
 | Adding/reading tiling or per-tensor DMA info in routing IR (halo, shim_dma, pp_depth, kernel rounds); "where did `tensor_N.halo` / `routing.spatial_out_rounds` go"; value reads 0 inside a conversion pattern | routingirtilingcarriers |
 | A `#pragma` you added is never `Detected` in the aiehlc log and its feature silently does nothing (build still rc=0) — stale `aiehlc` binary | stalepragmabinary |
 | Gen2-only build break: missing `xpseudo_asm_armclang.h`, or `XPAR_CPU_TIMESTAMP_CLK_FREQ` undeclared | bspheadergen2 |
@@ -952,9 +960,6 @@ Read the matching skill when the task fits:
 | `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aiebackend` (two LLVMs) | aiebackendtvmllvm |
 | `run_test.sh` check 3: no `aie/` under the offloaded layer; `--aiegraph` lifts 0 convs under int8 (`non-4D shapes`); may `--aie-offload` change `layers/` vs golden | aieoffloadaiegraph |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |
-| Misspelled `#include` reported as `` `HW_ROWS` ... no #define `` instead of `file not found`; kernel-only kernel: `kernel analysis needs the launch mesh: no device.partition(...)` though the call exists (mesh macros behind `#include <x.h>`); xchesscc `no matching function for call to 'aiehlc_load_buffer'` (window port by value, missing `*`); adding an early source-level diagnostic | kernelanalysisdiagnostics |
-| Kernel-only `{.depth / .resident / .tile}` options; `the core window is N elements x R round(s) ... but the kernel's blocks (#routing.kernel_block) are`; `the port buffers take N B of core memory`; a GEMM with B loaded once / full-K A strips; kernel macro under `#ifndef` undeclared | gemmdataflowoptions |
-| `data used without being loaded` and WHICH constant causes it (`oc_t = 15` vs loops walking 16); `cause (static analysis)` / `out-of-block access (static analysis)` lines; extending `kernel_static.cpp` | blockstaticbounds |
 | `pip install -e .` / `import aiegraph`: TVM 0.16 not found or provisioning unexpectedly, `no aiehlc checkout`, `exists and was not written by aiegraph`, stale results after changing model/calib, packaging `frontend` namespace | aiegraphinstall |
 | `aiegraph` region API: `no region matches 'layer1.0.conv1'`, a region offloads its sibling too (`move together` / *dragged*), `region="layer1"` vs `offload_check("layer1")` mean different things, `partition` undid an earlier offload, `register_kernel` "contract contradicts" | aiegraphregion |
 | A kernel-file backbone for a layer: args in TVM call order, roles, AIEK_SPEC, kernel frame + host run + entry (`ag.offload_prototype`, `aiegraph prototype`) | aiekernelprototype |
@@ -995,6 +1000,7 @@ to reload the MCP server.
 ### Debug tools
 
 - **[src/tool/debug/README.md](src/tool/debug/README.md)** — user guide and CLI for all debug tools
+- **`script/aiedump.py <palmyra_local|vek385-N> [--pm] [--dm] [--memtile-dm]`** — JTAG dump of every live column's named registers (+ core PM/DM) into `summary.txt` / `regs.txt` / `mem/*.bin`; starts hw_server through `hws.ensure` when 3121 is closed; one piped xsdb session + block `mrd`s on the `Versal*` DAP target (28 tiles / 20k registers in 2.3 s). Skill **aiedump**.
 - **Skill: debug-ui-framework** — implementation map for `schedule_debug_server.py`, `schedule_view.py`, `aiegdb.py`, `aiemcp.py`, `aiediag.py`, `xaiehost2provenance.py` (detail in [reference.md](.cursor/skills/debug-ui-framework/reference.md))
 
 ### Build notes
