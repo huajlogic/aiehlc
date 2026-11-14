@@ -411,7 +411,8 @@ class EmbeddedModel:
     # ── build / run ──────────────────────────────────────────────────────
 
     def build(self, target: str = "a78", output=None, *, local: bool = False,
-              profile: bool = False, verbose: bool = False) -> BuildReport:
+              profile: bool = False, verbose: bool = False,
+              main_c=None, extra_sources=(), extra_cflags: str = "") -> BuildReport:
         """Link ``main.elf`` (A78; needs the Vitis cross toolchain), or with
         ``target="x86"`` ``main_local.elf`` for this host. ``local=True`` builds
         both. ``profile=True`` links ``main.elf`` with ``make PROFILE=1`` (a
@@ -424,7 +425,9 @@ class EmbeddedModel:
         x86 = target == "x86"
         res = ab.build_arm_elf(self.workdir, c_name=f"{self._stem()}.c", run_make=not x86,
                                image=self.image, local=local or x86, local_run=False,
-                               verbose=verbose, make_vars={"PROFILE": 1} if profile else None)
+                               verbose=verbose, make_vars={"PROFILE": 1} if profile else None,
+                               main_c=main_c, extra_sources=extra_sources,
+                               extra_cflags=extra_cflags)
         if x86:
             loc = res.get("local") or {}
             rep = BuildReport(bool(loc.get("ok")), loc.get("elf"), loc.get("reason", ""), loc)

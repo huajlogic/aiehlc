@@ -61,6 +61,17 @@ def preprocess_image(image=None, verbose: bool = True):
     tensor) and, for a URL or the default, network access on first use; the
     download is cached under ``~/.cache/resnet18py``.
     """
+    if image is not None and str(image).endswith((".bin", ".npy")):
+        # aiegraph-unet-multiinput: a non-image input, given as the raw float32
+        # tensor itself (little-endian .bin, or .npy). No preprocessing.
+        import numpy as np
+        from pathlib import Path as _P
+        path = _P(image).resolve()
+        tensor = (np.load(path) if str(path).endswith(".npy")
+                  else np.fromfile(path, dtype="<f4")).astype(np.float32).ravel()
+        if verbose:
+            print(f"  [input] raw float32 tensor {path} ({tensor.size} elems)")
+        return tensor, path
     classify = _classify_mod()
     path = classify.resolve(image, classify.DEFAULT_IMAGE_URL, "input_image")
     tensor = classify.preprocess(path).numpy()

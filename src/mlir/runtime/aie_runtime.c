@@ -157,6 +157,16 @@ static unsigned long long g_ctrl_plan_cyc = 0ULL, g_sync_dev_cyc = 0ULL;
  * array's register state (rt_plan_cache below) is valid only within one
  * generation: a re-init resets the stream switches it describes. */
 static unsigned g_partition_gen = 1U;
+/* Bumped by everything that may change AIE program memory OTHER than the
+ * skip-bss MMIO loader's own writes (partition init/teardown, aie-rt
+ * XAie_LoadElfMem, control-packet ELF loads). AIEHLC_PM_WARM_SKIP trusts a
+ * tile's resident program only while this has not moved. */
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+static unsigned g_pm_foreign_seq;
+#define AIEHLC_PM_FOREIGN_BUMP() (g_pm_foreign_seq++)
+#else
+#define AIEHLC_PM_FOREIGN_BUMP() ((void)0) /* default build: no trace in the runtime */
+#endif
 static unsigned int g_ctrl_plan_n = 0U, g_sync_dev_n = 0U;
 static unsigned long long g_pmap_print_cyc = 0ULL;
 static unsigned int g_pmap_print_n = 0U;
@@ -270,6 +280,28 @@ void __Runtime_pmap_print_cycles(unsigned long long *cyc, unsigned int *lines) {
 static int s_core_perf_probe_valid = 0;
 static XAie_LocType s_core_perf_probe_tile;
 static XAie_DevInst *s_core_perf_probe_dev = NULL;
+#define RT_CORE_PERF_MAX_TILES 64
+static XAie_LocType s_core_perf_tiles[RT_CORE_PERF_MAX_TILES];
+static int s_core_perf_ntiles = 0;
+/* Snapshot of ACTIVE / LOCK_STALL taken right before the first DMA start of a launch, so the
+ * report can separate "core enabled, host still configuring BDs / flushing inputs" from the
+ * on-array run (the kernel group is enabled before the host writes BDs and starts IO). */
+static uint32_t s_core_perf_snap_a[RT_CORE_PERF_MAX_TILES];
+static uint32_t s_core_perf_snap_ls[RT_CORE_PERF_MAX_TILES];
+static int s_core_perf_snap_pending = 0;
+static int s_core_perf_snap_valid = 0;
+__attribute__((unused)) static void rt_core_perf_snap_at_startio(void) {
+    if (!s_core_perf_snap_pending || s_core_perf_probe_dev == NULL)
+        return;
+    s_core_perf_snap_pending = 0;
+    for (int i = 0; i < s_core_perf_ntiles; i++) {
+        s_core_perf_snap_a[i] = 0;
+        s_core_perf_snap_ls[i] = 0;
+        (void)XAie_PerfCounterGet(s_core_perf_probe_dev, s_core_perf_tiles[i], XAIE_CORE_MOD, 0, &s_core_perf_snap_a[i]);
+        (void)XAie_PerfCounterGet(s_core_perf_probe_dev, s_core_perf_tiles[i], XAIE_CORE_MOD, 3, &s_core_perf_snap_ls[i]);
+    }
+    s_core_perf_snap_valid = 1;
+}
 
 AieRC __Runtime_core_perf_setup(XAie_DevInst *dev, XAie_LocType tile) {
     AieRC rc;
@@ -329,6 +361,53 @@ void __Runtime_core_perf_read_probe(uint32_t *active, uint32_t *vec_instr, uint3
         XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, 2, stream_stall);
     if (lock_stall)
         XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, 3, lock_stall);
+}
+
+/* Read the 4 core perf counters armed by __Runtime_core_perf_setup on any core tile
+ * (declared in aie_runtime.h; was never defined). Counters: 0 ACTIVE, 1 INSTR_VECTOR,
+ * 2 STREAM_STALL, 3 LOCK_STALL. NULL outputs are skipped. */
+AieRC __Runtime_core_perf_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t *active, uint32_t *vec_instr,
+                               uint32_t *stream_stall, uint32_t *lock_stall) {
+    uint32_t *out[4] = {active, vec_instr, stream_stall, lock_stall};
+    if (dev == NULL)
+        return XAIE_INVALID_ARGS;
+    for (uint8_t c = 0; c < 4; c++) {
+        if (out[c] == NULL)
+            continue;
+        AieRC rc = XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, c, out[c]);
+        if (rc != XAIE_OK)
+            return rc;
+    }
+    return XAIE_OK;
+}
+
+/* Print the core perf counters of every core tile armed at the last kernel launch
+ * (needs AIEHLC_PROFILING and AIE_DEBUG_FLAG_CORE_PERF_COUNTER in g_runtime_debug_level).
+ * One "[PERF] tag=.. tile=(c,r) ..." line per tile + one "[PERFSUM]" line. */
+void __Runtime_core_perf_report(int tag) {
+    uint32_t amax = 0, amin = 0xffffffffu;
+    unsigned long long asum = 0;
+    if (s_core_perf_ntiles == 0 || s_core_perf_probe_dev == NULL) {
+        printf("[PERF] tag=%d no core tiles armed (build with --profiling and set g_runtime_debug_level |= 0x100)\n", tag);
+        return;
+    }
+    for (int i = 0; i < s_core_perf_ntiles; i++) {
+        uint32_t a = 0, v = 0, ss = 0, ls = 0;
+        AieRC rc = __Runtime_core_perf_read(s_core_perf_probe_dev, s_core_perf_tiles[i], &a, &v, &ss, &ls);
+        printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u vec_instr=%u stream_stall=%u lock_stall=%u\n", tag,
+               (unsigned)s_core_perf_tiles[i].Col, (unsigned)s_core_perf_tiles[i].Row, (int)rc, a, v, ss, ls);
+        if (s_core_perf_snap_valid)
+            printf("[PERFIO] tag=%d tile=(%u,%u) pre_io_active=%u pre_io_lock_stall=%u io_active=%u io_lock_stall=%u\n",
+                   tag, (unsigned)s_core_perf_tiles[i].Col, (unsigned)s_core_perf_tiles[i].Row, s_core_perf_snap_a[i],
+                   s_core_perf_snap_ls[i], a - s_core_perf_snap_a[i], ls - s_core_perf_snap_ls[i]);
+        asum += a;
+        if (a > amax)
+            amax = a;
+        if (a < amin)
+            amin = a;
+    }
+    printf("[PERFSUM] tag=%d tiles=%d active_cyc min=%u max=%u mean=%llu\n", tag, s_core_perf_ntiles, amin, amax,
+           asum / (unsigned long long)s_core_perf_ntiles);
 }
 
 void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1) {
@@ -2997,9 +3076,79 @@ void __Runtime_platform_init(void) {
     // Xil_ICacheDisable();
 }
 
+/* ---------------------------------------------------------------------------
+ * Opt-in posted MMIO writes to the AIE array (-DAIEHLC_AIE_MMIO_POSTED=1).
+ * The A78 bare-metal BSP maps the AIE window (0x200_0000_0000, 1 GiB L1
+ * blocks) as 0x409 = Device-nGnRnE: every Xil_Out32 waits for the write
+ * response from the array. Linux ioremap() uses Device-nGnRE. Remapping the
+ * blocks to 0x40D (nGnRE, XN kept) lets writes complete early; order is kept
+ * (nR), reads still wait. Only blocks that are nGnRnE/nGnRE are touched.
+ * Analysis: jane/knowledge/2026-11-10-a78-aie-window-ngnrne-posted-writes.md.
+ * ----------------------------------------------------------------------- */
+#if defined(AIEHLC_AIE_MMIO_POSTED) && AIEHLC_AIE_MMIO_POSTED && !defined(__AIESIM__) && !defined(__linux__)
+#include "xil_mmu.h"
+#ifdef __cplusplus
+extern "C" INTPTR MMUTableL1;
+#else
+extern INTPTR MMUTableL1;
+#endif
+static void __Runtime_aie_mmio_posted(void) {
+    const uint64_t blk = 1ULL << 30, lowmask = 0xFFFULL, xn = 3ULL << 53;
+    const uint64_t base = (uint64_t)XAIE_BASE_ADDR;
+    const uint64_t size = ((uint64_t)XAIE_NUM_COLS << XAIE_COL_SHIFT);
+    int changed = 0, bad = 0;
+    for (uint64_t a = base & ~(blk - 1); a < base + size; a += blk) {
+        volatile INTPTR *e = &MMUTableL1 + (a / blk);
+        const uint64_t d = (uint64_t)*e;
+        if ((d & lowmask) == 0x40DULL)
+            continue;
+        if ((d & lowmask) != 0x409ULL) {
+            bad++;
+            continue;
+        }
+        Xil_SetTlbAttributes((UINTPTR)a, (d & xn) | 0x40DULL);
+        if (((uint64_t)*e & lowmask) == 0x40DULL)
+            changed++;
+        else
+            bad++;
+    }
+    printf("[aie_runtime] mmio-posted: AIE window 0x%llx+0x%llx -> Device-nGnRE, %d block(s) remapped, %d refused\n",
+           (unsigned long long)base, (unsigned long long)size, changed, bad);
+    {
+        /* Is the table we patched the one the MMU walks, at the EL we run in? */
+        uint64_t el, ttbr = 0, sctlr = 0;
+        __asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
+        el = (el >> 2) & 3;
+        if (el == 3) {
+            __asm__ volatile("mrs %0, ttbr0_el3" : "=r"(ttbr));
+            __asm__ volatile("mrs %0, sctlr_el3" : "=r"(sctlr));
+        } else if (el == 2) {
+            __asm__ volatile("mrs %0, ttbr0_el2" : "=r"(ttbr));
+            __asm__ volatile("mrs %0, sctlr_el2" : "=r"(sctlr));
+        } else if (el == 1) {
+            __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr));
+            __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+        }
+        extern INTPTR MMUTableL0;
+        const volatile uint64_t *l0 = (const volatile uint64_t *)(uintptr_t)(ttbr & 0x0000FFFFFFFFF000ULL);
+        const uint64_t l0e = l0 ? l0[base >> 39] : 0;
+        printf("[aie_runtime] mmio-posted: EL%llu sctlr=0x%llx ttbr0=0x%llx &MMUTableL0=%p &MMUTableL1=%p "
+               "active L0[%llu]=0x%llx\n",
+               (unsigned long long)el, (unsigned long long)sctlr, (unsigned long long)ttbr, (void *)&MMUTableL0,
+               (void *)&MMUTableL1, (unsigned long long)(base >> 39), (unsigned long long)l0e);
+        /* Timed burst: 4096 posted writes + dsb to the shim tile's (col 0) data-less
+         * register space would be unsafe here (array not yet initialized), so only the
+         * table walk is checked; the kload phase timer is the A/B metric. */
+    }
+}
+#else
+static void __Runtime_aie_mmio_posted(void) {}
+#endif
+
 void __Runtime_init(void) {
     AIEHLC_LOG(printf("[aie_runtime] __Runtime_init--\n"););
     __Runtime_platform_init();
+    __Runtime_aie_mmio_posted();
     __rt_pmccntr_enable();
 
     AIEHLC_LOG(printf("[aie_runtime] _init OK\n"));
@@ -3034,6 +3183,7 @@ static AieRC __Runtime_partition_initialize(XAie_DevInst *dev) {
     return XAIE_OK;
 #else
     g_ctrl_high_throughput_ready = 0;
+    AIEHLC_PM_FOREIGN_BUMP();
 #if AIE_GEN == 5
     if (g_ctrl_high_throughput) {
         XAie_PartInitOpts opts;
@@ -3095,6 +3245,7 @@ AieRC __Runtime_device_teardown(XAie_DevInst *dev) {
         printf("[aie_runtime] device_teardown SKIPPED (DISABLE_PARTITIONTEARDOWN flag set)\n");
         return XAIE_OK;
     }
+    AIEHLC_PM_FOREIGN_BUMP();
     AieRC RC = XAie_PartitionTeardown(dev);
     AIEHLC_LOG(printf("[aie_runtime] device_teardown done rc=%d\n", (int)RC););
     return RC;
@@ -6716,6 +6867,9 @@ void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int3
  */
 struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
     rt_dsync_drain_inputs(); /* CPU-written launch args clean before any DMA starts */
+#if AIEHLC_PROFILING
+    rt_core_perf_snap_at_startio();
+#endif
     unsigned long long __sio_t0 = RT_PROF_TIC();
     struct_ioevent evt;
     evt.io = io;
@@ -6897,16 +7051,268 @@ struct_ioevent _Runtime_startio_ooo(XAie_DevInst *dev, struct_io io, int32_t bd_
 static unsigned g_elf_load_seq;
 
 #if !defined(__AIESIM__)
-static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elfmem) {
+/* True if [lo, hi) is fully covered by the kernel's DMA port buffers, i.e. by
+ * symbols aiehlc emits as buf_in_ping_N / buf_in_pong_N / buf_out_ping_N /
+ * buf_out_pong_N (passblueprinttoschedulekernel.cpp, flowtransfer_kernel.cpp).
+ * Port buffers are always written (by the DMA or by the core) before they are
+ * read, so zero-filling them on load is wasted MMIO. Anything else in .bss
+ * (kernel statics, klog, runtime state) may rely on C zero-init. If the ELF
+ * has no symbol table, or any byte of the range is not a port buffer, this
+ * returns 0 and the caller zero-fills the segment as before (safe fallback). */
+static int __Runtime_elf_range_is_port_bufs(const unsigned char *elfmem, u32 lo, u32 hi) {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elfmem;
+    if (ehdr->e_shoff == 0U || ehdr->e_shnum == 0U || ehdr->e_shentsize != sizeof(Elf32_Shdr))
+        return 0;
+    const Elf32_Shdr *sh = (const Elf32_Shdr *)(elfmem + ehdr->e_shoff);
+    const Elf32_Shdr *symsh = NULL;
+    for (u32 i = 0; i < ehdr->e_shnum; i++) {
+        if (sh[i].sh_type == (u32)SHT_SYMTAB) {
+            symsh = &sh[i];
+            break;
+        }
+    }
+    if (!symsh || symsh->sh_entsize != sizeof(Elf32_Sym) || symsh->sh_link >= ehdr->e_shnum)
+        return 0;
+    const Elf32_Sym *sym = (const Elf32_Sym *)(elfmem + symsh->sh_offset);
+    const char *strtab = (const char *)(elfmem + sh[symsh->sh_link].sh_offset);
+    const u32 nsym = symsh->sh_size / (u32)sizeof(Elf32_Sym);
+    u32 cur = lo;
+    while (cur < hi) {
+        u32 best_end = cur;
+        for (u32 k = 0; k < nsym; k++) {
+            const u32 a = sym[k].st_value, e = sym[k].st_value + sym[k].st_size;
+            if (sym[k].st_size == 0U || a > cur || e <= best_end)
+                continue;
+            const char *n = strtab + sym[k].st_name;
+            if (strncmp(n, "buf_in_ping_", 12) != 0 && strncmp(n, "buf_in_pong_", 12) != 0 &&
+                strncmp(n, "buf_out_ping_", 13) != 0 && strncmp(n, "buf_out_pong_", 13) != 0)
+                continue;
+            best_end = e;
+        }
+        if (best_end == cur)
+            return 0; /* a gap that is not a port buffer */
+        cur = best_end;
+    }
+    return 1;
+}
+
+#if defined(AIEHLC_ZFILL_WIDE) && AIEHLC_ZFILL_WIDE && defined(__aarch64__)
+/* Experimental (-DAIEHLC_ZFILL_WIDE=1): zero a .bss segment of the tile's OWN
+ * data memory (core view 0x70000..0x7FFFF on a non-checkerboard device) with
+ * 128-bit stores instead of aie-rt's one 32-bit Xil_Out32 per word. Returns 0
+ * (caller falls back to aie-rt) for anything else. With
+ * -DAIEHLC_ZFILL_WIDE_VERIFY=1 the first 64 calls read every word back. */
+static int __Runtime_dm_zero_wide(XAie_DevInst *dev, XAie_LocType loc, u32 paddr, u32 size) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    const XAie_MemMod *mm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].MemMod;
+    const u32 dms = cm->DataMemSize, off = paddr & (dms - 1U);
+    if (cm->IsCheckerBoard || paddr < cm->DataMemAddr || (paddr - cm->DataMemAddr) / dms != 3U ||
+        off + size > dms || ((paddr | size) & 3U))
+        return 0;
+    const u64 tile = dev->BaseAddr + ((u64)loc.Col << dev->DevProp.ColShift) + ((u64)loc.Row << dev->DevProp.RowShift);
+    uintptr_t a = (uintptr_t)(tile + mm->MemAddr + off), end = a + size;
+    while ((a & 15U) && a < end) {
+        *(volatile u32 *)a = 0U;
+        a += 4U;
+    }
+    __asm__ volatile("movi v31.16b, #0" ::: "v31");
+    for (; a + 16U <= end; a += 16U)
+        __asm__ volatile("str q31, [%0]" ::"r"(a) : "memory");
+    for (; a < end; a += 4U)
+        *(volatile u32 *)a = 0U;
+#if defined(AIEHLC_ZFILL_WIDE_VERIFY) && AIEHLC_ZFILL_WIDE_VERIFY
+    static unsigned s_verified;
+    if (s_verified < 64U) {
+        s_verified++;
+        __asm__ volatile("dsb sy" ::: "memory");
+        u32 nz = 0;
+        for (u32 o = 0; o < size; o += 4U) {
+            u32 w = 0xdeadbeefU;
+            XAie_DataMemRdWord(dev, loc, off + o, &w);
+            nz += (w != 0U);
+        }
+        printf("[aie_runtime] zfill-wide verify tile(%u,%u) 0x%x+0x%x: %u nonzero words\n", loc.Col, loc.Row, paddr,
+               size, nz);
+    }
+#endif
+    return 1;
+}
+#else
+static int __Runtime_dm_zero_wide(XAie_DevInst *dev, XAie_LocType loc, u32 paddr, u32 size) {
+    (void)dev, (void)loc, (void)paddr, (void)size;
+    return 0;
+}
+#endif
+
+#if defined(AIEHLC_PMLOAD_WIDE) && AIEHLC_PMLOAD_WIDE && defined(__aarch64__)
+/* Experimental (-DAIEHLC_PMLOAD_WIDE=1): write a program-memory segment with
+ * 128-bit stores instead of aie-rt's one 32-bit write per word (each AXI
+ * transaction to the array costs ~650 ns regardless of width). Writes exactly
+ * the words aie-rt would (ceil(p_memsz/4), reading past the segment like
+ * _XAie_LoadProgMemSection). Returns 0 (caller falls back to aie-rt) if the
+ * segment is not a PM segment or the target is not 16-byte aligned. With
+ * -DAIEHLC_PMLOAD_WIDE_VERIFY=1 the first 64 calls read every word back. */
+static int __Runtime_pm_write_wide(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *src,
+                                   const Elf32_Phdr *phdr) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    if (phdr->p_paddr >= cm->ProgMemSize || phdr->p_paddr + phdr->p_memsz > cm->ProgMemSize ||
+        (phdr->p_paddr & 15U))
+        return 0;
+    const u64 tile = dev->BaseAddr + ((u64)loc.Col << dev->DevProp.ColShift) + ((u64)loc.Row << dev->DevProp.RowShift);
+    const uintptr_t base = (uintptr_t)(tile + cm->ProgMemHostOffset + phdr->p_paddr);
+    const u32 nwords = (phdr->p_memsz + 3U) / 4U;
+    u32 w = 0;
+    for (; w + 4U <= nwords; w += 4U) {
+        __asm__ volatile("ldr q30, [%0]\n\tstr q30, [%1]" ::"r"(src + 4U * w), "r"(base + 4U * w) : "v30", "memory");
+    }
+    for (; w < nwords; w++) {
+        u32 v;
+        memcpy(&v, src + 4U * w, 4U);
+        *(volatile u32 *)(base + 4U * w) = v;
+    }
+#if defined(AIEHLC_PMLOAD_WIDE_VERIFY) && AIEHLC_PMLOAD_WIDE_VERIFY
+    static unsigned s_verified;
+    if (s_verified < 64U) {
+        s_verified++;
+        __asm__ volatile("dsb sy" ::: "memory");
+        u32 bad = 0;
+        for (u32 i = 0; i < nwords; i++) {
+            u32 exp, got = 0xdeadbeefU;
+            memcpy(&exp, src + 4U * i, 4U);
+            XAie_Read32(dev, XAie_GetTileAddr(dev, loc.Row, loc.Col) + cm->ProgMemHostOffset + phdr->p_paddr + 4U * i, &got);
+            bad += (got != exp);
+        }
+        printf("[aie_runtime] pmload-wide verify tile(%u,%u) pm 0x%x+%u words: %u mismatched\n", loc.Col, loc.Row,
+               phdr->p_paddr, nwords, bad);
+    }
+#endif
+    return 1;
+}
+#else
+static int __Runtime_pm_write_wide(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *src,
+                                   const Elf32_Phdr *phdr) {
+    (void)dev, (void)loc, (void)src, (void)phdr;
+    return 0;
+}
+#endif
+
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+/* Experimental (-DAIEHLC_PM_WARM_SKIP=1): on a relaunch, do not rewrite a
+ * tile's program memory if this loader itself last wrote the SAME ELF blob
+ * (pointer) into that tile, on the same device, in the same partition
+ * generation, and no foreign PM writer (g_pm_foreign_seq) ran since. The AIE
+ * core cannot write its own program memory, and core reset does not clear it.
+ * Data segments and every non-port .bss are still rewritten on each launch.
+ * -DAIEHLC_PM_WARM_SKIP_VERIFY=1 reads every skipped word back and prints the
+ * mismatch count (UART: do not time that build). */
+#define RT_PM_WARM_SLOTS 64
+static struct {
+    const unsigned char *elf;
+    XAie_DevInst *dev;
+    unsigned gen, fseq;
+    u8 col, row, ok;
+} s_pm_warm[RT_PM_WARM_SLOTS];
+static unsigned g_pm_warm_skipped_segs, g_pm_warm_cold_loads;
+/* Host-side stats (C linkage): per-tile PM segments skipped and per-tile cold
+ * (program-memory written) loads since boot. A caller that samples cold_loads
+ * around one launch knows whether that launch (re)loaded the kernel. */
+extern "C" void __Runtime_pm_warm_stats(unsigned *skipped_segs, unsigned *cold_tile_loads) {
+    if (skipped_segs)
+        *skipped_segs = g_pm_warm_skipped_segs;
+    if (cold_tile_loads)
+        *cold_tile_loads = g_pm_warm_cold_loads;
+}
+
+static int rt_pm_warm_slot(XAie_LocType loc) {
+    int free_slot = -1;
+    for (int i = 0; i < RT_PM_WARM_SLOTS; i++) {
+        if (s_pm_warm[i].ok && s_pm_warm[i].col == loc.Col && s_pm_warm[i].row == loc.Row)
+            return i;
+        if (!s_pm_warm[i].ok && free_slot < 0)
+            free_slot = i;
+    }
+    return free_slot;
+}
+static int rt_pm_warm_resident(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elf) {
+    int i = rt_pm_warm_slot(loc);
+    return i >= 0 && s_pm_warm[i].ok && s_pm_warm[i].elf == elf && s_pm_warm[i].dev == dev &&
+           s_pm_warm[i].gen == g_partition_gen && s_pm_warm[i].fseq == g_pm_foreign_seq;
+}
+static void rt_pm_warm_record(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elf, int ok) {
+    int i = rt_pm_warm_slot(loc);
+    if (i < 0)
+        return; /* table full: never skip for this tile */
+    s_pm_warm[i].elf = elf;
+    s_pm_warm[i].dev = dev;
+    s_pm_warm[i].gen = g_partition_gen;
+    s_pm_warm[i].fseq = g_pm_foreign_seq;
+    s_pm_warm[i].col = (u8)loc.Col;
+    s_pm_warm[i].row = (u8)loc.Row;
+    s_pm_warm[i].ok = (u8)(ok != 0);
+}
+static int rt_pm_is_pm_seg(XAie_DevInst *dev, const Elf32_Phdr *phdr) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    return phdr->p_filesz != 0U && phdr->p_paddr < cm->ProgMemSize && phdr->p_paddr + phdr->p_memsz <= cm->ProgMemSize;
+}
+#if defined(AIEHLC_PM_WARM_SKIP_VERIFY) && AIEHLC_PM_WARM_SKIP_VERIFY
+static void rt_pm_warm_verify(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *src, const Elf32_Phdr *phdr) {
+    const XAie_CoreMod *cm = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    const u32 nwords = phdr->p_filesz / 4U; /* full words that came from the file */
+    u32 bad = 0;
+    for (u32 i = 0; i < nwords; i++) {
+        u32 exp, got = 0xdeadbeefU;
+        memcpy(&exp, src + 4U * i, 4U);
+        XAie_Read32(dev, XAie_GetTileAddr(dev, loc.Row, loc.Col) + cm->ProgMemHostOffset + phdr->p_paddr + 4U * i, &got);
+        bad += (got != exp);
+    }
+    printf("[aie_runtime] pm-warm-skip verify tile(%u,%u) pm 0x%x+%u words: %u mismatched\n", loc.Col, loc.Row,
+           phdr->p_paddr, nwords, bad);
+}
+#endif
+#endif
+
+/* mode 1: skip every zero-filled (.bss-only) segment (unsafe if the kernel
+ *         reads a zero-initialised static before writing it).
+ * mode 2: skip only .bss segments made entirely of DMA port buffers; all other
+ *         .bss is still zero-filled. */
+static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elfmem,
+                                             int mode) {
     g_elf_load_seq++;
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elfmem;
-    u32 skipped = 0, loaded = 0;
+    u32 skipped = 0, loaded = 0, skipped_bytes = 0, zfill_bytes = 0;
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+    const int pm_warm = rt_pm_warm_resident(dev, loc, elfmem);
+    if (!pm_warm)
+        g_pm_warm_cold_loads++;
+    rt_pm_warm_record(dev, loc, elfmem, 0); /* invalid while PM is being (re)written */
+#endif
     for (u32 ph = 0; ph < ehdr->e_phnum; ph++) {
         const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elfmem + ehdr->e_phoff + (u64)ph * sizeof(Elf32_Phdr));
         if (phdr->p_type != (u32)PT_LOAD)
             continue;
-        if (phdr->p_filesz == 0U) {
+        if (phdr->p_filesz == 0U &&
+            (mode == 1 || __Runtime_elf_range_is_port_bufs(elfmem, phdr->p_vaddr, phdr->p_vaddr + phdr->p_memsz))) {
             skipped++;
+            skipped_bytes += phdr->p_memsz;
+            continue;
+        }
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+        if (pm_warm && rt_pm_is_pm_seg(dev, phdr)) {
+            g_pm_warm_skipped_segs++;
+#if defined(AIEHLC_PM_WARM_SKIP_VERIFY) && AIEHLC_PM_WARM_SKIP_VERIFY
+            rt_pm_warm_verify(dev, loc, elfmem + phdr->p_offset, phdr);
+#endif
+            continue;
+        }
+#endif
+        if (phdr->p_memsz > phdr->p_filesz)
+            zfill_bytes += phdr->p_memsz - phdr->p_filesz;
+        if (phdr->p_filesz == 0U && __Runtime_dm_zero_wide(dev, loc, phdr->p_paddr, phdr->p_memsz)) {
+            loaded++;
+            continue;
+        }
+        if (phdr->p_filesz != 0U && __Runtime_pm_write_wide(dev, loc, elfmem + phdr->p_offset, phdr)) {
+            loaded++;
             continue;
         }
         AieRC rc = XAie_LoadElfSection(dev, loc, elfmem + phdr->p_offset, phdr);
@@ -6914,12 +7320,24 @@ static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc
             return rc;
         loaded++;
     }
-    AIEHLC_LOG(printf("[aie_runtime] skip-bss load: %u segs loaded, %u bss segs skipped\n", loaded, skipped));
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+    rt_pm_warm_record(dev, loc, elfmem, 1); /* every PM segment is now this ELF's */
+#endif
+    AIEHLC_LOG(printf("[aie_runtime] skip-bss(mode %d) load: %u segs loaded (%u B zero-filled), %u bss segs skipped "
+                      "(%u B)\n",
+                      mode, loaded, zfill_bytes, skipped, skipped_bytes));
+#if defined(AIEHLC_PM_WARM_SKIP) && AIEHLC_PM_WARM_SKIP
+    AIEHLC_LOG(printf("[aie_runtime] pm-warm-skip tile(%u,%u): %s (total %u PM segs skipped, %u cold loads)\n", loc.Col,
+                      loc.Row, pm_warm ? "warm" : "cold", g_pm_warm_skipped_segs, g_pm_warm_cold_loads));
+#endif
     return XAIE_OK;
 }
 #endif
 
 #if !defined(__AIESIM__)
+/* 0 = zero-fill all .bss (XAie_LoadElfMem), 1 = skip all .bss, 2 = skip only
+ * port-buffer .bss. Build default -DAIEHLC_SKIP_BSS_DEFAULT=<n> (aiehlc.sh
+ * --skip-bss / --skip-port-bss), else env AIEHLC_SKIP_BSS=0|1|2|ports. */
 static int __Runtime_skip_bss_enabled(void) {
 #if defined(AIEHLC_SKIP_BSS_DEFAULT)
     return (AIEHLC_SKIP_BSS_DEFAULT);
@@ -6927,7 +7345,12 @@ static int __Runtime_skip_bss_enabled(void) {
     static int s_skip_bss = -1;
     if (s_skip_bss < 0) {
         const char *e = getenv("AIEHLC_SKIP_BSS");
-        s_skip_bss = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (!e || !e[0] || e[0] == '0')
+            s_skip_bss = 0;
+        else if (e[0] == '2' || e[0] == 'p')
+            s_skip_bss = 2;
+        else
+            s_skip_bss = 1;
     }
     return s_skip_bss;
 #endif
@@ -6937,11 +7360,13 @@ static int __Runtime_skip_bss_enabled(void) {
 static void __Runtime_load_kernel_elf(XAie_DevInst *dev, XAie_LocType loc, unsigned char *elfmem) {
     g_elf_load_seq++;
 #if !defined(__AIESIM__)
-    if (__Runtime_skip_bss_enabled()) {
-        __Runtime_load_elf_mem_skip_bss(dev, loc, elfmem);
+    const int skip_mode = __Runtime_skip_bss_enabled();
+    if (skip_mode) {
+        __Runtime_load_elf_mem_skip_bss(dev, loc, elfmem, skip_mode);
         return;
     }
 #endif
+    AIEHLC_PM_FOREIGN_BUMP();
     XAie_LoadElfMem(dev, loc, elfmem);
 }
 
@@ -7131,13 +7556,14 @@ static uint32_t rt_ctrl_elf_count_pkts(XAie_DevInst *dev, const uint8_t *elf, XA
     uint32_t npkt = 0U;
     for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
         const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elf + ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize);
-        if (phdr->p_type != (uint32_t)PT_LOAD || phdr->p_filesz == 0U)
+        const uint32_t len = rt_cpe_seg_load_len(elf, phdr);
+        if (len == 0U)
             continue;
         uint32_t tile_addr = 0U;
         if (rt_ctrl_elf_target(dev, loc, phdr->p_paddr, &tile_addr) != XAIE_OK ||
             tile_addr == RT_CTRL_ELF_SKIP_ADDR)
             continue;
-        npkt += (phdr->p_filesz + (uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS - 1U) /
+        npkt += (len + (uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS - 1U) /
                 ((uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS);
     }
     return npkt;
@@ -7180,22 +7606,23 @@ static AieRC rt_ctrl_elf_core_reset(XAie_DevInst *dev, uint32_t *pkt, uint32_t m
 
 static inline uint32_t rt_ctrl_odd_parity_bit(uint32_t v) { return (uint32_t)(!__builtin_parity(v)) << 31U; }
 
-static AieRC rt_ctrl_elf_fill_seg_packed(const uint8_t *src, uint32_t filesz, uint32_t tile_addr, uint32_t *pkt,
-                                         uint32_t capacity, uint32_t *acc, uint32_t *payload_words,
+/* Writes @len bytes at @tile_addr: @filesz bytes from @src, then zeros (.bss tail). */
+static AieRC rt_ctrl_elf_fill_seg_packed(const uint8_t *src, uint32_t filesz, uint32_t len, uint32_t tile_addr,
+                                         uint32_t *pkt, uint32_t capacity, uint32_t *acc, uint32_t *payload_words,
                                          uint32_t *last_addr, uint32_t *last_value) {
     const uint32_t pkt_hdr = (uint32_t)ACR_ID_BCAST | rt_ctrl_odd_parity_bit((uint32_t)ACR_ID_BCAST);
     uint32_t pw = *payload_words;
     uint32_t off = 0U;
     uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
     uint32_t nwords = 0U;
-    for (; off < filesz; off += (uint32_t)sizeof(words)) {
-        uint32_t chunk = filesz - off < (uint32_t)sizeof(words) ? filesz - off : (uint32_t)sizeof(words);
+    for (; off < len; off += (uint32_t)sizeof(words)) {
+        uint32_t chunk = len - off < (uint32_t)sizeof(words) ? len - off : (uint32_t)sizeof(words);
         nwords = (chunk + 3U) / 4U;
         if (pw + 2U + nwords > capacity)
             return XAIE_ERR;
-        if (chunk < (uint32_t)sizeof(words))
-            memset(words, 0, sizeof(words));
-        memcpy(words, src + off, chunk);
+        memset(words, 0, sizeof(words));
+        if (off < filesz)
+            memcpy(words, src + off, filesz - off < chunk ? filesz - off : chunk);
         uint32_t ctrl = (((nwords - 1U) & 0x3U) << 20U) | ((tile_addr + off) & 0xFFFFFU);
         pkt[pw] = pkt_hdr;
         pkt[pw + 1U] = ctrl | rt_ctrl_odd_parity_bit(ctrl);
@@ -7253,7 +7680,8 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const __Runtime_CtrlRowFabric *
         return reset_rc;
     for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
         const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elf + ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize);
-        if (phdr->p_type != (uint32_t)PT_LOAD || phdr->p_filesz == 0U)
+        const uint32_t len = rt_cpe_seg_load_len(elf, phdr);
+        if (len == 0U)
             continue;
         uint32_t tile_addr = 0U;
         AieRC rc = rt_ctrl_elf_target(dev, loc, phdr->p_paddr, &tile_addr);
@@ -7262,7 +7690,7 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const __Runtime_CtrlRowFabric *
         if (tile_addr == RT_CTRL_ELF_SKIP_ADDR)
             continue;
         if (packed) {
-            rc = rt_ctrl_elf_fill_seg_packed(elf + phdr->p_offset, phdr->p_filesz, tile_addr, pkt,
+            rc = rt_ctrl_elf_fill_seg_packed(elf + phdr->p_offset, phdr->p_filesz, len, tile_addr, pkt,
                                              max_acc * RT_CTRL_ELF_PKT_STRIDE, &acc, &payload_words, &last_addr,
                                              &last_value);
             if (rc != XAIE_OK)
@@ -7270,14 +7698,17 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const __Runtime_CtrlRowFabric *
             continue;
         }
         uint32_t byte_off = 0U;
-        while (byte_off < phdr->p_filesz) {
+        while (byte_off < len) {
             uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
-            uint32_t chunk_bytes = phdr->p_filesz - byte_off;
+            uint32_t chunk_bytes = len - byte_off;
             if (chunk_bytes > sizeof(words))
                 chunk_bytes = sizeof(words);
             uint32_t nwords = (chunk_bytes + 3U) / 4U;
             memset(words, 0, sizeof(words));
-            memcpy(words, elf + phdr->p_offset + byte_off, chunk_bytes);
+            if (byte_off < phdr->p_filesz) {
+                uint32_t nfile = phdr->p_filesz - byte_off;
+                memcpy(words, elf + phdr->p_offset + byte_off, nfile < chunk_bytes ? nfile : chunk_bytes);
+            }
             rc = rt_ctrl_elf_put(pkt, max_acc, packed, &acc, &payload_words, tile_addr + byte_off, words, nwords);
             if (rc != XAIE_OK)
                 return rc;
@@ -7727,6 +8158,7 @@ void *__Runtime_ctrl_kernel_pkt_build(__Runtime_CtrlRowFabric *fab, const unsign
 static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, int32_t bd_id, int32_t mm2s_ch) {
     if (!fab || !fab->dev || !elf || fab->nrows == 0U)
         return XAIE_INVALID_ARGS;
+    AIEHLC_PM_FOREIGN_BUMP();
     XAie_LocType loc = XAie_TileLoc(fab->rows[0].col_lo, fab->rows[0].row);
     if (g_ctrl_high_throughput_ready && s_active_kernel_pkt) {
         AieRC arc = rt_ctrl_load_elf_aot(fab, elf, loc, bd_id, mm2s_ch);
@@ -7888,9 +8320,14 @@ static void rt_kernel_profile_setup(XAie_DevInst *dev, struct_kernel_group kg) {
     }
     if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_CORE_PERF_COUNTER)) {
         int chosen = 0;
+        s_core_perf_ntiles = 0;
+        s_core_perf_snap_pending = 1;
+        s_core_perf_snap_valid = 0;
         for (uint32_t i = 0; i < kg.num_tiles; i++) {
             if (__Runtime_is_aie_core_tile(kg.tiles[i])) {
                 __Runtime_core_perf_setup(dev, kg.tiles[i]);
+                if (s_core_perf_ntiles < RT_CORE_PERF_MAX_TILES)
+                    s_core_perf_tiles[s_core_perf_ntiles++] = kg.tiles[i];
                 if (!chosen) {
                     s_core_perf_probe_tile = kg.tiles[i];
                     s_core_perf_probe_valid = 1;
