@@ -229,11 +229,43 @@ def _aiegraph_ops_for(kind: str, ops: list) -> list:
     """
     if "conv2d" not in ops:
         return []
-    # Two `add`s means bias + residual join; the second becomes its own op.
-    residual = ops.count("add") > 1
-    if residual:
+    joins = _residual_joins(ops)
+    if joins == 0:
+        return ["conv_bn_relu" if "relu" in ops else "conv_bn"]
+    if not _float_bias(ops):
+        # QNN path (ResNet-18): ReLU is folded into a requant ``clip`` that
+        # cannot be told apart from int8 saturation, so keep the ResNet
+        # assumption that a single join is the block tail.
+        return ["conv_bn", "residual_add_relu"] if joins == 1 else []
+    # Float import path: the activation is a real ``relu`` op. A join without
+    # it (UNet skip / timestep / attention residual) or more than one join has
+    # no aiegraph op -- leave it unmapped rather than claim it as conv_bn and
+    # silently drop the add, or append a ReLU the model does not have.
+    if joins == 1 and "relu" in ops:
         return ["conv_bn", "residual_add_relu"]
-    return ["conv_bn_relu" if "relu" in ops else "conv_bn"]
+    return []
+
+
+def _float_bias(ops: list) -> bool:
+    """True when the conv bias came in as ``nn.bias_add``.
+
+    ``ops`` is either real Relay op names (``bias_add``) or the underscore-split
+    tokens of the fused function name (``bias``, ``add``); accept both.
+    """
+    return "bias_add" in ops or "bias" in ops
+
+
+def _residual_joins(ops: list) -> int:
+    """How many element-wise ``add``s in a fused conv are residual joins.
+
+    Exactly one bias is assumed. It arrives as ``bias_add`` (one op name, not
+    counted as ``add``), as tokens ``bias`` + ``add``, or as a plain ``add``
+    (BN folded, the ResNet-18 path); in the last two one ``add`` is the bias.
+    """
+    adds = ops.count("add")
+    if "bias_add" in ops:
+        return adds
+    return max(adds - 1, 0)
 
 
 def build_nodes(manifest: dict, graph: dict) -> list:

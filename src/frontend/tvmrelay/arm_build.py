@@ -215,6 +215,103 @@ def param_offsets(blob_path: Path) -> dict:
     return out
 
 
+def params_inplace() -> bool:
+    """``AIEGRAPH_PARAMS_INPLACE=1`` (aiegraph-unet-multiinput): kernels read the
+    weights straight out of the linked blob instead of a ``.bss`` copy. For
+    graphs whose weights are too big to hold twice in the 2 GiB DDR_LOW0 region
+    (bk-sdm-tiny UNet: 1.29 GB fp32). Off by default -- ResNet is unchanged."""
+    return os.environ.get("AIEGRAPH_PARAMS_INPLACE") == "1"
+
+
+def params_wdtype() -> str:
+    """``AIEGRAPH_WDTYPE=bf16`` (sprint unet-bf16-streamload, needs
+    PARAMS_INPLACE): fp32 weights are stored in weights.bin as compact bf16
+    (round-to-nearest-even) and expanded per kernel call into one reusable
+    static fp32 scratch (``g_wscratch``, .bss -- never malloc). Default fp32."""
+    return os.environ.get("AIEGRAPH_WDTYPE", "fp32")
+
+
+def f32_to_bf16_rne(a):
+    """fp32 -> bf16 bits (uint16), round-to-nearest-even. Same rounding as
+    ``torch.Tensor.to(torch.bfloat16)`` (Shuhua's ``bf()``); NaN stays quiet NaN."""
+    import numpy as np
+    u = np.ascontiguousarray(a, dtype="<f4").view("<u4").astype(np.uint64)
+    r = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+    nan = np.isnan(np.asarray(a, dtype="<f4"))
+    if nan.any():
+        r[nan] = ((u[nan] >> 16) | 0x40).astype(np.uint16)
+    return r
+
+
+def write_aligned_blob(params_path: Path, offsets: dict, out_path: Path,
+                       align: int = 64, bf16_names=()) -> dict:
+    """Raw weights, each at an ``align``-byte offset, into ``out_path``.
+    Returns the new ``{name: (offset, nbytes)}``. Bytes are copied verbatim,
+    except names in ``bf16_names`` (fp32 tensors) which are written as bf16 RNE
+    (nbytes halves)."""
+    data = params_path.read_bytes()
+    new, pos = {}, 0
+    with open(out_path, "wb") as f:
+        for name, (off, nbytes) in sorted(offsets.items(), key=lambda kv: kv[1][0]):
+            pad = (-pos) % align
+            f.write(b"\0" * pad)
+            pos += pad
+            raw = data[off:off + nbytes]
+            if name in bf16_names:
+                import numpy as np
+                raw = f32_to_bf16_rne(np.frombuffer(raw, dtype="<f4")).tobytes()
+            f.write(raw)
+            new[name] = (pos, len(raw))
+            pos += len(raw)
+    return new
+
+
+def _bf16_layout(in_eids, bf16_eids):
+    """``[(eid, blob_off, elems, scratch_byte_off)]`` for one call's bf16 weights."""
+    out, pos, seen = [], 0, set()
+    for e in in_eids:
+        if e in bf16_eids and e not in seen:
+            seen.add(e)
+            off, elems = bf16_eids[e]
+            out.append((e, off, elems, pos))
+            pos += (elems * 4 + 63) // 64 * 64
+    return out, pos
+
+
+def _bf16_scratch_decl(nodes, eid, bf16_eids) -> list:
+    """The static fp32 scratch every APU call expands its bf16 weights into,
+    sized by the call with the most fp32 weight bytes. .bss, never malloc."""
+    if not bf16_eids:
+        return []
+    need = 0
+    for node in nodes:
+        if node.get("op") != "tvm_op" or node["attrs"]["func_name"] == "__nop":
+            continue
+        _, pos = _bf16_layout([eid(s, k) for s, k, _ in node["inputs"]], bf16_eids)
+        need = max(need, pos)
+    return [
+        "/* AIEGRAPH_WDTYPE=bf16: weights.bin holds bf16 (RNE); each call expands its",
+        " * weights into this one reusable fp32 scratch (largest call: %d B). */" % need,
+        "#define GRAPH_WSCRATCH_BYTES %dULL" % need,
+        "static uint8_t g_wscratch[GRAPH_WSCRATCH_BYTES] __attribute__((aligned(64)));",
+        "static void graph_bf16_expand(float *dst, const uint16_t *src, uint64_t n) {",
+        "    uint32_t *d = (uint32_t *)dst;",
+        "    for (uint64_t i = 0; i < n; ++i) d[i] = (uint32_t)src[i] << 16;",
+        "}",
+        "unsigned long long graph_wscratch_bytes(void) { return GRAPH_WSCRATCH_BYTES; }",
+    ]
+
+
+def _bf16_expand_lines(in_eids, bf16_eids) -> list:
+    lay, _ = _bf16_layout(in_eids, bf16_eids)
+    out = []
+    for e, off, elems, so in lay:
+        out += [f"    graph_bf16_expand((float *)(g_wscratch + {so}), "
+                f"(const uint16_t *)(g_params + {off}), {elems}ULL);",
+                f"    tensors[{e}].data = g_wscratch + {so};"]
+    return out
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Driver generation
 # ═══════════════════════════════════════════════════════════════════════════
@@ -447,7 +544,8 @@ def graph_widths(nodes: list, shapes: list) -> tuple:
     return max_ndim, max_args
 
 
-def _driver_init(sids, shapes, dltypes, offsets, nodes, eid) -> list:
+def _driver_init(sids, shapes, dltypes, offsets, nodes, eid, inplace=False,
+                 has_buf=None, bf16_eids=None) -> list:
     """``(lines, n_params)`` -- the body of ``graph_init()``.
 
     DLTensor headers, then one ``memcpy`` per weight out of the linked blob.
@@ -465,8 +563,10 @@ def _driver_init(sids, shapes, dltypes, offsets, nodes, eid) -> list:
             0 if dltype.startswith("int") else 1)
         for d, dim in enumerate(shape):
             init.append(f"    shape_store[{i}][{d}] = {dim};")
+        data = (f"buf_{sid}" if not inplace or sid in has_buf
+                else "0 /* in-place param, set below */")
         init += [
-            f"    tensors[{i}].data = buf_{sid};",
+            f"    tensors[{i}].data = {data};",
             f"    tensors[{i}].device.device_type = 1;",
             f"    tensors[{i}].device.device_id = 0;",
             f"    tensors[{i}].ndim = {len(shape)};",
@@ -487,8 +587,15 @@ def _driver_init(sids, shapes, dltypes, offsets, nodes, eid) -> list:
         if name not in offsets:
             continue            # the network input, not a parameter
         off, nbytes = offsets[name]
-        init.append(f"    memcpy(buf_{sids[eid(node_idx)]}, "
-                    f"g_params + {off}, {nbytes});   /* {name} */")
+        if inplace and eid(node_idx) in (bf16_eids or {}):
+            init.append(f"    tensors[{eid(node_idx)}].data = 0;"
+                        f"   /* {name}: bf16 @{off}+{nbytes} B, expanded per call */")
+        elif inplace:
+            init.append(f"    tensors[{eid(node_idx)}].data = (void *)(g_params + {off});"
+                        f"   /* {name}, {nbytes} B in place */")
+        else:
+            init.append(f"    memcpy(buf_{sids[eid(node_idx)]}, "
+                        f"g_params + {off}, {nbytes});   /* {name} */")
         n_params += 1
     init += ["}", ""]
     return init, n_params
@@ -553,9 +660,35 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
 
     max_ndim, max_args = graph_widths(nodes, shapes)
 
+    offsets = param_offsets(params_path)
+    inplace = params_inplace()
+    param_eids = set()
+    bf16_eids = {}          # eid -> (blob offset, elems) of a bf16-stored fp32 weight
+    if inplace:
+        bf16_names = set()
+        if params_wdtype() == "bf16":
+            bf16_names = {node["name"] for i, node in enumerate(nodes)
+                          if node.get("op") == "null" and node["name"] in offsets
+                          and dltypes[row_ptr[i]] == "float32"}
+        elif params_wdtype() != "fp32":
+            raise ValueError(f"AIEGRAPH_WDTYPE={params_wdtype()!r}: fp32|bf16")
+        offsets = write_aligned_blob(params_path, offsets, out_dir / "weights.bin",
+                                     bf16_names=bf16_names)
+        param_eids = {row_ptr[i] for i, node in enumerate(nodes)
+                      if node.get("op") == "null" and node["name"] in offsets}
+        bf16_eids = {row_ptr[i]: (offsets[node["name"]][0], offsets[node["name"]][1] // 2)
+                     for i, node in enumerate(nodes)
+                     if node.get("op") == "null" and node["name"] in bf16_names}
+    elif params_wdtype() != "fp32":
+        raise ValueError("AIEGRAPH_WDTYPE=bf16 needs AIEGRAPH_PARAMS_INPLACE=1")
+    act_sids = {sid for e, sid in enumerate(sids) if e not in param_eids}
+
     # One buffer per storage id, sized by the largest tensor assigned to it.
+    # In-place params own no buffer (unless an activation shares the sid).
     sizes: dict = {}
-    for sid, shape, dltype in zip(sids, shapes, dltypes):
+    for e, (sid, shape, dltype) in enumerate(zip(sids, shapes, dltypes)):
+        if inplace and sid not in act_sids:
+            continue
         elems = 1
         for dim in shape:
             elems *= dim
@@ -564,8 +697,6 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
     if total > DDR_BYTES:
         raise ValueError(f"graph needs {total:,} B of buffers, over the "
                          f"{DDR_BYTES:,} B the BSP linker script maps")
-
-    offsets = param_offsets(params_path)
 
     # entry index -> flat tensor index, so a node's inputs resolve to storage.
     def eid(node_idx: int, slot: int = 0) -> int:
@@ -634,6 +765,7 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         "",
         f"static uint8_t kernel_ws[{_KERNEL_WS}] __attribute__((aligned(64)));",
         "static const uint8_t *g_params;",
+    ] + _bf16_scratch_decl(nodes, eid, bf16_eids) + [
         "",
         "/* Both widths come from the graph, not from a round number: the",
         " * widest node takes %d kernel arguments and the widest tensor is"
@@ -651,7 +783,8 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
     ]
 
     init_lines, n_params = _driver_init(sids, shapes, dltypes,
-                                        offsets, nodes, eid)
+                                        offsets, nodes, eid, inplace=inplace,
+                                        has_buf=set(sizes), bf16_eids=bf16_eids)
     lines += init_lines
 
     # Entry index -> (graph name, blob offset, bytes) for every weight, as
@@ -677,6 +810,22 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
     for dim in shapes[out_eid]:
         out_elems *= dim
 
+    # aiegraph-unet-multiinput: every graph input (null node, not a weight), in
+    # graph order, reachable by index; graph_input() stays input 0.
+    in_idxs = [i for i, node in enumerate(nodes)
+               if node.get("op") == "null" and node["name"] not in offsets]
+    lines += ["#define GRAPH_N_INPUTS %d" % len(in_idxs),
+              "int graph_n_inputs(void) { return %d; }" % len(in_idxs),
+              "void *graph_input_k(int k) {"]
+    for k, i in enumerate(in_idxs):
+        lines.append("    if (k == %d) return (void *)buf_%d;   /* %s %s %s */"
+                     % (k, sids[eid(i)], nodes[i]["name"], shapes[eid(i)],
+                        dltypes[eid(i)]))
+    lines += ["    return 0;", "}",
+              "const char *graph_input_name(int k) {"]
+    for k, i in enumerate(in_idxs):
+        lines.append('    if (k == %d) return "%s";' % (k, nodes[i]["name"]))
+    lines += ["    return \"\";", "}"]
     lines += [
         "float *graph_input(void) { return (float *)buf_%d; }"
         % sids[eid(input_idx)],
@@ -712,6 +861,7 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         n_out = int(node["attrs"].get("num_outputs", 1))
         out_eids = [eid(node_idx, k) for k in range(n_out)]
         arg_eids = in_eids + out_eids
+        lines += _bf16_expand_lines(in_eids, bf16_eids)
         for slot, tensor_idx in enumerate(arg_eids):
             lines.append(f"    args[{slot}].v_handle = &tensors[{tensor_idx}];")
         tl = dict(param_of=param_of, roles=roles.get(fn, {}), nodes=nodes,
@@ -1574,6 +1724,7 @@ main.o: main.c input_image.h imagenet_labels.h
 # otherwise main.c's extern symbol will not resolve.
 weights.o: weights.bin
 \t$(LD) -r -b binary -o $@ $<
+\t$(CROSS)objcopy --set-section-alignment .data=64 $@
 
 # ───────────────────────────────────────────────────────────────────────────
 #  LOCAL (x86 / this host) build -- `make local`, `make run-local`
@@ -2426,7 +2577,8 @@ def build_arm_elf(out_dir, repo_root=None, c_name="resnet18.c",
     summary = generate_driver(graph, params, build, c_source=out_dir / c_name,
                               verbose=verbose)
     _write_tvm_header_stubs(build)
-    shutil.copyfile(params, build / "weights.bin")
+    if not params_inplace():
+        shutil.copyfile(params, build / "weights.bin")   # else: aligned blob written above
 
     # The image the ELF classifies, plus the names it prints. Written before
     # the Makefile so a missing image fails here rather than as a mysterious
