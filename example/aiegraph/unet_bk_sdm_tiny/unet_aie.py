@@ -32,18 +32,11 @@ import sys as _sys  # noqa: E402
 _SRC = _os.path.normpath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "../../../src"))
 if _SRC not in _sys.path:  # C text lives in src/aiednn/<cat>/ (kernels) and src/aiegraph/runtime/
     _sys.path.insert(0, _SRC)
-from aiednn import path as _tplpath, runtime_source as _rt, template as _tpl  # noqa: E402
+from aiednn import path as _tplpath  # noqa: E402
 
 _HERE = Path(__file__).resolve().parent  # UNet-only C text lives next to this file
 
 
-def _local(fn):
-    with open(_HERE / fn, encoding="utf-8", newline="") as f:
-        return f.read()
-
-
-P2K = _HERE / "bf16_gemm_convin.cc"  # 64x64 ports (8e7254d, board PASS p0_board.log)
-P2K_KT = _HERE / "bf16_gemm_convin_ktimer.cc"  # --ktimer: core timer tail, b 80x64 / c 64x80
 ENTRY = "aiek_unetconv"
 
 
@@ -232,83 +225,22 @@ PROF_C = _bm.prof_c()
 
 
 def check_data_arg0(layers_dir: Path, sel: list) -> None:
-    """The TVM kernel's conv reads its activation from p0 (not a residual/temb arg)."""
-    for sym in sorted({c["symbol"] for c in sel}):
-        hits = [p for p in layers_dir.glob("*/*.c") if f" {sym}(void* args" in p.read_text()]
-        assert len(hits) == 1, (sym, hits)
-        t = hits[0].read_text()
-        src = set()
-        for line in t.splitlines():
-            if "p1_1)[" in line and "*" in line:
-                src |= {x for x in re.findall(r"\(\(float\*\)(\w+)\)\[", line) if x != "p1_1"}
-        if "data_pad" in src:
-            src.discard("data_pad")
-            for line in t.splitlines():
-                if re.search(r"condval = |data_pad\)\[.*\] = ", line):
-                    src |= set(re.findall(r"\(\(float\*\)(p\d+_1)\)\[", line))
-        assert src == {"p0_1"}, f"{sym} ({hits[0].name}): conv activation from {src}, expected p0_1"
-    log(f"checked {len({c['symbol'] for c in sel})} TVM conv kernels: activation = arg 0, weight = arg 1")
+    """The TVM kernel's conv reads its activation from p0: aiegraph.callsite.check_conv_arg0."""
+    from aiegraph.callsite import check_conv_arg0
+    n = check_conv_arg0(layers_dir, [c["symbol"] for c in sel])
+    log(f"checked {n} TVM conv kernels: activation = arg 0, weight = arg 1")
 
 
 # ─────────────────────────────── kernel source ───────────────────────────────
-HOST_CC = (_tpl("conv2d/tile64_conv_host.cc") + _tpl("elementwise/epilogue_bias_residual.cc") + _tpl("conv2d/tile64_conv_entry.cc"))
+# unet-decl P4: the 64x64x64 tile path (HOST_CC, REF_C, kernel_text, kt_select, write_kernel) is off the build
+# (build_unet.py needs --kincore); it can be recovered at d5e9f15. The --ctrlpkt pragmas come from aiegraph.kincore.
+from aiegraph import kincore as _kincore  # noqa: E402
 
-REF_C = _tpl("conv2d/conv_bf16_carrier_ref.c")
-
-
-def kernel_text(ktimer: bool = False) -> str:
-    src = (P2K_KT if ktimer else P2K).read_text()
-    m = re.search(r"(__global__ void gemm_bf16\(.*?\n\})\s*\n\s*int main\(", src, re.S)
-    assert m, "gemm_bf16 not found"
-    return m.group(1)
-
-
-SOFTFLOAT_RM = _local("softfloat_rm_reset.cc")
-
-
-CTRLPKT_PRAGMAS = (  # --ctrlpkt aot (P2a): spelled as aiehlc prints them (src/llvm/aiehlc.cc); no KERNELCONFIGOFFLOAD (P3)
-    _tpl("gemm/ctrlpkt_aot_pragmas.h"))
 # --ctrlpkt aot-kco (build_unet.py) / UNET_CTRLPKT_KCO=1 in the env (kacc_bench.sh -> kacc_gemm.py): the same 5
 # pragmas + KERNELCONFIGOFFLOAD (the core programs its own DMA, .TM in kernel.lst); one switch for probe and full net
 CTRLPKT_KCO = os.environ.get("UNET_CTRLPKT_KCO", "0") == "1"
-if CTRLPKT_KCO:
-    CTRLPKT_PRAGMAS += _tpl("gemm/ctrlpkt_kco_pragma.h")
-CTRLPKT_NPRAGMAS = CTRLPKT_PRAGMAS.count("#pragma")
-
-
-def kt_select(text: str, ktimer: bool) -> str:
-    """keep /*KT+*/../*KT-*/ spans with --ktimer, /*NK+*/../*NK-*/ spans without; drop the other"""
-    keep, drop = (("KT", "NK") if ktimer else ("NK", "KT"))
-    text = re.sub(r"/\*%s\+\*/.*?/\*%s-\*/" % (drop, drop), "", text, flags=re.S)
-    text = text.replace("/*%s+*/" % keep, "").replace("/*%s-*/" % keep, "")
-    assert "/*KT" not in text and "/*NK" not in text
-    return text
-
-
-def write_kernel(kdst: Path, spec: str, maxacc: int, warm: bool = False, ctrlpkt: str = "off",
-                 ktimer: bool = False) -> Path:
-    spec = spec.replace('"out ', '"export    aiednn_aie_conv\\n"\n        "export    aiednn_aie_stats\\n"\n'
-                        '        "export    aiednn_aie_launch_stats\\n"\n'
-                        '        "export    aiednn_aie_host_split_site\\n"\n'
-                        '        "export    aiednn_aie_host_split_line\\n"\n' +
-                        ('        "export    aiednn_aie_ktimer_stats\\n"\n' if ktimer else '') +
-                        '        "export    aiednn_aie_split_stats\\n"\n        "out ', 1)
-    assert "export    aiednn_aie_conv" in spec, spec
-    kdst.mkdir(parents=True, exist_ok=True)
-    kcc = kdst / f"{ENTRY}.cc"
-    head = _local("tile64_conv_head.cc").replace("@E@", ENTRY).replace("@SRC@", str(P2K_KT if ktimer else P2K))
-    if ctrlpkt == "aot":
-        head = CTRLPKT_PRAGMAS + head
-    ktext = kernel_text(ktimer)
-    if warm:
-        i = ktext.index(") {\n") + len(") {\n")
-        ktext = ktext[:i] + SOFTFLOAT_RM + ktext[i:]
-    kcc.write_text(head + ktext + "\n" + kt_select(HOST_CC, ktimer).replace("@MAXACC@", str(maxacc)).replace("@WARM@", "1" if warm else "0")
-                   .replace("@CTRLPKT@", "1" if ctrlpkt == "aot" else "0")
-                   .replace("@PART_C0@", "2" if ctrlpkt == "aot" else "3")
-                   .replace("@E@", ENTRY).replace("@SPEC@", spec))
-    (kdst / f"{ENTRY}_ref.c").write_text(REF_C.replace("@E@", ENTRY))
-    return kcc
+CTRLPKT_PRAGMAS = _kincore.ctrlpkt_head("aot-kco" if CTRLPKT_KCO else "aot")
+CTRLPKT_NPRAGMAS = _kincore.ctrlpkt_npragmas("aot-kco" if CTRLPKT_KCO else "aot")
 
 
 # ─────────────────────────────── --kincore (P4bg) ───────────────────────────────
@@ -338,7 +270,7 @@ def kacc_geom(ch: int, k: int, px: int) -> dict:
         raise AssertionError(str(e))
 
 
-KACC_KERNEL = _tpl("gemm/gemm_kacc_kernel.cc")   # C++ template __global__: aiehlc instantiates it per launch
+KACC_KERNEL = _kincore.KACC_KERNEL   # C++ template __global__: aiehlc instantiates it per launch
 
 
 def write_kernel_kacc(kdst: Path, spec: str, shapes: list, warm: bool = False, ctrlpkt: str = "off",

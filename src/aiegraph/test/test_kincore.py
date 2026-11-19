@@ -170,3 +170,31 @@ def test_write_source_rejects_non_identifier_entry(tmp_path):
     with pytest.raises(AiegraphError):
         kincore.write_source(tmp_path, SPEC, SHAPES, entry="aiek-x")
     assert not list(tmp_path.iterdir())
+
+
+# ── ctrlpkt_head / ctrlpkt_npragmas (unet-decl P4: the --ctrlpkt pragmas, was the example's CTRLPKT_PRAGMAS) ──
+def test_ctrlpkt_head_modes():
+    aot, kco = aiednn.template("gemm/ctrlpkt_aot_pragmas.h"), aiednn.template("gemm/ctrlpkt_kco_pragma.h")
+    assert kincore.ctrlpkt_head("off") == ""
+    assert kincore.ctrlpkt_head("aot") == aot
+    assert kincore.ctrlpkt_head("aot-kco") == aot + kco
+    t = kincore.kernel_source(SPEC, SHAPES, entry="aiek_x", ctrlpkt="aot")
+    assert t.startswith(kincore.ctrlpkt_head("aot")) and "KERNELCONFIGOFFLOAD" not in t
+    assert kincore.KACC_KERNEL == aiednn.template("gemm/gemm_kacc_kernel.cc")
+
+
+def test_ctrlpkt_head_rejects_unknown_mode():
+    for bad in ("kco", "AOT", "", None):
+        with pytest.raises(AiegraphError):
+            kincore.ctrlpkt_head(bad)
+
+
+def test_ctrlpkt_npragmas_counts_pragma_lines():
+    assert kincore.ctrlpkt_npragmas("off") == 0
+    assert kincore.ctrlpkt_npragmas("aot") == 5
+    assert kincore.ctrlpkt_npragmas("aot-kco") == 6
+
+
+def test_ctrlpkt_npragmas_rejects_unknown_mode():
+    with pytest.raises(AiegraphError):
+        kincore.ctrlpkt_npragmas("aot+kco")

@@ -13,6 +13,9 @@ import sys
 from pathlib import Path
 
 
+ENTRY = "aiek_unetconv"   # the carrier's aiek entry (aiegraph.kincore.write_source names the unit after it)
+
+
 def log(msg):
     print(f"[build_unet] {msg}", flush=True)
 
@@ -75,13 +78,15 @@ def offload(a, emod, out: Path):
     import aiegraph._env as env
     from aiegraph import boardmain as bm
     env.frontend("")
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import unet_aie as ua
+    if not a.kincore:
+        # unet-decl P4: the 64x64x64 tile path (one launch per tile, the example's own kernel text) is gone;
+        # it can be recovered at d5e9f15 (example/aiegraph/unet_bk_sdm_tiny/unet_aie.py write_kernel)
+        raise SystemExit("--aie without --kincore (64x64 tile path) was dropped in unet-decl; see d5e9f15")
     import aiegraph as ag
     from aiegraph import attnsite, flashattn, kincore
     import frontend.tvmrelay.arm_build as ab
     import onnx
-    from aiegraph.callsite import all_conv_calls, pick_carrier
+    from aiegraph.callsite import all_conv_calls, check_conv_arg0, pick_carrier
     from aiegraph.wlayout import kacc_dense_wlayout, kacc_wlayout
     part = json.loads(a.partition.resolve().read_text())
     work = Path(emod.workdir)
@@ -157,11 +162,6 @@ def offload(a, emod, out: Path):
         shapes = sorted(set(shapes) | (set() if fa else set(attnsite.attn_shapes(att))))
         log(f"KINCORE layers={len(sel) + len(att)} launches_planned={planned} kernel=bf16_gemm_kacc; "
             f"shapes={len(shapes)} (old 64x64x64 launches {part['N']})")
-    else:
-        convsel = sel
-        planned = sum(c["launches"] for c in sel)
-        if planned != int(part["N"]):
-            raise SystemExit(f"planned launches {planned} != partition.json N {part['N']}")
     if att:
         log(f"aie_launches_planned={planned} (partition.json N={part['N']}, {len(sel) + len(att)} layers: "
             f"{len(sel) - len(lin)} conv + {len(lin)} linear + {len(att)} attn, "
@@ -182,28 +182,23 @@ def offload(a, emod, out: Path):
         log(f"  aie attn {c['cid']:3d} {c['role']} g{c['group']} {c['onnx']} -> node {c['node']} {c['func']} "
             f"H={g['H']} M={c['M']} K={c['K']} N={c['N']} swap={g['swap']} ch={g['chs']} k={g['Kp']} px={g['pxs']} "
             f"S={g['S']} launches={c['launches']}")
-    ua.check_data_arg0(work / "layers", convsel)
+    n = check_conv_arg0(work / "layers", [c["symbol"] for c in convsel])
+    log(f"checked {n} TVM conv kernels: activation = arg 0, weight = arg 1")
     lidx, car = pick_carrier(convsel, convs, work / "layers")
     log(f"carrier layer {lidx} ({car['func']}): aiegraph offload builds the gemm_bf16 archive on it")
-    p = emod.offload_prototype(lidx, entry=ua.ENTRY)
-    if a.kincore:
-        kcc = ua.write_kernel_kacc(out / "aiek_src", p.spec(), shapes, warm=(a.launch_opt == "warm"),
-                                   ctrlpkt=a.ctrlpkt,
-                                   lin=linrows,
-                                   **({"att": att} if att else {}), **({"fa": fa} if fa else {}))
-    else:
-        kcc = ua.write_kernel(out / "aiek_src", p.spec(), max(c["M"] * c["N"] for c in sel),
-                              warm=(a.launch_opt == "warm"), ctrlpkt=a.ctrlpkt, ktimer=a.ktimer)
+    p = emod.offload_prototype(lidx, entry=ENTRY)
+    ctrlpkt = "aot-kco" if a.ctrlpkt == "aot" and getattr(a, "ctrlpkt_kco", False) else a.ctrlpkt
+    parts = flashattn.fa_kernel_parts(fa) if fa else attnsite.attn_kernel_parts(att) if att else {}
+    kcc = kincore.write_source(out / "aiek_src", p.spec(), shapes, entry=ENTRY, warm=(a.launch_opt == "warm"),
+                               ctrlpkt=ctrlpkt, lin=linrows, **parts)
     if a.ctrlpkt == "aot":
-        log(f"ctrlpkt=aot pragmas={ua.CTRLPKT_NPRAGMAS}")
+        log(f"ctrlpkt=aot pragmas={kincore.ctrlpkt_npragmas(ctrlpkt)}")
     log(f"kernel source {kcc}")
     if fa:
         fa_offload_groups(emod, att, kcc, out)
 
     # S1: conv / linear call sites through aiegraph -- one-call groups, the "args" step ABI, bf16 weights
     # pre-laid out for gemm_kacc in weights.bin (aiegraph drops their graph_bf16_expand)
-    if not a.kincore:
-        raise SystemExit("aiegraph conv/linear groups need --kincore (kacc weight layout)")
     # P3 (unet-m4): --keep-layout = fold declarations -- match("conv+layout") (the conv scatter writes the
     # NCHW / NHWC its reader wants), match("linear+layout") (residual into the linear scatter, the next conv
     # reads [M][C] as NHWC), match("dense+silu") (SiLU scale on the dense input, weight pre-packed); every

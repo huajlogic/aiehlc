@@ -193,8 +193,7 @@ def kernel_source(spec: str, shapes: list, *, entry: str, warm: bool = False, ct
     head = (_tpl("gemm/kacc_unit_head.cc").replace("@E@", entry).replace("@SRC@", str(_tplpath("gemm/gemm_kacc_kernel.cc")))
             .replace("@NSHAPES@", str(len(shapes))))
     if ctrlpkt != "off":
-        head = _tpl("gemm/ctrlpkt_aot_pragmas.h") + (_tpl("gemm/ctrlpkt_kco_pragma.h") if ctrlpkt == "aot-kco"
-                                                     else "") + head
+        head = ctrlpkt_head(ctrlpkt) + head
     head += prologue
     ktext = (_tpl("gemm/gemm_kacc_kernel.cc") if shapes else "") + kernels
     from .boardmain import kt_select
@@ -220,6 +219,25 @@ def kernel_source(spec: str, shapes: list, *, entry: str, warm: bool = False, ct
     return head + ktext + "\n" + (host.replace("@MAXACC@", "1").replace("@WARM@", "1" if warm else "0")
                                   .replace("@CTRLPKT@", "1" if on else "0").replace("@PART_C0@", "2" if on else "3")
                                   .replace("@E@", entry).replace("@SPEC@", spec))
+
+
+KACC_KERNEL = _tpl("gemm/gemm_kacc_kernel.cc")   # C++ template __global__: aiehlc instantiates it per launch
+
+
+def ctrlpkt_head(ctrlpkt: str) -> str:
+    """The aiehlc control-packet pragmas a kernel unit starts with: ``"off"`` none, ``"aot"`` the AOT plan
+    (aiednn gemm/ctrlpkt_aot_pragmas.h), ``"aot-kco"`` the same + KERNELCONFIGOFFLOAD (the core programs its
+    own DMA). Raises AiegraphError on any other mode."""
+    if ctrlpkt not in ("off", "aot", "aot-kco"):
+        raise AiegraphError(_STAGE, f"ctrlpkt={ctrlpkt!r}", hint="off, aot or aot-kco")
+    if ctrlpkt == "off":
+        return ""
+    return _tpl("gemm/ctrlpkt_aot_pragmas.h") + (_tpl("gemm/ctrlpkt_kco_pragma.h") if ctrlpkt == "aot-kco" else "")
+
+
+def ctrlpkt_npragmas(ctrlpkt: str) -> int:
+    """Number of pragma lines :func:`ctrlpkt_head` puts in front of a unit (build log / plan check)."""
+    return sum(1 for ln in ctrlpkt_head(ctrlpkt).splitlines() if ln.lstrip().startswith("#pragma"))
 
 
 def write_source(kdst: Path, spec: str, shapes: list, *, entry: str, **kw) -> Path:

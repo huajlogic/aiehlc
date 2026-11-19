@@ -19,7 +19,7 @@ sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(HERE))
 
 from aiegraph import cnn  # noqa: E402
-from aiegraph.callsite import pick_carrier  # noqa: E402
+from aiegraph.callsite import check_conv_arg0, pick_carrier  # noqa: E402
 from aiegraph.errors import AiegraphError  # noqa: E402
 from aiegraph.fold import keep_layout_plan  # noqa: E402
 from aiegraph.wlayout import kacc_dense_wlayout, kacc_wlayout, prelayout_weights  # noqa: E402
@@ -164,6 +164,43 @@ def test_pick_carrier_rejects_ambiguous_definition(tmp_path):
     sel = [dict(node=10, symbol="tvmgen_default_fa")]
     with pytest.raises(AiegraphError, match="2 layer files"):
         pick_carrier(sel, sel, d)
+
+
+# ── check_conv_arg0 (unet-decl P4: was the example's check_data_arg0) ──
+_CONV_DIRECT = (" tvmgen_default_c0(void* args, int32_t* codes) {\n"
+                "  y = (y + (((float*)p0_1)[i] * ((float*)p1_1)[j]));\n}\n")
+_CONV_PADDED = (" tvmgen_default_c1(void* args, int32_t* codes) {\n"
+                "  ((float*)data_pad)[i] = condval = ((float*)p0_1)[i];\n"
+                "  y = (y + (((float*)data_pad)[i] * ((float*)p1_1)[j]));\n}\n")
+_CONV_RESID = (" tvmgen_default_c2(void* args, int32_t* codes) {\n"
+               "  y = (y + (((float*)p2_1)[i] * ((float*)p1_1)[j]));\n}\n")
+
+
+def _conv_layers(tmp_path, files):
+    d = tmp_path / "layers"
+    for name, text in files.items():
+        (d / name).mkdir(parents=True)
+        (d / name / "k.c").write_text("int32_t" + text)
+    return d
+
+
+def test_check_conv_arg0_direct_and_padded(tmp_path):
+    d = _conv_layers(tmp_path, {"0_a": _CONV_DIRECT, "1_b": _CONV_PADDED})
+    assert check_conv_arg0(d, ["tvmgen_default_c0", "tvmgen_default_c1", "tvmgen_default_c0"]) == 2
+
+
+def test_check_conv_arg0_rejects_activation_from_other_arg(tmp_path):
+    d = _conv_layers(tmp_path, {"0_a": _CONV_DIRECT, "2_c": _CONV_RESID})
+    with pytest.raises(AiegraphError, match="p2_1"):
+        check_conv_arg0(d, ["tvmgen_default_c0", "tvmgen_default_c2"])
+
+
+def test_check_conv_arg0_rejects_missing_or_duplicate_definition(tmp_path):
+    d = _conv_layers(tmp_path, {"0_a": _CONV_DIRECT, "1_a": _CONV_DIRECT})
+    with pytest.raises(AiegraphError, match="2 layer files"):
+        check_conv_arg0(d, ["tvmgen_default_c0"])
+    with pytest.raises(AiegraphError, match="0 layer files"):
+        check_conv_arg0(d, ["tvmgen_default_c9"])
 
 
 # ───────────────────────────── keep_layout rows -> layout folds ─────────────────────────────
