@@ -17,13 +17,14 @@ def log(msg):
     print(f"[build_unet] {msg}", flush=True)
 
 
-def keep_layout_step(ua, onnx_path, part: dict, layers: list, out: Path):
-    """GAP-B: partition rows with ``keep_layout`` -- the output stays in the AIE layout, Transposes / Reshapes
-    to its AIE consumers are labels only (aiegraph.partition.plan_keep_layout). Tags ``layers``, writes
-    <out>/keep_layout.json, prints KEEP_LAYOUT. None when no row has the field (build unchanged)."""
+def keep_layout_step(onnx_path, part: dict, layers: list, out: Path, folds=None):
+    """GAP-B: partition rows with ``keep_layout`` (aiegraph.fold.keep_layout_plan; with *folds* each kept
+    producer must be realized by a layout fold). Tags ``layers``, writes <out>/keep_layout.json, prints
+    KEEP_LAYOUT. None when no row has the field (build unchanged)."""
     if not any(L.get("keep_layout") for L in part["layers"]):
         return None
-    keep = ua.keep_layout_plan(onnx_path, part, layers)
+    from aiegraph.fold import keep_layout_plan
+    keep = keep_layout_plan(onnx_path, part, layers, folds=folds)
     out.mkdir(parents=True, exist_ok=True)
     (out / "keep_layout.json").write_text(json.dumps(keep, indent=1))
     log(f"KEEP_LAYOUT edges={keep['kept']} label_ops={keep['label_ops']} "
@@ -80,7 +81,8 @@ def offload(a, emod, out: Path):
     from aiegraph import kincore
     import frontend.tvmrelay.arm_build as ab
     import onnx
-    from aiegraph.callsite import all_conv_calls
+    from aiegraph.callsite import all_conv_calls, pick_carrier
+    from aiegraph.wlayout import kacc_dense_wlayout, kacc_wlayout
     part = json.loads(a.partition.resolve().read_text())
     work = Path(emod.workdir)
     # S1 (unet-m3): aiegraph matches every partition conv / linear row to its TVM call -- one group
@@ -138,7 +140,6 @@ def offload(a, emod, out: Path):
         for k in fa:
             log(f"GFA class {k['idx']} {k['name']} split={k['split']} nkv={k['nkv']} kvl={k['kvl']} units={k['units']} "
                 f"launches/site={k['launches']}")
-    keep = keep_layout_step(ua, a.onnx.resolve(), part, sel + lin + att, out)
     if a.kincore:
         # P4bg: one launch per layer (aiegraph.kincore.kplan, K in the core) -- the partition.json N (64x64x64
         # tile launches) does not apply on this path
@@ -183,7 +184,7 @@ def offload(a, emod, out: Path):
             f"H={g['H']} M={c['M']} K={c['K']} N={c['N']} swap={g['swap']} ch={g['chs']} k={g['Kp']} px={g['pxs']} "
             f"S={g['S']} launches={c['launches']}")
     ua.check_data_arg0(work / "layers", convsel)
-    lidx, car = ua.pick_carrier(convsel, convs, work / "layers")
+    lidx, car = pick_carrier(convsel, convs, work / "layers")
     log(f"carrier layer {lidx} ({car['func']}): aiegraph offload builds the gemm_bf16 archive on it")
     p = emod.offload_prototype(lidx, entry=ua.ENTRY)
     if a.kincore:
@@ -211,6 +212,7 @@ def offload(a, emod, out: Path):
     from aiegraph.fold import step_io
     by_call = {c["group"].calls[0]: c for c in sel}
     groups = [c["group"] for c in sel]
+    folds = None
     if a.keep_layout:
         convg = [c["group"] for c in sel if c["kind"] != "linear"]
         f1 = emod.match("conv+layout", base=convg, log=log)
@@ -218,12 +220,9 @@ def offload(a, emod, out: Path):
         groups += f1 + f2
         log(f"aiegraph match: conv+layout={len(f1)} linear+layout={len(f2)} (folds, removed calls "
             f"{sum(len(g.info['fold'].removed) for g in f1 + f2)})")
-        if keep is not None:   # partition keep_layout edges: each producer must be folded
-            folded = {k for g in f1 + f2 for k in g.calls}
-            miss = [e["node"] for e in keep["edges"] if next(c for c in sel + lin + att
-                                                              if c.get("onnx") == e["node"])["call"] not in folded]
-            if miss:
-                raise SystemExit(f"planned keep_layout edges not realized by a fold: {miss}")
+        folds = f1 + f2
+    # partition keep_layout rows: each kept producer must be one of these folds (--keep-layout)
+    keep = keep_layout_step(a.onnx.resolve(), part, sel + att, out, folds=folds)
     cg = emod.call_graph()
     nw = ng = 0
     for g in emod.merge_groups(groups):
@@ -235,13 +234,13 @@ def offload(a, emod, out: Path):
             rd, wr, args = step_io(cg, g, k) if g.info.get("fold") else (c["group"].x, c["group"].y, None)
             if c["kind"] == "linear":
                 steps.append(ag.step("aiednn_aie_linear", reads=rd, writes=wr, args=args, at=k if args else None,
-                                     weights=c["group"].w.as_bf16(layout=lambda w, c=c: ua.kacc_dense_wlayout(
+                                     weights=c["group"].w.as_bf16(layout=lambda w, c=c: kacc_dense_wlayout(
                                          w, c["N"], c["K"], c["pxs"])),
                                      consts=dict(cid=c["cid"], S=c["S"]), call=("cid", "args", "nargs", "wbf", "S"),
                                      wrap=("UP_AIE_BEGIN", "UP_AIE_END"), tag=f"aie aiednn_aie_lin {c['cid']}"))
             else:
                 steps.append(ag.step("aiednn_aie_conv", reads=rd, writes=wr, args=args, at=k if args else None,
-                                     weights=c["group"].w.as_bf16(layout=lambda w, c=c: ua.kacc_wlayout(
+                                     weights=c["group"].w.as_bf16(layout=lambda w, c=c: kacc_wlayout(
                                          w, c["N"], c["K"], c["M"])),
                                      consts=dict(cid=c["cid"], sh=c["sh"], sw=c["sw"], ph=c["ph"], pw=c["pw"]),
                                      call=("cid", "args", "nargs", "wbf", "sh", "sw", "ph", "pw"),

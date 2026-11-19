@@ -282,24 +282,6 @@ def attn_shapes(att: list) -> list:
     return sorted({(c["geo"]["chs"], c["geo"]["Kp"], c["geo"]["pxs"]) for c in att})
 
 
-def keep_layout_plan(onnx_path, partition: dict, layers: list = ()) -> dict:
-    """GAP-B: the partition rows with ``keep_layout`` (aiegraph.partition.plan_keep_layout: output stays in the
-    AIE layout, Transpose/Reshape on the way are labels only, every consumer is a partition layer).
-    Tags the mapped ``layers`` (map_layers / map_linears / map_attn dicts, by ``onnx`` node name):
-    producer ``keep_layout=<layout>``, consumer ``keep_in=[producer node, ...]``. No row with the field ->
-    ``{"edges": [], ...}`` and the layers are not touched (the generated code stays byte-identical)."""
-    from aiegraph.partition import plan_keep_layout
-    rep = plan_keep_layout(onnx_path, partition)
-    by = {c.get("onnx"): c for c in layers}
-    for e in rep["edges"]:
-        if e["node"] in by:
-            by[e["node"]]["keep_layout"] = e["layout"]
-        for u in e["consumers"]:
-            if u in by:
-                by[u].setdefault("keep_in", []).append(e["node"])
-    return rep
-
-
 def check_data_arg0(layers_dir: Path, sel: list) -> None:
     """The TVM kernel's conv reads its activation from p0 (not a residual/temb arg)."""
     for sym in sorted({c["symbol"] for c in sel}):
@@ -317,17 +299,6 @@ def check_data_arg0(layers_dir: Path, sel: list) -> None:
                     src |= set(re.findall(r"\(\(float\*\)(p\d+_1)\)\[", line))
         assert src == {"p0_1"}, f"{sym} ({hits[0].name}): conv activation from {src}, expected p0_1"
     log(f"checked {len({c['symbol'] for c in sel})} TVM conv kernels: activation = arg 0, weight = arg 1")
-
-
-def pick_carrier(sel: list, all_calls: list, layers_dir: Path):
-    selnodes = {c["node"] for c in sel}
-    for c in sel:
-        same = [x for x in all_calls if x["symbol"] == c["symbol"]]
-        if all(x["node"] in selnodes for x in same):
-            d = [p.parent for p in layers_dir.glob("*/*.c") if f" {c['symbol']}(void* args" in p.read_text()]
-            assert len(d) == 1, d
-            return int(d[0].name.split("_")[0]), c
-    raise SystemExit("no carrier: every selected TVM conv function also has CPU call sites")
 
 
 # ─────────────────────────────── kernel source ───────────────────────────────
@@ -437,7 +408,7 @@ def patch_driver(text: str, sel: list) -> tuple:
         m = re.search(r"    tensors\[(\d+)\]\.data = 0;   /\* %s: bf16 @(\d+)\+(\d+) B" % re.escape(c["wname"]), text)
         assert m, f"no bf16 init line for {c['wname']}"
         eid, off, nb = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        c["woff"] = off   # P4w: prelayout_weights rewrites this bf16 region of weights.bin
+        c["woff"] = off   # P4w: aiegraph.wlayout.prelayout_weights rewrites this bf16 region of weights.bin
         wel = 1
         for d in c["wshape"]:
             wel *= d
@@ -534,54 +505,6 @@ def prof_c_attn() -> str:
 # (px = 64 = 4 mesh cols x 16); here each core also walks px/64 16-wide pixel tiles (kplan's
 # per-layer walk of 64x64 output macro tiles). Host: im2col + pre-tiling (bf16) only; NO K-sum.
 KACC_CC = _tplpath("gemm/gemm_kacc_kernel.cc")
-
-
-def kacc_wlayout(w6, N: int, K: int, M: int):
-    """P4w: bf16 weight [O/ob][C/ib][KH][KW][ib][ob] (TVM OIHW{i}{o}) -> the kacc W port chunk layout for K
-    (what uc_conv re-tiled on every call until P4w): W natural [N][K] (k = c*KH*KW + t), each 16-row block
-    = 16 rows x K, chunk j (kch bf16) at j*kch of every row, in-chunk flat f = mi*8*kch + kb*64 + mm*8 + kk
-    (n = 16*nb + 8*mi + mm, k = j*kch + 8*kb + kk). The Kp zero chunk (kacc_geom kp > k) is NOT stored: uc_conv
-    appends it per row."""
-    import numpy as np
-    on, cn, kh, kw, ib, ob = w6.shape
-    assert on * ob == N and cn * ib * kh * kw == K, (w6.shape, N, K)
-    kch = kacc_geom(N, K, M)["kch"]
-    wn = w6.transpose(0, 5, 1, 4, 2, 3).reshape(N, K)                      # [n][c][kh][kw]
-    t = wn.reshape(N // 16, 2, 8, K // kch, kch // 8, 8)                    # nb mi mm j kb kk
-    t = t.transpose(0, 3, 1, 4, 2, 5).reshape(N // 16, K // kch, 16, kch)   # nb j (f//kch) (f%kch)
-    return np.ascontiguousarray(t.transpose(0, 2, 1, 3)).reshape(-1)       # nb row j q
-
-
-def kacc_dense_wlayout(wp, N: int, K: int, pxs: int):
-    """PDN: TVM dense_pack weight [N/nb][K][nb] (bf16) -> the kacc W chunk layout of instance (N, K, pxs), same
-    order as kacc_wlayout / kacc_gemm.layout(wside=True): nb row j q (16-row block, chunk j of kch bf16)."""
-    on, k, ob = wp.shape
-    assert on * ob == N and k == K, (wp.shape, N, K)
-    kch = kacc_geom(N, K, pxs)["kch"]
-    wn = wp.transpose(0, 2, 1).reshape(N, K)
-    t = wn.reshape(N // 16, 2, 8, K // kch, kch // 8, 8).transpose(0, 3, 1, 4, 2, 5)
-    t = t.reshape(N // 16, K // kch, 16, kch).transpose(0, 2, 1, 3)
-    return np.ascontiguousarray(t).reshape(-1)
-
-
-def prelayout_weights(wbin: Path, sel: list) -> int:
-    """P4w: rewrite every AIE conv layer's bf16 weight in weights.bin (in place, same size) into the kacc
-    chunk layout, so the board pre step is only im2col. Returns the bytes rewritten."""
-    import numpy as np
-    blob = np.memmap(wbin, dtype=np.uint8, mode="r+")
-    tot = 0
-    for c in sel:
-        nel = int(np.prod(c["wshape"]))
-        w = np.frombuffer(blob[c["woff"]:c["woff"] + 2 * nel].tobytes(), dtype="<u2").reshape(c["wshape"])
-        if c.get("kind") == "linear":   # PDN: TVM dense_pack [N/nb][K][nb] -> natural [N][K] -> kacc chunks
-            lw = kacc_dense_wlayout(w, c["N"], c["K"], c["pxs"])
-        else:
-            lw = kacc_wlayout(w, c["N"], c["K"], c["M"])
-        blob[c["woff"]:c["woff"] + 2 * nel] = lw.view(np.uint8)
-        tot += 2 * nel
-    blob.flush()
-    del blob
-    return tot
 
 
 def kacc_name(ch: int, k: int, px: int) -> str:

@@ -34,7 +34,7 @@ from pathlib import Path
 from .errors import AiegraphError
 
 __all__ = ["WeightRef", "WeightSpec", "conv_groups", "linear_groups", "weight_bytes",
-           "params_file"]
+           "params_file", "pick_carrier"]
 
 _STAGE = "group"
 
@@ -314,6 +314,24 @@ def all_conv_calls(cg) -> list:
     return [dict(call=c.call, node=c.node,
                  symbol=c.symbol if c.symbol.startswith("tvmgen_") else "tvmgen_default_" + c.symbol)
             for c in cg.calls if "conv2d" in c.symbol]
+
+
+def pick_carrier(sel: list, all_calls: list, layers_dir) -> tuple:
+    """The layer that carries the AIE archive: the first *sel* call (dicts with ``node`` / ``symbol``)
+    whose TVM function has no call site outside *sel* (*all_calls*: ``all_conv_calls``), so offloading
+    that function moves no CPU call. Its layer directory (``<layers_dir>/<idx>_*/`` holding the one C
+    file that defines the function) gives the layer index. Returns ``(layer index, sel entry)``; raises
+    AiegraphError when every selected function also has CPU call sites, or the function is defined in
+    no or several layer files."""
+    selnodes = {c["node"] for c in sel}
+    for c in sel:
+        if any(x["node"] not in selnodes for x in all_calls if x["symbol"] == c["symbol"]):
+            continue
+        d = [p.parent for p in Path(layers_dir).glob("*/*.c") if f" {c['symbol']}(void* args" in p.read_text()]
+        if len(d) != 1:
+            raise AiegraphError(_STAGE, f"carrier {c['symbol']}: defined in {len(d)} layer files {d}, expected 1")
+        return int(d[0].name.split("_")[0]), c
+    raise AiegraphError(_STAGE, "no carrier: every selected TVM conv function also has CPU call sites")
 
 
 def linear_groups(cg, workdir, onnx_path, partition, model=None) -> list:
