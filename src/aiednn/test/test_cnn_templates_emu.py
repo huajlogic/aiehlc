@@ -30,18 +30,19 @@ def _conv_case(template, model, x_shape, w_shape, s, p, mesh, kxk=True, tag=""):
     rng = _rng(tag or template + str(x_shape))
     x = rng.uniform(-1, 1, x_shape).astype(np.float32)
     toh = largest_divisor(OH, max(1, 256 // OW))
-    prm = dict(CI=C, H=H, W=W, CO=CO, OH=OH, OW=OW, S=s,
-               TCO=tco(CO), TOH=toh)
-    if kxk:
+    prm = dict(CI=C, CO=CO, OH=OH, OW=OW, S=s, TCO=tco(CO), TOH=toh)
+    xk = bf16_bits(x)
+    if kxk:  # the KxK kernels read the zero-padded input [C][H + 2p][W + 2p]
         tci = C if "stem7x7" in template else largest_divisor(C, max(1, 288 // (KH * KW)))
-        prm.update(KH=KH, KW=KW, P=p, K=C * KH * KW, TCI=tci)
+        prm.update(HP=H + 2 * p, WP=W + 2 * p, KH=KH, KW=KW, K=C * KH * KW, TCI=tci)
+        xk = np.pad(xk, ((0, 0), (p, p), (p, p)))
     else:
-        prm.update(TCI=largest_divisor(C, 64, 8))
+        prm.update(H=H, W=W, TCI=largest_divisor(C, 64, 8))
     if "conv_silu" not in template:
         prm["ACT"] = act
     else:
         assert act == 2, f"{model} conv {x_shape} {w_shape} is not followed by Sigmoid (consumers {cons})"
-    y = emulate(template, prm, [bf16_bits(x), bf16_bits(w).reshape(CO, -1), b], (CO, OH, OW), False, mesh)
+    y = emulate(template, prm, [xk, bf16_bits(w).reshape(CO, -1), b], (CO, OH, OW), False, mesh)
     ref = conv_np(bf16(x), bf16(w), b, s, p, act=act)
     c = cos(y, ref)
     print(f"{template} {model} x{x_shape} w{w_shape} s{s} act{act} tiles {prm}: cos={c:.9f}")
@@ -94,8 +95,10 @@ def test_dw3x3_yolo26n(c, h):
     assert list(attrs["pads"]) == [1] * 4
     act = _act(cons)
     x = _rng(f"dw{c}_{h}").uniform(-1, 1, (c, h, h)).astype(np.float32)
-    prm = dict(C=c, H=h, W=h, TC=largest_divisor(c, 16), TOH=largest_divisor(h, 8), ACT=act)
-    y = emulate("conv2d/dw3x3_bf16.cc", prm, [bf16_bits(x), bf16_bits(w).reshape(c, 9), b], (c, h, h), False, (2, 2))
+    wx = (h + 15) // 16 * 16 + 2  # zero-padded input: 1 row / col halo, rows padded to whole 16-lane steps
+    prm = dict(C=c, H=h, W=h, HP=h + 2, WX=wx, TC=largest_divisor(c, 16), TOH=largest_divisor(h, 8), ACT=act)
+    xk = np.pad(bf16_bits(x), ((0, 0), (1, 1), (1, wx - h - 1)))
+    y = emulate("conv2d/dw3x3_bf16.cc", prm, [xk, bf16_bits(w).reshape(c, 9), b], (c, h, h), False, (4, 1))
     ref = conv_np(bf16(x), bf16(w), b, 1, 1, group=c, act=act)
     cc = cos(y, ref)
     print(f"dw3x3 c{c} {h}x{h} act{act}: cos={cc:.9f}")
@@ -107,8 +110,8 @@ def test_fc_gemm_resnet18_classifier():
     w, b, attrs, _ = layer("resnet18", "Gemm", (1, 512), (1000, 512))
     assert attrs.get("transB", 0) == 1 and attrs.get("alpha", 1.0) == 1.0 and attrs.get("beta", 1.0) == 1.0
     x = np.abs(_rng("fc").standard_normal(512)).astype(np.float32)  # post-ReLU average-pooled features
-    y = emulate("gemm/fc_gemm_bf16.cc", dict(K=512, N=1000, NB=25), [bf16_bits(x), bf16_bits(w), b],
-                (1000,), True, (2, 4))
+    y = emulate("gemm/fc_gemm_bf16.cc", dict(K=512, N=1000, NB=40, NY=125), [bf16_bits(x), bf16_bits(w), b],
+                (1000,), True, (8, 1))  # R x 1 mesh: the kernel deals the NB-row blocks over mesh rows
     ref = bf16(w).astype(np.float64) @ bf16(x).astype(np.float64) + b
     c = cos(y, ref)
     print(f"fc_gemm 512->1000: cos={c:.9f} top5 {np.argsort(-y)[:5]} ref {np.argsort(-ref)[:5]}")

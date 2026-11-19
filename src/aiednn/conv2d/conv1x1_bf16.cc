@@ -1,12 +1,13 @@
 // aiednn/conv2d/conv1x1_bf16.cc -- 1x1 conv (pointwise; stride 1, or 2 for the ResNet downsample shortcut) as a
 // GEMM over pixels: y[co][p] = sum_ci w[co][ci] x[ci][p] + b[co], bf16 in / out, fp32 accumulation on
 // aie::mmul<4,8,4,bf16,bf16,accfloat>, bias + optional activation fused (ACT: 0 none, 1 ReLU, 2 SiLU).
-// Stride 1 reads the B tiles straight from the input block (4-pixel vectors); stride 2 gathers them.
-// Ports: x [CI][H][W], w = ONNX weight [CO][CI], b fp32 [CO], y [CO][OH][OW].
+// The core gathers each B tile (8 channels x 4 pixels) from its input block, for stride 1 and 2 alike (the old
+// stride-1 4-pixel vector load is an aie::vector<bfloat16, 4>, which the AIE API does not have).
+// Ports: x [CI][H][W], w = ONNX weight [CO][CI], b fp32 [CO] (as bf16 [CO][2]), y [CO][OH][OW].
 template <int CI, int H, int W, int CO, int OH, int OW, int S, int TCO, int TOH, int TCI, int ACT>
 __global__ void conv1x1_bf16(aie::port<input_window_bfloat16 *, aie::IFM, aie::shape<CI, H, W>> x_port,
                              aie::port<input_window_bfloat16 *, aie::WEIGHTS, aie::shape<CO, CI>> w_port,
-                             aie::port<input_window_float *, aie::WEIGHTS, aie::shape<CO>> b_port,
+                             aie::port<input_window_bfloat16 *, aie::WEIGHTS, aie::shape<CO, 2>> b_port,
                              aie::port<output_window_bfloat16 *, aie::OFM, aie::shape<CO, OH, OW>> y_port) {
     // TCO / TOH / TCI: a block is TCO out channels x TOH out rows; the K chunk is TCI input channels
     static_assert(OH == (H - 1) / S + 1 && OW == (W - 1) / S + 1, "1x1 conv, no padding");
@@ -41,14 +42,11 @@ __global__ void conv1x1_bf16(aie::port<input_window_bfloat16 *, aie::IFM, aie::s
                         aie::vector<bfloat16, 32> b = aie::zeros<bfloat16, 32>();
                         for (int kk = 0; kk < 8; kk++) {
                             const bfloat16 *xr = x + (kb * 8 + kk) * IHT * IWT;
-                            if constexpr (S == 1 && NP % 4 == 0)
-                                b.insert(kk, aie::load_unaligned_v<4>(xr + q * 4));
-                            else
-                                for (int j = 0; j < 4; j++) {
-                                    const int p = q * 4 + j;
-                                    if (p < NP)
-                                        b.set(xr[(p / OW) * S * IWT + (p % OW) * S], kk * 4 + j);
-                                }
+                            for (int j = 0; j < 4; j++) {
+                                const int p = q * 4 + j;
+                                if (p < NP)
+                                    b.set(xr[(p / OW) * S * IWT + (p % OW) * S], kk * 4 + j);
+                            }
                         }
                         aie::store_v(bt[kb], b);
                     }
@@ -63,7 +61,7 @@ __global__ void conv1x1_bf16(aie::port<input_window_bfloat16 *, aie::IFM, aie::s
                 }
                 aie::release(x_port);
             }
-            const float *bias = aie::load_buffer(b_port, {co0}, {TCO});
+            const float *bias = (const float *)aie::load_buffer(b_port, {co0, 0}, {TCO, 2});
             bfloat16 *y = aie::store_buffer(y_port, {co0, oh0, 0}, {TCO, TOH, OW});
             for (int g = 0; g < TCO / 4; g++)
                 for (int q = 0; q < NPG; q++) {
@@ -78,7 +76,8 @@ __global__ void conv1x1_bf16(aie::port<input_window_bfloat16 *, aie::IFM, aie::s
                         v = aie::mul(v, aie::inv(aie::add(e, aie::broadcast<float, 16>(1.0f)))).template to_vector<float>();
                     }
                     aie::accum<accfloat, 16> o;
-                    const aie::vector<bfloat16, 16> ob = o.from_vector(v).template to_vector<bfloat16>();
+                    o.from_vector(v);
+                    const aie::vector<bfloat16, 16> ob = o.template to_vector<bfloat16>();
                     for (int i = 0; i < 16; i++)
                         if (q * 4 + i % 4 < NP)
                             y[(g * 4 + i / 4) * NP + q * 4 + i % 4] = ob[i];
