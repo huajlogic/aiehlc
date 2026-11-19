@@ -238,7 +238,7 @@ def test_driver():
                 [(c["N"], c["K"], -(-c["M"] // 64) * 64, c["pxs"]) for c in lin], att=att)
     nsite, ntag = t.count("    unet_aie_attn("), len(re.findall(r'GRAPH_PROF_END\(\d+, "aie unet_aie_attn \d+"\);', t))
     groups = len({c["group"] for c in att})
-    insts = sum(1 for s in ua.attn_shapes(att) if f"__global__ void {ua.kacc_name(*s)}(" in k)
+    insts = sum(1 for s in ua.attn_shapes(att) if f"{ua.kacc_name(*s)}<<<mesh>>>(" in k)
     print(f"GATTDRV attn partition_attn={natt} mapped={len(att)} groups={groups} sites={nsite} prof_tags={ntag} "
           f"prof_attn_branch={int('op=aie_host_attn%s' in t)} batch_matmul_left={t.count('_nn_batch_matmul(args')} "
           f"kernel_attn={int(KATTN in k)} pack_inc={int(KPACK in k)} "

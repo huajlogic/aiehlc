@@ -585,7 +585,9 @@ def prelayout_weights(wbin: Path, sel: list) -> int:
 
 
 def kacc_name(ch: int, k: int, px: int) -> str:
-    return f"gemm_kacc_{ch}x{k}x{px}"
+    """the launch callee of instance (ch, k, px): gemm_kacc<template args> (aiednn.gemm_kacc_launch)"""
+    import aiednn
+    return aiednn.gemm_kacc_launch(ch, k, px, kacc_geom(ch, k, px))
 
 
 def kacc_geom(ch: int, k: int, px: int) -> dict:
@@ -622,20 +624,7 @@ def kacc_geom(ch: int, k: int, px: int) -> dict:
                 arows=rows, brows=cols, l1=l1)
 
 
-KACC_KERNEL = _tpl("gemm/gemm_kacc_kernel.cc")
-
-
-def kacc_kernel_text(ch: int, k: int, px: int) -> str:
-    g = kacc_geom(ch, k, px)
-    t = KACC_KERNEL
-    for key, v in (("@NAME@", kacc_name(ch, k, px)), ("@SID@", f"{ch}x{k}x{px}"), ("@CH@", ch), ("@KW@", g["kp"] // 2), ("@PX@", px), ("@K@", k),
-                   ("@TKW@", g["tkw"]), ("@KCH@", g["kch"]), ("@NKC@", g["nkc"]), ("@NT@", g["ntile"]),
-                   ("@S@", g["S"]), ("@AROWS@", g["arows"]), ("@BROWS@", g["brows"]), ("@TR@", g["tr"]),
-                   ("@LHS@", "(const uint16_t *)w + s * 16 * kch" if g["tr"] else "x"),
-                   ("@RHS@", "x" if g["tr"] else "(const uint16_t *)w + s * 16 * kch")):
-        t = t.replace(key, str(v))
-    assert "@" not in t
-    return t
+KACC_KERNEL = _tpl("gemm/gemm_kacc_kernel.cc")   # C++ template __global__: aiehlc instantiates it per launch
 
 
 def kacc_host(shapes: list, lin: list = (), att: list = ()) -> str:
@@ -682,7 +671,7 @@ def write_kernel_kacc(kdst: Path, spec: str, shapes: list, warm: bool = False, c
             .replace("@NSHAPES@", str(len(shapes))))
     if ctrlpkt == "aot":
         head = CTRLPKT_PRAGMAS + head
-    ktext = "\n\n".join(kacc_kernel_text(*s) for s in shapes)
+    ktext = KACC_KERNEL if shapes else ""   # one template; aiehlc instantiates it per launch (same TU)
     if fa:  # GFA (--attn-fa): flash-attention prologue (static helpers) before the kernels, one kernel per class
         import fa_attn
         head = head + fa_attn.fa_prologue(fa) + "\n"
