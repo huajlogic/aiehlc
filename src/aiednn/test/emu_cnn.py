@@ -10,6 +10,7 @@ missing model, compiler or failed build is a test FAILURE, never a skip.
 from __future__ import annotations
 
 import functools
+import json
 import re
 import shutil
 import subprocess
@@ -26,10 +27,9 @@ import aiednn  # noqa: E402
 from aiegraph.kemu import _LAUNCH, _PRELUDE  # noqa: E402
 
 REPO = SRC.parent
-MODELS = {
-    "resnet18": Path("/scratch/staff/huaj/modelzoo/artifacts/resnet18/onnx/resnet18_fp32_op17.onnx"),
-    "yolo26n": Path("/scratch/staff/huaj/modelzoo/artifacts/yolo26/yolo26n.onnx"),
-}
+# The real models (key -> ONNX path) live with the examples, not in the library: the tests only name the layer kind.
+MODELS = {k: Path(v) for k, v in json.loads((REPO / "example" / "aiednn" / "emu_models.json").read_text()).items()
+          if not k.startswith("_")}
 COS_MIN = 0.99999
 
 

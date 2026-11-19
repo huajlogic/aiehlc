@@ -347,14 +347,14 @@ env -u AIEHLC_ROOT AIEHLC_BIN=$T/build/aiehlc $PY build_unet.py \
 [build_unet] loaded unet_sim_t32: inputs {'sample': [1, 4, 32, 32], 'timestep': [1], 'encoder_hidden_states': [1, 77, 768]} -> [1, 4, 32, 32], 828 nodes
 [build_unet] KINCORE layers=156 launches_planned=258 kernel=bf16_gemm_kacc; shapes=38 (old 64x64x64 launches 216200)
 [build_unet] ctrlpkt=aot pragmas=6
-[build_unet] graph_driver.c: 156 partition call sites -> unet_aie_conv (48) + unet_aie_linear (72) + unet_aie_attn (36) (aiegraph group steps + driver template)
+[build_unet] graph_driver.c: 156 partition call sites -> aiednn_aie_conv (48) + aiednn_aie_linear (72) + aiednn_aie_attn (36) (aiegraph group steps + driver template)
 [build_unet] AIO section off=0x403b7100 addr=0x403a7100 bytes=253248 n_in=3 crc32=a5b911e2 dump_out=1
 [build_unet] built .../main.elf -> $WORK/build/main.elf (1,080,180,080 B; weights.bin 646,757,376 B)
 GATE_RC=0
 ```
 
 想看生成出来的东西：
-- aiegraph 改写后的图驱动：`$WORK/build/ag_work/arm_build/graph_driver.c`（找 `unet_aie_conv(`）；
+- aiegraph 改写后的图驱动：`$WORK/build/ag_work/arm_build/graph_driver.c`（找 `aiednn_aie_conv(`）；
 - 每层的放置结果：`$WORK/build/ag_work/layers/partition.json`；
 - 所有 AIE kernel 和主机函数：`$WORK/build/aiek_src/`。
 

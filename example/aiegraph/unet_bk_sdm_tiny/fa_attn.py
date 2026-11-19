@@ -128,14 +128,14 @@ DECL_FA = _tpl("attention/fa_decl.h")
 
 
 # ── Group-offload steps (design 2026-11-16-aiegraph-group-offload §5.3, sprint unet-m3 P1abi) ─────────────────────
-# Thin AIEK_STEP wrappers over unet_aie_attn_kl, so aiegraph's offload_group can place them instead of
+# Thin AIEK_STEP wrappers over aiednn_aie_attn_kl, so aiegraph's offload_group can place them instead of
 # keep_layout_rt.py's text rewrite. One wrapper per keep-layout role (aie_user_kernel.h has the step <-> role
 # table): a step's aiek_buf carries the [rows][H*D] linear output's pointer and row stride (ld = H*D), which is
 # exactly the (a, lda) / (b, ldb) the kl roles take today, so the generated call is the same kl call.
 # Not appended to the kernel source yet (that is S3: the driver must stay byte-equivalent until then).
 FA_STEPS = _tpl("attention/fa_steps.cc")
 
-#: step -> keep-layout role of unet_aie_attn_kl (keep_layout_rt.py roles 2/3/5/6)
+#: step -> keep-layout role of aiednn_aie_attn_kl (keep_layout_rt.py roles 2/3/5/6)
 FA_STEP_ROLES = {"fa_step_pack_q": 2, "fa_step_pack_k": 3, "fa_step_pack_v": 5, "fa_step_run_o": 6}
 
 
@@ -146,7 +146,7 @@ def fa_steps() -> str:
 
 # ── S3: FA groups as aiegraph group steps ─────────────────────────────────────────────────────────────────────────
 #: the keep-layout entry the steps call (was inserted by keep_layout_rt.fa_pass)
-DECL_KL = ("int unet_aie_attn_kl(int cid, int role, int cls, const float *a, int lda, float *b, int ldb,\n"
+DECL_KL = ("int aiednn_aie_attn_kl(int cid, int role, int cls, const float *a, int lda, float *b, int ldb,\n"
            "                     float s);   /* FA group steps (aiegraph offload_group, fa_attn.fa_step_emit) */\n")
 
 
@@ -161,7 +161,7 @@ def fa_group_steps(ag, g, cid_qk: int, cid_pv: int, cls: int) -> list:
 
 
 def fa_step_emit(g):
-    """offload_group(emit=): the driver code of a step = the unet_aie_attn_kl call its AIEK_STEP wrapper makes
+    """offload_group(emit=): the driver code of a step = the aiednn_aie_attn_kl call its AIEK_STEP wrapper makes
     (FA_STEP_ROLES, aie_user_kernel.h step <-> role table), with the boundary buffer's pointer and row stride"""
     bufs = {"fa_step_pack_q": g.q, "fa_step_pack_k": g.k, "fa_step_pack_v": g.v, "fa_step_run_o": g.o}
 
@@ -170,11 +170,11 @@ def fa_step_emit(g):
         t = (s["writes"] if role == 6 else s["reads"])
         assert t == [b.tensor], (g.name, s["name"], t, b.tensor)
         if role == 6:
-            call = "unet_aie_attn_kl(%d, 6, %d, 0, 0, (float *)tensors[%d].data, %d, 1.0f);" % (
+            call = "aiednn_aie_attn_kl(%d, 6, %d, 0, 0, (float *)tensors[%d].data, %d, 1.0f);" % (
                 c["cid"], c["cls"], b.tensor, b.ld)
         else:
-            call = "unet_aie_attn_kl(%d, %d, %d, (const float *)tensors[%d].data, %d, 0, 0, %.9ef);" % (
+            call = "aiednn_aie_attn_kl(%d, %d, %d, (const float *)tensors[%d].data, %d, 0, 0, %.9ef);" % (
                 c["cid"], role, c["cls"], b.tensor, b.ld, float(c.get("s", 1.0)))
         return {"c": ["UP_AIE_BEGIN(@K@);", call + "   /* %s %s */" % (g.name, s["name"]), "UP_AIE_END(@K@);"],
-                "tag": "unet_aie_attn %d" % c["cid"]}
+                "tag": "aiednn_aie_attn %d" % c["cid"]}
     return emit

@@ -109,7 +109,7 @@ def kernel_source(spec: str, shapes: list, *, warm: bool = True, ctrlpkt: str = 
     if ctrlpkt not in ("off", "aot", "aot-kco"):
         raise AiegraphError("cnn", f"ctrlpkt={ctrlpkt!r}", hint="off, aot or aot-kco")
     shapes = sorted(set(shapes))
-    head = (_tpl("gemm/kacc_unit_head.cc").replace("@E@", entry).replace("@SRC@", str(_tplpath("gemm/bf16_gemm_kacc.cc")))
+    head = (_tpl("gemm/kacc_unit_head.cc").replace("@E@", entry).replace("@SRC@", str(_tplpath("gemm/gemm_kacc_kernel.cc")))
             .replace("@NSHAPES@", str(len(shapes))))
     if ctrlpkt != "off":
         head = _tpl("gemm/ctrlpkt_aot_pragmas.h") + (_tpl("gemm/ctrlpkt_kco_pragma.h") if ctrlpkt == "aot-kco"

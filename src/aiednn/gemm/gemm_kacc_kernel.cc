@@ -1,5 +1,5 @@
-// gemm_kacc: K-in-core bf16 GEMM (fp32 accumulator in the c window) on the 4x4 mesh, one C++ template
-// __global__ instantiated by aiehlc per launch gemm_kacc<CH, KDIM, PX, KW, AROWS, BROWS, TKW, KCH, NKC, NT, S, TR>.
+// gemm_kacc: K-in-core bf16 GEMM (fp32 accumulator in the c window) on the 4x4 mesh, one C++ template kernel
+// instantiated by aiehlc per launch gemm_kacc<CH, KDIM, PX, KW, AROWS, BROWS, TKW, KCH, NKC, NT, S, TR>.
 // The template arguments come from the walk geometry (aiegraph kacc_geom -> aiednn.gemm_kacc_targs):
 //   CH / KDIM / PX  the instance's channels, K (bf16) and pixels; KW = padded K in int32 words
 //   AROWS / BROWS   rows of the a / b ports (CH / PX, swapped when transposed)
@@ -10,7 +10,7 @@ __global__ void gemm_kacc(aie::port<input_window_int32 *, aie::IFM, aie::shape<A
                           aie::port<input_window_int32 *, aie::WEIGHTS, aie::shape<BROWS, KW>> b_port,
                           aie::port<output_window_int32 *, aie::OFM, aie::shape<AROWS, BROWS>> c_port) {
     // ports named per instance: aiehlc's block descriptors (aiehlc_desc_<port>) are file-scope statics
-    // P4bg: gemm_kacc (bf16_gemm_kacc.cc, Maxwell P4bk) for ch=CH K=KDIM px=PX -- see unet_aie.kacc_geom
+    // gemm_kacc (from the bf16_gemm_kacc bench, Maxwell P4bk) for ch=CH K=KDIM px=PX -- geometry: aiegraph kacc_geom
     const int tm = 16, tn = 16, tkw = TKW, kch = KCH; // tile; K chunk = tkw words = kch bf16
     const int nkc = NKC;   // K chunks per tile
     const int ntile = NT;  // a-port 16-row tiles per core (channels; pixels when transposed)
