@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Two instances of ONE template __global__ in one source file (aiehlc
+ * Two instances of ONE template kernel in one source file (aiehlc
  * regression for multi-instance templates, sprint aiednn-tpl P1).
  *
  * tpl2_gemm is the gemm_kacc_bf16.cc kernel (C = epilogue(A . B^T), bf16,
