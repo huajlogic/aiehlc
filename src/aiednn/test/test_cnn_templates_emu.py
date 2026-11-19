@@ -30,7 +30,7 @@ def _conv_case(template, model, x_shape, w_shape, s, p, mesh, kxk=True, tag=""):
     rng = _rng(tag or template + str(x_shape))
     x = rng.uniform(-1, 1, x_shape).astype(np.float32)
     toh = largest_divisor(OH, max(1, 256 // OW))
-    prm = dict(NAME="aiek_" + template.split("/")[1].split("_bf16")[0], CI=C, H=H, W=W, CO=CO, OH=OH, OW=OW, S=s,
+    prm = dict(CI=C, H=H, W=W, CO=CO, OH=OH, OW=OW, S=s,
                TCO=tco(CO), TOH=toh)
     if kxk:
         tci = C if "stem7x7" in template else largest_divisor(C, max(1, 288 // (KH * KW)))
@@ -94,7 +94,7 @@ def test_dw3x3_yolo26n(c, h):
     assert list(attrs["pads"]) == [1] * 4
     act = _act(cons)
     x = _rng(f"dw{c}_{h}").uniform(-1, 1, (c, h, h)).astype(np.float32)
-    prm = dict(NAME="aiek_dw3x3", C=c, H=h, W=h, TC=largest_divisor(c, 16), TOH=largest_divisor(h, 8), ACT=act)
+    prm = dict(C=c, H=h, W=h, TC=largest_divisor(c, 16), TOH=largest_divisor(h, 8), ACT=act)
     y = emulate("conv2d/dw3x3_bf16.cc", prm, [bf16_bits(x), bf16_bits(w).reshape(c, 9), b], (c, h, h), False, (2, 2))
     ref = conv_np(bf16(x), bf16(w), b, 1, 1, group=c, act=act)
     cc = cos(y, ref)
@@ -107,7 +107,7 @@ def test_fc_gemm_resnet18_classifier():
     w, b, attrs, _ = layer("resnet18", "Gemm", (1, 512), (1000, 512))
     assert attrs.get("transB", 0) == 1 and attrs.get("alpha", 1.0) == 1.0 and attrs.get("beta", 1.0) == 1.0
     x = np.abs(_rng("fc").standard_normal(512)).astype(np.float32)  # post-ReLU average-pooled features
-    y = emulate("gemm/fc_gemm_bf16.cc", dict(NAME="aiek_fc", K=512, N=1000, NB=25), [bf16_bits(x), bf16_bits(w), b],
+    y = emulate("gemm/fc_gemm_bf16.cc", dict(K=512, N=1000, NB=25), [bf16_bits(x), bf16_bits(w), b],
                 (1000,), True, (2, 4))
     ref = bf16(w).astype(np.float64) @ bf16(x).astype(np.float64) + b
     c = cos(y, ref)

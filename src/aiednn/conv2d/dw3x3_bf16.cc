@@ -1,23 +1,24 @@
 // aiednn/conv2d/dw3x3_bf16.cc -- depthwise 3x3 conv (groups = C, stride 1, pad 1; the YOLO DWConv), bf16 in / out,
-// fp32 accumulation, bias + optional activation fused (@ACT@: 0 none, 1 ReLU, 2 SiLU).
+// fp32 accumulation, bias + optional activation fused (ACT: 0 none, 1 ReLU, 2 SiLU).
 // Per channel, 16 output pixels of a row per step: 9 aie::mac of a shifted 16-pixel input vector by the
 // broadcast tap (accfloat). The input block is zero-padded by the load (borders and the 16-lane row tail).
 // Ports: x [C][H][W], w = ONNX weight [C][1*3*3], b fp32 [C], y [C][H][W].
-__global__ void @NAME@(aie::port<input_window_bfloat16 *, aie::IFM, aie::shape<@C@, @H@, @W@>> x_@NAME@,
-                       aie::port<input_window_bfloat16 *, aie::WEIGHTS, aie::shape<@C@, 9>> w_@NAME@,
-                       aie::port<input_window_float *, aie::WEIGHTS, aie::shape<@C@>> b_@NAME@,
-                       aie::port<output_window_bfloat16 *, aie::OFM, aie::shape<@C@, @H@, @W@>> y_@NAME@) {
-    constexpr int C = @C@, OH = @H@, OW = @W@, TC = @TC@, TOH = @TOH@;
+template <int C, int H, int W, int TC, int TOH, int ACT>
+__global__ void dw3x3_bf16(aie::port<input_window_bfloat16 *, aie::IFM, aie::shape<C, H, W>> x_port,
+                           aie::port<input_window_bfloat16 *, aie::WEIGHTS, aie::shape<C, 9>> w_port,
+                           aie::port<input_window_float *, aie::WEIGHTS, aie::shape<C>> b_port,
+                           aie::port<output_window_bfloat16 *, aie::OFM, aie::shape<C, H, W>> y_port) {
+    constexpr int OH = H, OW = W;
     static_assert(C % TC == 0 && OH % TOH == 0, "block tiling");
     constexpr int NJ = (OW + 15) / 16, IHT = TOH + 2, IWT = NJ * 16 + 2; // 16-lane row steps; padded footprint
     const int pid = aie::program_id(0) * aie::num_programs(1) + aie::program_id(1);
     const int np = aie::num_programs(0) * aie::num_programs(1);
     for (int blk = pid; blk < (C / TC) * (OH / TOH); blk += np) {
         const int c0 = blk / (OH / TOH) * TC, oh0 = blk % (OH / TOH) * TOH;
-        const bfloat16 *w = aie::load_buffer(w_@NAME@, {c0, 0}, {TC, 9});
-        const float *bias = aie::load_buffer(b_@NAME@, {c0}, {TC});
-        const bfloat16 *x = aie::load_buffer(x_@NAME@, {c0, oh0 - 1, -1}, {TC, IHT, IWT}, {.pad = aie::pad_value::zero});
-        bfloat16 *y = aie::store_buffer(y_@NAME@, {c0, oh0, 0}, {TC, TOH, OW});
+        const bfloat16 *w = aie::load_buffer(w_port, {c0, 0}, {TC, 9});
+        const float *bias = aie::load_buffer(b_port, {c0}, {TC});
+        const bfloat16 *x = aie::load_buffer(x_port, {c0, oh0 - 1, -1}, {TC, IHT, IWT}, {.pad = aie::pad_value::zero});
+        bfloat16 *y = aie::store_buffer(y_port, {c0, oh0, 0}, {TC, TOH, OW});
         for (int c = 0; c < TC; c++) {
             aie::vector<bfloat16, 16> tap[9];
             for (int t = 0; t < 9; t++)
@@ -31,9 +32,9 @@ __global__ void @NAME@(aie::port<input_window_bfloat16 *, aie::IFM, aie::shape<@
                             a = aie::mac(a, aie::load_unaligned_v<16>(x + (c * IHT + r + kh) * IWT + j * 16 + kw),
                                          tap[kh * 3 + kw]);
                     aie::vector<float, 16> v = aie::add(a.template to_vector<float>(), bv);
-                    if constexpr (@ACT@ == 1)
+                    if constexpr (ACT == 1)
                         v = aie::max(v, aie::zeros<float, 16>());
-                    if constexpr (@ACT@ == 2) {
+                    if constexpr (ACT == 2) {
                         const aie::vector<float, 16> e = aie::exp2<float>(aie::mul(v, -1.4426950408889634f).template to_vector<float>());
                         v = aie::mul(v, aie::inv(aie::add(e, aie::broadcast<float, 16>(1.0f)))).template to_vector<float>();
                     }
@@ -47,9 +48,9 @@ __global__ void @NAME@(aie::port<input_window_bfloat16 *, aie::IFM, aie::shape<@
                             yr[i] = ob[i];
                 }
         }
-        aie::commit(y_@NAME@);
-        aie::release(x_@NAME@);
-        aie::release(b_@NAME@);
-        aie::release(w_@NAME@);
+        aie::commit(y_port);
+        aie::release(x_port);
+        aie::release(b_port);
+        aie::release(w_port);
     }
 }
