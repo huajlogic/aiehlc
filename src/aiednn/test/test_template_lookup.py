@@ -70,17 +70,19 @@ def _template_refs(py: Path):
         if isinstance(n, ast.Call) and n.args and isinstance(n.args[0], ast.Constant) \
                 and isinstance(n.args[0].value, str):
             f = ast.unparse(n.func)
-            if f in ("_tpl", "_tplpath", "_render", "_rt", "aiednn.template", "aiednn.render"):
+            if f in ("_tpl", "_tplpath", "_render", "_rt", "aiednn.template", "aiednn.render", "_bench", "_bench_render"):
                 out.append((f, n.args[0].value))
     return out
 
 
 def test_example_templates_resolve():
-    refs = [r for d in EXAMPLES for py in sorted(d.glob("*.py")) for r in _template_refs(py)]
+    refs = [(py, *r) for d in EXAMPLES for py in sorted(d.glob("*.py")) for r in _template_refs(py)]
     assert len(refs) >= 30, refs
     cats = set()
-    for f, name in refs:
-        if f == "_rt":
+    for py, f, name in refs:
+        if f in ("_bench", "_bench_render"):   # example-only bench text, loaded by path from <example>/bench/
+            assert (py.parent / "bench" / name).is_file(), (py.name, name)
+        elif f == "_rt":
             aiednn.runtime_path(name)
         else:
             cats.add(aiednn.path(name).parent.name)
