@@ -223,63 +223,12 @@ def map_linears(onnx_path: Path, partition: dict, work: Path, offsets_fn) -> lis
     return out
 
 
-# ─────────────────────── GATT: attention bmm sites (--aie conv,linear,attn) ───────────────────────
-def bmm_geom(H: int, M: int, K: int, N: int) -> dict:
-    """GATT: geometry of one attention bmm Y[h] = X[h] (M x K) . W[h]^T (W [N][K]) on ONE gemm_kacc instance --
-    the board-proven PBK rules of kacc_gemm.main_bmm (fd4cb96): M/K/N zero-padded to 64 (aiegraph.gemmpad.pad_mkn),
-    swap (ch = M) for big square outputs, kacc_gemm.plan split, one more zero ch block when the a/b ports would
-    have the same shape (aiehlc GemmSpace port sizing), K padded until kp/2 is not 32/64 (aiehlc 2-dim+iter b BD)."""
-    import sys
-    src = str(Path(__file__).resolve().parents[3] / "src")
-    if src not in sys.path:
-        sys.path.insert(0, src)
-    from aiegraph.gemmpad import pad_mkn
-    import kacc_gemm
-    Mp, Kp, Np = pad_mkn(M, K, N)
-    swap = int(Mp == Np and H * M * N >= (4 << 20))
-    CHR, PXR = (M, N) if swap else (N, M)
-    CHP, PXP = (Mp, Np) if swap else (Np, Mp)
-    mode, S, chs, pxs = kacc_gemm.plan(CHP, Kp, PXP)
-    geo = kacc_geom(chs, Kp, pxs)
-    while geo["arows"] == geo["brows"] and mode == "none":
-        CHP += 64
-        mode, S, chs, pxs = kacc_gemm.plan(CHP, Kp, PXP)
-        geo = kacc_geom(chs, Kp, pxs)
-    while geo["kp"] // 2 in (32, 64):
-        Kp += 64
-        geo = kacc_geom(chs, Kp, pxs)
-    return dict(H=H, M=M, K=K, N=N, swap=swap, CHR=CHR, PXR=PXR, CHP=CHP, PXP=PXP, Kp=Kp, kp=geo["kp"],
-                kch=geo["kch"], tr=geo["tr"], splitpx=int(mode == "px"), S=S, chs=chs, pxs=pxs)
+# GATT / GFA attention sites + driver glue: aiegraph.attnsite / aiegraph.flashattn (unet-decl P3); old names kept
+# for the bench and the runtime tests
+from aiegraph.attnsite import ATTN_HOST, attn_shapes, bmm_geom, prof_c_attn  # noqa: E402,F401
+from aiegraph import boardmain as _bm  # noqa: E402
 
-
-def map_attn(partition: dict, work: Path, onnx=None) -> list:
-    """GATT (GAP-aiegraph-attn-site), sprint unet-m3 S3: the matching moved into aiegraph --
-    ``aiegraph.attention.partition_attention`` finds the attention groups on graph.json (+ ONNX for the
-    Q/K/V sources and the scale) and joins the partition 'attn' rows to their TVM nn_batch_matmul calls by
-    ONNX node name. Here only the kernel geometry is added (bmm_geom). ``ag_group`` = the AttentionGroup."""
-    import sys
-    src = str(Path(__file__).resolve().parents[3] / "src")
-    if src not in sys.path:
-        sys.path.insert(0, src)
-    from aiegraph.attention import partition_attention
-    from aiegraph.group import CallGraph
-    cg = CallGraph.load(work)
-    att = partition_attention(cg, partition, onnx=onnx, workdir=work)
-    log(f"TVM graph: {len(att)} attention bmm calls in {len({c['ag_group'].name for c in att})} aiegraph attention "
-        f"groups ({sum(len(g.calls) for g in {c['ag_group'].name: c['ag_group'] for c in att}.values())} calls)")
-    out = []
-    for c in att:
-        H, M, K, N = c["H"], c["M"], c["K"], c["N"]
-        geo = bmm_geom(H, M, K, N)
-        out.append(dict(c, geo=geo, launches=H * geo["S"], macs=H * M * N * K))
-    log(f"mapped {len(out)} partition attn bmm layers ({len({c['group'] for c in out})} groups) to TVM "
-        f"nn_batch_matmul calls, {sum(c['launches'] for c in out)} gemm_kacc launches")
-    return out
-
-
-def attn_shapes(att: list) -> list:
-    """gemm_kacc instances (ch, K, px) of the attention sites"""
-    return sorted({(c["geo"]["chs"], c["geo"]["Kp"], c["geo"]["pxs"]) for c in att})
+PROF_C = _bm.prof_c()
 
 
 def check_data_arg0(layers_dir: Path, sel: list) -> None:
@@ -362,142 +311,6 @@ def write_kernel(kdst: Path, spec: str, maxacc: int, warm: bool = False, ctrlpkt
     return kcc
 
 
-# ─────────────────────────────── driver patch ───────────────────────────────
-DECL = ("int aiednn_aie_conv(int cid, void *args, int nargs, const uint16_t *wbf, "
-        "int sh, int sw, int ph, int pw);   /* build_unet.py --aie conv */\n"
-        "int aiednn_aie_linear(int cid, void *args, int nargs, const uint16_t *wbf, int S);   /* --aie conv,linear */\n")
-DECL_ATTN = ("int aiednn_aie_attn(int cid, void *args, int nargs, int qk, int swap, int chp, int pxp, int kk, int kp, "
-             "int kch, "
-             "int splitpx, int S, int chs, int pxs, int tr);   /* --aie conv,linear,attn (GATT) */\n")
-CALL_RE = re.compile(r"    GRAPH_PROF_BEGIN\((\d+)\);\n(#ifdef GRAPH_AIE_OFFLOAD\n.*?#endif\n|"
-                     r"    \w+\(args, codes, \d+, 0, 0, 0\);\n    GRAPH_PROF_END\(\1, \"[^\"]*\"\);\n)", re.S)
-
-
-def patch_driver(text: str, sel: list) -> tuple:
-    """The text patches aiegraph does not do yet. S1 (unet-m3): when aiegraph already placed the
-    conv / linear group steps (its declarations sit before kernel_ws), only the attention sites,
-    the attention declaration and the PROF glue are added here; *sel* must then hold attn layers
-    only. Without aiegraph steps (test_attn_sites.py) the conv / linear sites are patched as before."""
-    head = text.split("static uint8_t kernel_ws[")[0]
-    if "UP_AIE_BEGIN(" in head or "up_pending_exp" in head:
-        raise RuntimeError("driver already patched")
-    ag_steps = "int aiednn_aie_conv(int cid, void" in head
-    att = [c for c in sel if c.get("kind") == "attn"]
-    sel = [c for c in sel if c.get("kind") != "attn"]
-    if ag_steps and sel:
-        raise RuntimeError("aiegraph placed the conv/linear steps: patch_driver takes attn layers only")
-    i = text.index("static uint8_t kernel_ws[")
-    # GATT: the attn declaration / PROF branch only when there are attn sites (--aie conv,linear stays byte-identical)
-    fam = bool(att) and all(c.get("fa") is not None for c in att)   # GFA: fused flash-attention sites
-    if fam:
-        import fa_attn
-        # S3: the FA groups are aiegraph group offloads (build_unet.fa_offload_groups): arm_build already placed
-        # their steps and removed the other calls (softmax included); only the declarations are added here
-        assert all(c.get("fa_steps") for c in att), "GFA sites must be aiegraph group steps"
-    text = text[:i] + ("" if ag_steps else DECL) + ((fa_attn.DECL_FA + fa_attn.DECL_KL if fam else DECL_ATTN) if att else "") + \
-        (prof_c_attn() if att else PROF_C) + "\n" + text[i:]
-    exp_body = "    for (uint64_t i = 0; i < n; ++i) d[i] = (uint32_t)src[i] << 16;\n}\n"
-    assert text.count(exp_body) == 1, text.count(exp_body)
-    text = text.replace(exp_body, "    XTime e0_, e1_;\n    XTime_GetTime(&e0_);\n" + exp_body[:-2] +
-                        "    XTime_GetTime(&e1_);\n    up_pending_exp += e1_ - e0_;\n    up_exp_calls++;\n}\n", 1)
-    run = "float *graph_run(void) {\n"
-    assert text.count(run) == 1
-    text = text.replace(run, run + "    up_pending_exp = 0; /* P1 PROF: expands before graph_run are not graph_run time */\n", 1)
-    n = 0
-    for c in sel:
-        m = re.search(r"    tensors\[(\d+)\]\.data = 0;   /\* %s: bf16 @(\d+)\+(\d+) B" % re.escape(c["wname"]), text)
-        assert m, f"no bf16 init line for {c['wname']}"
-        eid, off, nb = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        c["woff"] = off   # P4w: aiegraph.wlayout.prelayout_weights rewrites this bf16 region of weights.bin
-        wel = 1
-        for d in c["wshape"]:
-            wel *= d
-        assert nb == 2 * wel, (c["wname"], nb, wel)
-        exp = re.compile(r"    graph_bf16_expand\(\(float \*\)\(g_wscratch \+ (\d+)\), \(const uint16_t \*\)"
-                         r"\(g_params \+ %d\), %dULL\);\n    tensors\[%d\]\.data = g_wscratch \+ \1;\n" % (off, wel, eid))
-        hits = exp.findall(text)
-        assert len(hits) == 1, (c["wname"], len(hits))
-        text = exp.sub("    tensors[%d].data = 0;   /* AIE conv %d: bf16 weight read in place by aiednn_aie_conv */\n"
-                       % (eid, c["cid"]), text)
-        a1 = "    args[1].v_handle = &tensors[%d];\n" % eid
-        assert text.count(a1) == 1, (c["wname"], text.count(a1))
-        pos = text.index(a1)
-        cm = CALL_RE.search(text, pos)
-        nxt = text.find("    args[0].v_handle", pos)
-        assert cm and (nxt < 0 or cm.start() < nxt), c["wname"]
-        calls = re.findall(r"(?:aie_)?(tvmgen_\w+)\(args, codes, (\d+), 0, 0, 0\);", cm.group(2))
-        assert calls and all(s == c["symbol"] and int(k) == c["nargs"] for s, k in calls), (calls, c["symbol"])
-        if c.get("kind") == "linear":   # PDN: tag "aie aiednn_aie_lin <cid>" -> PROF op=aie_host_linear<cid>
-            rep = ("    GRAPH_PROF_BEGIN(%s);\n    UP_AIE_BEGIN(%s);\n"
-                   "    aiednn_aie_linear(%d, args, %d, (const uint16_t *)(g_params + %d), %d);\n"
-                   "    UP_AIE_END(%s);\n    GRAPH_PROF_END(%s, \"aie aiednn_aie_lin %d\");\n"
-                   % (cm.group(1), cm.group(1), c["cid"], c["nargs"], off, c["S"], cm.group(1), cm.group(1), c["cid"]))
-        else:
-            rep = ("    GRAPH_PROF_BEGIN(%s);\n    UP_AIE_BEGIN(%s);\n"
-                   "    aiednn_aie_conv(%d, args, %d, (const uint16_t *)(g_params + %d), %d, %d, %d, %d);\n"
-                   "    UP_AIE_END(%s);\n    GRAPH_PROF_END(%s, \"aie aiednn_aie_conv %d\");\n"
-                   % (cm.group(1), cm.group(1), c["cid"], c["nargs"], off, c["sh"], c["sw"], c["ph"], c["pw"],
-                      cm.group(1), cm.group(1), c["cid"]))
-        text = text[:cm.start()] + rep + text[cm.end():]
-        n += 1
-    nl = sum(1 for c in sel if c.get("kind") == "linear")
-    if not ag_steps:
-        assert text.count("    aiednn_aie_conv(") == len(sel) - nl and text.count("    aiednn_aie_linear(") == nl
-    if fam:   # S3: count the group steps arm_build emitted (2 per bmm site: pack_q+pack_k / pack_v+run_o)
-        nkl = len(re.findall(r"^    aiednn_aie_attn_kl\(", text, re.M))
-        assert nkl == 2 * len(att), (nkl, len(att))
-        assert not re.search(r"\btvmgen_default_fused_nn_(softmax|batch_matmul)\w*\(args, ",
-                             text.split("float *graph_run(void)")[1]), "attention call left in graph_run"
-        return text, n + len(att)
-    for c in att:   # GATT: tag "aie aiednn_aie_attn <cid>" -> PROF op=aie_host_attn<cid>
-        text = _patch_attn_site(text, c)
-        n += 1
-    assert text.count("    aiednn_aie_attn(") == len(att)
-    return text, n
-
-
-def _patch_attn_site(text: str, c: dict) -> str:
-    """GATT: one TVM nn_batch_matmul call site (located by its unique args[0..2] tensor block) -> aiednn_aie_attn.
-    No weight: both operands are activations, packed at run time by the host (aie_kacc_pack.h)."""
-    e0, e1 = c["eids"]
-    blk = ("    args[0].v_handle = &tensors[%d];\n    args[1].v_handle = &tensors[%d];\n"
-           "    args[2].v_handle = &tensors[%d];\n" % (e0, e1, c["yeid"]))
-    assert text.count(blk) == 1, (c["onnx"], c["node"], text.count(blk))
-    pos = text.index(blk)
-    cm = CALL_RE.search(text, pos)
-    nxt = text.find("    args[0].v_handle", pos + len(blk))
-    assert cm and (nxt < 0 or cm.start() < nxt), (c["onnx"], c["node"])
-    calls = re.findall(r"(?:aie_)?(tvmgen_\w+)\(args, codes, (\d+), 0, 0, 0\);", cm.group(2))
-    assert calls and all(s == c["symbol"] and int(k) == c["nargs"] for s, k in calls), (calls, c["symbol"])
-    if c.get("fa") is not None:  # GFA: role 0 = QK (pack Q, K), role 1 = PV (pack V, launch, write O)
-        rep = ("    GRAPH_PROF_BEGIN(%s);\n    UP_AIE_BEGIN(%s);\n"
-               "    aiednn_aie_attn(%d, args, %d, %d, %d);   /* fa %s g%d %s */\n"
-               "    UP_AIE_END(%s);\n    GRAPH_PROF_END(%s, \"aie aiednn_aie_attn %d\");\n"
-               % (cm.group(1), cm.group(1), c["cid"], c["nargs"], int(c["role"] == "pv"), c["fa"], c["role"],
-                  c["group"], c["onnx"].replace("*/", "*_/"), cm.group(1), cm.group(1), c["cid"]))
-        return text[:cm.start()] + rep + text[cm.end():]
-    g = c["geo"]
-    rep = ("    GRAPH_PROF_BEGIN(%s);\n    UP_AIE_BEGIN(%s);\n"
-           "    aiednn_aie_attn(%d, args, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d);   /* %s g%d %s */\n"
-           "    UP_AIE_END(%s);\n    GRAPH_PROF_END(%s, \"aie aiednn_aie_attn %d\");\n"
-           % (cm.group(1), cm.group(1), c["cid"], c["nargs"], int(c["role"] == "qk"), g["swap"], g["CHP"], g["PXP"],
-              g["Kp"], g["kp"], g["kch"], g["splitpx"], g["S"], g["chs"], g["pxs"], g["tr"], c["role"], c["group"],
-              c["onnx"].replace("*/", "*_/"), cm.group(1), cm.group(1), c["cid"]))
-    return text[:cm.start()] + rep + text[cm.end():]
-
-
-# P1 (b) per-call-site A78 time (graph_driver.c PROF glue) and the board main are generated by
-# aiegraph.boardmain (unet-m4 P4); kept here under their old names for patch_driver / test_host_split.
-from aiegraph import boardmain as _bm  # noqa: E402
-
-PROF_C = _bm.prof_c()
-
-
-def prof_c_attn() -> str:
-    """PROF_C with the GATT branch: attention sites print op=aie_host_attn<cid> (counted as aie_host by hsplit)"""
-    return _bm.prof_c(attn=True)
-
-
 # ─────────────────────────────── --kincore (P4bg) ───────────────────────────────
 # One launch per conv layer, K accumulated in the core: Maxwell's gemm_kacc (bf16_gemm_kacc.cc,
 # P4bk) instantiated per distinct layer GEMM shape. The kernel runs the transposed GEMM
@@ -531,31 +344,11 @@ KACC_KERNEL = _tpl("gemm/gemm_kacc_kernel.cc")   # C++ template __global__: aieh
 def write_kernel_kacc(kdst: Path, spec: str, shapes: list, warm: bool = False, ctrlpkt: str = "off",
                       lin: list = (), att: list = (), fa: list = ()) -> Path:
     """--kincore: aiek_unetconv.cc from aiegraph.kincore.write_source (one gemm_kacc instance per distinct
-    (ch, K, px), conv / linear host); att / fa: the attention parts (fa_attn) passed as its extra parts"""
+    (ch, K, px), conv / linear host); att / fa: the attention parts (aiegraph.attnsite / aiegraph.flashattn)"""
     from aiegraph import kincore
     if ctrlpkt == "aot" and CTRLPKT_KCO:
         ctrlpkt = "aot-kco"
-    kw = {}
-    if att:
-        kw["exports"] = ("aiednn_aie_attn",) + (("aiednn_aie_attn_kl",) if fa else ())
-    if fa:  # GFA (--attn-fa): flash-attention prologue, the fa_kernel template, the FA host entries
-        import fa_attn
-        kw.update(prologue=fa_attn.fa_prologue(fa) + "\n", kernels="\n\n" + fa_attn.FA_KERNEL,
-                  host_entries=fa_attn.fa_host(fa).lstrip("\n"))
-    elif att:
-        kw.update(host_entries=ATTN_HOST.lstrip("\n"),
-                  bufs=[(g["CHP"] * g["kp"], g["PXP"] * g["kp"], g["CHP"] * g["PXP"]) for g in (c["geo"] for c in att)])
+    from aiegraph import attnsite, flashattn
+    kw = flashattn.fa_kernel_parts(fa) if fa else attnsite.attn_kernel_parts(att) if att else {}
     return kincore.write_source(kdst, spec, shapes, entry=ENTRY, warm=warm, ctrlpkt=ctrlpkt, lin=lin, **kw)
 
-
-ATTN_HOST = _tpl("attention/kacc_bmm_host.cc")
-
-
-# S6 (unet-m3) / P4 (unet-m4): the driver template is aiegraph.boardmain.driver_glue.
-def driver_template(att: list) -> dict:
-    """``emod.driver_template(**driver_template(att))`` (old name): *att* must be the GFA (``fa``)
-    attention layers placed as aiegraph FA group steps, or empty."""
-    if att and not all(c.get("fa") is not None and c.get("fa_steps") for c in att):
-        raise ValueError("driver_template: attention layers must be aiegraph FA group steps (--attn-fa)")
-    import fa_attn
-    return _bm.driver_glue(fa_attn.DECL_FA + fa_attn.DECL_KL if att else "", attn=bool(att))

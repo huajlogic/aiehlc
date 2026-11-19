@@ -34,14 +34,14 @@ def keep_layout_step(onnx_path, part: dict, layers: list, out: Path, folds=None)
 
 def fa_offload_groups(emod, att: list, kcc: Path, out: Path) -> int:
     """S3 (design 2026-11-16 §5.2): every attention group = one aiegraph group offload with the four FA steps
-    (fa_attn.FA_STEPS, checked against their AIEK_STEP declarations); aiegraph places them, removes the other
+    (aiegraph.flashattn.FA_STEPS, checked against their AIEK_STEP declarations); aiegraph places them, removes the other
     calls (QK bmm, softmax, O merge) after its liveness / external-reader / early-write checks, and records the
     group in layers/partition.json, from which arm_build emits the driver."""
     import aiegraph as ag
-    import fa_attn
+    from aiegraph import flashattn as fa
     from aiegraph.group import reset_groups
     stepsrc = out / "aiek_src" / "fa_steps.cc"
-    stepsrc.write_text(fa_attn.fa_steps())
+    stepsrc.write_text(fa.FA_STEPS)
     specs = ag.load_steps(stepsrc)
     reset_groups(emod.workdir)
     by = {}
@@ -53,9 +53,9 @@ def fa_offload_groups(emod, att: list, kcc: Path, out: Path) -> int:
         g = qk["ag_group"]
         if qk["fa"] != pv["fa"] or qk["fa"] != g.cls:
             raise SystemExit(f"{name}: FA class {qk['fa']}/{pv['fa']} != aiegraph class {g.cls}")
-        steps = fa_attn.fa_group_steps(ag, g, qk["cid"], pv["cid"], qk["fa"])
+        steps = fa.fa_group_steps(ag, g, qk["cid"], pv["cid"], qk["fa"])
         ag.check_steps(specs, steps)
-        plan = emod.offload_group(g, source=str(kcc), steps=steps, emit=fa_attn.fa_step_emit(g))
+        plan = emod.offload_group(g, source=str(kcc), steps=steps, emit=fa.fa_step_emit(g))
         want = {"fa_step_pack_q": g.q_call, "fa_step_pack_k": g.k_call, "fa_step_pack_v": g.v_call,
                 "fa_step_run_o": g.pv}
         if plan.placement != want or sorted(plan.removed) != sorted([g.qk, g.softmax, g.merge]):
@@ -78,7 +78,7 @@ def offload(a, emod, out: Path):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import unet_aie as ua
     import aiegraph as ag
-    from aiegraph import kincore
+    from aiegraph import attnsite, flashattn, kincore
     import frontend.tvmrelay.arm_build as ab
     import onnx
     from aiegraph.callsite import all_conv_calls, pick_carrier
@@ -125,7 +125,7 @@ def offload(a, emod, out: Path):
             raise SystemExit("--aie conv,linear,attn: partition has no attn layers (autopart --mode attn)")
         if not a.kincore:
             raise SystemExit("--aie conv,linear,attn needs --kincore (gemm_kacc)")
-        att = ua.map_attn(part, work, onnx=a.onnx.resolve())   # S3: aiegraph attention matcher
+        att = attnsite.attn_sites(part, work, onnx=a.onnx.resolve(), log=log)   # S3: aiegraph attention matcher
         if len(att) != natt_part:
             raise SystemExit(f"mapped {len(att)} attn layers, partition has {natt_part}")
     fa = []
@@ -133,8 +133,7 @@ def offload(a, emod, out: Path):
         # GFA (P2): each attention group = ONE flash-attention (online softmax) on the AIE; TVM softmax removed
         if not att:
             raise SystemExit("--attn-fa needs --aie conv,linear,attn")
-        import fa_attn
-        fa = fa_attn.fa_classes(att)
+        fa = flashattn.fa_classes(att)
         for c in att:
             c["launches"] = fa[c["fa"]]["launches"] if c["role"] == "pv" else 0
         for k in fa:
@@ -155,7 +154,7 @@ def offload(a, emod, out: Path):
         convsel = sel
         sel = sel + lin
         planned = sum(c["launches"] for c in sel + att)
-        shapes = sorted(set(shapes) | (set() if fa else set(ua.attn_shapes(att))))
+        shapes = sorted(set(shapes) | (set() if fa else set(attnsite.attn_shapes(att))))
         log(f"KINCORE layers={len(sel) + len(att)} launches_planned={planned} kernel=bf16_gemm_kacc; "
             f"shapes={len(shapes)} (old 64x64x64 launches {part['N']})")
     else:
@@ -271,10 +270,7 @@ def offload(a, emod, out: Path):
     # S6: the C glue (FA kernel declarations, PROF macros, expand timing) is the driver template that
     # aiegraph places at checked anchors of every generated driver -- registered before keep_layout so
     # it runs first; the build_unet.py side only declares groups + this template
-    if att and not all(c.get("fa") is not None and c.get("fa_steps") for c in att):
-        raise SystemExit("attention layers must be aiegraph FA group steps (--attn-fa)")
-    import fa_attn
-    emod.driver_template(**bm.driver_glue(fa_attn.DECL_FA + fa_attn.DECL_KL if att else "", attn=bool(att)))
+    emod.driver_template(**flashattn.fa_driver_glue(att))
     n = len(sel) + len(att)
     log(f"graph_driver.c: {n} partition call sites -> aiednn_aie_conv ({n - len(lin) - len(att)}) + "
         f"aiednn_aie_linear ({len(lin)})" + (f" + aiednn_aie_attn ({len(att)})" if att else "") +

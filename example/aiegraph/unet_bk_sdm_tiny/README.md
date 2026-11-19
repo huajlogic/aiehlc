@@ -14,8 +14,9 @@ states 77×768) built with aiegraph → TVM C for the A78, with the conv layers 
 
 UNet-only C text lives in this directory: `build_unet.py`'s `MAIN_C`, the bench text in `bench/`, and
 `bf16_gemm_convin.cc` (`gemm_bf16`, one 64×64×64 bf16 tile per launch), its `--ktimer` variant
-`bf16_gemm_convin_ktimer.cc`, the TU head `tile64_conv_head.cc`, the x86 rounding-mode probe `softfloat_rm_reset.cc`
-and the x86 test harness `kacc_bmm_host_x86_harness.cc` (used by `test_attn_sites.py`). Every generic kernel and host-glue
+`bf16_gemm_convin_ktimer.cc`, the TU head `tile64_conv_head.cc` and the x86 rounding-mode probe `softfloat_rm_reset.cc`.
+The attention sites, the flash-attention groups and the driver glue are generic aiegraph code (`aiegraph.attnsite`,
+`aiegraph.flashattn`; their tests and the x86 harness are in `src/aiegraph/test/`). Every generic kernel and host-glue
 template is read from the aiednn library, the board compare tool from the aiegraph runtime:
 
 | Template | What |

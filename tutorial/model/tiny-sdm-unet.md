@@ -94,7 +94,7 @@ Files used in this tutorial:
 |---|---|
 | [`build_unet.py`](../../example/aiegraph/unet_bk_sdm_tiny/build_unet.py) | build entry point (full listing in section 5): declares the inputs and options, calls aiegraph |
 | [`unet_offload.py`](../../example/aiegraph/unet_bk_sdm_tiny/unet_offload.py) | the UNet's offload declaration: conv / linear / attention groups, the keep-layout plan; no C text |
-| [`kacc_gemm.py`](../../example/aiegraph/unet_bk_sdm_tiny/kacc_gemm.py), [`fa_attn.py`](../../example/aiegraph/unet_bk_sdm_tiny/fa_attn.py), [`unet_aie.py`](../../example/aiegraph/unet_bk_sdm_tiny/unet_aie.py) | instantiate the gemm_kacc / flash-attention templates in `src/aiednn` per layer shape |
+| [`kacc_gemm.py`](../../example/aiegraph/unet_bk_sdm_tiny/kacc_gemm.py), [`unet_aie.py`](../../example/aiegraph/unet_bk_sdm_tiny/unet_aie.py), [`aiegraph/flashattn.py`](../../src/aiegraph/flashattn.py), [`aiegraph/attnsite.py`](../../src/aiegraph/attnsite.py) | instantiate the gemm_kacc / flash-attention templates in `src/aiednn` per layer shape (attention + driver glue: generic aiegraph) |
 | [`partition_p4a.json`](../../example/aiegraph/unet_bk_sdm_tiny/partition_p4a.json) | which layers go to the AIE |
 | [`a78_layer_cflags.txt`](../../example/aiegraph/unet_bk_sdm_tiny/a78_layer_cflags.txt) | compiler flags for the TVM C code on the A78 (NEON) |
 | [`export_real_io.py`](../../example/aiegraph/unet_bk_sdm_tiny/export_real_io.py) | exports one real UNet input and the x86 reference output |

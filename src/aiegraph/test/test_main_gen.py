@@ -17,7 +17,8 @@ from aiegraph import boardmain as bm  # noqa: E402
 
 EX = ROOT / "example" / "aiegraph" / "unet_bk_sdm_tiny"
 OLD = "5649d6a"
-OLD_K = "unet"   # the kernel archive prefix at OLD
+OLD_K = "unet"
+FA_LAST = "d5e9f15"   # last commit with example/.../fa_attn.py (unet-decl P3 moved it to aiegraph.flashattn)   # the kernel archive prefix at OLD
 IO = ("sample", "timestep_i32", "ehs")
 
 
@@ -50,6 +51,17 @@ def _old_module(rel: str, name: str):
 def old():
     bu = _old_module("example/aiegraph/unet_bk_sdm_tiny/build_unet.py", "old_build_unet")
     ua = _old_module("example/aiegraph/unet_bk_sdm_tiny/unet_aie.py", "old_unet_aie")
+    # unet-decl P3: fa_attn.py left the example (aiegraph.flashattn); the old driver_template imports it lazily
+    # (its OLD text names templates that are gone, so the last example copy, at FA_LAST, stands in for it)
+    if "fa_attn" not in sys.modules:
+        src = subprocess.run(["git", "-C", str(ROOT), "show", f"{FA_LAST}:example/aiegraph/unet_bk_sdm_tiny/fa_attn.py"],
+                             capture_output=True, text=True).stdout
+        if not src:
+            pytest.skip(f"git show {FA_LAST}:fa_attn.py unavailable")
+        fa = types.ModuleType("fa_attn")
+        fa.__file__ = str(EX / "fa_attn.py")
+        exec(compile(src, fa.__file__, "exec"), fa.__dict__)
+        sys.modules["fa_attn"] = fa
     return bu, ua
 
 
@@ -109,7 +121,8 @@ def test_inputs_header_identical(old, tmp_path):
 
 def test_driver_glue_identical(old):
     _, ua = old
-    import fa_attn
-    assert bm.driver_glue() == ua.driver_template([])
+    from aiegraph import flashattn
+    assert bm.driver_glue() == ua.driver_template([]) == flashattn.fa_driver_glue([])
     att = [dict(fa=0, fa_steps=True)]
-    assert bm.driver_glue(fa_attn.DECL_FA + fa_attn.DECL_KL, attn=True) == ua.driver_template(att)
+    assert bm.driver_glue(flashattn.DECL_FA + flashattn.DECL_KL, attn=True) == ua.driver_template(att)
+    assert flashattn.fa_driver_glue(att) == ua.driver_template(att)

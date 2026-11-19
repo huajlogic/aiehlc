@@ -12,7 +12,8 @@ build_unet.keep_layout_step, aiegraph.partition.plan_keep_layout).
    host Transpose+Reshape result (bit-identical, no data movement); nchw is not -> plan rejects it.
 4. test_unet_host_consumer_rejected: same row with the consumers left on the host -> AiegraphError naming the
    LayerNormalization (today's partition cannot keep the layout there; never silently ignored).
-Run: python3 -m pytest -q example/aiegraph/unet_bk_sdm_tiny/test_layout_keep.py   (numpy, onnx)
+Moved from example/aiegraph/unet_bk_sdm_tiny/ (unet-decl P3).
+Run: python3 -m pytest -q src/aiegraph/test/test_layout_keep.py   (numpy, onnx)
 """
 import json
 import os
@@ -24,7 +25,8 @@ import pytest
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-sys.path.insert(0, str(HERE))
+EX = ROOT / "example" / "aiegraph" / "unet_bk_sdm_tiny"   # unet_offload.keep_layout_step, partition.json
+sys.path.insert(0, str(EX))
 sys.path.insert(0, str(ROOT / "src"))
 import unet_offload as bu  # noqa: E402
 from aiegraph.fold import keep_layout_plan  # noqa: E402
@@ -46,7 +48,7 @@ def model():
 
 
 def test_no_field_unchanged(tmp_path):
-    part = json.loads((HERE / "partition.json").read_text())
+    part = json.loads((EX / "partition.json").read_text())
     assert not any("keep_layout" in L for L in part["layers"])
     layers = [dict(onnx=L["node"], cid=L["idx"]) for L in part["layers"]]
     before = json.dumps(layers)
