@@ -26,3 +26,6 @@ test_layout_keep.py::test_no_field_unchanged -> test_layout_keep.py::test_no_fie
 test_layout_keep.py::test_unet_proj_in_kept -> test_layout_keep.py::test_unet_proj_in_kept
 test_layout_keep.py::test_unet_proj_in_label_proof -> test_layout_keep.py::test_unet_proj_in_label_proof
 test_layout_keep.py::test_unet_host_consumer_rejected -> test_layout_keep.py::test_unet_host_consumer_rejected
+# unet-decl P4d: the example's unet_aie.py and its 64x64-path C text are deleted (recoverable at d5e9f15); no test
+# id retired or renamed: test_main_gen.py reads that C text with git show d5e9f15, test_gap_offload.py compares
+# against aiegraph.kaccbench.kacc_geom (new, test_kaccbench.py)

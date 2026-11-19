@@ -283,7 +283,6 @@ def offload(a, emod, out: Path):
                 TOTAL_GEMM_MACS=(int(part["total_gemm_macs"]), "ULL"))
     if keep is not None:
         defs["KEEP_LAYOUT_EDGES"] = keep["kept"]
-    log(f"ktimer={'on' if a.ktimer else 'off'}")
     return defs, (len(sel) - len(lin), len(lin), len(att))
 
 

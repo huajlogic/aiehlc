@@ -22,6 +22,25 @@ FA_LAST = "d5e9f15"   # last commit with example/.../fa_attn.py (unet-decl P3 mo
 IO = ("sample", "timestep_i32", "ehs")
 
 
+LEGACY_TEXT = ("bf16_gemm_convin.cc", "bf16_gemm_convin_ktimer.cc", "softfloat_rm_reset.cc", "tile64_conv_head.cc")
+_LEGACY_DIR = []
+
+
+def _legacy_text_dir() -> Path:
+    """the example's 64x64-path C text as of FA_LAST, written once to a temp directory"""
+    if not _LEGACY_DIR:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="old_unet_text_"))
+        for f in LEGACY_TEXT:
+            r = subprocess.run(["git", "-C", str(ROOT), "show", f"{FA_LAST}:example/aiegraph/unet_bk_sdm_tiny/{f}"],
+                               capture_output=True)
+            if r.returncode:
+                pytest.skip(f"git show {FA_LAST}:{f} unavailable")
+            (d / f).write_bytes(r.stdout)
+        _LEGACY_DIR.append(d)
+    return _LEGACY_DIR[0]
+
+
 def _old_module(rel: str, name: str):
     try:
         src = subprocess.run(["git", "-C", str(ROOT), "show", f"{OLD}:{rel}"], capture_output=True, text=True,
@@ -34,11 +53,13 @@ def _old_module(rel: str, name: str):
     src = (src.replace(f'"aie {OLD_K}_aie_lin ", 17', '"aie aiednn_aie_lin ", 19')
            .replace(f"{OLD_K}_aie_", "aiednn_aie_").replace(f"{OLD_K}_prof_print", "aiednn_prof_print")
            .replace('"gemm/bf16_gemm_kacc.cc"', '"gemm/gemm_kacc_kernel.cc"'))
-    # aiednn-reorg P3: the UNet-only C text left src/aiednn for the example directory (loaded next to unet_aie.py)
-    for f in ("bf16_gemm_convin.cc", "bf16_gemm_convin_ktimer.cc"):
-        src = src.replace(f'_tplpath("conv2d/{f}")', f'(Path(__file__).resolve().parent / "{f}")')
-    for f in ("softfloat_rm_reset.cc", "tile64_conv_head.cc"):
-        src = src.replace(f'_tpl("conv2d/{f}")', f'open(Path(__file__).resolve().parent / "{f}", encoding="utf-8", newline="").read()')
+    # aiednn-reorg P3 moved the UNet-only C text to the example directory; unet-decl P4d dropped it there too:
+    # the old module reads the last copies (FA_LAST = d5e9f15, git show) from a temp directory
+    d = _legacy_text_dir()
+    for f in LEGACY_TEXT[:2]:
+        src = src.replace(f'_tplpath("conv2d/{f}")', f'(Path({str(d)!r}) / "{f}")')
+    for f in LEGACY_TEXT[2:]:
+        src = src.replace(f'_tpl("conv2d/{f}")', f'open(Path({str(d)!r}) / "{f}", encoding="utf-8", newline="").read()')
     mod = types.ModuleType(name)
     mod.__file__ = str(ROOT / rel)   # the old module resolves its templates relative to its own path
     if str(EX) not in sys.path:
