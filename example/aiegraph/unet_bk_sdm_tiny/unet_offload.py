@@ -77,6 +77,7 @@ def offload(a, emod, out: Path):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import unet_aie as ua
     import aiegraph as ag
+    from aiegraph import kincore
     import frontend.tvmrelay.arm_build as ab
     import onnx
     from aiegraph.callsite import all_conv_calls
@@ -90,7 +91,7 @@ def offload(a, emod, out: Path):
     assert all("proj_in" in x for x in folded), f"weight mismatch outside proj_in: {folded}"
     sel = [dict(g.info, group=g) for g in cgroups]
     for c in sel:
-        launches = ua.ceil64(c["M"]) * ua.ceil64(c["N"]) * ua.ceil64(c["K"])
+        launches = -(-c["M"] // 64) * -(-c["N"] // 64) * -(-c["K"] // 64)
         L = next(L for L in part["layers"] if L["idx"] == c["cid"])
         assert launches == L["launches"], (c["onnx"], launches, L["launches"])
         c["launches"] = launches
@@ -103,7 +104,7 @@ def offload(a, emod, out: Path):
         # PDN: the partition's linear layers (TVM nn_contrib_dense_pack) -> aiednn_aie_linear, gemm_kacc
         lin = [dict(g.info, group=g) for g in emod.match("linear", partition=part, model=onnx_model)]
         for c in lin:
-            c["S"], c["pxs"] = ua.kacc_split(c["N"], c["K"], -(-c["M"] // 64) * 64)
+            c["S"], c["pxs"] = kincore.kacc_split(c["N"], c["K"], -(-c["M"] // 64) * 64)
             c["launches"] = c["S"]
         log(f"aiegraph match('linear'): {len(lin)} partition linear layers -> one-call groups "
             f"(weights equal by value), {sum(c['S'] for c in lin)} gemm_kacc launches")
@@ -139,9 +140,8 @@ def offload(a, emod, out: Path):
                 f"launches/site={k['launches']}")
     keep = keep_layout_step(ua, a.onnx.resolve(), part, sel + lin + att, out)
     if a.kincore:
-        # P4bg: one launch per layer from kplan.py (K in the core) -- the partition.json N (64x64x64
+        # P4bg: one launch per layer (aiegraph.kincore.kplan, K in the core) -- the partition.json N (64x64x64
         # tile launches) does not apply on this path
-        import kplan
         if a.kincore_layers != "all":
             # P4bp: probe subset -- unselected layers keep their TVM C call site (no aiegraph group for them)
             want = sorted({int(x) for x in a.kincore_layers.split(",") if x.strip()})
@@ -150,17 +150,11 @@ def offload(a, emod, out: Path):
                 raise SystemExit(f"--kincore-layers {a.kincore_layers}: indices must be in 0..{len(sel) - 1}")
             sel = [sel[i] for i in want]
             log(f"KINCORE subset --kincore-layers {','.join(map(str, want))} -> cids {[c['cid'] for c in sel]}")
-        for c in sel:
-            kp = kplan.plan(c["M"], c["K"], c["N"])
-            if not kp["legal"] or kp["launches"] != 1:
-                raise SystemExit(f"kplan: layer {c['cid']} M={c['M']} K={c['K']} N={c['N']} "
-                                 f"legal={kp['legal']} launches={kp['launches']} why={kp['why']}")
-            c["launches"] = kp["launches"]
+        shapes, linrows = kincore.plan_kincore(sel, lin)
         convsel = sel
         sel = sel + lin
         planned = sum(c["launches"] for c in sel + att)
-        shapes = sorted({(c["N"], c["K"], c["M"]) for c in convsel} | {(c["N"], c["K"], c["pxs"]) for c in lin} |
-                        (set() if fa else set(ua.attn_shapes(att))))
+        shapes = sorted(set(shapes) | (set() if fa else set(ua.attn_shapes(att))))
         log(f"KINCORE layers={len(sel) + len(att)} launches_planned={planned} kernel=bf16_gemm_kacc; "
             f"shapes={len(shapes)} (old 64x64x64 launches {part['N']})")
     else:
@@ -195,7 +189,7 @@ def offload(a, emod, out: Path):
     if a.kincore:
         kcc = ua.write_kernel_kacc(out / "aiek_src", p.spec(), shapes, warm=(a.launch_opt == "warm"),
                                    ctrlpkt=a.ctrlpkt,
-                                   lin=[(c["N"], c["K"], -(-c["M"] // 64) * 64, c["pxs"]) for c in lin],
+                                   lin=linrows,
                                    **({"att": att} if att else {}), **({"fa": fa} if fa else {}))
     else:
         kcc = ua.write_kernel(out / "aiek_src", p.spec(), max(c["M"] * c["N"] for c in sel),

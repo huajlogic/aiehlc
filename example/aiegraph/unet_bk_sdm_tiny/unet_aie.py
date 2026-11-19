@@ -145,21 +145,13 @@ def map_layers(onnx_path: Path, partition: dict, work: Path, offsets_fn) -> tupl
 
 
 def kacc_split(N: int, K: int, Mp: int) -> tuple:
-    """PDN: launches of ONE gemm_kacc instance for a dense GEMM (= kacc_gemm.plan, PDK board-proven c009):
-    the whole GEMM if (ch N, k K, px Mp) fits, else S launches along px (X rows / Y blocks contiguous).
-    Returns (S, px per launch)."""
-    def fits(ch, k, px):
-        try:
-            kacc_geom(ch, k, px)
-            return True
-        except AssertionError:
-            return False
-    if fits(N, K, Mp):
-        return 1, Mp
-    for s in (2, 4, 8, 16):
-        if Mp % (64 * s) == 0 and fits(N, K, Mp // s):
-            return s, Mp // s
-    raise SystemExit(f"kacc_split: no px split of N={N} K={K} M={Mp} fits gemm_kacc")
+    """PDN: (S, px per launch) of a dense GEMM on ONE gemm_kacc instance (aiegraph.kincore.kacc_split)."""
+    from aiegraph import kincore
+    from aiegraph.errors import AiegraphError
+    try:
+        return kincore.kacc_split(N, K, Mp)
+    except AiegraphError as e:
+        raise SystemExit(str(e))
 
 
 def map_linears(onnx_path: Path, partition: dict, work: Path, offsets_fn) -> list:
@@ -593,128 +585,47 @@ def prelayout_weights(wbin: Path, sel: list) -> int:
 
 
 def kacc_name(ch: int, k: int, px: int) -> str:
-    """the launch callee of instance (ch, k, px): gemm_kacc<template args> (aiednn.gemm_kacc_launch)"""
-    import aiednn
-    return aiednn.gemm_kacc_launch(ch, k, px, kacc_geom(ch, k, px))
+    """the launch callee of instance (ch, k, px): aiegraph.kincore.kacc_name"""
+    from aiegraph import kincore
+    return kincore.kacc_name(ch, k, px)
 
 
 def kacc_geom(ch: int, k: int, px: int) -> dict:
-    """walk of one layer on the 4x4 mesh (aiehlc's trace fitter takes a 2-level affine walk per port):
-    core (pm, pn) owns ch/4 channels (ntile tiles of 16) x px/4 pixels (S sub-tiles of 16);
-      a (W)  [ch][k/2]  block {16, tkw}      rounds (t, j)  -- Maxwell's c013 walk
-      b (X)  [px][k/2]  block {px/4, tkw}    rounds (t, j), step_i 0 -- the core's whole pixel range per chunk
-      c (Y)  [ch][px]   block {16, px/4} fp32  rounds (t) -- the core's whole pixel range, held over the K walk
-    P4bx: the c window IS the fp32 accumulator (S 16x16 tiles, [s][mi][ni][8x8] order; the host un-tiles it).
-    A {16, 16} c block with a {px/4, tkw} b block made aiehlc take tileN=16 < tileCols=px/4 (the C port's d2
-    overrides B's) and emit the N-sub-tiled walk: A re-sent nRounds=px/64 times per K walk, the core takes it
-    once -> the px=1024 layer hung (P4bq probe_0). With c = {16, px/4}, tileN == tileCols: the "no N sub-tiling"
-    walk of the board-proven px=64 layers (P4bq probe_16). K chunk kch = 2*tkw bf16, tkw = min(32, 4096/px)
-    so the b block stays <= 4 KiB. px == 64: Maxwell's c013 walk."""
-    assert ch % 64 == 0 and px % 64 == 0 and k % 64 == 0, (ch, k, px)
-    tkw = min(32, 4096 // px)
-    # aiehlc's port-buffer region is 29696 B (trace_routing kPortBufferBytes) and an output window is always
-    # ping-pong: px=1024 (c block {16,256} fp32 = 16 KiB) cannot fit. Those layers run TRANSPOSED (tr=1):
-    # a = X [px][k/2] block {16, tkw} walked over px tiles, b = W [ch][k/2] block {ch/4, tkw}, c = Y^T [px][ch]
-    # block {16, ch/4}; same kernel walk, same host pre-tiling (W stays the mmul's left operand).
-    tr = 2 * (16 * tkw * 4 + (px // 4) * tkw * 4 + 16 * (px // 4) * 4) > 29696
-    if tr:
-        tkw = 32
-        while (ch // 4) * tkw > 1024 or (k // 2) % tkw:
-            tkw //= 2
-    assert tkw >= 4 and (k // 2) % tkw == 0, (ch, k, px, tkw)
-    # K padded by one zero chunk when the W port would be square (ch == k/2 words): aiehlc's GemmSpace
-    # derivation then mis-sizes the A window (gemm_kacc_1280x2560x64: 24 elements instead of 512)
-    kp = k + 2 * tkw if ch == k // 2 else k
-    rows, cols = (px, ch) if tr else (ch, px)   # a-port rows (walked by t) / b-port rows (whole range per core)
-    l1 = 2 * (16 * tkw * 4 + (cols // 4) * tkw * 4 + 16 * (cols // 4) * 4)
-    assert l1 <= 29696, (ch, k, px, l1)
-    return dict(ntile=rows // 64, S=cols // 64, tkw=tkw, kch=2 * tkw, nkc=(kp // 2) // tkw, kp=kp, tr=int(tr),
-                arows=rows, brows=cols, l1=l1)
+    """walk of one gemm_kacc launch on the 4x4 mesh: aiegraph.cnn.kacc_geom (the C window rule of
+    GAP-aiehlc-tilinglinalg-a45e5b is aiegraph.kincore.c_window); a shape without a walk raises AssertionError
+    here (kacc_gemm.fits / plan catch it)."""
+    from aiegraph import cnn
+    from aiegraph.errors import AiegraphError
+    try:
+        return cnn.kacc_geom(ch, k, px)
+    except AiegraphError as e:
+        raise AssertionError(str(e))
 
 
 KACC_KERNEL = _tpl("gemm/gemm_kacc_kernel.cc")   # C++ template __global__: aiehlc instantiates it per launch
 
 
-def kacc_host(shapes: list, lin: list = (), att: list = ()) -> str:
-    """host part of the --kincore aiek source: uc_conv with ONE gemm_kacc launch per layer (no host K-sum);
-    lin (PDN): (N, K, Mp, pxs) of the linear layers -- buffers hold the whole GEMM (all S px launches)"""
-    sw = "\n".join("    if (N == %d && K == %d && M == %d) {\n        %s<<<mesh>>>(%s, ky);\n        return 0;\n    }"
-                   % (ch, k, px, kacc_name(ch, k, px), "kx, kw" if kacc_geom(ch, k, px)["tr"] else "kw, kx")
-                   for ch, k, px in shapes)
-    return KACC_HOST.replace("@DISPATCH@", sw) \
-        .replace("@MAXW@", str(max([sh[0] * kacc_geom(*sh)["kp"] for sh in shapes] +
-                                   [n * kacc_geom(n, k, p)["kp"] for n, k, mp, p in lin] +
-                                   [g["CHP"] * g["kp"] for g in att]))) \
-        .replace("@MAXX@", str(max([sh[2] * kacc_geom(*sh)["kp"] for sh in shapes] +
-                                   [mp * kacc_geom(n, k, p)["kp"] for n, k, mp, p in lin] +
-                                   [g["PXP"] * g["kp"] for g in att]))) \
-        .replace("@MAXY@", str(max([ch * px for ch, k, px in shapes] + [n * mp for n, k, mp, p in lin] +
-                                   [g["CHP"] * g["PXP"] for g in att])))
-
-
-KACC_HOST = (_tpl("conv2d/kacc_conv_host_head.cc") + _tpl("layout/neon_tr4_f32.cc") + _tpl("conv2d/kacc_conv_host.cc"))
-
-LINEAR_HOST = _tpl("gemm/kacc_linear_host.cc")
+def write_kernel_kacc(kdst: Path, spec: str, shapes: list, warm: bool = False, ctrlpkt: str = "off",
+                      lin: list = (), att: list = (), fa: list = ()) -> Path:
+    """--kincore: aiek_unetconv.cc from aiegraph.kincore.write_source (one gemm_kacc instance per distinct
+    (ch, K, px), conv / linear host); att / fa: the attention parts (fa_attn) passed as its extra parts"""
+    from aiegraph import kincore
+    if ctrlpkt == "aot" and CTRLPKT_KCO:
+        ctrlpkt = "aot-kco"
+    kw = {}
+    if att:
+        kw["exports"] = ("aiednn_aie_attn",) + (("aiednn_aie_attn_kl",) if fa else ())
+    if fa:  # GFA (--attn-fa): flash-attention prologue, the fa_kernel template, the FA host entries
+        import fa_attn
+        kw.update(prologue=fa_attn.fa_prologue(fa) + "\n", kernels="\n\n" + fa_attn.FA_KERNEL,
+                  host_entries=fa_attn.fa_host(fa).lstrip("\n"))
+    elif att:
+        kw.update(host_entries=ATTN_HOST.lstrip("\n"),
+                  bufs=[(g["CHP"] * g["kp"], g["PXP"] * g["kp"], g["CHP"] * g["PXP"]) for g in (c["geo"] for c in att)])
+    return kincore.write_source(kdst, spec, shapes, entry=ENTRY, warm=warm, ctrlpkt=ctrlpkt, lin=lin, **kw)
 
 
 ATTN_HOST = _tpl("attention/kacc_bmm_host.cc")
-
-
-def write_kernel_kacc(kdst: Path, spec: str, shapes: list, warm: bool = False, ctrlpkt: str = "off",
-                      lin: list = (), att: list = (), fa: list = ()) -> Path:
-    """--kincore: aiek_unetconv.cc = one gemm_kacc instance per distinct (ch, K, px) + host aiednn_aie_conv;
-    lin (PDN): (N, K, Mp, pxs) per linear layer -> + host aiednn_aie_linear"""
-    spec = spec.replace('"out ', '"export    aiednn_aie_conv\\n"\n        "export    aiednn_aie_stats\\n"\n' +
-                        ('        "export    aiednn_aie_linear\\n"\n' if lin else '') +
-                        ('        "export    aiednn_aie_attn\\n"\n' if att else '') +
-                        ('        "export    aiednn_aie_attn_kl\\n"\n' if fa else '') +  # P4a keep-layout
-                        '        "export    aiednn_aie_launch_stats\\n"\n'
-                        '        "export    aiednn_aie_host_split_site\\n"\n'
-                        '        "export    aiednn_aie_host_split_line\\n"\n'
-                        '        "export    aiednn_aie_split_stats\\n"\n        "out ', 1)
-    assert "export    aiednn_aie_conv" in spec, spec
-    kdst.mkdir(parents=True, exist_ok=True)
-    kcc = kdst / f"{ENTRY}.cc"
-    head = (_tpl("gemm/kacc_unit_head.cc").replace("@E@", ENTRY).replace("@SRC@", str(KACC_CC))
-            .replace("@NSHAPES@", str(len(shapes))))
-    if ctrlpkt == "aot":
-        head = CTRLPKT_PRAGMAS + head
-    ktext = KACC_KERNEL if shapes else ""   # one template; aiehlc instantiates it per launch (same TU)
-    if fa:  # GFA (--attn-fa): flash-attention prologue (static helpers) before the kernels; the fa_kernel template
-        import fa_attn  # once, aiehlc instantiates it per class launch (fa_attn.fa_launch in fa_host)
-        head = head + fa_attn.fa_prologue(fa) + "\n"
-        ktext = ktext + "\n\n" + fa_attn.FA_KERNEL
-    host = kt_select(HOST_CC, False)
-    # replace the 64x64-tile uc_conv (host K-sum) by the one-launch version up to its epilogue
-    i0 = host.index("static int uc_conv(")
-    i1 = host.index('extern "C" int aiednn_aie_conv(')  # GPOOL: epilogue fused into the kacc scatter
-    host = host[:i0] + (kacc_host(shapes, lin, [c["geo"] for c in att]) if att and not fa else kacc_host(shapes, lin)) + host[i1:]
-    if lin:  # PDN: aiednn_aie_linear before aiednn_aie_conv
-        j = host.index('extern "C" int aiednn_aie_conv(int cid')
-        host = host[:j] + LINEAR_HOST.lstrip("\n") + host[j:]
-    if att:  # GATT: aiednn_aie_attn before aiednn_aie_conv
-        j = host.index('extern "C" int aiednn_aie_conv(int cid')
-        if fa:
-            import fa_attn
-            host = host[:j] + fa_attn.fa_host(fa).lstrip("\n") + host[j:]
-        else:
-            host = host[:j] + ATTN_HOST.lstrip("\n") + host[j:]
-    # drop the 64x64-port state the one-launch path does not use (no unused-static warnings)
-    a0, a1 = host.index("static int uc_alloc(void) {"), host.index("static long uc_numel(")
-    host = host[:a0] + host[a1:]
-    for dead in ("static float g_uc_acc[UC_MAX_ACC] __attribute__((aligned(64))); // .bss, never malloc\n",
-                 "static int32_t *g_uc_a = nullptr; // port a: bf16 [64][128]\n",
-                 "static int32_t *g_uc_b = nullptr; // port b: bf16 [UC_BR][128]\n",
-                 "static int32_t *g_uc_c = nullptr; // port c: f32  [64][UC_CW]\n"):
-        assert host.count(dead) == 1, dead
-        host = host.replace(dead, "")
-    assert "gemm_bf16<<<" not in host and "g_uc_acc[(size_t)(mb" not in host
-    kcc.write_text(head + ktext + "\n" + host.replace("@MAXACC@", "1").replace("@WARM@", "1" if warm else "0")
-                   .replace("@CTRLPKT@", "1" if ctrlpkt == "aot" else "0")
-                   .replace("@PART_C0@", "2" if ctrlpkt == "aot" else "3")
-                   .replace("@E@", ENTRY).replace("@SPEC@", spec))
-    (kdst / f"{ENTRY}_ref.c").write_text(REF_C.replace("@E@", ENTRY))
-    return kcc
 
 
 # S6 (unet-m3) / P4 (unet-m4): the driver template is aiegraph.boardmain.driver_glue.
