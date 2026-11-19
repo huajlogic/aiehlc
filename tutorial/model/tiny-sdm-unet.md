@@ -200,10 +200,9 @@ def main(argv=None) -> int:
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
     log = lambda msg: print(f"[build_unet] {msg}", flush=True)
-    if a.ctrlpkt == "aot-kco":  # before unet_aie is imported: it reads UNET_CTRLPKT_KCO at import time
-        os.environ["UNET_CTRLPKT_KCO"], a.ctrlpkt = "1", "aot"
-    elif "unet_aie" not in sys.modules:
-        os.environ.pop("UNET_CTRLPKT_KCO", None)
+    a.ctrlpkt_kco = a.ctrlpkt == "aot-kco"   # aot-kco = the aot plan + KERNELCONFIGOFFLOAD (aiegraph.kincore)
+    if a.ctrlpkt_kco:
+        a.ctrlpkt = "aot"
     import aiegraph as ag
     from aiegraph import boardmain as bm
     errs = [m for bad, m in (
