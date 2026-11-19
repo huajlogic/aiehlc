@@ -80,11 +80,10 @@ FA_COMMON = _tpl("attention/fa_common.cc")
 
 FA_NS = (_tpl("attention/fa_ns_head.cc") + _tpl("norm/fa_online_softmax.cc") + _tpl("attention/fa_ns_tail.cc"))
 
+#: one C++ template __global__ fa_kernel<NS, HEADS, NQ, MK, DH, SPLIT, E, NKV, QKROW, VROW, OROW> (aiehlc instantiates
+#: it per launch in the same source file); emitted once, every class launches fa_launch(c)
 FA_KERNEL = _tpl("attention/fa_kernel.cc")
-
-BODY_FULL = _tpl("attention/fa_body_full.cc")
-
-BODY_SPLIT = _tpl("attention/fa_body_split.cc")
+FA_TPARAMS = ("NS", "HEADS", "NQ", "MK", "DH", "SPLIT", "E", "NKV", "QKROW", "VROW", "OROW")
 
 
 def _sub(t: str, kv: dict) -> str:
@@ -101,16 +100,16 @@ def fa_prologue(classes: list) -> str:
     return t + "// AIEHLC_KERNEL_PROLOGUE_END\n"
 
 
-def fa_kernel_text(c: dict) -> str:
-    kv = dict(K=c["name"], NS="ns_" + c["name"], E=c["E"], E4=4 * c["E"], NKV=c["nkv"], QKROW=c["qkrow"],
-              VROW=c["vrow"], OROW=c["orow"], H=c["H"], N=c["N"], M=c["M"], D=c["D"])
-    body = _sub(BODY_SPLIT if c["split"] else BODY_FULL, kv)
-    if c["split"]:
-        kv.update(PNDOC="head pn, query block pm>>1, output half pm&1", QSEL="(j >> 1) == pn", QHALF="j & 1", NQB=8)
-    else:
-        kv.update(PNDOC="head pn, query block pm", QSEL="j == pn", QHALF="0", NQB=4)
-    kv["BODY"] = body
-    return _sub(FA_KERNEL, kv)
+def fa_targs(c: dict) -> str:
+    """``<...>`` template argument list of class *c*'s fa_kernel instance (FA_TPARAMS order)"""
+    vals = ("ns_" + c["name"], c["H"], c["N"], c["M"], c["D"], c["split"], c["E"], c["nkv"], c["qkrow"], c["vrow"],
+            c["orow"])
+    return "<" + ", ".join(str(v) for v in vals) + ">"
+
+
+def fa_launch(c: dict) -> str:
+    """The launch callee ``fa_kernel<...>`` of class *c* (the TU holds FA_KERNEL once)"""
+    return "fa_kernel" + fa_targs(c)
 
 
 FA_HOST = _tpl("attention/fa_host.cc")
@@ -121,7 +120,7 @@ def fa_host(classes: list) -> str:
                       % (c["H"], c["N"], c["M"], c["D"], c["split"], c["dq"], c["nkv"], c["E"], c["units"], c["upr"],
                          c["launches"], c["qkrow"], c["vrow"], c["orow"]) for c in classes)
     disp = "\n".join("    if (k == %d) {\n        %s<<<mesh>>>(q16, v16, o16);\n        return 0;\n    }"
-                     % (c["idx"], c["name"]) for c in classes)
+                     % (c["idx"], fa_launch(c)) for c in classes)
     return FA_HOST.replace("@CLASSES@", rows).replace("@DISPATCH@", disp)
 
 

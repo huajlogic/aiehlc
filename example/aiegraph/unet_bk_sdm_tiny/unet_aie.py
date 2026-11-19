@@ -672,10 +672,10 @@ def write_kernel_kacc(kdst: Path, spec: str, shapes: list, warm: bool = False, c
     if ctrlpkt == "aot":
         head = CTRLPKT_PRAGMAS + head
     ktext = KACC_KERNEL if shapes else ""   # one template; aiehlc instantiates it per launch (same TU)
-    if fa:  # GFA (--attn-fa): flash-attention prologue (static helpers) before the kernels, one kernel per class
-        import fa_attn
+    if fa:  # GFA (--attn-fa): flash-attention prologue (static helpers) before the kernels; the fa_kernel template
+        import fa_attn  # once, aiehlc instantiates it per class launch (fa_attn.fa_launch in fa_host)
         head = head + fa_attn.fa_prologue(fa) + "\n"
-        ktext = ktext + "\n\n" + "\n\n".join(fa_attn.fa_kernel_text(c) for c in fa)
+        ktext = ktext + "\n\n" + fa_attn.FA_KERNEL
     host = kt_select(HOST_CC, False)
     # replace the 64x64-tile uc_conv (host K-sum) by the one-launch version up to its epilogue
     i0 = host.index("static int uc_conv(")
