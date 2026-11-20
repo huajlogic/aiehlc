@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **26.3 %** (2.24 ms per 4.83 G MAC, MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **26.8 %** (2.20 ms per 4.83 G MAC, MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -236,6 +236,7 @@ host loop (`flowtransfer_host.cpp`, `computeMultipleInputShimBd`).
 | + MemTile BDs written once, only re-armed per launch | 2.25 ms | 26.2 % |
 | + B received in NT parts (replay starts on part 0) | **2.24 ms** | **26.3 %** |
 | C uncached instead of the invalidate contract | 2.43 ms | 24.3 % (slower) |
+| 64 x 64, kc 96, two blocks (8 accumulators) per step | **2.20 ms** | **26.8 %** (DMA-bound) |
 | 80 x 80, kc 48, 2 x 2 register blocks | 4.35 ms / 7.08 G MAC | 19.9 % (compute-bound) |
 | 80 x 80, kc 48, two blocks (8 accumulators) per step (`gemm_kacc_ntile_80x80.cc`) | 3.42 ms | 25.3 % (still compute-bound) |
 | same as 23.5 % row, DMA only (no MACs) | 2.29 ms | (25.8 %) |

@@ -50,13 +50,13 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
-## Best so far: 26.3 % end to end (MemTile-staged, hand-edited) -- 2026-11-20
+## Best so far: 26.8 % end to end (MemTile-staged, hand-edited) -- 2026-11-20
 `example/tileprogram/ccode/gemm_memtile/`: K-accumulating kernel (int32 C tile per
 core, written once) + `memtile_ab.py`, which edits the generated host.cc / routing.cc:
 - B is resident in each column's MemTile and replayed once per m tile;
 - A is double-buffered per mesh row and replayed once per n tile;
 - the shim sends every byte once.
-2.24 ms / 4.83 G MAC on palmyra, GOLDEN PASS.
+2.20 ms / 4.83 G MAC (26.8 %) on palmyra, GOLDEN PASS (two-block kernel).
 
 Traps:
 - **The kernel analysis takes 2-level block sequences only.** Trace (x86 `#else`) what

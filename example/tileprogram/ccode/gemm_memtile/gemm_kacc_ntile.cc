@@ -33,60 +33,145 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
                 const int8_t *w =
                     aie::load_buffer(b, {(pn * KA_NT + nt) * KA_TN, j * KA_KC}, {KA_TN, KA_KC}, {.depth = 2});
                 using MM = aie::mmul<8, 8, 8, int8_t, int8_t>;
-                for (int mh = 0; mh < KA_TM / 16; mh++)
-                    for (int nh = 0; nh < KA_TN / 16; nh++) {
-                        const int8_t *__restrict pa0 = x + (2 * mh) * kb * 64, *__restrict pa1 = pa0 + kb * 64;
+                // Two 16x16 blocks (8 accumulators) per step, so one block's accumulator
+                // loads / stores can overlap the other's MACs; an odd last block runs alone.
+#define KA_LD(c, p)                                                                                                    \
+    {                                                                                                                  \
+        aie::accum<acc32, 64> q_;                                                                                      \
+        q_.from_vector(aie::load_v<64>(p));                                                                            \
+        c = MM(q_);                                                                                                    \
+    }
+#define KA_ST32(p, c) aie::store_v((p), (c).to_vector<int32_t>())
+#define KA_ST8(p, c) aie::store_v((p), (c).to_vector<int8_t>(0))
+                const int nbn = KA_TN / 16;
+                for (int mh = 0; mh < KA_TM / 16; mh++) {
+                    const int8_t *__restrict pa0 = x + (2 * mh) * kb * 64, *__restrict pa1 = pa0 + kb * 64;
+                    int nh = 0;
+                    for (; nh + 1 < nbn; nh += 2)
+                        chess_prepare_for_pipelining {
+                            const int8_t *__restrict pb0 = w + (2 * nh) * kb * 64, *__restrict pb1 = pb0 + kb * 64;
+                            const int8_t *__restrict pb2 = pb1 + kb * 64, *__restrict pb3 = pb2 + kb * 64;
+                            int32_t *__restrict ad = acc + (mh * nbn + nh) * 256, *__restrict ae = ad + 256;
+                            MM d00, d01, d10, d11, e00, e01, e10, e11;
+                            if (j == 0) {
+                                const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0), a1 = aie::load_v<64>(pa1);
+                                const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0), b1 = aie::load_v<64>(pb1);
+                                const aie::vector<int8_t, 64> b2 = aie::load_v<64>(pb2), b3 = aie::load_v<64>(pb3);
+                                d00.mul(a0, b0);
+                                d01.mul(a0, b1);
+                                d10.mul(a1, b0);
+                                d11.mul(a1, b1);
+                                e00.mul(a0, b2);
+                                e01.mul(a0, b3);
+                                e10.mul(a1, b2);
+                                e11.mul(a1, b3);
+                            } else {
+                                KA_LD(d00, ad);
+                                KA_LD(d01, ad + 64);
+                                KA_LD(d10, ad + 128);
+                                KA_LD(d11, ad + 192);
+                                KA_LD(e00, ae);
+                                KA_LD(e01, ae + 64);
+                                KA_LD(e10, ae + 128);
+                                KA_LD(e11, ae + 192);
+                                const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0), a1 = aie::load_v<64>(pa1);
+                                const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0), b1 = aie::load_v<64>(pb1);
+                                const aie::vector<int8_t, 64> b2 = aie::load_v<64>(pb2), b3 = aie::load_v<64>(pb3);
+                                d00.mac(a0, b0);
+                                d01.mac(a0, b1);
+                                d10.mac(a1, b0);
+                                d11.mac(a1, b1);
+                                e00.mac(a0, b2);
+                                e01.mac(a0, b3);
+                                e10.mac(a1, b2);
+                                e11.mac(a1, b3);
+                            }
+                            for (int ki = 1; ki < kb; ki++)
+                                chess_flatten_loop {
+                                    const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0 + ki * 64);
+                                    const aie::vector<int8_t, 64> a1 = aie::load_v<64>(pa1 + ki * 64);
+                                    const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0 + ki * 64);
+                                    const aie::vector<int8_t, 64> b1 = aie::load_v<64>(pb1 + ki * 64);
+                                    const aie::vector<int8_t, 64> b2 = aie::load_v<64>(pb2 + ki * 64);
+                                    const aie::vector<int8_t, 64> b3 = aie::load_v<64>(pb3 + ki * 64);
+                                    d00.mac(a0, b0);
+                                    d01.mac(a0, b1);
+                                    d10.mac(a1, b0);
+                                    d11.mac(a1, b1);
+                                    e00.mac(a0, b2);
+                                    e01.mac(a0, b3);
+                                    e10.mac(a1, b2);
+                                    e11.mac(a1, b3);
+                                }
+                            if (j == nk - 1) {
+                                int8_t *t = y + ((2 * mh) * nti + 2 * nh) * 64;
+                                KA_ST8(t, d00);
+                                KA_ST8(t + 64, d01);
+                                KA_ST8(t + nti * 64, d10);
+                                KA_ST8(t + nti * 64 + 64, d11);
+                                KA_ST8(t + 128, e00);
+                                KA_ST8(t + 192, e01);
+                                KA_ST8(t + nti * 64 + 128, e10);
+                                KA_ST8(t + nti * 64 + 192, e11);
+                            } else {
+                                KA_ST32(ad, d00);
+                                KA_ST32(ad + 64, d01);
+                                KA_ST32(ad + 128, d10);
+                                KA_ST32(ad + 192, d11);
+                                KA_ST32(ae, e00);
+                                KA_ST32(ae + 64, e01);
+                                KA_ST32(ae + 128, e10);
+                                KA_ST32(ae + 192, e11);
+                            }
+                        }
+                    for (; nh < nbn; nh++) {
                         const int8_t *__restrict pb0 = w + (2 * nh) * kb * 64, *__restrict pb1 = pb0 + kb * 64;
-                        int32_t *__restrict ac = acc + (mh * (KA_TN / 16) + nh) * 256;
-                        MM c00, c01, c10, c11;
+                        int32_t *__restrict ad = acc + (mh * nbn + nh) * 256;
+                        MM d00, d01, d10, d11;
                         if (j == 0) {
                             const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0), a1 = aie::load_v<64>(pa1);
                             const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0), b1 = aie::load_v<64>(pb1);
-                            c00.mul(a0, b0);
-                            c01.mul(a0, b1);
-                            c10.mul(a1, b0);
-                            c11.mul(a1, b1);
+                            d00.mul(a0, b0);
+                            d01.mul(a0, b1);
+                            d10.mul(a1, b0);
+                            d11.mul(a1, b1);
                         } else {
-                            aie::accum<acc32, 64> q00, q01, q10, q11;
-                            q00.from_vector(aie::load_v<64>(ac));
-                            q01.from_vector(aie::load_v<64>(ac + 64));
-                            q10.from_vector(aie::load_v<64>(ac + 128));
-                            q11.from_vector(aie::load_v<64>(ac + 192));
-                            c00 = MM(q00);
-                            c01 = MM(q01);
-                            c10 = MM(q10);
-                            c11 = MM(q11);
+                            KA_LD(d00, ad);
+                            KA_LD(d01, ad + 64);
+                            KA_LD(d10, ad + 128);
+                            KA_LD(d11, ad + 192);
                             const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0), a1 = aie::load_v<64>(pa1);
                             const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0), b1 = aie::load_v<64>(pb1);
-                            c00.mac(a0, b0);
-                            c01.mac(a0, b1);
-                            c10.mac(a1, b0);
-                            c11.mac(a1, b1);
+                            d00.mac(a0, b0);
+                            d01.mac(a0, b1);
+                            d10.mac(a1, b0);
+                            d11.mac(a1, b1);
                         }
                         for (int ki = 1; ki < kb; ki++)
-                            chess_prepare_for_pipelining chess_loop_range(3, ) {
+                            chess_flatten_loop {
                                 const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0 + ki * 64);
                                 const aie::vector<int8_t, 64> a1 = aie::load_v<64>(pa1 + ki * 64);
                                 const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0 + ki * 64);
                                 const aie::vector<int8_t, 64> b1 = aie::load_v<64>(pb1 + ki * 64);
-                                c00.mac(a0, b0);
-                                c01.mac(a0, b1);
-                                c10.mac(a1, b0);
-                                c11.mac(a1, b1);
+                                d00.mac(a0, b0);
+                                d01.mac(a0, b1);
+                                d10.mac(a1, b0);
+                                d11.mac(a1, b1);
                             }
                         if (j == nk - 1) {
                             int8_t *t = y + ((2 * mh) * nti + 2 * nh) * 64;
-                            aie::store_v(t, c00.to_vector<int8_t>(0));
-                            aie::store_v(t + 64, c01.to_vector<int8_t>(0));
-                            aie::store_v(t + nti * 64, c10.to_vector<int8_t>(0));
-                            aie::store_v(t + nti * 64 + 64, c11.to_vector<int8_t>(0));
+                            KA_ST8(t, d00);
+                            KA_ST8(t + 64, d01);
+                            KA_ST8(t + nti * 64, d10);
+                            KA_ST8(t + nti * 64 + 64, d11);
                         } else {
-                            aie::store_v(ac, c00.to_vector<int32_t>());
-                            aie::store_v(ac + 64, c01.to_vector<int32_t>());
-                            aie::store_v(ac + 128, c10.to_vector<int32_t>());
-                            aie::store_v(ac + 192, c11.to_vector<int32_t>());
+                            KA_ST32(ad, d00);
+                            KA_ST32(ad + 64, d01);
+                            KA_ST32(ad + 128, d10);
+                            KA_ST32(ad + 192, d11);
                         }
                     }
+                }
                 aie::release(a);
                 aie::release(b);
             }
