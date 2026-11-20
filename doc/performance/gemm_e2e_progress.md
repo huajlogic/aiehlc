@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **14.6 %** (0.897 ms per 1.07 G MAC = 2.15 G op) | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **23.5 %** (2.51 ms per 4.83 G MAC, MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -214,6 +214,41 @@ once:
 2. MemTile staging in the compiler. Hand-edited, it took the run phase from
    0.15 to 0.12 ms, but the pipeline has no MemTile BD/lock support today.
 3. An output path past the 64-round limit (see section 2).
+
+## 8. K-accumulating GEMM with MemTile-resident B and replayed A (2026-11-20)
+Kernel: `example/tileprogram/ccode/simplegemm_kacc.cc`. Every core keeps an int32 C tile
+(tm x tn) across all K chunks and writes C once. The board runs used a variant with an
+n-tile loop (`/tmp/claude-35620/gs33/gemm_ka.cc`), plus a hand edit
+(`/tmp/claude-35620/memtile_ab.py`, applied to the generated `host.cc` / `routing.cc`):
+- each MemTile (c,1) holds its column's whole B slice and replays it once per m tile;
+- it double-buffers its mesh row's A tile and replays each one once per n tile;
+- the shim sends every byte once.
+
+Compiler fix that made it run: a whole-K-walk shim BD was started k_rounds times
+(hang). With `output_tile_major`, the M rounds now use one BD iteration instead of a
+host loop (`flowtransfer_host.cpp`, `computeMultipleInputShimBd`).
+
+| build (palmyra, GOLDEN PASS unless noted) | end to end | % peak |
+|---|---|---|
+| K-acc, A and B from DDR (B re-read per m tile) | 3.50 ms / 2.42 G MAC | 8.4 % |
+| + B in MemTile, replayed | 1.85 ms / 2.42 G MAC | 16.0 % |
+| + n-tile loop, A double-buffered in MemTile (tm = tn = 64, kc = 96, K 1152) | **2.51 ms / 4.83 G MAC** | **23.5 %** |
+| same, DMA only (no MACs) | 2.29 ms | (25.8 %) |
+| tm 96 x tn 80, kc 32 | 6.96 ms / 8.92 G MAC | 14.9 % (compute-bound: accumulator reload per 32-B chunk) |
+
+Measured limits:
+- **AIE clock on palmyra is 1000 MHz** (core timer vs XTime).
+- **The on-chip DMA sets the pace.** The DMA-only probe is 2.29 ms vs 2.51 ms with the MACs.
+- **Per-core input is 5.4 GB/s = 2.7 B/cycle per S2MM channel** (67 % of the 32-bit
+  stream). This is the slope of DMA-only 8 vs 16 rounds: 1.41 vs 2.29 ms.
+- **Fixed cost is ~0.53 ms per launch:** ELF over control packets, MemTile setup, B
+  prefill, final C drain.
+- **Ceiling for this design:** core input bytes per MAC = 1/tm + 1/tn.
+  - 64 x 64 tiles: 32 MAC/B x 5.4 GB/s = 171 GMAC/s per core = 33 %.
+  - About 42 % at most for any tile that fits in 64 KB, with accumulator and ping-pong
+    buffers.
+  - Going higher needs cores to share operands through neighbour memory, or a faster
+    DMA channel.
 
 ## 7. Files
 - Branch `gemm-e2e-opt` (`53406fee`, `6d6f7500`), worktree `.worktrees/gemm_e2e`.

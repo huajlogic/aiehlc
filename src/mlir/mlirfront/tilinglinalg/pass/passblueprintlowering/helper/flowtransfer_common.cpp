@@ -13,6 +13,7 @@
 // Bodies are moved verbatim: only the `static` keyword is removed and the
 // namespace wrapper added. No behavioral change.
 
+#include <cstdlib>
 #include "flowtransfer_internal.h"
 #include "routingmanager.h"
 #include <cassert>
@@ -757,6 +758,13 @@ LogicalResult checkKernelBlock(Operation *op, const KernelBlockUse &u, int64_t w
                                StringRef who) {
     if (!u.check || (windowElems == u.blockElems && rounds == u.rounds))
         return success();
+    // Hand experiments that re-route a port's DMA afterwards (e.g. a MemTile replay) build
+    // with AIEHLC_KB_CHECK_WARN=1: the mismatch is reported, not fatal.
+    if (const char *w = std::getenv("AIEHLC_KB_CHECK_WARN"); w && *w && *w != '0') {
+        op->emitWarning() << who << ": core window " << windowElems << " x " << rounds << " vs kernel blocks "
+                          << u.blockElems << " x " << u.rounds << " (AIEHLC_KB_CHECK_WARN: not fatal)";
+        return success();
+    }
     op->emitError() << who << ": the core window is " << windowElems << " elements x " << rounds
                     << " round(s) per launch, but the kernel's blocks (#routing.kernel_block) are " << u.blockElems
                     << " elements x " << u.rounds
