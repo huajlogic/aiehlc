@@ -2,7 +2,10 @@
 # K accumulated on core (C written once), A strips double-buffered in MemTile. Ignores launch cost.
 PEAK=16*512*0.998e9
 best={}
-import sys
+import sys, os
+# Per-channel core input in B/cycle: 4 = the 32-bit stream; 2.7 = measured on palmyra
+# (memtile -> core, DMA-only slope, 2026-11-20). AIEHLC_BOUND_CH=2.7 to use it.
+CH = float(os.environ.get("AIEHLC_BOUND_CH", "4"))
 for BW in [float(x)*1e9 for x in (sys.argv[1:] or ["7.4","11"])]:
     b=(0,)
     for K in range(64,4097,64):
@@ -11,11 +14,11 @@ for BW in [float(x)*1e9 for x in (sys.argv[1:] or ["7.4","11"])]:
                 for tn in range(8,257,8):
                     if Tn % (4*tn): continue
                     for kc in (32,64,128):
-                        core = 4*tm*tn + 2*kc*(tm+tn)        # int32 acc + ping-pong A/B chunks
+                        core = 4*tm*tn + 2*kc*(tm+tn) + 2*tm*tn  # int32 acc + ping-pong A/B chunks + C int8 ping-pong
                         if core > 60*1024: continue
                         memt = K*Tn//4 + 2*4*tm*K             # B column slice + 2 x (4 row strips of A)
                         if memt > 512*1024: continue
-                        r_core = min(512, 8/(1/tm+1/tn))      # MAC/cycle/core: 2 S2MM x 4 B/cycle
+                        r_core = min(512, CH*tn, CH*tm)       # MAC/cycle/core: A channel carries 1/tn B/MAC, B channel 1/tm
                         r_ddr  = BW/(1/K + 1/Tn)/(16*0.998e9) # A once per Tn, C once (int8), B ~once
                         r = min(r_core, r_ddr)/512
                         if r > b[0]: b=(r,K,Tn,tm,tn,kc,core,memt)
