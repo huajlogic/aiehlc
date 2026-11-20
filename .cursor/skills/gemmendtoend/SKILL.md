@@ -51,6 +51,14 @@ problem.
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
 ## The wall: mixed DDR traffic (ruled out: compute, release order, shim placement)
+**CAVEAT (2026-11-20):** the GB/s figures below are NOT dedicated DMA probes --
+they are bytes / the wait_io PMU phase of a whole launch. The "input only ~37
+GB/s" is not physical (4 row streams x 4 B/cycle at ~1 GHz cap near 16 GB/s) and
+the "output only 20.5 GB/s" needs 5.1 GB/s per 32-bit S2MM channel: wait_io most
+likely does not cover the whole transfer in those two probes. Amit's dedicated
+palmyra213 probes (amit/tasks/2026-11-14_palmyra-ddr-cap: read 9.9, write 8.0,
+r+w 7.4 GB/s) are the reference; the conclusions below that lean on 37/20.5
+(phase separation gains, projections) are unverified.
 Probes on the 32-row-strip shape (A 2.1 MB in, C 4.2 MB out per launch):
 | Probe | run phase |
 |---|---|
