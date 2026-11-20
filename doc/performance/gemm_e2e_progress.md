@@ -170,12 +170,17 @@ involved. Steady-state calls on palmyra:
 - The earlier 11 GB/s (bytes / `wait_io`) and the "37 / 20.5 GB/s" both came from
   the phase timers and overstate the rate.
 
-With 7.8 GB/s the exhaustive bound above is **47 %**. Even granting the
-read-only rate of 9.9 GB/s to every byte, it is **57 %**. **60-70 % end to end
-is therefore not reachable for int8 GEMM on this 4x4 mesh**: the limit is
-palmyra's DDR bandwidth against 2.5 MB of on-chip memory, not the compiler. The
-remaining headroom is ~14.6 % -> at most ~45 %, and it needs the MemTile design
-in this section.
+With 7.8 GB/s the exhaustive bound above is 47 %, **but that holds only while
+reads and writes share DDR at the same time**. Write-only probes (A resident in
+the cores, C streamed out; 16 vs 64 rounds, no KCO) give a slope of **13.9 GB/s**,
+and the bound at 13.9 GB/s is **70 %** (K 640, N_tile 1216, core tile 64 x 152).
+So mixing reads and writes looks like the cost, and a design that keeps them
+apart in time (A staged in the MemTiles during a read phase, C written while
+the cores compute) is not ruled out. The read-only probe is not usable: it
+added 0.018 ms for 1.57 MB, which is not physical. Its reads overlap the ~0.5 ms
+fixed launch cost, so the slope says nothing. Re-measuring both on the KCO
+build at 16/32/64 rounds. **Conclusion withdrawn: 60-70 % is not shown to be
+unreachable.**
 
 ## 6. What remains (not built)
 1. A persistent kernel re-armed in microseconds (today ~0.17-0.9 ms fixed cost per

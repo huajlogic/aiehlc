@@ -54,8 +54,12 @@ problem.
 These are DMA-only probes at 16/32/64 rounds: 0.311 / 0.515 / 0.909 ms end to
 end for 1.57 / 3.15 / 6.29 MB. The slope is 7.7-7.9 GB/s and the fixed cost
 ~0.11 ms per launch. The GEMM (0.897 ms) equals its DMA-only twin, so it is
-DDR-bound. `script/perf/gemm_e2e_bound.py 7.8` gives a 47 % ceiling for ANY
-tiling (MemTile-stationary B, K accumulated on core), launch cost ignored.
+DDR-bound. `script/perf/gemm_e2e_bound.py 7.8` gives 47 % for a design that
+mixes reads and writes. But write-only measures 13.9 GB/s (bound 70 %), so
+keeping reads and writes apart in time (reads staged in the MemTiles) is the
+open lever -- do NOT call 60 % impossible from the mixed rate alone. A read-only
+slope taken inside the ~0.5 ms fixed launch cost is meaningless (0.018 ms for
+1.57 MB): use >= 3 sizes and check they are linear.
 Measure bandwidth by the slope of whole-launch time vs bytes, never by
 bytes / a phase timer.
 
