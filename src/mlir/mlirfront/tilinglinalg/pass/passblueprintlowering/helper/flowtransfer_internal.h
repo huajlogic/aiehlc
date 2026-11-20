@@ -152,6 +152,12 @@ struct MultipleInputOffsetParams {
     int64_t haloHStrideBytes = 0;
     int64_t haloWStrideBytes = 0;
     int64_t haloWRoundsVal = 0;
+    // The shim BD each round sends (computeMultipleInputShimBd). oneBd: the rounds are
+    // walked by ONE BD (iteration over the round stride, repeat = rounds) armed once,
+    // with no host round loop.
+    int64_t loopLen = 0;
+    int32_t loopIterStep = 0, loopIterWrap = 0, loopRepeat = 1;
+    bool oneBd = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -513,6 +519,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
     // computation (no op emission). Fills MultipleInputOffsetParams.
     void computeMultipleInputOffsetParams(FlowLoweringCtx &c, ModuleOp moduleOp, bool nOuterPolicy,
                                           struct MultipleInputOffsetParams &p) const;
+    void computeMultipleInputShimBd(FlowLoweringCtx &c, struct MultipleInputOffsetParams &p) const;
     void emitScheduleOooOutput(FlowLoweringCtx &c) const;
     void emitScheduleStraightLine(FlowLoweringCtx &c) const;
 
