@@ -130,6 +130,25 @@ pipeline support the compiler does not have today: MemTile buffers with
 BDs and locks, an on-core K-accumulation loop with C written once, and broadcast
 in both dimensions.
 
+### Search over every legal tiling (`script/perf/gemm_e2e_bound.py`)
+The search covers every K, N_tile, core tile tm x tn and K chunk that fits:
+- int32 accumulators plus ping-pong chunks in <= 60 KB of core memory;
+- the B column slice plus a double-buffered A in <= 512 KB of MemTile.
+
+Each point is limited by DDR and by core intake. Launch cost and imperfect
+overlap are set to zero, so this is an upper bound:
+
+| mixed DDR bandwidth | best possible end to end | at |
+|---|---|---|
+| 7.4 GB/s (Amit's r+w probe) | **45 %** | K 768, N_tile 1408, core tile 40 x 176 |
+| 11 GB/s (the highest mixed rate measured here) | **61 %** | K 640, N_tile 1728, core tile 48 x 216 |
+
+Both optima fill the MemTile to the last ~2 KB. **90 % is out of reach on this
+board**: the DDR bandwidth and the 2.5 MB of on-chip memory rule it out, whatever
+the compiler does. 60-70 % is reachable only at the very top of the measured
+bandwidth range, and only with zero launch cost and perfect overlap. A real
+implementation would sit below these numbers.
+
 ## 6. What remains (not built)
 1. A persistent kernel re-armed in microseconds (today ~0.17-0.9 ms fixed cost per
    launch, versus ~0.1-0.3 ms of ideal work per launch).
