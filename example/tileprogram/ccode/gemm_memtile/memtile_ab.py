@@ -21,32 +21,42 @@ static void mt_bd(XAie_DevInst *dev, XAie_LocType mt, int bd, unsigned addr, uns
 }
 static void memtile_ab(XAie_DevInst *dev, int col, unsigned blen, int breps, unsigned alen, int nt, int arounds) {
     XAie_LocType mt = XAie_TileLoc(col, 1);
-    const unsigned B0 = 0x80000, A0 = 0x80000 + blen, A1 = A0 + alen;
-    /* locks: 0 B full, 1 B empty, 2 A0 empty, 3 A1 empty, 4 A0 full, 5 A1 full */
-    XAie_LockSetValue(dev, mt, XAie_LockInit(0, 0));
-    XAie_LockSetValue(dev, mt, XAie_LockInit(1, 1));
+    const unsigned B0 = 0x80000, A0 = 0x80000 + blen, A1 = A0 + alen, bpart = blen / nt;
+    /* locks: 2 A0 empty, 3 A1 empty, 4 A0 full, 5 A1 full; 6+k B part k full, 10+k B part k empty */
     XAie_LockSetValue(dev, mt, XAie_LockInit(2, 1));
     XAie_LockSetValue(dev, mt, XAie_LockInit(3, 1));
     XAie_LockSetValue(dev, mt, XAie_LockInit(4, 0));
     XAie_LockSetValue(dev, mt, XAie_LockInit(5, 0));
-    mt_bd(dev, mt, 0, B0, blen, 1, -1, 0, 1, -1);
-    mt_bd(dev, mt, 1, B0, blen, 0, -1, 0, 1, -1);
-    mt_bd(dev, mt, 24, A0, alen, 2, -1, 4, 1, 25);
-    mt_bd(dev, mt, 25, A1, alen, 3, -1, 5, 1, -1);
-    int bd = 26;
-    for (int b = 0; b < 2; b++)
-        for (int r = 0; r < nt; r++, bd++) {
-            const int last = (b == 1 && r == nt - 1);
-            mt_bd(dev, mt, bd, b ? A1 : A0, alen, 4 + b, -1, r == nt - 1 ? 2 + b : 4 + b, 1, last ? -1 : bd + 1);
+    for (int k = 0; k < nt; k++) {
+        XAie_LockSetValue(dev, mt, XAie_LockInit(6 + k, 0));
+        XAie_LockSetValue(dev, mt, XAie_LockInit(10 + k, 1));
+    }
+    static int bds_written[8];
+    if (!bds_written[col]) {
+        bds_written[col] = 1;
+        /* B: received once in nt parts (S2MM BD 0..nt-1), replayed part by part (MM2S BD 8..8+nt-1):
+         * the cores start on part 0 while the rest is still arriving. */
+        for (int k = 0; k < nt; k++) {
+            mt_bd(dev, mt, k, B0 + k * bpart, bpart, 10 + k, -1, 6 + k, 1, k + 1 < nt ? k + 1 : -1);
+            mt_bd(dev, mt, 8 + k, B0 + k * bpart, bpart, 6 + k, -1, 6 + k, 1, k + 1 < nt ? 8 + k + 1 : -1);
         }
+        mt_bd(dev, mt, 24, A0, alen, 2, -1, 4, 1, 25);
+        mt_bd(dev, mt, 25, A1, alen, 3, -1, 5, 1, -1);
+        int bd = 26;
+        for (int b = 0; b < 2; b++)
+            for (int r = 0; r < nt; r++, bd++) {
+                const int last = (b == 1 && r == nt - 1);
+                mt_bd(dev, mt, bd, b ? A1 : A0, alen, 4 + b, -1, r == nt - 1 ? 2 + b : 4 + b, 1, last ? -1 : bd + 1);
+            }
+        XAie_DmaChannelEnable(dev, mt, 0, DMA_S2MM);
+        XAie_DmaChannelEnable(dev, mt, 0, DMA_MM2S);
+        XAie_DmaChannelEnable(dev, mt, 1, DMA_S2MM);
+        XAie_DmaChannelEnable(dev, mt, 1, DMA_MM2S);
+    }
     XAie_DmaChannelSetStartQueue(dev, mt, 0, DMA_S2MM, 0, 1, 0);
-    XAie_DmaChannelEnable(dev, mt, 0, DMA_S2MM);
-    XAie_DmaChannelSetStartQueue(dev, mt, 0, DMA_MM2S, 1, breps, 0);
-    XAie_DmaChannelEnable(dev, mt, 0, DMA_MM2S);
+    XAie_DmaChannelSetStartQueue(dev, mt, 0, DMA_MM2S, 8, breps, 0);
     XAie_DmaChannelSetStartQueue(dev, mt, 1, DMA_S2MM, 24, arounds / 2, 0);
-    XAie_DmaChannelEnable(dev, mt, 1, DMA_S2MM);
     XAie_DmaChannelSetStartQueue(dev, mt, 1, DMA_MM2S, 26, arounds / 2, 0);
-    XAie_DmaChannelEnable(dev, mt, 1, DMA_MM2S);
 }
 """
 wl, blen, breps, alen, nt, ar, rdir = sys.argv[1], *map(int, sys.argv[2:7]), sys.argv[7]
