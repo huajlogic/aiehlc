@@ -50,6 +50,30 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
+## Best so far: 26.3 % end to end (MemTile-staged, hand-edited) -- 2026-11-20
+`example/tileprogram/ccode/gemm_memtile/`: K-accumulating kernel (int32 C tile per
+core, written once) + `memtile_ab.py`, which edits the generated host.cc / routing.cc:
+- B is resident in each column's MemTile and replayed once per m tile;
+- A is double-buffered per mesh row and replayed once per n tile;
+- the shim sends every byte once.
+2.24 ms / 4.83 G MAC on palmyra, GOLDEN PASS.
+
+Traps:
+- **The kernel analysis takes 2-level block sequences only.** Trace (x86 `#else`) what
+  the SHIM sends; the chess path consumes the replays. Build with
+  `AIEHLC_KB_CHECK_WARN=1`, and match the A offsets to the trace cursor, or klog fills
+  with BLKE.
+- **MemTile BD rules:** BDs on odd channels are 24..47; own memory starts at 0x80000;
+  own locks are 64+ in a BD.
+- **Write the MemTile BDs once** (static flag) and re-arm only locks + start queue:
+  0.26 ms per launch of MMIO at 372 ns/write.
+- **The limit now is on-chip core input:** 2.7 B/cycle per S2MM channel (slope of
+  DMA-only 8 vs 16 rounds), and the input bytes per MAC are 1/tm + 1/tn. 64 x 64 tiles
+  give 33 %; no tile that fits 64 KB (int32 accumulator + ping-pong + C ping-pong)
+  gives more than ~42 %. A 32-B K chunk makes the accumulator reload dominate
+  (96 x 80, kc 32: 14.9 %).
+- AIE clock on palmyra: 1000 MHz.
+
 ## MEASURED DDR rate (2026-11-20): 7.8 GB/s mixed
 These are DMA-only probes at 16/32/64 rounds: 0.311 / 0.515 / 0.909 ms end to
 end for 1.57 / 3.15 / 6.29 MB. The slope is 7.7-7.9 GB/s and the fixed cost

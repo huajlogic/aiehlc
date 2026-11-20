@@ -11,5 +11,8 @@ replay them (B resident per column, A double-buffered per mesh row).
     WORKLOCAL_DIR=$PWD/aout/worklocal AIE_VERSION=5 PLATFORM=baremetal bash script/hostcompile.sh
     python3 script/test/apppaltest.py aout/worklocal/build/host -y --netload
 
-palmyra: 2.51 ms per 4.83 G MAC = 23.5 % of peak end to end, GOLDEN PASS.
+palmyra: **2.24 ms per 4.83 G MAC = 26.3 % of peak end to end**, GOLDEN PASS
+(MemTile BDs written once and only re-armed per launch: 2.51 -> 2.25 ms; B received in
+NT parts so replay starts on part 0: 2.25 -> 2.24 ms; uncached C instead of the
+invalidate contract: slower, 2.43 ms).
 Details: doc/performance/gemm_e2e_progress.md section 8.
