@@ -12,7 +12,7 @@ Peak = 16 cores x 512 int8 MAC/cycle (`mmul<8,8,8,int8,int8>` = one
 91.5 % (`example/tileprogram/ccode/simplegemm_peak.cc`); end to end is another
 problem.
 
-## Measured ladder (2.15 G MAC per launch, GOLDEN PASS every row)
+## Measured ladder (1.07 G MAC = 2.15 G op per launch, GOLDEN PASS every row)
 | Change | per launch | % peak |
 |---|---|---|
 | kernel-only GEMM as generated | 293 ms | 0.09 |
