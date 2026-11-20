@@ -2,7 +2,8 @@
 # K accumulated on core (C written once), A strips double-buffered in MemTile. Ignores launch cost.
 PEAK=16*512*0.998e9
 best={}
-for BW in (7.4e9, 11e9):
+import sys
+for BW in [float(x)*1e9 for x in (sys.argv[1:] or ["7.4","11"])]:
     b=(0,)
     for K in range(64,4097,64):
         for Tn in range(64,8193,64):

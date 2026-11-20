@@ -142,12 +142,40 @@ overlap are set to zero, so this is an upper bound:
 |---|---|---|
 | 7.4 GB/s (Amit's r+w probe) | **45 %** | K 768, N_tile 1408, core tile 40 x 176 |
 | 11 GB/s (the highest mixed rate measured here) | **61 %** | K 640, N_tile 1728, core tile 48 x 216 |
+| **7.8 GB/s (measured below, 2026-11-20)** | **47 %** | K 768, N_tile 1408, core tile 40 x 176 |
+| 9.9 GB/s (Amit's read-only rate, an upper limit for any mix) | 57 % | K 704, N_tile 1408, core tile 48 x 176 |
 
 Both optima fill the MemTile to the last ~2 KB. **90 % is out of reach on this
 board**: the DDR bandwidth and the 2.5 MB of on-chip memory rule it out, whatever
 the compiler does. 60-70 % is reachable only at the very top of the measured
 bandwidth range, and only with zero launch cost and perfect overlap. A real
 implementation would sit below these numbers.
+
+### Measured: sustained mixed DDR rate = 7.8 GB/s
+These are DMA-only probes: the best build (`gs18`) with every MAC removed, at 16,
+32 and 64 rounds per launch. Each round moves 96 KB (A 32 KB in, C 64 KB out).
+The time is host XTime around the whole launch, so no phase accounting is
+involved. Steady-state calls on palmyra:
+
+| rounds | bytes | end to end |
+|---|---|---|
+| 16 | 1.57 MB | 0.311 ms |
+| 32 | 3.15 MB | 0.515 ms |
+| 64 | 6.29 MB | 0.909 ms |
+
+- The slope is 7.7-7.9 GB/s between every pair; the fixed cost is ~0.11 ms per
+  launch.
+- The real GEMM at 64 rounds takes 0.897 ms, the same as its DMA-only twin, so
+  14.6 % is exactly what DDR allows for this byte count.
+- The earlier 11 GB/s (bytes / `wait_io`) and the "37 / 20.5 GB/s" both came from
+  the phase timers and overstate the rate.
+
+With 7.8 GB/s the exhaustive bound above is **47 %**. Even granting the
+read-only rate of 9.9 GB/s to every byte, it is **57 %**. **60-70 % end to end
+is therefore not reachable for int8 GEMM on this 4x4 mesh**: the limit is
+palmyra's DDR bandwidth against 2.5 MB of on-chip memory, not the compiler. The
+remaining headroom is ~14.6 % -> at most ~45 %, and it needs the MemTile design
+in this section.
 
 ## 6. What remains (not built)
 1. A persistent kernel re-armed in microseconds (today ~0.17-0.9 ms fixed cost per

@@ -50,6 +50,15 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
+## MEASURED DDR rate (2026-11-20): 7.8 GB/s mixed
+These are DMA-only probes at 16/32/64 rounds: 0.311 / 0.515 / 0.909 ms end to
+end for 1.57 / 3.15 / 6.29 MB. The slope is 7.7-7.9 GB/s and the fixed cost
+~0.11 ms per launch. The GEMM (0.897 ms) equals its DMA-only twin, so it is
+DDR-bound. `script/perf/gemm_e2e_bound.py 7.8` gives a 47 % ceiling for ANY
+tiling (MemTile-stationary B, K accumulated on core), launch cost ignored.
+Measure bandwidth by the slope of whole-launch time vs bytes, never by
+bytes / a phase timer.
+
 ## The wall: mixed DDR traffic (ruled out: compute, release order, shim placement)
 **CAVEAT (2026-11-20):** the GB/s figures below are NOT dedicated DMA probes --
 they are bytes / the wait_io PMU phase of a whole launch. The "input only ~37
