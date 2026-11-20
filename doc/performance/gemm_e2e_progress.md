@@ -236,6 +236,8 @@ host loop (`flowtransfer_host.cpp`, `computeMultipleInputShimBd`).
 | + MemTile BDs written once, only re-armed per launch | 2.25 ms | 26.2 % |
 | + B received in NT parts (replay starts on part 0) | **2.24 ms** | **26.3 %** |
 | C uncached instead of the invalidate contract | 2.43 ms | 24.3 % (slower) |
+| 80 x 80, kc 48, 2 x 2 register blocks | 4.35 ms / 7.08 G MAC | 19.9 % (compute-bound) |
+| 80 x 80, kc 48, two blocks (8 accumulators) per step (`gemm_kacc_ntile_80x80.cc`) | 3.42 ms | 25.3 % (still compute-bound) |
 | same as 23.5 % row, DMA only (no MACs) | 2.29 ms | (25.8 %) |
 | tm 96 x tn 80, kc 32 | 6.96 ms / 8.92 G MAC | 14.9 % (compute-bound: accumulator reload per 32-B chunk) |
 
@@ -252,6 +254,14 @@ Measured limits:
     buffers.
   - Going higher needs cores to share operands through neighbour memory, or a faster
     DMA channel.
+
+Why the larger tile stays compute-bound: every K chunk reloads and re-stores the int32
+accumulators. Each 64-lane acc32 is 4 VLDA + 4 VST, at 1 VLDA and 1 VST per cycle, so
+2 x 2 blocks spend ~32 cycles moving accumulators per 24 MACs (kc 48). There are only
+8 accumulator registers, so the next block's loads cannot overlap the current
+block's MACs (`kernel.lst`). Running two blocks per step overlaps part of it
+(23 % -> 30 % compute efficiency). A tile that beats 64 x 64 needs kc >= ~96 to
+amortise this, and 64 KB of core memory does not fit that.
 
 ## 9. Bound with the measured core-input rate (2026-11-20)
 `AIEHLC_BOUND_CH=2.7 script/perf/gemm_e2e_bound.py <GB/s>` now models what each core
