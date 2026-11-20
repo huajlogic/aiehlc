@@ -229,6 +229,14 @@ public:
     int row() const { return row_; }
     int col() const { return col_; }
 
+    // Channels of `direct` already allocated on this shim tile.
+    int allocatedCount(DMADIRECTION direct) const {
+        int n = 0;
+        for (const auto &ch : (direct == DMADIRECTION::MM2S ? mm2s_ : s2mm_))
+            n += ch.allocated ? 1 : 0;
+        return n;
+    }
+
     bool isReserved() const { return reserved_; }
     int getReservedByIoId() const { return reservedByIoId_; }
 

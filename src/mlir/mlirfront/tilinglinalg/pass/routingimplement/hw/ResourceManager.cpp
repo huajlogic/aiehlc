@@ -46,9 +46,16 @@ std::optional<uint32_t> CoreMemAllocator::allocate(const std::string &name, uint
         if (slot.symbolName == name)
             return slot.address;
     }
+    // A buffer placed by the gap search below may sit above nextFree_.
+    auto overlaps = [&](uint32_t a, uint32_t sz) {
+        for (const auto &slot : allocations_)
+            if (a < slot.address + slot.size && slot.address < a + sz)
+                return true;
+        return false;
+    };
     // Align nextFree_ up to the requested alignment
     uint32_t aligned = (nextFree_ + alignment - 1) & ~(alignment - 1);
-    if (aligned + size > baseAddr_ + totalSize_) {
+    if (aligned + size > baseAddr_ + totalSize_ || overlaps(aligned, size)) {
         // Default layout keeps a 32 KB stack at [0x70000, 0x78000) although most kernels
         // need far less (GN+SiLU 512 B, vec8 192 B per kernel.calltree). Instead of failing,
         // take the space from the top of the stack: place the buffer just below the current
@@ -69,6 +76,36 @@ std::optional<uint32_t> CoreMemAllocator::allocate(const std::string &name, uint
             totalSize_ += baseAddr_ - below;
             baseAddr_ = below;
             return below;
+        }
+        // A buffer larger than either side (e.g. a 43 KB resident block: 32 KB
+        // area, 28 KB of stack above the minimum) can still straddle the area
+        // start: take the highest free gap in [kStackBase + minStack, end) that
+        // avoids every buffer, and move the area start (= stack top) down to it.
+        if (!pinned || !*pinned) {
+            // The top ~3 KB stay free: the klog ring sits at DM offset 0xF800
+            // (kernel_log.h) and the linker needs room for the kernel's statics
+            // (the same reserve as convautotile's portBufferLimit).
+            const uint32_t end = baseAddr_ + totalSize_ - 3072, floor = kStackBase + minStack;
+            std::vector<uint32_t> tops = {end};
+            for (const auto &slot : allocations_)
+                tops.push_back(slot.address);
+            std::sort(tops.rbegin(), tops.rend());
+            for (uint32_t top : tops) {
+                if (top < floor + size)
+                    continue;
+                const uint32_t x = (top - size) & ~(alignment - 1);
+                if (x < floor || overlaps(x, size))
+                    continue;
+                std::cerr << "CoreMemAllocator: \"" << name << "\" (" << size << " B) placed at 0x" << std::hex << x
+                          << " across the buffer-area start; core stack shrinks to 0x"
+                          << (std::min(baseAddr_, x) - kStackBase) << std::dec << " B" << std::endl;
+                allocations_.push_back({name, x, size, ownerId});
+                if (x < baseAddr_) {
+                    totalSize_ += baseAddr_ - x;
+                    baseAddr_ = x;
+                }
+                return x;
+            }
         }
         std::cerr << "CoreMemAllocator: out of memory for \"" << name << "\" (need " << size << " bytes, "
                   << (baseAddr_ + totalSize_ - aligned) << " available above, "
@@ -457,6 +494,12 @@ std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTile
                                                      int requesterIoId) const {
     auto iopaireddst = ioPaireddstTileloc->loc;
     std::shared_ptr<ShimTile> findShimTile;
+    // AIEHLC_SHIM_BALANCE=1: prefer the shim tile with the fewest channels of this
+    // direction already allocated, then the nearest. Default (nearest only) puts
+    // every mesh row's gather on the columns next to its LAST core, so a 4x4 GEMM
+    // loads two shim tiles with all four outputs while two others idle.
+    const char *bal = std::getenv("AIEHLC_SHIM_BALANCE");
+    const bool balance = bal && *bal && *bal != '0';
     for (const auto& kv : shimTiles_) {
         ShimTile& t = *(kv.second);
         // Skip shim tiles outside partition column bounds
@@ -472,6 +515,12 @@ std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTile
             auto c = t.col();
             uint32_t new_distance = std::abs((int)c - (int)iopaireddst.c);
             uint32_t old_distance = std::abs((int)findShimTile->col() - (int)iopaireddst.c);
+            if (balance) {
+                const int nu = t.allocatedCount(direct), ou = findShimTile->allocatedCount(direct);
+                if (nu < ou || (nu == ou && new_distance < old_distance))
+                    findShimTile = kv.second;
+                continue;
+            }
             if (new_distance < old_distance) {
                 findShimTile = kv.second;
                 continue;

@@ -80,8 +80,11 @@ non-host 30.43 ms).
 
 **Peak of the 4×4 mesh** (int8, `aie::mmul`): 16 tiles × 256 MAC/cycle × 1 GHz =
 4.10 TMAC/s = **8.19 TOPS**. (256 MAC/cycle is the AIE-ML figure used in
-`doc/design/cost_model_optimizer.md:138`; if AIE2PS's int8 rate is 512, every
-percentage below halves and the floor halves.)
+`doc/design/cost_model_optimizer.md:138`. **Measured since: AIE2PS's int8 rate
+is 512** -- `aie::mmul<8,8,8,int8,int8>` is one `mac_8x8_8x8` (512 MACs) per
+VLIW word, and `example/tileprogram/ccode/simplegemm_peak.cc` issues 768 of them
+in 839 cycles per core on the board (91.5 %). So the peak is 8.19 TMAC/s =
+**16.4 TOPS**, every percentage below halves and the floor halves.)
 
 | Metric | Value |
 |---|---|

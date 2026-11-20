@@ -535,6 +535,17 @@ the dataflow. Port buffers get **32 KB**, not 48
 (`checkPortBuffers`). Design: `doc/design/trace_to_routing.md` "Dataflow
 options"; skill **gemmdataflowoptions**.
 
+**int8 GEMM at 91.5 % of the core peak** (`example/tileprogram/ccode/simplegemm_peak.cc`):
+AIE2PS (`__AIE_ARCH__` 22) uses the aie2p mmul backend, where `mmul<8,8,8,int8,int8>`
+is ONE `mac_8x8_8x8` = **512 MAC/cycle per core** (not the 256 older docs assume).
+Both operands `{.resident}`, host-packed in mmul order (aligned 64-byte loads),
+2x2 register blocking (8 `dm` accumulators exist; the compiler overlaps a tile's
+write-back with the next tile's MACs), C written tile-major. K sets it: 32x32x384
+per core = 768 MAC instructions in **839 cycles** (91.5 %), 64x64x128 = 75.4 %
+(~19 cycles per 16x16 tile outside the K loop). Measured per core by klog `CYC`
+around the compute (validated: 2 passes = 2.09x); the ~226 ms launch is kernel
+load, not compute.
+
 ### bfloat16 ports (`input_window_bfloat16`)
 
 A kernel-only kernel can take / produce bf16 tensors
@@ -964,7 +975,7 @@ Read the matching skill when the task fits:
 | palmyra hws (hw_server service) gone again: `[hws] status DOWN` / `3121 closed` every hour, hws session ends with no `hws_down` log, hw_server killed when another systest exits; does hws detect "service up but board gone" | hwsservicedrops |
 | VEK385 run via `apppaltest -board vek385 -host <farm host>` (JTAG or `--netload`): no output / nbspin never ends (system counter off), supervisor never answers ARP (GEM DMA in DDR_LOW0), `wake of app core FAILED` / #0.1 in Reset Catch (`rst -cores`), `APU core power request denied`, systest-client `User signal 1` | vek385netboot |
 | `KERNELCONFIGOFFLOAD` + partition start col ≠ 0 hangs; high core columns' MM2S never armed (`get_coreid()` absolute vs plan relative) | kcocoreidpartition |
-| Print values from an AIE kernel (`klog`); klog output never appears; `aie::print_log` (does not exist) | kernelklog |
+| Print values from an AIE kernel (`klog`); klog output never appears (`no log (write_index=0)`, e.g. a build run outside the repo root); `aie::print_log` (does not exist) | kernelklog |
 | Sim PS.so load segfault | aiesimloaddebug |
 | aiesim live debug register socket | aiesim-debug-socket |
 | HW performance counters | aiehwprofile |
@@ -983,6 +994,7 @@ Read the matching skill when the task fits:
 | Kernel-only `{.depth / .resident / .tile}` options; `the core window is N elements x R round(s) ... but the kernel's blocks (#routing.kernel_block) are`; `the port buffers take N B of core memory`; a GEMM with B loaded once / full-K A strips; kernel macro under `#ifndef` undeclared | gemmdataflowoptions |
 | Misspelled `#include` reported as `` `HW_ROWS` ... no #define `` instead of `file not found`; kernel-only kernel: `kernel analysis needs the launch mesh: no device.partition(...)` though the call exists (mesh macros behind `#include <x.h>`) or with `aieArray device(4, 4)` + `k<<<device>>>`; xchesscc `no matching function for call to 'aiehlc_load_buffer'` (window port by value, missing `*`); per-core `offset has 4 ... but the tensor has 3` / `outside the tensor extent 4` from a wrong port `aie::shape` (now a `hint:` line); a kernel-analysis error that names a port but not the call line to fix; adding an early source-level diagnostic | kernelanalysisdiagnostics |
 | bfloat16 ports: `input_window_bfloat16`, DMA lengths twice/half, `output block bytes per round` mismatch on a 16-bit conv, `bfloat16` does not compile for tracing, a few hundred outputs reading 0 on 1 run in 6 | bf16kernel |
+| Streaming GEMM end to end: a 300 ms launch, a host `for` over rounds in host.cc, GOLDEN FAIL after an input stops being re-armed per round, `Memory budget exceeded` / CoreMemAllocator out of memory for a >32 KB resident block, a run phase that does not move when the compute gets faster (mixed DDR read/write wall) | gemmendtoend |
 | AIEDNN template kernel (GEMM/conv, one launch per layer, fp32 K accumulation): window `N x R ... kernel's blocks are 4N` with M and K rounds, input-shim `wait_io TIMEOUT` ch 1, `.tile` on a K chunk refused, `[KernelTemplate]` / template kernel "never launched" or argument-count errors, bigger TK slower | aiednnkernel |
 | Kernel-only kernel: `hand-written GemmSpaces checked ...` + `parameter `aie::port<..., aie::port<..., ...` is not an aie::port<T, <GemmSpace>>` (whole list as one parameter); `the `<` of aie::port is never closed` — a port missing its closing `>` | portunclosedangle |
 | `data used without being loaded` and WHICH constant causes it (`oc_t = 15` vs loops walking 16); `cause (static analysis)` / `out-of-block access (static analysis)` lines; extending `kernel_static.cpp` | blockstaticbounds |

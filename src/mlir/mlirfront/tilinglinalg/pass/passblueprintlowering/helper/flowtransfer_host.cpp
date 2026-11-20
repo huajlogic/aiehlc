@@ -311,6 +311,39 @@ void FlowTransferConversion::applyKernelBlockShim(FlowLoweringCtx &c) const {
     c.shimIterWrap = 0;
     c.shimDimStrides = c.kb.tileStrides.empty() ? ArrayAttr() : c.rewriter.getI32ArrayAttr(c.kb.tileStrides);
     c.shimDimWraps = c.kb.tileWraps.empty() ? ArrayAttr() : c.rewriter.getI32ArrayAttr(c.kb.tileWraps);
+    // Blocks back to back in DDR (a strip walk: each round starts where the last
+    // ended) need no host round loop: one 2-D BD -- d0 one block in words, d1
+    // the rounds -- streams them all, and the core's ping-pong locks pace it.
+    // The round loop re-programmed the shim BD over MMIO and waited every round.
+    {
+        const int64_t blk = c.perTileShimLen, R = c.kb.rounds, RJ = c.kb.roundsJ;
+        constexpr int64_t kWrapMax = 1024; // shim BD dim wrap (aie2ps)
+        const bool backToBack = (RJ == R && c.kb.strideJBytes == blk) || (RJ == 1 && c.kb.strideIBytes == blk) ||
+                                (RJ > 1 && RJ < R && c.kb.strideJBytes == blk && c.kb.strideIBytes == RJ * blk);
+        // A block over kWrapMax words splits into f-word chunks (f | blockWords): 3 dims.
+        const int64_t blkWords = blk / 4;
+        int64_t f = std::min<int64_t>(blkWords, kWrapMax);
+        while (f > 1 && blkWords % f != 0)
+            --f;
+        // Only with #pragma output_tile_major: then every output is ONE BD armed
+        // once, so nothing is re-programmed while the cores run ahead of the host.
+        // With per-round output re-arming, a free-running input lets fast cores
+        // emit round r+1 into BDs still being re-armed for round r (GOLDEN FAIL).
+        if (passState->outputTileMajor && R > 1 && c.kb.tileStrides.empty() && backToBack && blk % 4 == 0 &&
+            blkWords / f <= kWrapMax && R <= kWrapMax) {
+            c.kbWalk = true;
+            c.perTileShimLen = blk * R;
+            if (f == blkWords) {
+                c.shimDimStrides = c.rewriter.getI32ArrayAttr({4, (int32_t)blk});
+                c.shimDimWraps = c.rewriter.getI32ArrayAttr({(int32_t)blkWords, (int32_t)R});
+            } else {
+                c.shimDimStrides = c.rewriter.getI32ArrayAttr({4, (int32_t)(4 * f), (int32_t)blk});
+                c.shimDimWraps = c.rewriter.getI32ArrayAttr({(int32_t)f, (int32_t)(blkWords / f), (int32_t)R});
+            }
+            llvm::errs() << "[KernelBlock] flowIdx=" << c.flowIndex << " one BD walks all " << R << " blocks ("
+                         << c.perTileShimLen << " B): no host round loop\n";
+        }
+    }
     llvm::errs() << "[KernelBlock] flowIdx=" << c.flowIndex << " input follows the kernel's blocks: " << c.kb.rounds
                  << " x " << c.perTileShimLen << " B per core, round stride " << c.kb.strideIBytes << "/"
                  << c.kb.strideJBytes << " B" << (c.kb.tileStrides.empty() ? "" : ", .tile panel-major") << "\n";
@@ -720,7 +753,7 @@ void FlowTransferConversion::classifyScheduleMode(FlowLoweringCtx &c) const {
     // A kernel-only input that follows its blocks loops once per kernel block
     // (an input the kernel takes once is sent once, outside any round loop).
     if (c.kb.follow)
-        c.needsOuterLoop = c.kb.rounds > 1;
+        c.needsOuterLoop = c.kb.rounds > 1 && !c.kbWalk;
 }
 
 // ---------------------------------------------------------------------------

@@ -1045,8 +1045,28 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             totalBufferBytes += ppDepth * bufSize;
         }
 
+        // CoreMemAllocator places a buffer that does not fit the buffer area below
+        // it, shrinking the core stack down to AIEHLC_DM_MIN_STACK (default 4 KB;
+        // the kernel build checks chess's stack bound against it). So the real
+        // ceiling is the tile memory less that stack and ~3 KB of klog ring /
+        // statics -- the limit the kernel analysis (convautotile
+        // portBufferLimit) already applies. AIEHLC_DM_BUF_BASE pins the layout.
         std::string errMsg;
-        if (!hwRes->checkDataMemoryFits(totalBufferBytes, &errMsg)) {
+        bool fits = hwRes->checkDataMemoryFits(totalBufferBytes, &errMsg);
+        const char *pinned = std::getenv("AIEHLC_DM_BUF_BASE");
+        if (!fits && (!pinned || !*pinned)) {
+            uint32_t minStack = 0x1000;
+            if (const char *ms = std::getenv("AIEHLC_DM_MIN_STACK"); ms && *ms)
+                minStack = static_cast<uint32_t>(std::strtoul(ms, nullptr, 0));
+            const uint32_t grown = hwRes->getTileMemoryBytes() - minStack - 3072;
+            if (totalBufferBytes <= grown) {
+                fits = true;
+                std::cout << "[TilingLinalg] Memory check: " << totalBufferBytes << " B exceeds the " << usableBytes
+                          << " B buffer area; fits by growing it into the core stack (limit " << grown
+                          << " B, AIEHLC_DM_MIN_STACK " << minStack << ")" << std::endl;
+            }
+        }
+        if (!fits) {
             llvm::errs() << "[TilingLinalg] ERROR: Memory budget exceeded!\n"
                          << "  " << errMsg << "\n"
                          << "  maxPingPongBytes=" << maxPingPongBytes << " numTensors=" << tensors.size() << "\n"
