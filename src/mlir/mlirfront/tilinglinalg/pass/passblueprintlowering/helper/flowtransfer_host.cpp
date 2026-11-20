@@ -907,6 +907,63 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
     p.haloWRoundsVal = haloWRoundsVal;
 }
 
+// The shim BD every round of a Multiple-mode input sends, and whether ONE BD can walk all
+// rounds instead of a host round loop (no op emission).
+void FlowTransferConversion::computeMultipleInputShimBd(FlowLoweringCtx &c, MultipleInputOffsetParams &p) const {
+    // A 3-D K-tiling shim BD (d2 wrap == k_rounds) already walks every k-round of this
+    // round's strip: send it as ONE task (len = whole walk, no BD iteration, repeat 1).
+    // The per-k-round form (one chunk per task + BD iteration + repeat k_rounds) is only
+    // legal for k_rounds <= 64 (aie2ps BD iteration wrap; start-queue repeat <= 256), and
+    // the M-round strip BD was started k_rounds times with an element-count len.
+    // P4bk c013: k_rounds 360 -> "Iteration parameters exceed ... Wrap:360" / "Invalid Repeat
+    // Count: 360" on palmyra213, inputs never started.
+    p.loopLen = c.perTileShimLen;
+    p.loopIterStep = c.shimIterStepSize;
+    p.loopIterWrap = c.shimIterWrap;
+    p.loopRepeat = p.perIterRepeat;
+    const int64_t kR = passState->kRounds;
+    ArrayAttr wr = c.shimDimWraps;
+    ArrayAttr st = c.shimDimStrides;
+    int64_t full = 4;
+    if (wr && wr.size() == 3)
+        for (Attribute a : wr)
+            full *= cast<IntegerAttr>(a).getInt();
+    const bool kWalk3D = kR > 1 && wr && st && wr.size() == 3 && st.size() == 3 &&
+                         cast<IntegerAttr>(wr[2]).getInt() == kR && cast<IntegerAttr>(st[0]).getInt() == 4;
+    // Only when one start does NOT already send the whole walk (len = one chunk, or an
+    // element count). A BD whose len IS the walk keeps its repeat + iteration: there they
+    // step whole strips (simplematmul2: 4 N strips, iter_step 4096 -- k_rounds happens to
+    // equal n_rounds), and collapsing it sent one strip instead of four.
+    if (kWalk3D && c.perTileShimLen != full) {
+        p.loopLen = full;
+        p.loopIterStep = 0;
+        p.loopIterWrap = 0;
+        p.loopRepeat = 1;
+        llvm::errs() << "[BlueprintToSchedule] 3D K BD covers all " << kR << " k-rounds: len=" << full
+                     << " B, repeat 1, no BD iteration (was len=" << c.perTileShimLen << " iter_wrap=" << c.shimIterWrap
+                     << " repeat=" << p.perIterRepeat << ")\n";
+    } else if (kWalk3D && p.loopIterWrap <= 1 && p.loopRepeat > 1) {
+        // len is the whole K walk and nothing steps between starts: a repeat would send the
+        // same strip k_rounds times, and the core takes it once (input shims never finish).
+        llvm::errs() << "[BlueprintToSchedule] 3D K BD is already the whole walk (" << full
+                     << " B) and does not iterate: repeat " << p.loopRepeat << " -> 1\n";
+        p.loopRepeat = 1;
+    }
+    // Every output armed once (#pragma output_tile_major): the M rounds need no host loop
+    // either. One BD walks them with its iteration (step = the round stride, <= 64 rounds:
+    // the aie2ps iteration wrap is 6 bits), started once per round; the core's locks pace it.
+    constexpr int64_t kIterWrapMax = 64;
+    if (passState->outputTileMajor && kWalk3D && p.outerRounds > 1 && p.outerRounds <= kIterWrapMax && !p.halo2D &&
+        p.loopIterWrap <= 1 && p.loopRepeat == 1 && p.loopLen == full) {
+        p.oneBd = true;
+        p.loopIterStep = p.subTileStride ? (int32_t)p.subTileStride : 0;
+        p.loopIterWrap = p.subTileStride ? (int32_t)p.outerRounds : 0;
+        p.loopRepeat = (int32_t)p.outerRounds;
+        llvm::errs() << "[BlueprintToSchedule] flowIdx=" << c.flowIndex << " one BD walks all " << p.outerRounds
+                     << " rounds (iter_step " << p.loopIterStep << " B): no host round loop\n";
+    }
+}
+
 LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx &c) const {
     ConversionPatternRewriter &rewriter = c.rewriter;
     Location loc = c.loc;
@@ -917,6 +974,7 @@ LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx 
 
     MultipleInputOffsetParams p;
     computeMultipleInputOffsetParams(c, moduleOp, nOuterPolicy, p);
+    computeMultipleInputShimBd(c, p);
     const int64_t outerRounds = p.outerRounds;
     const int32_t perIterRepeat = p.perIterRepeat;
     const int64_t subTileStride = p.subTileStride;
@@ -951,6 +1009,53 @@ LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx 
         coreStartIoEvents.push_back(coreStartIo.getEvent());
     }
 
+    // One round's shim BD + start at `offset`; returns the start event.
+    auto emitRoundBd = [&](Value offset) -> Value {
+        auto loopPktConst =
+            rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+        auto loopOooConst =
+            rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(-1));
+        auto loopBd =
+            rewriter.create<dfschedule::ConfigDmaBdOp>(loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+                                                       c.ddrBuffer,                            // buffer
+                                                       c.shimTileOp.getTile(),                 // tile
+                                                       c.shimBdIdConst.getResult(),            // bd_id
+                                                       offset,                                 // offset (dynamic)
+                                                       loopPktConst.getResult(),               // packet_id
+                                                       loopOooConst.getResult(),               // out_of_order_bd_id
+                                                       rewriter.getI32IntegerAttr(p.loopLen),  // len
+                                                       rewriter.getBoolAttr(false),            // enable_packet
+                                                       rewriter.getI32IntegerAttr(4294967295), // next_bd = none
+                                                       rewriter.getI32IntegerAttr(0),          // acquire_lock_id
+                                                       rewriter.getI32IntegerAttr(0),          // acquire_lock_val
+                                                       rewriter.getI32IntegerAttr(0),          // release_lock_id
+                                                       rewriter.getI32IntegerAttr(0),          // release_lock_val
+                                                       rewriter.getI32IntegerAttr(dataId),     // data_id
+                                                       Value(),                                // linked_bd = none
+                                                       c.shimDimStrides, c.shimDimWraps,
+                                                       rewriter.getI32IntegerAttr(p.loopIterStep),  // iter_step_size
+                                                       rewriter.getI32IntegerAttr(p.loopIterWrap)); // iter_wrap
+        auto loopCreateIo = rewriter.create<dfschedule::ConfigCreateIoOp>(
+            loc, dfschedule::IoHandleType::get(rewriter.getContext()), loopBd.getBdHandle(), c.shimTileOp.getTile(),
+            rewriter.getI32IntegerAttr(c.shimChannel), rewriter.getStringAttr(c.dmaDirection),
+            rewriter.getStringAttr(c.ioOperation), rewriter.getBoolAttr(false));
+        auto loopGetBdId = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), c.shimTileOp.getTile());
+        auto loopStartIo = rewriter.create<dfschedule::StartIoOp>(
+            loc, dfschedule::EventType::get(rewriter.getContext()), loopCreateIo.getIoHandle(), loopGetBdId.getBdId(),
+            rewriter.getI32IntegerAttr(c.flowIndex), rewriter.getI32IntegerAttr(p.loopRepeat));
+        return loopStartIo.getEvent();
+    };
+
+    SmallVector<Value> finalEvents;
+    finalEvents.push_back(launchKernelGroupOp.getEvent());
+    if (p.oneBd) {
+        // 4'. ONE BD walks every round (computeMultipleInputShimBd): armed once, no loop.
+        auto zero = rewriter.create<arith::ConstantIntOp>(loc, 0, rewriter.getI32Type());
+        finalEvents.push_back(emitRoundBd(zero));
+        rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
+        return success();
+    }
+
     // 4. Single scf.for from 0 to outerRounds (ALL iterations uniform)
     {
         auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -982,83 +1087,14 @@ LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx 
             offset = rewriter.create<arith::MulIOp>(loc, ivI32, strideConst);
         }
 
-        // A 3-D K-tiling shim BD (d2 wrap == k_rounds) already walks every k-round of this
-        // round's strip: send it as ONE task (len = whole walk, no BD iteration, repeat 1).
-        // The per-k-round form (one chunk per task + BD iteration + repeat k_rounds) is only
-        // legal for k_rounds <= 64 (aie2ps BD iteration wrap; start-queue repeat <= 256), and
-        // the M-round strip BD was started k_rounds times with an element-count len.
-        // P4bk c013: k_rounds 360 -> "Iteration parameters exceed ... Wrap:360" / "Invalid Repeat
-        // Count: 360" on palmyra213, inputs never started.
-        int64_t loopLen = c.perTileShimLen;
-        int32_t loopIterStep = c.shimIterStepSize, loopIterWrap = c.shimIterWrap, loopRepeat = perIterRepeat;
-        {
-            const int64_t kR = passState->kRounds;
-            ArrayAttr wr = c.shimDimWraps;
-            ArrayAttr st = c.shimDimStrides;
-            int64_t full = 4;
-            if (wr && wr.size() == 3)
-                for (Attribute a : wr)
-                    full *= cast<IntegerAttr>(a).getInt();
-            // Only when one start does NOT already send the whole walk (len = one chunk, or an
-            // element count). A BD whose len IS the walk keeps its repeat + iteration: there they
-            // step whole strips (simplematmul2: 4 N strips, iter_step 4096 -- k_rounds happens to
-            // equal n_rounds), and collapsing it sent one strip instead of four.
-            if (kR > 1 && wr && st && wr.size() == 3 && st.size() == 3 && cast<IntegerAttr>(wr[2]).getInt() == kR &&
-                cast<IntegerAttr>(st[0]).getInt() == 4 && c.perTileShimLen != full) {
-                loopLen = full;
-                loopIterStep = 0;
-                loopIterWrap = 0;
-                loopRepeat = 1;
-                llvm::errs() << "[BlueprintToSchedule] 3D K BD covers all " << kR << " k-rounds: len=" << full
-                             << " B, repeat 1, no BD iteration (was len=" << c.perTileShimLen
-                             << " iter_wrap=" << c.shimIterWrap << " repeat=" << perIterRepeat << ")\n";
-            }
-        }
-        auto loopPktConst =
-            rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-        auto loopOooConst =
-            rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(-1));
-        auto loopBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
-            loc, dfschedule::BdHandleType::get(rewriter.getContext()),
-            c.ddrBuffer,                            // buffer
-            c.shimTileOp.getTile(),                 // tile
-            c.shimBdIdConst.getResult(),            // bd_id
-            offset,                                 // offset (dynamic)
-            loopPktConst.getResult(),               // packet_id
-            loopOooConst.getResult(),               // out_of_order_bd_id
-            rewriter.getI32IntegerAttr(loopLen),    // len
-            rewriter.getBoolAttr(false),            // enable_packet
-            rewriter.getI32IntegerAttr(4294967295), // next_bd = none
-            rewriter.getI32IntegerAttr(0),          // acquire_lock_id
-            rewriter.getI32IntegerAttr(0),          // acquire_lock_val
-            rewriter.getI32IntegerAttr(0),          // release_lock_id
-            rewriter.getI32IntegerAttr(0),          // release_lock_val
-            rewriter.getI32IntegerAttr(dataId),     // data_id
-            Value(),                                // linked_bd = none
-            c.shimDimStrides, c.shimDimWraps,
-            rewriter.getI32IntegerAttr(loopIterStep),  // iter_step_size (K-round)
-            rewriter.getI32IntegerAttr(loopIterWrap)); // iter_wrap (kRounds)
-
-        auto loopCreateIo = rewriter.create<dfschedule::ConfigCreateIoOp>(
-            loc, dfschedule::IoHandleType::get(rewriter.getContext()), loopBd.getBdHandle(), c.shimTileOp.getTile(),
-            rewriter.getI32IntegerAttr(c.shimChannel), rewriter.getStringAttr(c.dmaDirection),
-            rewriter.getStringAttr(c.ioOperation), rewriter.getBoolAttr(false));
-
-        auto loopGetBdId = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), c.shimTileOp.getTile());
-        auto loopStartIo = rewriter.create<dfschedule::StartIoOp>(
-            loc, dfschedule::EventType::get(rewriter.getContext()), loopCreateIo.getIoHandle(), loopGetBdId.getBdId(),
-            rewriter.getI32IntegerAttr(c.flowIndex), rewriter.getI32IntegerAttr(loopRepeat));
-
         SmallVector<Value> loopWaitEvents;
-        loopWaitEvents.push_back(loopStartIo.getEvent());
+        loopWaitEvents.push_back(emitRoundBd(offset));
         rewriter.create<dfschedule::ScheduleWaitOp>(loc, loopWaitEvents);
 
         rewriter.setInsertionPointAfter(forOp);
     }
 
     // 5. After all iterations: wait for kernel launch event
-    SmallVector<Value> finalEvents;
-    finalEvents.push_back(launchKernelGroupOp.getEvent());
     rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
     return success();
 }
