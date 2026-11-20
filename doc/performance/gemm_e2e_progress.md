@@ -253,6 +253,24 @@ Measured limits:
   - Going higher needs cores to share operands through neighbour memory, or a faster
     DMA channel.
 
+## 9. Bound with the measured core-input rate (2026-11-20)
+`AIEHLC_BOUND_CH=2.7 script/perf/gemm_e2e_bound.py <GB/s>` now models what each core
+receives. The A channel carries 1/tn B per MAC and the B channel 1/tm, at 2.7
+B/cycle each (measured above). Core memory also counts the C int8 ping-pong buffers.
+Launch cost is 0 and compute efficiency 100 %, including at kc = 32 (measured: 15-25 %).
+
+| per-channel core input | mixed DDR | best end to end, any tiling |
+|---|---|---|
+| 2.7 B/cycle (measured) | 7.8 GB/s (measured) | **38 %** |
+| 2.7 B/cycle (measured) | 11 GB/s (optimistic) | 46 % |
+| 4 B/cycle (full stream width) | 11 GB/s (optimistic) | 54 % |
+
+**No stream-fed design reaches 60 %**, even granting a full-width stream, 11 GB/s,
+zero launch cost and perfect compute. That covers any tiling, with or without MemTile
+staging. The bound does not cover cores reading operands directly from neighbour tile
+memory. That design is not expressible in aiehlc today, and its rate on palmyra is
+unmeasured.
+
 ## 7. Files
 - Branch `gemm-e2e-opt` (`53406fee`, `6d6f7500`), worktree `.worktrees/gemm_e2e`.
 - Per-core peak example: `example/tileprogram/ccode/simplegemm_peak.cc`.
