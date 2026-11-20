@@ -182,6 +182,32 @@ fixed launch cost, so the slope says nothing. Re-measuring both on the KCO
 build at 16/32/64 rounds. **Conclusion withdrawn: 60-70 % is not shown to be
 unreachable.**
 
+### Re-measured on the KCO build, 16 / 32 / 64 rounds (end to end, steady state)
+| probe | 16 | 32 | 64 | slope |
+|---|---|---|---|---|
+| write-only (C 64 KB/round) | 0.256 ms | 0.349 ms | 0.544 ms | 11.3 / 10.8 GB/s, linear |
+| read-only (A 32 KB/round) | 0.198 ms | 0.221 ms | 0.36-0.40 ms | not linear: ~7 GB/s between 32 and 64 |
+| mixed (A + C, above) | 0.311 ms | 0.515 ms | 0.909 ms | 7.7-7.9 GB/s, linear |
+
+- **Writes run at ~11 GB/s.** The 13.9 GB/s from the non-KCO build was too high.
+- **Reads are capped by the channels, not by DDR.** A enters through only 4 shim
+  MM2S channels (one per mesh row). The resnetengine measured ~2.3 GB/s per
+  MM2S channel, so 4 channels give ~9 GB/s at most.
+- **Effective rate for the bound's best design is ~9.8 GB/s.** That design is
+  ~65 % writes, with reads and writes kept apart in time, which gives
+  1 / (0.35/8 + 0.65/11).
+- **The bound at 9.8 GB/s is 56 %.** It would rise only if A came in through
+  more MM2S channels; a shim tile has 2, and the `{2,6}` partition has 5 shim
+  tiles. The bound reaches 61 % at an effective 11 GB/s.
+
+**Status:** 60 % sits at the edge of what the measured rates allow. It is not
+shown to be impossible, and it is not shown to be reachable. It needs, all at
+once:
+- the MemTile-stationary design;
+- read and write phases kept apart in time;
+- more input channels;
+- near-zero launch cost.
+
 ## 6. What remains (not built)
 1. A persistent kernel re-armed in microseconds (today ~0.17-0.9 ms fixed cost per
    launch, versus ~0.1-0.3 ms of ideal work per launch).
