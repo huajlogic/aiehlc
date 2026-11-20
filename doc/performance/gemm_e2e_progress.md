@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **14.6 %** (0.897 ms per 2.15 G MAC) | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **14.6 %** (0.897 ms per 1.07 G MAC = 2.15 G op) | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -69,7 +69,7 @@ The proof first: the same launch with every MAC removed takes the same time
 | One shim BD walk for A + tile-major output (compiler) | load-bound (153 ms ELF+BSS load) |
 | `control_plan_op_control_packet` (ELF over control packets) + `--skip-port-bss` + `AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN` | ~1.0 ms |
 | C `__Runtime_buffer_device_written`, A/B `__Runtime_alloc_uncached` | 0.84 ms |
-| Shape N=512, K=256, 32-row strips (2.15 G MAC) | 1.08 ms (2x the work) |
+| Shape N=512, K=256, 32-row strips (1.07 G MAC) | 1.08 ms (2x the work) |
 | `KERNELCONFIGOFFLOAD` + two compiler fixes so it honours `{.resident}` | **0.897 ms (14.6 %)** |
 
 Compiler fixes (branch `gemm-e2e-opt`; generated code for simplegemm_dataflow /
@@ -98,14 +98,46 @@ whole launches, **not** DMA probes. 37 GB/s is not physical (4 streams x 4 B/cyc
 Use Amit's palmyra213 probes (read 9.9, write 8.0, r+w 7.4 GB/s) as the reference.
 Ceiling projections built on 37/20.5 are unverified.
 
-## 5. What remains (not built)
+## 5. Bound: why this architecture cannot reach 60 %
+Inputs, all measured or from the driver tables:
+- mixed DDR read + write: ~11 GB/s here (the DMA-only launch moves A 2.1 MB +
+  C 4.2 MB in 0.574 ms, GOLDEN PASS); Amit's probes give 7.4-9.9 GB/s;
+- 60 % of peak = 4.9 TMAC/s, so DDR may carry at most ~2.2e-3 B/MAC
+  (at least ~450 MAC per DDR byte);
+- core data memory 64 KB, MemTile 512 KB (`xaie2psgbl_reginit.c`); a core takes
+  at most ~8 B/cycle in (2 S2MM channels x 32 bit).
+
+**Today's design** (B resident in the cores, full-K A strips, C int8 written
+once) moves 1/N_array + 1/K bytes per MAC. The resident B caps cn x K at about
+43 KB per core, so the best case is K ~ 330 with a 512-wide array tile:
+~5e-3 B/MAC, about **25 % of peak at 11 GB/s**, before any launch cost. Bigger
+matrices do not help; only higher on-chip reuse does.
+
+**An architecture that could reach ~50-60 %** (not built):
+- B stationary in the MemTiles (e.g. K = N_tile = 1024: 1 MB over 4 MemTiles);
+- a double-buffered A strip (256 x K) in the MemTiles;
+- every core keeps an int32 C tile (~96 x 96 = 36 KB) and accumulates over K;
+  A is broadcast along the row and B along the column, MemTile -> core;
+- C goes to DDR once, after the full K.
+
+The numbers for that design:
+- DDR: 1/1024 + 1/1024 = ~2e-3 B/MAC, about 63 % at 10 GB/s;
+- core intake: 1/48 B/MAC, so 8 B/cycle carries ~75 % of peak;
+- launch cost: amortised only if one launch is >= ~10 G MAC.
+
+The real result would sit below the smaller of those two (~50-60 %). It needs
+pipeline support the compiler does not have today: MemTile buffers with
+BDs and locks, an on-core K-accumulation loop with C written once, and broadcast
+in both dimensions.
+
+## 6. What remains (not built)
 1. A persistent kernel re-armed in microseconds (today ~0.17-0.9 ms fixed cost per
    launch, versus ~0.1-0.3 ms of ideal work per launch).
 2. MemTile staging in the compiler. Hand-edited, it took the run phase from
    0.15 to 0.12 ms, but the pipeline has no MemTile BD/lock support today.
 3. An output path past the 64-round limit (see section 2).
 
-## 6. Files
+## 7. Files
 - Branch `gemm-e2e-opt` (`53406fee`, `6d6f7500`), worktree `.worktrees/gemm_e2e`.
 - Per-core peak example: `example/tileprogram/ccode/simplegemm_peak.cc`.
 - All measurements: `.cursor/skills/gemmendtoend/SKILL.md`.
