@@ -673,6 +673,35 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     desc.bdDims.push_back({outW_w * wordBytes, tileM});  // D1: DDR row stride, tileM rows
     desc.roundDims.push_back({outerRounds, outerStrideBytes});
 
+    // #pragma output_tile_major on the GEMM path, as on the conv path above: each
+    // core's rounds land back to back ([mesh row][mesh col][round][block]), so ONE
+    // shim S2MM BD per core walks them with its iteration dimension and the host
+    // arms it once (totalRounds = 1) -- no per-round re-programming, which races a
+    // fast core. The iteration counter is 6 bits: at most kIterMax rounds.
+    constexpr int64_t kIterMax = 64;
+    const int64_t outRounds = mRounds * nRounds;
+    if (passState.outputTileMajor && outRounds > 1 && outRounds <= kIterMax) {
+        const int64_t roundBytes = desc.bdLenBytes;
+        desc.bdDims.clear();
+        if (roundBytes % 64 == 0) {
+            desc.bdDims.push_back({wordBytes, 64 / wordBytes});
+            desc.bdDims.push_back({64, roundBytes / 64});
+        } else {
+            desc.bdDims.push_back({wordBytes, roundBytes / wordBytes});
+        }
+        desc.iterStep = static_cast<int32_t>(roundBytes);
+        desc.iterWrap = static_cast<int32_t>(outRounds);
+        desc.totalRounds = 1;
+        desc.roundDims.clear();
+        desc.roundDims.push_back({1, 0});
+        desc.perTileStrideBytes = outRounds * roundBytes;
+        llvm::errs() << "[OutputTileDescriptor] GEMM output_tile_major: roundBytes=" << roundBytes
+                     << " rounds/core=" << outRounds << " perTileStride=" << desc.perTileStrideBytes << "\n";
+    } else if (passState.outputTileMajor && outRounds > kIterMax) {
+        llvm::errs() << "[OutputTileDescriptor] GEMM output_tile_major: " << outRounds << " rounds/core > " << kIterMax
+                     << " (6-bit BD iteration): per-round host loop kept\n";
+    }
+
     return desc;
 }
 

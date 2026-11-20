@@ -441,7 +441,10 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         // trusting either side alone, and fail the build on disagreement.
         const bool isOut = (w.direction == "out");
         for (const auto &e : offloadPlan) {
-            if (e.isOutput != isOut)
+            // Same direction AND same core DMA channel: two inputs (a streamed A
+            // and a {.resident} B) sit on different S2MM channels with different
+            // depths, and must not be checked against each other.
+            if (e.isOutput != isOut || e.channel != w.channel)
                 continue;
             if (e.ppDepth == 1 && !w.singleBuffer) {
                 windowDefOp.emitError()

@@ -1,3 +1,4 @@
+#include <map>
 /******************************************************************************
  * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -363,18 +364,28 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     dmaphop::tile memTile;
     dmaphop::port memPortIn, memPortOut;
     if (memEngine) {
-        // Mem tile uses the same column as shim (shimcol), not memEngine.getIoId()
-        memTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("mem"), 
-                                                  rewriter.getI64IntegerAttr(shimcol),  // Same col as shim (Rule #3)
-                                                  rewriter.getI64IntegerAttr(0));
+        // Mem tile: SAME column as the shim (Rule #3), the first memtile row
+        // (row 1 on AIE-ML / AIE2PS: rows 1..2 are memtiles), and one memtile DMA
+        // channel per staged flow in that column (a column can stage an A row and
+        // a B column; an AIE2PS memtile has 6 S2MM / 6 MM2S channels).
+        static std::map<int64_t, int64_t> memChanNext; // column -> next free channel
+        constexpr int64_t kMemTileRow = 1, kMemTileChannels = 6;
+        const int64_t memChan = memChanNext[shimcol]++;
+        if (memChan >= kMemTileChannels)
+            llvm::errs() << "[dmaphop] ERROR: memtile col " << shimcol << " has no free DMA channel\n";
+        memTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("mem"),
+                                                 rewriter.getI64IntegerAttr(shimcol), // Same col as shim (Rule #3)
+                                                 rewriter.getI64IntegerAttr(kMemTileRow));
         memPortIn = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("In"),
                                                    rewriter.getStringAttr(flowPrefix + "memPortIn"),
-                                                   rewriter.getI64IntegerAttr(0),
+                                                   rewriter.getI64IntegerAttr(memChan),
                                                    nullptr); // dmapktid
         memPortOut = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("Out"),
                                                     rewriter.getStringAttr(flowPrefix + "memPortOut"),
-                                                    rewriter.getI64IntegerAttr(0),
+                                                    rewriter.getI64IntegerAttr(memChan),
                                                     nullptr); // dmapktid
+        llvm::errs() << "[dmaphop] memtile stage: col " << shimcol << " row " << kMemTileRow << " ch " << memChan
+                     << " (flow " << flowPrefix << ")\n";
     }
     
 

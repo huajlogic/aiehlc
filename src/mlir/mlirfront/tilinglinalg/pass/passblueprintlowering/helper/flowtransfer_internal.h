@@ -334,6 +334,9 @@ struct FlowLoweringCtx {
     int32_t shimIterWrap = 0;
     // Kernel-only input whose traced blocks this flow follows (resolveKernelBlock).
     KernelBlockUse kb;
+    // kb's blocks lie back to back in DDR: ONE shim BD walks all of them
+    // (no host round loop; the core's ping-pong locks pace the stream).
+    bool kbWalk = false;
     bool usedMRounds3D = false;
     int64_t oooMRounds = 1;
     int32_t oooIterStepSize = 0;

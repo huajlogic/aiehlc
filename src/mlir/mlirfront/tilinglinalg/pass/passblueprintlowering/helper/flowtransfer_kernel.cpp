@@ -254,6 +254,13 @@ LogicalResult emitCoreTileParams(FlowLoweringCtx &c, CoreTileCtx &t, const CoreT
         }
     }
 
+    // c.kb is resolved by applyKernelBlockShim, which only the host's shim side
+    // runs. Under KERNELCONFIGOFFLOAD the core DMA is emitted on the kernel
+    // clone, where it was never resolved: follow read false and a {.resident}
+    // input got the flow's default two buffers (a 43 KB B became 2 x 43 KB).
+    if (c.isInput && !c.kb.check && d.passState && t.elementSizeBytes > 0)
+        c.kb = resolveKernelBlock(d.passState->tensorInfo, c.funcArgIdx, true,
+                                  isFullConnectAuto(c.op->getParentOfType<ModuleOp>()), t.elementSizeBytes);
     // Kernel-only input that follows its traced blocks: one window per kernel
     // block, one DMA round per block (the shim side does the same, see
     // applyKernelBlockShim). Must run after computeCoreIterations so the GEMM
