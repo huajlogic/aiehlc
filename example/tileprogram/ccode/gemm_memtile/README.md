@@ -18,7 +18,7 @@ NT parts so replay starts on part 0: 2.25 -> 2.24 ms; uncached C instead of the
 invalidate contract: slower, 2.43 ms).
 Details: doc/performance/gemm_e2e_progress.md section 8.
 
-**Best: 1.80 ms per 4.76 G MAC = 32.3 % of peak end to end** (steady state), GOLDEN PASS:
+**Best: 1.401 ms per 4.76 G MAC = 41.5 % of peak end to end** (steady state, KA_KC 128, uncached A), GOLDEN PASS. Earlier: 1.80 ms = 32.3 %,
 A triple-buffered in the MemTile (`memtile_a3.py`), NT 3, R 21. With two A buffers,
 refilling a tile from DDR did not overlap the replay of the other, and A reached the
 cores at ~4.5 GB/s instead of ~8.

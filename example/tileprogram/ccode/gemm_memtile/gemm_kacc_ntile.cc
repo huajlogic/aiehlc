@@ -8,7 +8,7 @@
 
 #define KA_TM 64
 #define KA_TN 64
-#define KA_KC 96
+#define KA_KC 128
 #define KA_K 1152
 #define KA_R 21
 #define KA_NT 3

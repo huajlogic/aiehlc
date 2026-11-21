@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **37.2 %** (1.562 ms per 4.76 G MAC: A triple-buffered in MemTile + A really uncached; 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **41.5 %** (1.401 ms per 4.76 G MAC: A triple-buffered in MemTile, A uncached, 128-B K chunks; 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -296,6 +296,10 @@ amortise this, and 64 KB of core memory does not fit that.
     buffer needs (`aie_runtime.c`). Result: **1.562 ms = 37.2 %**, GOLDEN PASS.
     Remaining per-launch time outside the stream (`wait_io`): kload 0.07 + BD config
     0.055 + ~0.11 ms.
+  - **K chunk 96 -> 128 B** (64 x 64 tile; core memory: 16 KB acc + 4 x 8 KB A/B +
+    2 x 4 KB C): halves the accumulator reload per MAC relative to the MACs.
+    **1.401 ms = 41.5 %**, GOLDEN PASS. `wait_io` 1.16 ms = the DMA-only time of the 96-B
+    build, so the stream is the limit again (~8 GB/s per core).
 - **Script bug fixed:** `memtile_ab.py` reused lock ids when NT > 4.
 
 **Correction to section 9:** that bound used 2.7 B/cycle as a per-channel cap. It is not
