@@ -368,6 +368,16 @@ Measured per-launch split (64 x 64, K 2560): kload 0.07 + MemTile re-arm 0.01 + 
 BD / start 0.15 ms (0 with `shim_bd_once`) + stream 2.06-2.17 ms. The DMA-only stream
 is 2.02 ms = 57.8 % if compute were free. Per core input is ~10 GB/s (A + B together).
 
+**DMA-only twin of the 57.0 % build** (same pragmas and host edits, no MACs):
+2.185-2.220 ms = **58.2-59.2 %**. Even with free compute this configuration stays under
+60 %: the stream sets the pace, and compute adds only ~0.08 ms.
+
+**B-shared 48 x 96 probes:**
+- Using only the own half (no neighbour reads; wrong data, speed only): 2.556 ms.
+- With neighbour reads: 2.706 ms, so the reads cost ~0.15 ms.
+- Even without them the 48 x 96 kernel reaches only ~60 % VMAC density, against ~80 %
+  for 64 x 64.
+
 **Where it stands:** this 64 x 64 / kc 128 configuration is bounded at ~58-60 % end to
 end by core input (~10 GB/s). Every way of lowering input bytes per MAC that was tried
 costs more elsewhere:
