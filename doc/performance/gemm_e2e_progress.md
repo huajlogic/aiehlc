@@ -300,6 +300,22 @@ amortise this, and 64 KB of core memory does not fit that.
     2 x 4 KB C): halves the accumulator reload per MAC relative to the MACs.
     **1.401 ms = 41.5 %**, GOLDEN PASS. `wait_io` 1.16 ms = the DMA-only time of the 96-B
     build, so the stream is the limit again (~8 GB/s per core).
+  - **The MemTiles are not the limit.** A on the row-2 MemTiles, B on row 1, one stream
+    per MemTile (`memtile_split.py`): 1.405 ms, the same. The limit is ~8 GB/s into each
+    core in total, split over its two S2MM channels.
+
+### Where 41.5 % stands (64 x 64 tile, kc 128)
+- **Core input:** 32 MAC/B x 8 B/cycle = 256 MAC/cycle = **50 %** while streaming.
+  `wait_io` is 1.16 ms against 0.58 ms ideal.
+- **Fixed cost:** ~0.24 ms per launch outside the stream: control-packet ELF 0.07, BD
+  config 0.055, rest ~0.11. That is 17 % of the launch.
+- **DDR is close too:** 10.4 MB per launch in 1.40 ms = 7.4 GB/s, against 7.8 GB/s
+  measured for mixed read+write. A bigger N or K (both MemTile rows give 1 MB per
+  column) would lower the bytes per MAC.
+- **Past 50 % needs fewer input bytes per MAC per core.** A larger tile does not fit
+  64 KB at kc 128, and a smaller kc costs compute. The candidate is B shared between
+  paired rows through neighbour memory: ~67 % stream bound. That is not expressible in
+  aiehlc today.
 - **Script bug fixed:** `memtile_ab.py` reused lock ids when NT > 4.
 
 **Correction to section 9:** that bound used 2.7 B/cycle as a per-channel cap. It is not
