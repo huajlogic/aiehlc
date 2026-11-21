@@ -22,6 +22,7 @@ step by step.
 | [6.3](06_gemm_optimization/3_conv_scheduling.md) | The same scheduling options on the conv2d | `simpleconv2dkernel_port_opts.cc` | runs, board PASS |
 | [6.4](06_gemm_optimization/4_conv_vector_scheduling.md) | Vector conv2d + scheduling, and the output race a fast kernel exposes | `simpleconv2dkernel_port_vec_opts.cc` | runs, board PASS |
 | [7.1](07_special_data_flow/1_broadcast.md) | Special data flow: broadcast (row and column) | simplegemm_kernel_port.cc | doc only |
+| [7.2](07_special_data_flow/2_halo.md) | Special data flow: input halo (overlapping windows) | simpleconv2dkernel_port.cc | doc only |
 
 "Lowering pending": chapters 2-5 show kernels the compiler's kernel analysis
 accepts, but the lowering after it still derives core windows from its GEMM
