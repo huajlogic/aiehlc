@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **41.5 %** (1.401 ms per 4.76 G MAC: A triple-buffered in MemTile, A uncached, 128-B K chunks; 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **44.5 %** (2.906 ms per 10.57 G MAC: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -304,7 +304,14 @@ amortise this, and 64 KB of core memory does not fit that.
     per MemTile (`memtile_split.py`): 1.405 ms, the same. The limit is ~8 GB/s into each
     core in total, split over its two S2MM channels.
 
-### Where 41.5 % stands (64 x 64 tile, kc 128)
+### K 2560 with both MemTile rows: 44.5 %
+B (3 n tiles x 64 x 2560 = 491 KB) in MemTile row 1, A (3 x 164 KB) in row 2
+(`memtile_split.py`): **2.906 ms / 10.57 G MAC = 44.5 %**, GOLDEN PASS.
+- Streaming is 2.66 ms against 1.29 ms ideal (48.6 %, near the 50 % core-input bound).
+- Fixed cost is 8.5 % of the launch.
+- DDR carries 19.9 MB in 2.9 ms = 6.9 GB/s.
+
+### Where 41.5 % stood (64 x 64 tile, kc 128, K 1152)
 - **Core input:** 32 MAC/B x 8 B/cycle = 256 MAC/cycle = **50 %** while streaming.
   `wait_io` is 1.16 ms against 0.58 ms ideal.
 - **Fixed cost:** ~0.24 ms per launch outside the stream: control-packet ELF 0.07, BD
