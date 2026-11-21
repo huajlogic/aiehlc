@@ -186,9 +186,14 @@ PROBE lowered_kacc_bds=no example/tileprogram/ccode script/test/flowcheck_data (
 
 ### K-split flow (K-accumulation, C-stationary): BD / lock table
 
-Derived from doc/debug + kernel source, not lowered 1a output. Lock ids below are
-the symbolic N / N+1 of the debug doc; no concrete lock id or value beyond those
-on the cited lines is given.
+Derived from doc/debug + kernel source + the compiler's lock allocator, not lowered 1a output.
+
+Lock pair: every buffer's lock pair (lockA, lockB) is handed out by the compiler's
+`RoutingTile::allocateLockPair`. It walks the tile's `lockPool_` from index 0 and marks the
+first two unused entries as used by the same owner, so lockA < lockB, but the two ids are
+not necessarily adjacent (a lock already taken between them is skipped). The debug doc writes
+this pair as the symbolic "N / N+1"; read N as lockA and N+1 as lockB, not as consecutive ids.
+No concrete lock id or value beyond those on the cited lines is given.
 
 Source facts:
 - 256x256 int8 GEMM on a 4x4 mesh, effectiveK=64, kRounds=4. <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:14 kRounds=4 -->
@@ -201,16 +206,17 @@ Source facts:
 
 | Row | Side | Resource | Rule | Source |
 |---|---|---|---|---|
-| L1 | Host BD, input S2MM (A and B windows) | lock N / N+1 | acquire lock_id=N (val=-1), release lock_id=N+1 (val=1); repeats num_a_rounds x k_rounds (A), num_b_rounds x k_rounds (B) | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:307-308 acquire lock_id=N (val=-1), release lock_id=N+1 (val=1) --> |
+| L0 | lock pair allocation (compiler) | lockA, lockB from the tile's lockPool_ | allocateLockPair walks lockPool_ and marks the first two unused entries (same ownerId); lockA < lockB, not necessarily adjacent; returns nullopt if fewer than two are free | <!-- ref src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:186-204 allocateLockPair --> |
+| L1 | Host BD, input S2MM (A and B windows) | lock N / N+1 (= lockA / lockB) | acquire lock_id=N (val=-1), release lock_id=N+1 (val=1); repeats num_a_rounds x k_rounds (A), num_b_rounds x k_rounds (B) | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:307-308 acquire lock_id=N (val=-1), release lock_id=N+1 (val=1) --> |
 | L2 | Kernel, input (win_a / win_b, per window per k-round) | same pair, opposite side | acquire lock_id=N+1 (data ready), release lock_id=N (buffer free) | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:309 acquire lock_id=N+1 (data ready) --> |
-| L3 | Kernel, output (win_c, after all k-rounds) | output lock pair | acquire lock_id=N (buffer free), fill data, release lock_id=N+1 (data ready); num_c_rounds times | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:311-312 release lock_id=N+1 (data ready) --> |
+| L3 | Kernel, output (win_c, after all k-rounds) | output lock pair (its own allocateLockPair call) | acquire lock_id=N (buffer free), fill data, release lock_id=N+1 (data ready); num_c_rounds times | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:311-312 release lock_id=N+1 (data ready) --> |
 | L4 | Host BD, output MM2S (C drain) | same pair | acquire lock_id=N+1 (val=-1), release lock_id=N (val=1) | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:313 acquire lock_id=N+1 (val=-1), release lock_id=N (val=1) --> |
 | L5 | Failure mode | any port | lock mismatch -> deadlock (kernel waits for a lock the host never releases) | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:316 Lock mismatch --> |
 
-Alloc / own / free: the accumulator is owned by the core for all kRounds (alloc at
-kr=0, free after the single C write); A/B buffers are freed every round by the
-kernel release of lock N (L2); the C buffer is freed by the host BD release of
-lock N (L4).
+Alloc / own / free: the lock pair is allocated at compile time by allocateLockPair (L0) and
+owned by the buffer's ownerId; the accumulator is owned by the core for all kRounds (alloc at
+kr=0, free after the single C write); A/B buffers are freed every round by the kernel release
+of lockA (L2); the C buffer is freed by the host BD release of lockA (L4).
 
 Note: the debug note's instance has a 64x64 C block per core; the 1a program
 above has 16x16 per core and 4 K rounds. The lock rule (rows L1-L4) is the
@@ -266,7 +272,7 @@ Sequence for one launch: **load -> allocate -> configure -> run -> sync -> relea
 | Partition / mesh (`device.partition`) | host `main` (`example/tileprogram/ccode/simplegemm_kernel_port.cc:41`) | runtime at load | runtime, whole program | `__Runtime_device_teardown` -> `XAie_PartitionTeardown` (`src/mlir/runtime/aie_runtime.c:3291-3298`) |
 | DDR A, B, C | host `main` via `__Runtime_Alloc` (`example/tileprogram/ccode/simplegemm_kernel_port.cc:42-44`) | host fills A, B before the launch | host; lent to the shim BDs during `gemm<<<mesh>>>` (`example/tileprogram/ccode/simplegemm_kernel_port.cc:48`) | host `free` after the check (`example/tileprogram/ccode/simplegemm_kernel_port.cc:52-54`) |
 | Shim and tile BDs for the 4 K rounds of A and B | compiler at lowering: `RoutingTile::allocateBd` (`src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:125`) | runtime at load: address + length (`src/mlir/runtime/aie_runtime.c:3681`) | the DMAs until the BD chain ends | partition teardown (no per-BD release call at 43fcb8f) |
-| Lock pairs guarding the A, B, C tile buffers | compiler at lowering: `RoutingTile::allocateLockPair` (`src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:186`) | runtime at load: `XAie_DmaSetLock` on the BD (`src/mlir/runtime/aie_runtime.c:3684-3685`) | per tile, alternately DMA and core (rows L1-L4) | partition teardown |
+| Lock pairs guarding the A, B, C tile buffers | compiler: `RoutingTile::allocateLockPair` at lowering (`src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:186`) | runtime at load: `XAie_DmaSetLock` on the BD (`src/mlir/runtime/aie_runtime.c:3684-3685`) | per tile, alternately DMA and core (rows L1-L4) | partition teardown |
 | Input ping/pong (A chunk, B chunk) | compiler at lowering | runtime at load | DMA while it writes chunk j; the core from `aie::load_buffer` to `aie::release` | the kernel, **every K round**: `aie::release(a)`, `aie::release(b)` (`example/tileprogram/ccode/simplegemm_kernel_port.cc:28-29`) |
 | Accumulator `acc[16*16]` (int32 partial sum) | core stack, `int acc[tm * tn]` (`example/tileprogram/ccode/simplegemm_kernel_port.cc:15`) | zeroed once by the kernel (`example/tileprogram/ccode/simplegemm_kernel_port.cc:15-17`) | the core, for **one launch** (all 4 K rounds) | dies with the kernel's stack frame after the last write |
 | Output C block | compiler at lowering; `aie::store_buffer` (`example/tileprogram/ccode/simplegemm_kernel_port.cc:14`) | runtime at load | the core for the whole K walk | the kernel, **once**, after the last `j`: `aie::commit(c)` (`example/tileprogram/ccode/simplegemm_kernel_port.cc:31-33`); then the output BD drains it (row L4) |
