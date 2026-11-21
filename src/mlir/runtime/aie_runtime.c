@@ -2853,7 +2853,7 @@ extern INTPTR MMUTableL2;
 #define RT_NC_SUPPORTED 1
 #endif
 #define RT_NC_BLOCK 0x200000UL
-#define RT_NC_MAX 4
+#define RT_NC_MAX 8
 static struct {
     void *base;
     size_t bytes;
@@ -2870,19 +2870,25 @@ static int rt_nc_covers(uintptr_t lo, uintptr_t hi) {
 
 void *__Runtime_alloc_uncached(size_t bytes) {
 #ifdef RT_NC_SUPPORTED
-    if (bytes > 0 && bytes <= RT_NC_BLOCK && g_nc_n < RT_NC_MAX) {
-        void *p = aligned_alloc(RT_NC_BLOCK, RT_NC_BLOCK);
-        if (p && (uint64_t)(uintptr_t)p + RT_NC_BLOCK <= 0x100000000ULL) {
+    /* Whole 2 MB blocks (the L2 translation granule), as many as `bytes` needs: a buffer
+     * over 2 MB used to fall back to cached memory silently, and every launch then
+     * cleaned all of it before the DMA could read it (6 MB of GEMM input: ~0.3 ms). */
+    const size_t span = (bytes + RT_NC_BLOCK - 1) / RT_NC_BLOCK * RT_NC_BLOCK;
+    if (bytes > 0 && g_nc_n < RT_NC_MAX) {
+        void *p = aligned_alloc(RT_NC_BLOCK, span);
+        if (p && (uint64_t)(uintptr_t)p + span <= 0x100000000ULL) {
             INTPTR *entry = &MMUTableL2 + ((uintptr_t)p / RT_NC_BLOCK);
             /* Keep every attribute bit of the block descriptor, drop its address. */
             const uint64_t old_attr = (uint64_t)*entry & ~(uint64_t)0x0000FFFFFFE00000ULL;
-            Xil_DCacheFlushRange((INTPTR)p, (INTPTR)RT_NC_BLOCK); /* no line may outlive the remap */
-            Xil_SetTlbAttributes((UINTPTR)p, NORM_NONCACHE);
+            Xil_DCacheFlushRange((INTPTR)p, (INTPTR)span); /* no line may outlive the remap */
+            for (size_t off = 0; off < span; off += RT_NC_BLOCK)
+                Xil_SetTlbAttributes((UINTPTR)p + off, NORM_NONCACHE);
             g_nc[g_nc_n].base = p;
-            g_nc[g_nc_n].bytes = RT_NC_BLOCK;
+            g_nc[g_nc_n].bytes = span;
             g_nc[g_nc_n].old_attr = old_attr;
             g_nc_n++;
-            AIEHLC_LOG(printf("[aie_runtime] alloc_uncached(%zu) = %p (2 MB block, Normal NC)\n", bytes, p););
+            AIEHLC_LOG(printf("[aie_runtime] alloc_uncached(%zu) = %p (%zu x 2 MB, Normal NC)\n", bytes, p,
+                              span / RT_NC_BLOCK););
             return p;
         }
         free(p);
@@ -2896,7 +2902,8 @@ void __Runtime_free_uncached(void *ptr) {
         if (g_nc[i].base != ptr)
             continue;
 #ifdef RT_NC_SUPPORTED
-        Xil_SetTlbAttributes((UINTPTR)ptr, g_nc[i].old_attr);
+        for (size_t off = 0; off < g_nc[i].bytes; off += RT_NC_BLOCK)
+            Xil_SetTlbAttributes((UINTPTR)ptr + off, g_nc[i].old_attr);
 #endif
         g_nc[i] = g_nc[--g_nc_n];
         break;

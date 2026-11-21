@@ -50,7 +50,14 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
-## Best so far: 32.3 % end to end (A triple-buffered in MemTile; 26.8 % with two buffers) (MemTile-staged, hand-edited) -- 2026-11-20
+## Best so far: 37.2 % end to end (A triple-buffered in MemTile + uncached A)
+- **`__Runtime_alloc_uncached` > 2 MB was silently cached** (fixed: multi-block).
+  A cached input is cleaned by the CPU at every launch before the DMA starts:
+  6.2 MB = ~0.24 ms.
+- **Two MemTile buffers are not enough for A:** the DDR refill did not overlap the
+  replay (A at 4.5 vs 8 GB/s per core). Use three (`memtile_a3.py`).
+- **Per-core input is ~8 GB/s in total**, split over the two S2MM channels; one heavy
+  stream alone also reaches 8. (MemTile-staged, hand-edited) -- 2026-11-20
 `example/tileprogram/ccode/gemm_memtile/`: K-accumulating kernel (int32 C tile per
 core, written once) + `memtile_ab.py`, which edits the generated host.cc / routing.cc:
 - B is resident in each column's MemTile and replayed once per m tile;
