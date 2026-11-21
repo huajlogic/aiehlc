@@ -374,6 +374,14 @@ is 2.02 ms = 57.8 % if compute were free. Per core input is ~10 GB/s (A + B toge
 2.185-2.220 ms = **58.2-59.2 %**. Even with free compute this configuration stays under
 60 %: the stream sets the pace, and compute adds only ~0.08 ms.
 
+**Per-core input is not buffer- or coupling-limited.** The same DMA-only twin with a
+3-deep input ring on every core (3 buffers per input, counting locks at 3, hand-edited
+KCO BD chain) streams in 2.181-2.208 ms, the same as with 2 buffers. Together with
+the probes above (MemTile channel swap, MemTile split, transfer size, B sharing):
+~10 GB/s into a core with both S2MM channels busy (~8 GB/s with one) is a hardware
+limit of this data path. **For this design the DMA-only twin -- 58-59 % -- is the
+ceiling.**
+
 **The tile is bounded by kc.** The pipelined kernel's efficiency falls with the K
 chunk, because there is more accumulator reload per MAC: kc 128 ~80 %, kc 96 ~53 %,
 kc 48 ~40 % (board timing). At kc 128 only 64 x 64 fits 64 KB of core memory, so
