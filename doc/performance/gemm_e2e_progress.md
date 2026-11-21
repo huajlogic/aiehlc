@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **44.5 %** (2.906 ms per 10.57 G MAC: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **55.9 %** (2.311 ms per 10.57 G MAC: software-pipelined kernel; before it 44.5 % = 2.906 ms: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -310,6 +310,37 @@ B (3 n tiles x 64 x 2560 = 491 KB) in MemTile row 1, A (3 x 164 KB) in row 2
 - Streaming is 2.66 ms against 1.29 ms ideal (48.6 %, near the 50 % core-input bound).
 - Fixed cost is 8.5 % of the launch.
 - DDR carries 19.9 MB in 2.9 ms = 6.9 GB/s.
+
+### Software-pipelined kernel: 55.9 %
+A DMA-only twin of the 44.5 % build streamed in 2.02 ms against 2.66 ms with compute,
+so that build was **compute-bound**: ~2,110 cycles per 64x64x128 chunk against 1,024
+ideal (49 %). In `kernel.lst`, each 16x32 step ran 32 accumulator loads, then the
+MACs, then 32 stores that overlapped nothing.
+
+The new kernel (`gemm_kacc_ntile.cc`):
+- **Two register sets X / Y of 4 accumulators.** While one set runs a 16x16 block's
+  MACs, the other stores the previous block and loads the next.
+- **Branch-free steady state.** The first and last blocks are peeled; runtime `if`s
+  split basic blocks and chess does not schedule across them.
+- **`__restrict` on the int8 operand pointers.** Char pointers alias everything, so
+  int32 stores could not move past them.
+- **Accumulators zeroed once per tile and converted to int8 once per tile**, so a
+  single compiled chunk body is needed.
+
+The middle-chunk loop went from 57 % to ~80 % VMAC density.
+**2.311 ms = 55.9 %**, GOLDEN PASS. `wait_io` 2.06 ms is about the DMA-only 2.02 ms,
+so the build is input-bound again.
+
+Traps:
+- **AIE2PS program memory is 16 KB, but the kernel.map PM model says 1 MB.** Three
+  flattened chunk variants (17.9 KB) linked and hung the board silently. Check
+  `Section summary for memory 'PM'` Total < 16384.
+- **A multi-line `#define` above the `__global__` kernel is NOT copied** into the
+  extracted kernel (only one-line defines are). Put multi-line helper macros inside
+  the kernel body.
+- **`c##0.to_vector` is a pp-number paste error.** Write `(c##0).to_vector`.
+- **chess backend "no mappings for bundle ... ssrs_store"** on accum load followed by an
+  int8 SRS store. Put `chess_separator_scheduler()` between them.
 
 ### Where 41.5 % stood (64 x 64 tile, kc 128, K 1152)
 - **Core input:** 32 MAC/B x 8 B/cycle = 256 MAC/cycle = **50 %** while streaming.
