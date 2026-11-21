@@ -351,6 +351,7 @@ Traps:
 | K 1536, NT 5 (less A from DDR) | 42.2 % (slower per chunk) |
 | B shared between row pairs, 64 x 64 (`memtile_bshare.py`) | 2.42 ms; DMA-only twin 2.08 ms = no gain |
 | B shared, 48 x 96 tile (fits only with B halves) | 2.706 ms = 51.2 %, GOLDEN PASS |
+| 64 x 96 tile, kc 64 (17 % fewer input bytes per MAC) | 3.79 ms / 15.1 G MAC = 48.8 % (compute-bound: kc 64 doubles the accumulator traffic per MAC) |
 
 B sharing is correct after two fixes:
 - **The MemTile part lock is released with +2** (two half-stream readers). With +1 the
@@ -364,6 +365,16 @@ input they save.
 Measured per-launch split (64 x 64, K 2560): kload 0.07 + MemTile re-arm 0.01 + shim
 BD / start 0.15 ms (0 with `shim_bd_once`) + stream 2.06-2.17 ms. The DMA-only stream
 is 2.02 ms = 57.8 % if compute were free. Per core input is ~10 GB/s (A + B together).
+
+**Where it stands:** this 64 x 64 / kc 128 configuration is bounded at ~58-60 % end to
+end by core input (~10 GB/s). Every way of lowering input bytes per MAC that was tried
+costs more elsewhere:
+- a bigger tile needs a smaller kc (accumulator traffic);
+- B sharing costs neighbour reads and pair coupling.
+
+Past ~60 % needs either a higher per-core input rate (cause of the ~10 GB/s cap
+unknown) or accumulators that stay in registers across K chunks (larger kc), which
+64 KB of core memory does not allow.
 
 ### Where 41.5 % stood (64 x 64 tile, kc 128, K 1152)
 - **Core input:** 32 MAC/B x 8 B/cycle = 256 MAC/cycle = **50 %** while streaming.
