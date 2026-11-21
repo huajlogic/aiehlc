@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **55.9 %** (2.311 ms per 10.57 G MAC: software-pipelined kernel; before it 44.5 % = 2.906 ms: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **56.5 %** (2.288 ms per 10.57 G MAC: software-pipelined kernel + shim BDs written once; 55.9 % = 2.311 ms; before it 44.5 % = 2.906 ms: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -341,6 +341,29 @@ Traps:
 - **`c##0.to_vector` is a pp-number paste error.** Write `(c##0).to_vector`.
 - **chess backend "no mappings for bundle ... ssrs_store"** on accum load followed by an
   int8 SRS store. Put `chess_separator_scheduler()` between them.
+
+### After 55.9 %: what moved and what did not
+| change | end to end |
+|---|---|
+| shim BDs + OOO channel config written on the first launch only (`shim_bd_once.py`) | **2.288 ms = 56.5 %** |
+| uncached C (now really uncached) | 2.32 ms (no change: the invalidate runs inside the wait) |
+| MMIO ELF loader + `AIEHLC_PM_WARM_SKIP` | 2.62 ms (the .data rewrite costs 0.38 ms) |
+| K 1536, NT 5 (less A from DDR) | 42.2 % (slower per chunk) |
+| B shared between row pairs, 64 x 64 (`memtile_bshare.py`) | 2.42 ms; DMA-only twin 2.08 ms = no gain |
+| B shared, 48 x 96 tile (fits only with B halves) | 2.706 ms = 51.2 %, GOLDEN PASS |
+
+B sharing is correct after two fixes:
+- **The MemTile part lock is released with +2** (two half-stream readers). With +1 the
+  second stream waits for the whole part and the cores deadlock.
+- **MemTile BD wraps are 10-bit: 1024 encodes as 0 (dimension off).** A 1024-word d0
+  wrap made the half-stream BD read linearly. Split it into 512 x 2.
+
+It does not pay off, though: neighbour reads and the pair coupling cost more than the
+input they save.
+
+Measured per-launch split (64 x 64, K 2560): kload 0.07 + MemTile re-arm 0.01 + shim
+BD / start 0.15 ms (0 with `shim_bd_once`) + stream 2.06-2.17 ms. The DMA-only stream
+is 2.02 ms = 57.8 % if compute were free. Per core input is ~10 GB/s (A + B together).
 
 ### Where 41.5 % stood (64 x 64 tile, kc 128, K 1152)
 - **Core input:** 32 MAC/B x 8 B/cycle = 256 MAC/cycle = **50 %** while streaming.

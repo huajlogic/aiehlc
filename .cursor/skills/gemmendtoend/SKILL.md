@@ -50,7 +50,7 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
-## Best so far: 55.9 % end to end (software-pipelined kernel; K 2560, B in MemTile row 1, A x3 in row 2)
+## Best so far: 56.5 % end to end (+ shim BDs written once); 55.9 % (software-pipelined kernel; K 2560, B in MemTile row 1, A x3 in row 2)
 - **Check compute vs input with a DMA-only twin** (no MACs). At 44.5 % the kernel was
   the limit (49 % VMAC density), not the DMA.
 - **Pipeline accumulator traffic across 2 register sets of 4** (X / Y).
@@ -58,6 +58,8 @@ problem.
   - Mark the int8 operand pointers `__restrict`; char aliasing pins the int32 stores.
 - **AIE2PS program memory is 16 KB.** kernel.map's PM model says 1 MB, so a 17.9 KB
   kernel linked and HUNG. Check the PM Total.
+- **MemTile BD wraps are 10-bit:** 1024 encodes as 0 and the dimension silently turns
+  off. A lock read by two MemTile channels must be released with +2.
 - **Multi-line `#define`s above `__global__` are dropped** by the kernel extraction. Put
   them inside the body.
 - **`__Runtime_alloc_uncached` > 2 MB was silently cached** (fixed: multi-block).
