@@ -6,7 +6,8 @@ path consumes A(m) NT times and B(n) R times -- `memtile_ab.py` makes the MemTil
 replay them (B resident per column, A double-buffered per mesh row).
 
     AIEHLC_KB_CHECK_WARN=1 source script/aiehlc.sh --aie-version 5 --runtime-source-file $PWD/gemm_kacc_ntile.cc
-    python3 memtile_ab.py aout/worklocal 294912 16 73728 4 16 x
+    python3 memtile_ab.py aout/worklocal 221184 21 73728 3 21 x
+    python3 memtile_a3.py aout/worklocal 221184 21 73728 3 21
     rm -f aout/worklocal/build/{host.o,routing.o,host}
     WORKLOCAL_DIR=$PWD/aout/worklocal AIE_VERSION=5 PLATFORM=baremetal bash script/hostcompile.sh
     python3 script/test/apppaltest.py aout/worklocal/build/host -y --netload
@@ -16,3 +17,8 @@ palmyra: **2.20 ms per 4.83 G MAC = 26.8 % of peak end to end**, GOLDEN PASS (tw
 NT parts so replay starts on part 0: 2.25 -> 2.24 ms; uncached C instead of the
 invalidate contract: slower, 2.43 ms).
 Details: doc/performance/gemm_e2e_progress.md section 8.
+
+**Best: 1.80 ms per 4.76 G MAC = 32.3 % of peak end to end** (steady state), GOLDEN PASS:
+A triple-buffered in the MemTile (`memtile_a3.py`), NT 3, R 21. With two A buffers,
+refilling a tile from DDR did not overlap the replay of the other, and A reached the
+cores at ~4.5 GB/s instead of ~8.

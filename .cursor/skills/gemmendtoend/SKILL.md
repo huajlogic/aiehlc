@@ -50,7 +50,7 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
-## Best so far: 26.8 % end to end (MemTile-staged, hand-edited) -- 2026-11-20
+## Best so far: 32.3 % end to end (A triple-buffered in MemTile; 26.8 % with two buffers) (MemTile-staged, hand-edited) -- 2026-11-20
 `example/tileprogram/ccode/gemm_memtile/`: K-accumulating kernel (int32 C tile per
 core, written once) + `memtile_ab.py`, which edits the generated host.cc / routing.cc:
 - B is resident in each column's MemTile and replayed once per m tile;
