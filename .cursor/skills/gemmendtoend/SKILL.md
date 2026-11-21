@@ -50,7 +50,7 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
-## Best so far: 41.5 % end to end (A triple-buffered in MemTile, uncached A, kc 128)
+## Best so far: 44.5 % end to end (K 2560: B in MemTile row 1, A x3 in row 2, uncached A, kc 128)
 - **`__Runtime_alloc_uncached` > 2 MB was silently cached** (fixed: multi-block).
   A cached input is cleaned by the CPU at every launch before the DMA starts:
   6.2 MB = ~0.24 ms.
