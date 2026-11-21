@@ -278,8 +278,16 @@ amortise this, and 64 KB of core memory does not fit that.
 - **The slow A refill is not because of strided DDR reads:** laying A out contiguously
   and reading it linearly was slower (3.00 ms vs 2.20 ms).
 - With both operands large, the two streams slow each other further.
-- **Still unexplained:** A path (MemTile ch1 -> up the column -> across the row)
-  vs B path (MemTile ch0 -> up the column).
+- **Not the MemTile channel:** A on MemTile ch0 and B on ch1 gives the same time
+  (0.965 ms).
+- **Per-tile model** (A-heavy probe, 4 and 8 replays per tile): time per A tile =
+  ~30 us + replays x 8.75 us.
+  - The replay itself runs at ~8.4 GB/s, the same as B.
+  - The ~30 us per 73.7 KB tile (~2.4 GB/s, about one shim channel's DDR read rate)
+    does NOT overlap the replay, although the MemTile double-buffers A
+    (BD24 -> BD25, empty / full locks per buffer).
+  - Open: why the refill serialises. Next check: dump the MemTile lock and BD state
+    mid-run (`script/aiedump.py`).
 - **Script bug fixed:** `memtile_ab.py` reused lock ids when NT > 4.
 
 **Correction to section 9:** that bound used 2.7 B/cycle as a per-channel cap. It is not
