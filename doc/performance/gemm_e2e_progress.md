@@ -264,6 +264,27 @@ block's MACs (`kernel.lst`). Running two blocks per step overlaps part of it
 (23 % -> 30 % compute efficiency). A tile that beats 64 x 64 needs kc >= ~96 to
 amortise this, and 64 KB of core memory does not fit that.
 
+### Which input stream is slow (DMA-only probes, 64 x 96 B chunks, slope of 4 vs 8 rounds)
+| probe | per-core input on the large operand |
+|---|---|
+| tm 16 (A tiny), B 64 rows: B only, from the MemTile, column broadcast | **~8 GB/s** |
+| tm 64, tn 16 (B tiny), A replayed 4x per MemTile tile | ~4.5 GB/s |
+| same, A replayed 8x per tile | ~5.9 GB/s |
+| 64 x 64, both large (the 26.8 % build) | 2.7 GB/s each |
+
+- **A single core input channel is not capped at 2.7 B/cycle.** B alone reaches ~8 GB/s.
+- **A is the slow path, and refilling it is part of the reason:** more replays per DDR
+  tile raise A's rate.
+- **The slow A refill is not because of strided DDR reads:** laying A out contiguously
+  and reading it linearly was slower (3.00 ms vs 2.20 ms).
+- With both operands large, the two streams slow each other further.
+- **Still unexplained:** A path (MemTile ch1 -> up the column -> across the row)
+  vs B path (MemTile ch0 -> up the column).
+- **Script bug fixed:** `memtile_ab.py` reused lock ids when NT > 4.
+
+**Correction to section 9:** that bound used 2.7 B/cycle as a per-channel cap. It is not
+a channel cap, so the 38-54 % figures there are not hard ceilings.
+
 ## 9. Bound with the measured core-input rate (2026-11-20)
 `AIEHLC_BOUND_CH=2.7 script/perf/gemm_e2e_bound.py <GB/s>` now models what each core
 receives. The A channel carries 1/tn B per MAC and the B channel 1/tm, at 2.7
