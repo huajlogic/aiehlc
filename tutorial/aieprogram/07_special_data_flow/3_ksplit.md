@@ -193,7 +193,7 @@ on the cited lines is given.
 Source facts:
 - 256x256 int8 GEMM on a 4x4 mesh, effectiveK=64, kRounds=4. <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:14 kRounds=4 -->
 - C is stationary: each core owns a 64x64 output region and accumulates partial products across K-rounds (level 1). <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:46 accumulates partial products across K-rounds -->
-- K-round 0..3: A[0:64, k] x B[k, 0:64] -> accum += partial_k (level 2 combine in the accumulator). <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:51-54 accum += partial_ -->
+- K-round 0..3: A[0:64, k] x B[k, 0:64] -> accum += partial_k (level 1: the core's accumulator). <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:51-54 accum += partial_ -->
 - Output written once: saturate(accum) -> C after all k-rounds. <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:56 one write after all k-rounds -->
 - Kernel loop: for kr < k_rounds, A acquires num_a_rounds, B acquires num_b_rounds, per window per k-round. <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:64-76 acquire_input_window -->
 - Totals: A num_a_rounds x k_rounds, B num_b_rounds x k_rounds, C num_c_rounds (once). <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:87-89 k_rounds -->
