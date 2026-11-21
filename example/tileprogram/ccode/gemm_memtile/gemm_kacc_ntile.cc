@@ -10,8 +10,8 @@
 #define KA_TN 64
 #define KA_KC 96
 #define KA_K 1152
-#define KA_R 16
-#define KA_NT 4
+#define KA_R 21
+#define KA_NT 3
 #define KA_M (4 * KA_TM * KA_R)
 #define KA_N (4 * KA_TN * KA_NT)
 

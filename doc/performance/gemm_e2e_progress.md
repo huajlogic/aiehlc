@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **26.8 %** (2.20 ms per 4.83 G MAC, MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **32.3 %** (1.80 ms per 4.76 G MAC, A triple-buffered in MemTile; 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -286,8 +286,10 @@ amortise this, and 64 KB of core memory does not fit that.
   - The ~30 us per 73.7 KB tile (~2.4 GB/s, about one shim channel's DDR read rate)
     does NOT overlap the replay, although the MemTile double-buffers A
     (BD24 -> BD25, empty / full locks per buffer).
-  - Open: why the refill serialises. Next check: dump the MemTile lock and BD state
-    mid-run (`script/aiedump.py`).
+  - **Fixed by a third A buffer** (`memtile_a3.py`): A reaches the cores at ~8.0 GB/s
+    (A-heavy probe, 3 vs 6 rounds: 0.110 ms for 885 KB per core), the same as B.
+    Full GEMM (64 x 64, NT 3, R 21): **1.80 ms / 4.76 G MAC = 32.3 %**, GOLDEN PASS
+    (196,608 checked).
 - **Script bug fixed:** `memtile_ab.py` reused lock ids when NT > 4.
 
 **Correction to section 9:** that bound used 2.7 B/cycle as a per-channel cap. It is not
