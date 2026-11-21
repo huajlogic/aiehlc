@@ -2,6 +2,7 @@
 // (KA_TM x KA_TN) in core memory across all K chunks; A and B arrive in KA_KC-wide chunks.
 #pragma aie_debug_level(AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
 #pragma control_plan_op_control_packet
+#pragma control_packet_mode(aot)
 #pragma KERNELCONFIGOFFLOAD
 #pragma output_tile_major
 #include "simplegemm_peak.h"

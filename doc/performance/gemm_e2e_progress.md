@@ -10,7 +10,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **56.5 %** (2.288 ms per 10.57 G MAC: software-pipelined kernel + shim BDs written once; 55.9 % = 2.311 ms; before it 44.5 % = 2.906 ms: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best | **57.0 %** (2.258-2.281 ms per 10.57 G MAC: pipelined kernel + shim BDs once + `control_packet_mode(aot)` warm ELF reload; 56.5 % = 2.288 ms; 55.9 % = 2.311 ms; before it 44.5 % = 2.906 ms: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -345,7 +345,9 @@ Traps:
 ### After 55.9 %: what moved and what did not
 | change | end to end |
 |---|---|
-| shim BDs + OOO channel config written on the first launch only (`shim_bd_once.py`) | **2.288 ms = 56.5 %** |
+| shim BDs + OOO channel config written on the first launch only (`shim_bd_once.py`) | 2.288 ms = 56.5 % |
+| + `#pragma control_packet_mode(aot)`: warm relaunch resends only reset + data, not PM (kload 0.074 -> 0.037 ms) | **2.258-2.281 ms = 57.0 %**, GOLDEN PASS |
+| hand-rolled "skip the ELF, only reset the cores" | 58.0 % but **GOLDEN FAIL**: the load's reset sequence does more than the core-control register (core DMA channels keep running their ping-pong chain) -- use the runtime's AOT warm path |
 | uncached C (now really uncached) | 2.32 ms (no change: the invalidate runs inside the wait) |
 | MMIO ELF loader + `AIEHLC_PM_WARM_SKIP` | 2.62 ms (the .data rewrite costs 0.38 ms) |
 | K 1536, NT 5 (less A from DDR) | 42.2 % (slower per chunk) |

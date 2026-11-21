@@ -50,7 +50,7 @@ problem.
   Result: host bdcfg 0.20 -> 0.06 ms, end to end 1.08 -> 0.90 ms (14.6 %).
 - **klog in the timed region** prints over the UART: seconds. Time without it.
 
-## Best so far: 56.5 % end to end (+ shim BDs written once); 55.9 % (software-pipelined kernel; K 2560, B in MemTile row 1, A x3 in row 2)
+## Best so far: 57.0 % end to end (+ AOT warm ELF reload, shim BDs once); 55.9 % (software-pipelined kernel; K 2560, B in MemTile row 1, A x3 in row 2)
 - **Check compute vs input with a DMA-only twin** (no MACs). At 44.5 % the kernel was
   the limit (49 % VMAC density), not the DMA.
 - **Pipeline accumulator traffic across 2 register sets of 4** (X / Y).
