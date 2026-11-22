@@ -10,7 +10,8 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 | Metric | Result | Window |
 |---|---|---|
 | Per-core compute | **91.5 %** of int8 peak | core cycle counter around the compute loop only |
-| End to end, best | **57.0 %** (2.258-2.281 ms per 10.57 G MAC: pipelined kernel + shim BDs once + `control_packet_mode(aot)` warm ELF reload; 56.5 % = 2.288 ms; 55.9 % = 2.311 ms; before it 44.5 % = 2.906 ms: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
+| End to end, best (weight-resident B) | **64.7 %** (1.999-2.013 ms per 10.57 G MAC; B loaded into the MemTiles on the first launch only -- fixed-weight / inference use) |
+| End to end, best (A and B both from DDR every launch) | **57.0 %** (2.258-2.281 ms per 10.57 G MAC: pipelined kernel + shim BDs once + `control_packet_mode(aot)` warm ELF reload; 56.5 % = 2.288 ms; 55.9 % = 2.311 ms; before it 44.5 % = 2.906 ms: K 2560, A in the row-2 MemTiles (3 buffers), B in row 1, A uncached, 128-B K chunks; 41.5 % / 37.2 % / 32.3 % / 26.8 % before; MemTile-staged A and B, hand-edited host/routing; section 8) -- 14.6 % (0.897 ms per 1.07 G MAC) from the compiler alone | host XTime around the whole launch: kernel load, BD config, DDR in/out, cache sync |
 | start_io -> wait done | 36-43 % (A from DDR), 48-57 % (A staged in MemTile, hand-edited) | DMA + compute only |
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
@@ -383,6 +384,14 @@ the probes above (MemTile channel swap, MemTile split, transfer size, B sharing)
 ~10 GB/s into a core with both S2MM channels busy (~8 GB/s with one) is a hardware
 limit of this data path. **For this design the DMA-only twin -- 58-59 % -- is the
 ceiling.**
+
+**Weight-resident B: 64.7 % (GOLDEN PASS).** `b_resident.py` loads B into the MemTiles on
+the first launch only. Later launches re-mark the B parts full and skip B's shim transfer
+and MemTile S2MM; A and C still move every launch. Result: 1.999-2.013 ms = 64.2-64.7 %
+(57.0 % with B re-read). Removing ~2 MB of the ~20 MB per-launch DDR traffic, and B's
+prefill wait at the start, is worth 7.7 points, consistent with a DDR / start-latency
+bound. Valid only when B is the same on every launch (fixed weights, e.g. an inference
+layer). A general GEMM with a new B per call stays at 57.0 %.
 
 **Is it DDR?** The 57 % build moves 19.9 MB per launch (~9 GB/s), which made DDR a
 suspect. Test: NT 4, K 2048 (B fills MemTile row 1 exactly) cuts DDR bytes per MAC by

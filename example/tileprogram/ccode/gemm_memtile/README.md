@@ -22,3 +22,6 @@ Details: doc/performance/gemm_e2e_progress.md section 8.
 A triple-buffered in the MemTile (`memtile_a3.py`), NT 3, R 21. With two A buffers,
 refilling a tile from DDR did not overlap the replay of the other, and A reached the
 cores at ~4.5 GB/s instead of ~8.
+
+**Weight-resident B (B fixed across launches): ~2.00 ms = 64.7 % end to end**, GOLDEN PASS
+-- add `python3 b_resident.py aout/worklocal` after `shim_bd_once.py`.
