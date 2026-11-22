@@ -353,6 +353,7 @@ Traps:
 | K 1536, NT 5 (less A from DDR) | 42.2 % (slower per chunk) |
 | B shared between row pairs, 64 x 64 (`memtile_bshare.py`) | 2.42 ms; DMA-only twin 2.08 ms = no gain |
 | B shared, 48 x 96 tile (fits only with B halves) | 2.706 ms = 51.2 %, GOLDEN PASS |
+| first chunk of each tile as a second body (mul init, no zeroing; PM 15.5 KB) | 2.41 ms = 53.5 %, GOLDEN PASS (slower than one body) |
 | 80 x 80 tile, kc 48, pipelined kernel (odd 25-block tail) | 4.37 ms / 13.9 G MAC = 39.0 % (compute: ~40 % kernel efficiency) |
 | 80 x 64 tile, kc 96 | 2.57 ms / 10.9 G MAC = 51.8 % (compute: ~53 %) |
 | 64 x 96 tile, kc 64 (17 % fewer input bytes per MAC) | 3.79 ms / 15.1 G MAC = 48.8 % (compute-bound: kc 64 doubles the accumulator traffic per MAC) |
