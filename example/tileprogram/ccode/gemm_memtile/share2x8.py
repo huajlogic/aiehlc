@@ -30,6 +30,9 @@ ap.add_argument('--k', type=int, default=2560)
 ap.add_argument('--bres', action='store_true', help='weight-resident B (loaded on the first launch only)')
 ap.add_argument('--single', action='store_true', help='one tile per output packet (needs T <= 64); default two')
 ap.add_argument('--persist', action='store_true', help='kernel stays loaded: later launches only release a go lock (no ELF reload / core reset)')
+ap.add_argument('--tile', action='store_true', help='one software pipeline per tile across chunk boundaries (share2x8_tile.inc)')
+ap.add_argument('--bench', action='store_true', help='before launch 0 each core runs 2 tiles of ka_tile with no lock waits; cycles stamped (needs --tile --kcyc)')
+ap.add_argument('--zones', default='', help='DDR zone per operand, e.g. A=0x50000000000:0x200000000,C=0x60000000000:0x100000000 (base:size); default heap (DDR_LOW0)')
 ap.add_argument('--kcyc', action='store_true', help='cores stamp cycle split (total / input wait / mac / output wait / convert) into their last tile')
 ap.add_argument('--stress', type=int, default=0, help='N extra launches, each fully sampled-checked; failures listed per tile')
 args = ap.parse_args()
@@ -290,6 +293,35 @@ if args.persist:
     assert hs.count(old) == 1
     hs = hs.replace(old, '  if (sh_first) __Runtime_wait(v1, %s);\n' % ev)
     hs = hs.replace('  g_bd_once = 1;\n', '  g_bd_once = 1;\n  sh_launched = 1;\n', 1)
+# the launch's cache-maintenance sizes come from the BASE ports; with the target's smaller A the range
+# ran past the non-cacheable mapping and every launch cleaned 13.8 MB of cache (~0.43 ms)
+M_, N_, K_ = 2 * 64 * R2, 8 * 64 * NT2, 128 * NK
+hs, nl = re.subn(r'__aie_launch\("gemm_ka", mesh, A, \(size_t\)\d+, B, \(size_t\)\d+, C, \(size_t\)\d+\)',
+                 '__aie_launch("gemm_ka", mesh, A, (size_t)%d, B, (size_t)%d, C, (size_t)%d) /* SHARE2X8 target sizes */' % (M_ * K_, N_ * K_, M_ * N_), hs)
+assert nl == 1, nl
+if args.bench:
+    hs = hs.replace('    for (int cr = 0; cr < 16; cr++) { /* KCYC stamps */', """    for (int cr = 0; cr < 16; cr++) { /* KBENCH */
+        const uint32_t *st = (const uint32_t *)(Ct + ((long)cr * R + R - 1) * 4096);
+        printf("KBENCH core %%2d: ka_tile no-wait %%.1f cycles / chunk (ideal 1024) -> %%.1f %%%%; live run %%.1f cycles / chunk\\n", cr,
+               st[6] / (2.0 * %d), 100.0 * 1024 * 2 * %d / st[6], st[3] / (double)(R * %d));
+    }
+    for (int cr = 0; cr < 16; cr++) { /* KCYC stamps */""" % (NK, NK, NK))
+if args.zones:
+    zones = dict(kv.split('=') for kv in args.zones.split(','))
+    def zal(name, size_expr, default):
+        if name not in zones:
+            return default
+        base, size = zones[name].split(':')
+        return '(int8_t *)__Runtime_alloc_zone(%sULL, %sULL, %s) /* zone */' % (base, size, size_expr)
+    old = 'int8_t *A2 = (int8_t *)__Runtime_alloc_uncached(M * K), *B2 = (int8_t *)__Runtime_alloc_uncached(N * K);'
+    assert old in hs
+    hs = hs.replace(old, 'int8_t *A2 = %s, *B2 = %s;' % (zal('A', 'M * K', '(int8_t *)__Runtime_alloc_uncached(M * K)'),
+                                                         zal('B', 'N * K', '(int8_t *)__Runtime_alloc_uncached(N * K)')))
+    old = 'int8_t *Ct = (int8_t *)__Runtime_Alloc(M * N);'
+    assert old in hs
+    hs = hs.replace(old, 'int8_t *Ct = %s;' % zal('C', 'M * N', '(int8_t *)__Runtime_Alloc(M * N)'))
+    hs = hs.replace('void *__Runtime_alloc_uncached(size_t bytes);', 'void *__Runtime_alloc_uncached(size_t bytes);\nvoid *__Runtime_alloc_zone(uint64_t zone_base, uint64_t zone_size, size_t bytes);', 1)
+    hs = hs.replace('int main() {', 'int main() {\n    printf("[share2x8] zones: %s\\n");' % args.zones, 1)
 open(wl + '/host.cc', 'w').write(hs)
 print('host: MemTiles, DDR layout, golden mapping%s' % (', weight-resident B' if bres else ''))
 
@@ -342,7 +374,7 @@ print('kernel.cc: hosted-stream DMA')
 
 # ---------------------------------------------------------------- gemm_ka.cc: kernel body
 gk = open(wl + '/gemm_ka.cc').read()
-CHUNK = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share2x8_chunk.inc')).read()
+CHUNK = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share2x8_tile.inc' if args.tile else 'share2x8_chunk.inc')).read()
 gk = gk.replace('  void gemm_ka(', CHUNK + '\n  void gemm_ka(', 1)
 a = gk.index('#if defined(__chess__)\n    // On the core')
 b = gk.index('#else\n    // Traced')
@@ -425,5 +457,29 @@ LOOP = r'''#if defined(__chess__)
     }
 ''' % {'T': T, 'NK': NK, 'KCYC': 1 if args.kcyc else 0, 'PERSIST': 1 if args.persist else 0}
 gk = gk[:a] + LOOP + gk[b:]
+if args.tile:
+    a = gk.index('                for (int j = 0; j < %d; j++, gc++) {' % NK)
+    b = gk.index('                const uint64_t k4 = ', a)
+    gk = gk[:a] + ("""                const uint64_t k2 = (uint64_t)aie::tile::current().cycles();
+                ka_tile(vA, vB, lA, lB, (aFirst ? 1 : 0) | (bFirst ? 2 : 0) | (al ? 4 : 0) | (be ? 8 : 0), gc, %d, 1, acc,
+                        acc + 2048); /* whole tile, one pipeline; lock waits inside (KCYC counts them as mac) */
+                gc += %d;
+                k_mac += (uint64_t)aie::tile::current().cycles() - k2;
+""" % (NK, NK)) + gk[b:]
+    a = gk.index('                for (int bl = 0; bl < 16; bl++) { /* iteration block bl holds logical block bl ^ 8 al ^ 2 be */')
+    b = gk.index('                k_cv += ', a)
+    gk = gk[:a] + '                sh_convert(y, acc, (al << 3) ^ (be << 1));\n' + gk[b:]
+if args.bench:
+    old = '        unsigned gc = 0; /* chunks consumed this launch */\n'
+    assert old in gk
+    gk = gk.replace(old, old + """        uint32_t k_bench;
+        { /* BENCH: 2 tiles with no lock waits (lock values 0), DMA live; results discarded */
+            const uint64_t b0 = (uint64_t)aie::tile::current().cycles();
+            for (int r = 0; r < 2; r++)
+                ka_tile(vA, vB, lA, lB, (aFirst ? 1 : 0) | (bFirst ? 2 : 0) | (al ? 4 : 0) | (be ? 8 : 0), 0, %d, 0, acc, acc + 2048);
+            k_bench = (uint32_t)((uint64_t)aie::tile::current().cycles() - b0);
+        }
+""" % NK)
+    gk = gk.replace('                    st[5] = (uint32_t)k_cv;\n', '                    st[5] = (uint32_t)k_cv;\n                    st[6] = k_bench;\n')
 open(wl + '/gemm_ka.cc', 'w').write(gk)
 print('gemm_ka.cc: shared-operand kernel')
