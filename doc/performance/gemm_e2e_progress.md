@@ -382,6 +382,12 @@ the probes above (MemTile channel swap, MemTile split, transfer size, B sharing)
 limit of this data path. **For this design the DMA-only twin -- 58-59 % -- is the
 ceiling.**
 
+**Is it DDR?** The 57 % build moves 19.9 MB per launch (~9 GB/s), which made DDR a
+suspect. Test: NT 4, K 2048 (B fills MemTile row 1 exactly) cuts DDR bytes per MAC by
+8.5 %, but ran at 1.95 ms / 8.05 G MAC = **50.4 %** (GOLDEN PASS), with DDR at only ~7.1
+GB/s. Per-chunk time rose: NT 3 1.63 us, NT 4 1.95 us, NT 5 2.07 us. So DDR is not the
+binding limit. Why the time per chunk grows with NT is not understood yet.
+
 **The tile is bounded by kc.** The pipelined kernel's efficiency falls with the K
 chunk, because there is more accumulator reload per MAC: kc 128 ~80 %, kc 96 ~53 %,
 kc 48 ~40 % (board timing). At kc 128 only 64 x 64 fits 64 KB of core memory, so
