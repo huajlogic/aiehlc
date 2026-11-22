@@ -24,6 +24,7 @@ step by step.
 | [7.1](07_special_data_flow/1_broadcast.md) | Special data flow: broadcast (row and column) | simplegemm_kernel_port.cc | doc only |
 | [7.2](07_special_data_flow/2_halo.md) | Special data flow: input halo (overlapping windows) | simpleconv2dkernel_port.cc | doc only |
 | [7.3](07_special_data_flow/3_ksplit.md) | Special data flow: K-split accumulation (partial sums, two-level combine) | simplegemm_kernel_port.cc | doc only |
+| [7.4](07_special_data_flow/4_pingpong.md) | Special data flow: ping-pong buffers (`.depth`) | simplegemm_opt1_schedule.cc | doc only |
 
 "Lowering pending": chapters 2-5 show kernels the compiler's kernel analysis
 accepts, but the lowering after it still derives core windows from its GEMM
