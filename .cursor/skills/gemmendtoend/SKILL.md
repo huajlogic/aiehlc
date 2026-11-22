@@ -187,3 +187,12 @@ gs90 65.5 %, versus 57.0 % / 64.7 % on palmyra. See `doc/performance/gemm_e2e_pr
 - Reusing another build's `build/kernel.o`: `hostcompile.sh` now refuses unless the worklocal's
   `kernel_<f>_ctrlpkt.h` matches (else the cores silently load the OTHER kernel).
 - Per-core KCYC stamps (`--kcyc`) are the tool: in-wait / mac / out-wait / convert per core.
+
+## Which design for which board: `script/perf/gemm_plan.py --board palmyra|vek385|x.json`
+- One controller and DDR-bound (palmyra: reads 16.1, writes 3.58 GB/s, not overlapping) ->
+  4 x 4 MemTile-staged (fewest DDR bytes per MAC). DDR not binding (VEK385, 3 MCs interleaved)
+  -> 2 x 8 shared, persistent, `--tile`. Separate zones on separate MCs -> `--zones`.
+- `--check` holds the model against the measured runs; re-fit when a new run disagrees.
+- `__aie_launch`'s cache-maintenance sizes come from the build's ports: if the host allocates a
+  smaller non-cacheable buffer, the range runs past it and every launch cleans the cache (+0.43 ms).
+- VEK385 `DDR_CH_1` (0x500_0000_0000) hangs the A78 on this PDI; `DDR_LOW1` works.

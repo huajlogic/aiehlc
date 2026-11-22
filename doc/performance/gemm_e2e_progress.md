@@ -616,3 +616,57 @@ Per-core cycle split (k1s, non-persistent; MAC 85.8 %, input wait 9.0 %, convert
 the chunk runs at ~1168 cycles in the shared layout vs 1120 in the bench (DMA bank conflicts).
 Next: fuse chunk boundaries (prologue / epilogue ~90 cycles + call), zero / convert inside the
 first / last chunk, find the 9 % input wait.
+
+## Tile pipeline, persistent kernel, and the per-board plan (2026-11-22, later)
+
+**VEK385: 0.891 ms per 7.05 G MAC = 77.4 % of the true peak**, GOLDEN PASS, no errors in any stress
+launch. Build: `share2x8.py ... --r2 42 --nt2 1 --k 2560 --bres --single --persist --tile`.
+
+- **`--tile` (`share2x8_tile.inc`) runs one software pipeline per tile, across its chunks.**
+  - At a chunk boundary, chunk j's block 15 overlaps chunk j+1's block 0: j+1 is acquired
+    first, its first operands are prefetched during block 15, and j is released right after
+    its last reads. Before: 0.930 ms, now 0.891.
+  - The int32 -> int8 conversion is a separate noinline function. Inlined, it hit chess's
+    "no mappings for bundle (SRS + store + add)".
+  - Program memory: 15.7 KB of 16 KB. Every further kernel change must stay below that.
+- **No-wait bench (`--bench`).** The same `ka_tile` runs with lock values 0 (acquire >= 0 and
+  release 0 are no-ops) on live buffers: **~1190 cycles / chunk** (85.5 %), against
+  **~1262** in the run.
+  - Lock waits are therefore only ~6 %.
+  - The rest is the kernel: about 120 cycles of static boundary / loop overhead and about
+    45 cycles of DMA bank conflicts.
+  - A branch-free boundary (acquire `role ? F : G`, release by `role`) measured *slower*
+    (0.91-0.93 ms). Keep the branches and the fence.
+- **A from DDR is not the limit at this size.** NT2 2 (half the A traffic) gave 0.902 ms.
+  - The first try at NT2 2 was 0.43 ms slower per launch. `__aie_launch` queued cache
+    maintenance with the BASE build's sizes, so the 13.8 MB A range ran past the target's
+    6.9 MB non-cacheable buffer and the host cleaned 13.8 MB of cache on every launch.
+  - The generator now passes the target sizes.
+- **palmyra: the shared layout loses** (52-57 % vs 64.7 % for the 4 x 4 + weight-resident
+  design). Palmyra is DDR-bound and the 4 x 4 design moves fewer bytes per MAC.
+- **DDR zones on VEK385 (probed from the A78).** `DDR_LOW1` (0x8_0000_0000) is real, separate
+  memory. `DDR_CH_1` (0x500_0000_0000) hangs on the first read: not populated with this PDI,
+  although the BSP maps it. So the 3 MCs are interleaved behind LOW0 / LOW1.
+  - `--zones A=base:size,...` (via `__Runtime_alloc_zone`) places buffers when a board has
+    separate zones.
+
+### Solution choice from the memory system: `script/perf/gemm_plan.py`
+
+- **What it holds:**
+  - board profiles with the measured facts: MC count; which zones exist, on which MC, and
+    whether they are interleaved; DDR read and write rates; shim channel rate; AIE clock;
+  - both designs' constraints (MemTile capacity, at most 64 output tiles per core, K not
+    split because the output is int8);
+  - a cost model, max(core, DDR, shim A) plus B prefill plus launch.
+- **What it does:** ranks the feasible tilings, adds A / B / C zone placement when there are
+  separate controllers, and prints the build commands.
+- **Calibration:** `--check` compares it with the 8 measured runs, worst error **3.0 points**.
+  - palmyra fits `reads / 16.1 GB/s + writes / 3.58 GB/s`. Reads and writes do not overlap on
+    the one controller, and writes are slow. That is why the 4 x 4 design, with fewer writes
+    per MAC, wins there.
+
+| board | memory system | chosen | model (measured) |
+|---|---|---|---|
+| palmyra | 1 MC, DDR-bound | 4 x 4 MemTile-staged, weight-resident, R 21 NT 3 K 2560 | 62.4 % (64.7 %) |
+| VEK385 | 3 MC interleaved, DDR not binding | 2 x 8 shared, persistent, tile pipeline, R2 42 NT2 1 K 2560 | 76.4 % (77.4 %) |
+| a board with 3 separate MC zones | separate controllers | 2 x 8 with `--zones` (A, C, B on different controllers) | -- (not measured) |
