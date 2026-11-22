@@ -176,3 +176,14 @@ per row, <= 64 output rounds per core). 60 % needs a persistent kernel re-armed 
 (measured: timer 0x340F8, xsdb, 1249-1250 MHz), divide its printed % by 1.25: gs79 62.8 %,
 gs90 65.5 %, versus 57.0 % / 64.7 % on palmyra. See `doc/performance/gemm_e2e_progress.md`
 "VEK385 farm board".
+
+## 2 x 8 shared-operand layout (VEK385 74.2 %, see gemm_e2e_progress.md)
+- Each tile hosts one operand stream that two neighbours read: split every buffer over two
+  16 KB **programmer banks** (AM027: 8 x 8 KB hardware banks, paired) and make the two readers
+  walk it in **opposite phase**; one E lock **per slot**, not per channel.
+- Tile DMA BD wraps are **8-bit** (256 = off), MemTile 10-bit (1024 = off).
+- Output BD iteration is 6-bit: <= 64 tiles per core per launch. Two tiles per packet works
+  only when the packet starts after BOTH tiles (ping acquires -2), and it costs ~10 %.
+- Reusing another build's `build/kernel.o`: `hostcompile.sh` now refuses unless the worklocal's
+  `kernel_<f>_ctrlpkt.h` matches (else the cores silently load the OTHER kernel).
+- Per-core KCYC stamps (`--kcyc`) are the tool: in-wait / mac / out-wait / convert per core.

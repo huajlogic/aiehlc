@@ -58,15 +58,20 @@ HOST_OPT_FLAGS="${HOSTCOMPILE_HOST_OPT:-${OPT_FLAGS}}"
 
 KERNEL_FUNC_NAME="computekernel"   # default fallback; overridden by auto-detection below
 
-# Hash of everything build/kernel.o is made from: kernel.cc, the bcf/prx the
-# linker places it with, kc.sh itself, kernel_build_flags.sh (klog on/off), and
-# the knobs that change its output.
+# Hash of everything build/kernel.o is made from: kernel.cc and the worklocal files it
+# #includes "..." (the kernel body lives in an included <func>.cc -- hashing kernel.cc alone
+# reused a stale kernel.o after a body-only edit), the bcf/prx the linker places it with,
+# kc.sh itself, kernel_build_flags.sh (klog on/off), and the knobs that change its output.
 kernel_stamp() {
-    local f
+    local f inc
     {
         for f in "${WORKLOCAL_DIR}/kernel.cc" "${WORKLOCAL_DIR}/aieml.bcf" "${WORKLOCAL_DIR}/aieml.prx" \
                  "${AIEHLC_ROOT}/script/kc.sh" "${KERNEL_DIR%/}/kernel_build_flags.sh"; do
             [ -f "$f" ] && sha256sum < "$f"
+        done
+        for inc in $(sed -nE 's/^[[:space:]]*#[[:space:]]*include[[:space:]]+"([^"]+)".*/\1/p' \
+                         "${WORKLOCAL_DIR}/kernel.cc" 2>/dev/null); do
+            [ -f "${WORKLOCAL_DIR}/${inc}" ] && { echo "${inc}"; sha256sum < "${WORKLOCAL_DIR}/${inc}"; }
         done
         echo "$1 ${AIE_VERSION:-5} ${PLATFORM:-baremetal} ${USE_LLVM_AIE:-false} ${DEBUG_SYMS:-0}"
     } | sha256sum | cut -d' ' -f1
@@ -204,6 +209,13 @@ kobj_cache_put() {
     return 0
 }
 
+# sha256 of the control-packet image kc.sh encoded from build/kernel (what a
+# control_plan_op_control_packet build actually loads onto the cores), or "none".
+kernel_ctrlpkt_sha() {
+    local h="${WORKLOCAL_DIR}/kernel_$1_ctrlpkt.h"
+    [ -f "$h" ] && sha256sum < "$h" | cut -d' ' -f1 || echo none
+}
+
 # check_kernel_stack <prx>: the BCF stack is [0x70000, buffer area start). CoreMemAllocator
 # shrinks it from the default 32 KB when the port buffers do not fit above 0x78000, so
 # compare chess's "Maximum stack size" (kernel.calltree) with the BCF _stack size.
@@ -246,8 +258,14 @@ compile_one_kernel() {
     kstamp="$(kernel_stamp "${kernel_func_name}")"
     if [ "${HOSTCOMPILE_KERNEL_REBUILD:-0}" != "1" ] && [ -f "${BUILD_DIR}/kernel.o" ] &&
         [ "$(cat "${BUILD_DIR}/kernel.stamp" 2>/dev/null)" = "${kstamp}" ]; then
-        echo "[hostcompile] Reusing ${BUILD_DIR}/kernel.o (kernel.cc, bcf, prx, kc.sh unchanged)"
-        return 0
+        # The control-packet image in the worklocal must be the one encoded with this kernel.o:
+        # a worklocal copied from another build keeps that build's image, and the cores would be
+        # loaded with the OTHER kernel (hang). No record = unknown provenance = rebuild.
+        if [ "$(cat "${BUILD_DIR}/kernel.ctrlpkt.sha" 2>/dev/null)" = "$(kernel_ctrlpkt_sha "${kernel_func_name}")" ]; then
+            echo "[hostcompile] Reusing ${BUILD_DIR}/kernel.o (kernel.cc + includes, bcf, prx, kc.sh, ctrlpkt image unchanged)"
+            return 0
+        fi
+        echo "[hostcompile] kernel.o not reused: the worklocal's kernel_${kernel_func_name}_ctrlpkt.h was not encoded from it"
     fi
     rm -f "${BUILD_DIR}/kernel.stamp"
 
@@ -315,6 +333,7 @@ compile_one_kernel() {
     fi
     if [ ${kc_rc} -eq 0 ] && [ -f "${BUILD_DIR}/kernel.o" ]; then
         echo "${kstamp}" > "${BUILD_DIR}/kernel.stamp"
+        kernel_ctrlpkt_sha "${kernel_func_name}" > "${BUILD_DIR}/kernel.ctrlpkt.sha"
         [ -n "${kobj_key}" ] && (cd "${WORKLOCAL_DIR}" && kobj_cache_put "${kernel_func_name}" "${kobj_key}")
         if [ -n "${kobj_key}" ]; then
             bash "${AIEHLC_ROOT}/script/kobj_cache_prune.sh" "${AIEHLC_KOBJ_CACHE}" >/dev/null || true
