@@ -386,7 +386,28 @@ ceiling.**
 suspect. Test: NT 4, K 2048 (B fills MemTile row 1 exactly) cuts DDR bytes per MAC by
 8.5 %, but ran at 1.95 ms / 8.05 G MAC = **50.4 %** (GOLDEN PASS), with DDR at only ~7.1
 GB/s. Per-chunk time rose: NT 3 1.63 us, NT 4 1.95 us, NT 5 2.07 us. So DDR is not the
-binding limit. Why the time per chunk grows with NT is not understood yet.
+binding limit **for NT 4**.
+
+NT 2 (K 2560, N 512): 2.89 ms / 10.07 G MAC = **42.5 %**, GOLDEN PASS, with DDR at
+8.6 GB/s.
+
+| NT | K | chunks per tile | DDR rate | per chunk | end to end |
+|---|---|---|---|---|---|
+| 2 | 2560 | 20 | 8.6 GB/s | 2.36 us | 42.5 % |
+| 3 | 2560 | 20 | 8.8 GB/s | 1.63 us | 57.0 % |
+| 4 | 2048 | 16 | 7.1 GB/s | 1.95 us | 50.4 % |
+| 5 | 1536 | 12 | ~6 GB/s | 2.07 us | 42.2 % |
+
+**Two limits meet at NT 3:**
+- **DDR, ~9 GB/s read+write in this pattern.** NT <= 3 runs at that rate. NT 2 reads
+  more A per MAC, so it is slower.
+- **Per-tile overhead**, when MemTile capacity forces a smaller K (fewer chunks per
+  tile). NT 4 / 5 do not reach the DDR rate.
+
+NT 3 with K 2560 is where both limits are lowest. Raising N at K 2560 needs more
+MemTile than the two rows hold (A x3 491 KB in row 2, B 491 KB in row 1). At this
+traffic, ~9 GB/s of DDR bounds the 57 % build at ~58-59 %, which matches its DMA-only
+twin.
 
 **The tile is bounded by kc.** The pipelined kernel's efficiency falls with the K
 chunk, because there is more accumulator reload per MAC: kc 128 ~80 %, kc 96 ~53 %,
