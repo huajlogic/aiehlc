@@ -159,7 +159,8 @@ When the path is core→shim **and** has producer core tiles, it calls
 The comment above the call names this case processing_type 2 (core→shim, gather by
 packet merge); the call itself is on line 1159 (line 1157 is only the comment). It
 passes the allocated shim point, the `DataIO`, the path and `producerCoreTiles`, and
-returns the packet-routing tile map `lastPkttilemap`.
+returns the packet-routing tile map `lastPkttilemap`. It is a consumer of the packet IDs: it does not allocate them; it
+reads the `dmapktid` that `DmapToDmaphopPass` already put on each core port (section 6).
 <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:1159 lastPkttilemap = GatherPktRoutingPathCreate( -->
 <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:1156-1167 isCoreToShim && !producerCoreTiles.empty() -->
 <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:1157 core-to-shim packet routing (processing_type=2) -->
@@ -274,14 +275,19 @@ Sequence for one launch: **load -> allocate -> configure -> run -> sync -> relea
 
 | Resource | Allocated by | Owned by (while live) | Freed |
 |---|---|---|---|
-| packet IDs 1..4 (one per core) | the routing pass: `GatherPktRoutingPathCreate` for the core->shim path (`src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:1159`), 1-based | the routing output; fixed at compile time | nothing is freed per launch |
+| packet IDs 1..4 (one per core) | `DmapToDmaphopPass`: `router.getRM()->allocatePktId(-1)` for each core `corePortOut`, Pull flows only (`src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:261`); pool assert "max 31" at `:262`; stored as the port's `dmapktid` attribute at `:263` (passed positionally at `:267`). Push flows get no ID (`basePktId = 0`) | the `dmapktid` attribute on the `dmaphop.port`; fixed at compile time | never: `ResourceMgr::releasePktId` (`src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:920`) has no caller at 43fcb8f |
 | slave slots (DMA 0 with ID k, mask 31; WEST 1 catch-all, mask 0) | routing pass; emitted as `XAie_StrmPktSwSlaveSlotEnable` in routing.cc | routing.cc, for the launch (`script/test/flowcheck_data/good/routing.cc:79-95`) | nothing is freed per launch |
 | shared master port (EAST 1 in cols 0-2, SOUTH 1 at (3,3)) | routing pass; `XAie_StrmPktSwMstrPortEnable` in routing.cc | routing.cc, for the launch (`script/test/flowcheck_data/good/routing.cc:81`, `:97`); the four cores take it packet by packet | nothing is freed per launch |
 | core MM2S BD 4 with packet_id = k | compiler (`dfschedule::ConfigDmaBdOp` packetIdOperand, `src/mlir/mlirfront/tilinglinalg/dataflowmap/dfschedule/dfschedulemanager.cpp:314-316`) | the tile DMA; issued once per round. **Rule: BD packet_id must equal the slot ID** (section 3, pitfall 1) | nothing is freed per launch |
 | shim S2MM ch0 BD 2 (sink) | compiler; listed in host.cc (`script/test/flowcheck_data/good/host.cc:26`) | the shim DMA, then the host after it waits for completion | nothing is freed per launch |
 | teardown of slots / master port | **not in repo**: no slot-disable or port-disable call for this flow at 43fcb8f | - | not in repo |
 
-<!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:1159 GatherPktRoutingPathCreate -->
+<!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:261 allocatePktId -->
+<!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:262 pkt_id pool exhausted (max 31) -->
+<!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:263 pktIdAttr = rewriter.getI32IntegerAttr -->
+<!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:267 pktIdAttr -->
+<!-- ref src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:920 releasePktId -->
+<!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp:469 basePktId = 0; // Push flows are circuit-switched -->
 <!-- ref script/test/flowcheck_data/good/routing.cc:79-95 XAie_StrmPktSwSlaveSlotEnable -->
 <!-- ref script/test/flowcheck_data/good/routing.cc:81 XAie_StrmPktSwMstrPortEnable -->
 <!-- ref script/test/flowcheck_data/good/routing.cc:97 XAie_StrmPktSwMstrPortEnable -->
@@ -294,8 +300,17 @@ Rules that follow from the table:
   nothing for this flow and frees nothing per launch.
 - The four cores share no lock; they share only the stream port. Each core's
   sync is on its own buffer (lock #k, by role only).
-- The one runtime invariant is ID equality: BD packet_id (compiler) == slot ID
-  (routing). Two components write the two halves, so check it first.
+- The one runtime invariant is ID equality: BD packet_id == slot ID. Both come from
+  ONE attribute, `dmapktid`, written once by `allocatePktId`. Routing reads it
+  (`src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:222-231`,
+  fallback 1 at `:224`) and so does the BD side
+  (`src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp:148`,
+  used at `:312`). Note: `git grep dmapktid` finds no writer, because the writer passes
+  `pktIdAttr` positionally; search for `allocatePktId` instead.
+  <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:222-231 getDmapktid -->
+  <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp:224 int pktId = 1; // fallback: 1-based -->
+  <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp:148 getDmapktid -->
+  <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp:312 getBasePktIdFromProducers -->
 
 ## 7. Pitfalls
 
