@@ -482,3 +482,93 @@ unmeasured.
 - All measurements: `.cursor/skills/gemmendtoend/SKILL.md`.
 - Test programs (not in repo): `/tmp/claude-35620/gs18/gemm_s2.cc` (best end to
   end), `gs13` (DMA-only probe), `hand1..3` (MemTile hand edits).
+
+## VEK385 farm board (vek385-6 @ gomphus6, 2026-11-22)
+
+The same ELFs ran unchanged (netload), GOLDEN PASS 196,608/196,608 each:
+
+| build | palmyra (998 MHz array) | VEK385 time | VEK385 % of own peak |
+|---|---|---|---|
+| gs79, A+B from DDR | 2.33 ms, 57.0 %, 9.3 TOPS | 1.643 ms, 12.9 TOPS | **62.8 %** |
+| gs90, weight-resident B | 64.7 % | 1.576 ms, 13.4 TOPS | **65.5 %** |
+
+**The array clock on the farm VEK385 is 1.25 GHz, not 998 MHz.** Measured from a core
+and a shim timer (0x340F8/0x340FC) read twice over xsdb 5 s apart: 1249.1 / 1250.1 MHz.
+The test hard-codes 998 MHz, so it prints 78.7 % / 82.1 % on this board; those figures
+are wrong. The true peak is 16 x 512 x 2 x 1.25 GHz = 20.5 TOPS.
+
+The wall-time gain is 1.42x, against a 1.25x clock ratio. So most of the speed-up is the
+clock, which a stream-/shim-bound design scales with (4 B/cycle per stream). The rest is
+DDR relief, worth about 6 points of efficiency. More memory controllers do not lift the
+design to 100 %: the per-shim-channel / per-core input rate remains the limit.
+
+## Kernel v2: 81.6 % -> 92.0 % per chunk (`gemm_kacc_v2.cc`, 2026-11-22)
+
+Each core stamped its own cycle counter into its last output tile (KCYC). The measurement
+build `gk1` on VEK385 split a core's time as follows:
+
+| phase | share |
+|---|---|
+| MAC chunks | 79.6 % |
+| waiting for input | 14.0 % |
+| lock and loop overhead | 5.0 % |
+| int32 -> int8 conversion | 1.2 % |
+
+The kernel was the first limit. A **bench** variant runs `KA_CHUNK` 64 more times on resident
+buffers and stamps the cycles per chunk (ideal: 1,024):
+
+| kernel | cycles per chunk | efficiency |
+|---|---|---|
+| gemm_kacc_ntile (X/Y sets, one accumulator pointer) | 1255 | 81.6 % |
+| + operands prefetched one k-step ahead, separate acc store / load pointers | 1280 | 80.0 % (worse) |
+| + accumulators split over two 8 KB banks (acc pinned at 0x72000) | 1233 | 83.0 % |
+| + two-step prefetch, rotating addresses (no div/mod), bank split | **1113** | **92.0 %** |
+
+- **Count bundles, then measure: the listing does not show stalls.** The 1-step prefetch
+  loop scheduled in 141 bundles instead of 150, yet ran slower. Its separate store and
+  load pointers let `VST acc(b)` and `VLDA acc(b+2)` issue in the same cycle. Both are
+  2 KB apart, so they sit in the same 8 KB **bank**, which cost ~130 stall cycles per chunk.
+- **Fix: put block b's accumulators in bank `(b >> 1) & 1`.** The store of b and the reload
+  of b+2 then always hit different banks. `alignas(8192)` on the static `acc` places it
+  at 0x72000, i.e. the two banks 0x72000 and 0x74000.
+- **The remaining loss** is about 5 register moves per 2-block iteration (the operand
+  rotation) and about 90 cycles of chunk prologue/epilogue.
+- **Do not unroll the block loop to 4 blocks:** chess was still scheduling it after 30 min.
+
+End to end (palmyra at 998 MHz, VEK385 at its real 1.25 GHz), GOLDEN PASS 196,608 everywhere:
+
+| build | palmyra | VEK385 |
+|---|---|---|
+| A + B from DDR: gs79 -> **v2** | 57.0 -> **58.4 %** | 62.8 -> **67.9 %** (1.521 ms) |
+| weight-resident B: gs90 -> **v2r** | 64.7 -> **64.5-64.9 %** | 65.5 -> **71.5 %** (1.446 ms) |
+
+Palmyra is DDR-bound, so the faster kernel barely moves it.
+
+### Why the current layout cannot reach 95 % (VEK385 measurements)
+
+- **The input stream caps the core at 87.5 %.** In the DMA-only twin (`gk2`, no MACs), chunks
+  complete every ~1,170 cycles: 16 KB / 1,170 cycles = 14 B/cycle per core, or ~7 B/cycle per
+  S2MM channel (the stream is 64-bit). A 64 x 64 tile needs 1/32 B per MAC, so even a perfect
+  kernel tops out at 14 x 32 = 448 MAC/cycle = 87.5 %.
+- **95 % needs fewer input bytes per tile.** The LP `share_lp.py` places operand streams so that
+  cores read their second operand from a north / south neighbour's memory.
+  - The standard 4 x 4 layout (A on mesh rows, B on columns) only gets to 1.5 streams per tile.
+  - A **2 x 8 logical grid** gets to **1.0**. Per column, mesh rows 0..3 receive A0, B_c,
+    B_{c+4}, A1, and each memory is read by two vertically adjacent cores.
+- **Neighbour memory reads (bench, 64 chunks):**
+
+  | case | cycles per chunk | cost |
+  |---|---|---|
+  | a neighbour's buffer that nobody else reads | 1113 | free |
+  | the same buffer read by two cores at once | 1169-1174 | +5 % |
+  | two shared operands, both read from the same memory | 1206-1261 | +8-13 % |
+
+  - The +5 % comes from one 8 KB bank serving 4 loads per 4 cycles.
+  - To remove it, spread each shared buffer over two banks with a 3-D S2MM BD.
+- **The lock protocol for one buffer with two consumers:**
+  - F: DMA -> first consumer, +1 per filled buffer.
+  - G: first -> second consumer, released right after the first consumer's acquire.
+  - E: both consumers -> DMA; the DMA acquires -2.
+
+  A single counting full lock would let a fast consumer take the slower consumer's count and
+  read a buffer that is not yet filled.

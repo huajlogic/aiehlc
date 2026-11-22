@@ -169,3 +169,10 @@ cache sync) vs 0.12 ms of ideal work per launch (A per launch <= memtile 512 KB
 per row, <= 64 output rounds per core). 60 % needs a persistent kernel re-armed in
 ~us, plus the staging above in the compiler.
 
+
+## VEK385: the clock is 1.25 GHz
+
+`gemm_kacc_ntile.cc` computes % of peak at a hard-coded 998 MHz (palmyra). On the farm VEK385
+(measured: timer 0x340F8, xsdb, 1249-1250 MHz), divide its printed % by 1.25: gs79 62.8 %,
+gs90 65.5 %, versus 57.0 % / 64.7 % on palmyra. See `doc/performance/gemm_e2e_progress.md`
+"VEK385 farm board".
