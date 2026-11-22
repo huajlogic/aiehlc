@@ -275,7 +275,7 @@ Sequence for one launch: **load -> allocate -> configure -> run -> sync -> relea
 
 | Resource | Allocated by | Owned by (while live) | Freed |
 |---|---|---|---|
-| packet IDs 1..4 (one per core) | `DmapToDmaphopPass`: `router.getRM()->allocatePktId(-1)` for each core `corePortOut`, Pull flows only (`src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:261`); pool assert "max 31" at `:262`; stored as the port's `dmapktid` attribute at `:263` (passed positionally at `:267`). Push flows get no ID (`basePktId = 0`) | the `dmapktid` attribute on the `dmaphop.port`; fixed at compile time | never: `ResourceMgr::releasePktId` (`src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:920`) has no caller at 43fcb8f |
+| packet IDs 1..4 for this stream (1..16 for the whole fixture, section 8) | `DmapToDmaphopPass`: `router.getRM()->allocatePktId(-1)` for each core `corePortOut`, Pull flows only (`src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:261`). This is ONE counter for the whole design, not one per stream, so IDs are unique across all streams (stream A gets 1..4, B 5..8, C 9..12, D 13..16); two streams that end on the same shim tile are kept apart by using different S2MM channels, not by reusing IDs; pool assert "max 31" at `:262`; stored as the port's `dmapktid` attribute at `:263` (passed positionally at `:267`). Push flows get no ID (`basePktId = 0`) | the `dmapktid` attribute on the `dmaphop.port`; fixed at compile time | never: `ResourceMgr::releasePktId` (`src/mlir/mlirfront/tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp:920`) has no caller at 43fcb8f |
 | slave slots (DMA 0 with ID k, mask 31; WEST 1 catch-all, mask 0) | routing pass; emitted as `XAie_StrmPktSwSlaveSlotEnable` in routing.cc | routing.cc, for the launch (`script/test/flowcheck_data/good/routing.cc:79-95`) | nothing is freed per launch |
 | shared master port (EAST 1 in cols 0-2, SOUTH 1 at (3,3)) | routing pass; `XAie_StrmPktSwMstrPortEnable` in routing.cc | routing.cc, for the launch (`script/test/flowcheck_data/good/routing.cc:81`, `:97`); the four cores take it packet by packet | nothing is freed per launch |
 | core MM2S BD 4 with packet_id = k | compiler (`dfschedule::ConfigDmaBdOp` packetIdOperand, `src/mlir/mlirfront/tilinglinalg/dataflowmap/dfschedule/dfschedulemanager.cpp:314-316`) | the tile DMA; issued once per round. **Rule: BD packet_id must equal the slot ID** (section 3, pitfall 1) | nothing is freed per launch |
@@ -339,3 +339,90 @@ the host hung at `__Runtime_wait`
 event means two things: normal turn-taking (it clears after a few hundred
 cycles) or an ID mismatch (it never clears and the shim S2MM shows starvation).
 Check the BD `pkt_id` against the slot PktId before reading it as a cost.
+
+## 8. The whole fixture: four merged streams, IDs 1-16
+
+Sections 1-7 follow stream A (row 3). The fixture has four such merged streams,
+one per round, in rows 3, 4, 5 and 6. Each one is the same pattern: four core
+MM2S ch0 BD 4 sources, each with its own DMA 0 slot (mask 31, exact match), one
+packet-switched path east along the row, then circuit hops down to a shim S2MM
+channel. The sink of each stream is read from the route (which shim tile and port
+the path leaves at), not assumed from the order in host.cc. All refs are at base
+43fcb8f.
+
+| Stream | Row | Packet IDs (DMA 0 slots, mask 31) | Packet masters, west to east | Circuit hops to the shim | Shim port | Sink (host.cc) |
+|---|---|---|---|---|---|---|
+| A | 3 | (0,3) XAie_PacketInit(1, 0)<br>(1,3) XAie_PacketInit(2, 0)<br>(2,3) XAie_PacketInit(3, 0)<br>(3,3) XAie_PacketInit(4, 0) | EAST 1, EAST 1, EAST 1, SOUTH 1 | col 3 down: (3,2) (3,1) (3,0), N1->S1 | (3,0) port 1 | host.cc:26 (3,0) S2MM ch0 bd2 |
+| B | 4 | (0,4) XAie_PacketInit(5, 0)<br>(1,4) XAie_PacketInit(6, 0)<br>(2,4) XAie_PacketInit(7, 0)<br>(3,4) XAie_PacketInit(8, 0) | EAST 0, EAST 1, EAST 1, SOUTH 1 | col 3 down: (3,3) N1->S2, (3,2) (3,1) N2->S2, (3,0) N2->S3 | (3,0) port 3 | host.cc:36 (3,0) S2MM ch1 bd7 |
+| C | 5 | (0,5) XAie_PacketInit(9, 0)<br>(1,5) XAie_PacketInit(10, 0)<br>(2,5) XAie_PacketInit(11, 0)<br>(3,5) XAie_PacketInit(12, 0) | EAST 1, EAST 1, EAST 1, SOUTH 1 | (3,4) N1->S2, (3,3) N2->W2, then col 2 down: (2,3) E2->S2, (2,2) (2,1) N2->S2, (2,0) N2->S1 | (2,0) port 1 | host.cc:46 (2,0) S2MM ch0 bd3 |
+| D | 6 | (0,6) XAie_PacketInit(13, 0)<br>(1,6) XAie_PacketInit(14, 0)<br>(2,6) XAie_PacketInit(15, 0)<br>(3,6) XAie_PacketInit(16, 0) | EAST 1, EAST 1, EAST 1, SOUTH 1 | (3,5) N1->S2, (3,4) N2->W2, (2,4) E2->S1, then col 2 down: (2,3) N1->S3, (2,2) (2,1) (2,0) N3->S3 | (2,0) port 3 | host.cc:56 (2,0) S2MM ch1 bd8 |
+
+<!-- ref script/test/flowcheck_data/good/routing.cc:79 XAie_PacketInit(1, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:84 XAie_PacketInit(2, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:89 XAie_PacketInit(3, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:94 XAie_PacketInit(4, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:96 XAie_EnableAieToShimDmaStrmPort(v1, XAie_TileLoc(3,0), 1) -->
+<!-- ref script/test/flowcheck_data/good/host.cc:26 channel_id=0, bd_id=2, tile=(3,0) -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:118 XAie_PacketInit(5, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:123 XAie_PacketInit(6, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:128 XAie_PacketInit(7, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:133 XAie_PacketInit(8, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:135 XAie_EnableAieToShimDmaStrmPort(v1, XAie_TileLoc(3,0), 3) -->
+<!-- ref script/test/flowcheck_data/good/host.cc:36 channel_id=1, bd_id=7, tile=(3,0) -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:160 XAie_PacketInit(9, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:165 XAie_PacketInit(10, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:170 XAie_PacketInit(11, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:175 XAie_PacketInit(12, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:177 XAie_EnableAieToShimDmaStrmPort(v1, XAie_TileLoc(2,0), 1) -->
+<!-- ref script/test/flowcheck_data/good/host.cc:46 channel_id=0, bd_id=3, tile=(2,0) -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:206 XAie_PacketInit(13, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:211 XAie_PacketInit(14, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:216 XAie_PacketInit(15, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:221 XAie_PacketInit(16, 0), 31 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:223 XAie_EnableAieToShimDmaStrmPort(v1, XAie_TileLoc(2,0), 3) -->
+<!-- ref script/test/flowcheck_data/good/host.cc:56 channel_id=1, bd_id=8, tile=(2,0) -->
+
+```
+ row 6  D: ids 13 14 15 16 --E1--E1--E1--> (3,6) S1 -+
+ row 5  C: ids  9 10 11 12 --E1--E1--E1--> (3,5) S1 -+-> (3,5) N1->S2 [D]
+ row 4  B: ids  5  6  7  8 --E0--E1--E1--> (3,4) S1  |   (3,4) N1->S2 [C]; N2->W2 [D] -> (2,4) E2->S1 [D]
+ row 3  A: ids  1  2  3  4 --E1--E1--E1--> (3,3) S1  |   (3,3) N1->S2 [B]; N2->W2 [C] -> (2,3) E2->S2 [C]
+                                                         (2,3) N1->S3 [D]
+ column 3 down to shim (3,0):                column 2 down to shim (2,0):
+   A: N1->S1 ... (3,0) S1 -> port 1            C: N2->S2 ... (2,0) N2->S1 -> port 1
+   B: N2->S2 ... (3,0) N2->S3 -> port 3        D: N3->S3 ... (2,0) N3->S3 -> port 3
+
+ sinks:  A -> host.cc:26  (3,0) S2MM ch0 bd2     C -> host.cc:46  (2,0) S2MM ch0 bd3
+         B -> host.cc:36  (3,0) S2MM ch1 bd7     D -> host.cc:56  (2,0) S2MM ch1 bd8
+```
+
+<!-- ref script/test/flowcheck_data/good/routing.cc:120 XAie_StrmPktSwMstrPortEnable(v1, XAie_TileLoc(0,4), EAST, 0 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:137 NORTH, 1, SOUTH, 2 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:140 NORTH, 2, SOUTH, 3 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:180 NORTH, 2, WEST, 2 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:181 EAST, 2, SOUTH, 2 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:184 NORTH, 2, SOUTH, 1 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:226 NORTH, 2, WEST, 2 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:227 EAST, 2, SOUTH, 1 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:228 NORTH, 1, SOUTH, 3 -->
+<!-- ref script/test/flowcheck_data/good/routing.cc:231 NORTH, 3, SOUTH, 3 -->
+
+What the four streams show together:
+
+- **IDs are unique across the whole design.** `allocatePktId` is one counter for
+  the design (section 6), so stream A gets 1-4, B 5-8, C 9-12 and D 13-16. No two
+  DMA 0 slots in the fixture share an ID, so a header always names exactly one core.
+  <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp:261 allocatePktId -->
+- **Two streams per shim tile, one S2MM channel each.** A and B both end at shim
+  (3,0), on ports 1 and 3 and S2MM ch0 / ch1; C and D both end at shim (2,0), again
+  on ports 1 and 3 and S2MM ch0 / ch1. The streams never merge with each other: each
+  keeps its own circuit path and its own shim channel.
+- **(0,4) is the one head on EAST 0.** At (0,3), (0,5) and (0,6) master EAST 0 is
+  taken by the circuit broadcast of the same round, so those heads use EAST 1.
+  <!-- ref script/test/flowcheck_data/good/routing.cc:72 XAie_TileLoc(0,3), SOUTH, 1, EAST, 0 -->
+  <!-- ref script/test/flowcheck_data/good/routing.cc:153 XAie_TileLoc(0,5), SOUTH, 1, EAST, 0 -->
+  <!-- ref script/test/flowcheck_data/good/routing.cc:199 XAie_TileLoc(0,6), SOUTH, 1, EAST, 0 -->
+  Stream B's next hop therefore listens on WEST 0 at (1,4), not WEST 1.
+  <!-- ref script/test/flowcheck_data/good/routing.cc:121 XAie_TileLoc(1,4), WEST, 0, 0, XAie_PacketInit(0, 0) -->
+- **Pitfall 1 applies per stream.** Each core's BD 4 packet_id must equal its own
+  slot ID (1..16 above), not its position in the row (1..4).
