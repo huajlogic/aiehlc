@@ -26,6 +26,7 @@ step by step.
 | [7.3](07_special_data_flow/3_ksplit.md) | Special data flow: K-split accumulation (partial sums, two-level combine) | simplegemm_kernel_port.cc | doc only |
 | [7.4](07_special_data_flow/4_pingpong.md) | Special data flow: ping-pong buffers (`.depth`) | simplegemm_opt1_schedule.cc | doc only |
 | [7.4b](07_special_data_flow/4b_resident.md) | Special data flow: resident buffers (`.resident`) | simplegemm_opt1_schedule.cc | doc only |
+| [7.5](07_special_data_flow/5_packet.md) | Special data flow: packet-switched shared stream (ID/mask, one port) | flowcheck fixture | doc only |
 
 "Lowering pending": chapters 2-5 show kernels the compiler's kernel analysis
 accepts, but the lowering after it still derives core windows from its GEMM
