@@ -685,8 +685,14 @@ AieRC __Runtime_core_perf_setup(XAie_DevInst *dev, XAie_LocType tile) {
     rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 2, 0);
     if (rc != XAIE_OK)
         return rc;
+#ifdef AIEHLC_PERF_CTR2_MEMSTALL
+    /* ctr2 repurposed: memory (DM bank conflict) stall instead of stream stall. */
+    rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 2, XAIE_EVENT_MEMORY_STALL_CORE,
+                                    XAIE_EVENT_MEMORY_STALL_CORE);
+#else
     rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 2, XAIE_EVENT_STREAM_STALL_CORE,
                                     XAIE_EVENT_STREAM_STALL_CORE);
+#endif
     if (rc != XAIE_OK)
         return rc;
     rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 3, 0);
@@ -777,7 +783,11 @@ void __Runtime_core_perf_report(int tag) {
     for (int i = 0; i < s_core_perf_ntiles; i++) {
         const uint32_t a = s_perf_rep_a[i], v = s_perf_rep_v[i], ss = s_perf_rep_ss[i], ls = s_perf_rep_ls[i];
         const AieRC rc = s_perf_rep_rc[i];
+#ifdef AIEHLC_PERF_CTR2_MEMSTALL
+        printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u vec_instr=%u mem_stall=%u lock_stall=%u\n", tag,
+#else
         printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u vec_instr=%u stream_stall=%u lock_stall=%u\n", tag,
+#endif
                (unsigned)s_core_perf_tiles[i].Col, (unsigned)s_core_perf_tiles[i].Row, (int)rc, a, v, ss, ls);
         /* launch window A->B: io_active = max(0, dACTIVE - ovl), compute = dACTIVE - dLOCK - dSTREAM,
          * ovl = this tile's A->B read-to-read host time outside the waits; pre_io_* = the rest since kernel-group enable;
