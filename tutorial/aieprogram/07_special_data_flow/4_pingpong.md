@@ -116,6 +116,14 @@ Source facts:
 | L6 | .depth=1 (single buffer) | one buffer, one BD, one lock pair | buffer_mode 0, num_buffers 1: one BD, so the DMA can refill only after the core releases the buffer; the core waits for every block and DMA and compute do not overlap. With no next_bd cycling the single BD fires once, so the compiler accepts .depth=1 only when numIterations==1 (else emitError: Single-buffer DMA cannot re-arm) | <!-- ref doc/debug/k_accumulate_c_stationary_shim_stuck.md:490 means single buffer --> |
 | L7 | .depth=1 compile check | single BD, numIterations | pp_depth=1 with numIterations above 1 is rejected (the core would deadlock on its second acquire_window); fix is pp_depth 2 or a larger max_buffer_bytes | <!-- ref src/mlir/mlirfront/tilinglinalg/pass/passblueprintlowering/helper/flowtransfer_kernel.cpp:322 pp_depth=1 requires numIterations==1 --> |
 
+**Exemption (reader note).** The check of row L7 skips an input that follows
+the kernel's blocks (`c.kb.follow && c.isInput`), the trace-routed input of the
+6.1 GEMM. That is why 6.1 step 0 ran A with one buffer for 32 rounds and
+passed the golden check (6.1, section 2: `A: one buffer, 32 rounds`). For such
+an input `.depth = 1` is legal; it only removes the overlap (section 4).
+<!-- ref src/mlir/mlirfront/tilinglinalg/pass/passblueprintlowering/helper/flowtransfer_kernel.cpp:327 !(c.kb.follow && c.isInput) -->
+<!-- ref tutorial/aieprogram/06_gemm_optimization/1_low_level_schedule.md:128 A: one buffer, 32 rounds -->
+
 **Which path this chapter describes.** In the dfschedule core-tile lowering
 both the ping BD and the pong BD are written with the same
 t.bdAcquireLockId / t.bdReleaseLockId (one lock pair shared by both buffers),
@@ -199,5 +207,6 @@ Rules that follow from the table:
 - Ownership of a ping/pong buffer changes at every lock release; a host BD
   repeat count that disagrees with the kernel's acquires hangs (7.3, row L5).
 - Choose `.depth = 2` when the DMA time per block is comparable to the compute
-  time per block; on a compute-bound kernel (as here) `.depth = 1` or the
-  default is cheaper.
+  time per block; on a compute-bound kernel (as here) `.depth = 1` on the input
+  is cheaper. The default (no option) is 2 buffers, not 1, and an output is
+  always 2.
