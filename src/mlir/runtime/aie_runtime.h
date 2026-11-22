@@ -1052,6 +1052,10 @@ void __Runtime_buffer_forget(void *ptr);
 // simulator, above 4 GB). Free with __Runtime_free_uncached.
 void *__Runtime_alloc_uncached(size_t bytes);
 void __Runtime_free_uncached(void *ptr);
+// DMA buffer in a chosen DDR zone (one memory controller's address window from the board
+// profile, e.g. DDR_CH_1 0x500_0000_0000), mapped Normal Non-cacheable; the zone must hold
+// nothing else. NULL when full / not supported. Zone buffers live for the whole run.
+void *__Runtime_alloc_zone(uint64_t zone_base, uint64_t zone_size, size_t bytes);
 
 // Data movement wrappers (wraps XAie routing APIs)
 void __Runtime_move_data_to_tile(XAie_RoutingInstance *routing, XAie_LocType shim_tile, XAie_LocType dest_tile,

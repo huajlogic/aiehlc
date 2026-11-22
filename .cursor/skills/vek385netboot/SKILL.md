@@ -17,6 +17,33 @@ farm lock: `BOARD_OWNER=huaj board.py lock vek385-3 -- <cmd>`
 `board.py power-cycle` inside `board.py lock` -- both take the same flock and it
 deadlocks.
 
+**Current apppaltest (with `devlock.py` + hws preflight, 2026-11-22): do not wrap it in
+`board.py lock` at all.** apppaltest takes the same device flock itself, so under
+`board.py lock` it prints `[devlock] gomphus3 busy, waiting ... board.py lock vek385-3 --
+...` -- the holder it names is its own parent -- and waits 1800 s. Run apppaltest bare.
+
+**Hold the board with hws, never with a hand-made `systest` session.** The preflight
+(`hws_vek385.py`) only accepts a hold it spawned itself (`script`-wrapped systest fed
+through `$HWS_LOG_DIR/<host>/in.fifo`). It starts one by itself when cluster-ping shows
+the board `ok`. If you hold it any other way (pexpect, a terminal) you get
+`HWS PREFLIGHT FAIL ... not free: hold session ended (Script done), 3121 closed`. Your own
+session then blocks the run, and you have no FIFO to type `power 0` / `exit` into it.
+Do not kill the systest client either: an unclean end can reboot the farm host. If you
+already did this, stop the keep-alive (`kill -STOP`) and wait for systest's idle
+autologout (~1 h), until cluster-ping shows `ok` again.
+
+**Fresh farm host (never used by you): run `hws.py --board <farmhost> --type vek385 up` first.**
+`--netload` stages files over ssh *before* the hws preflight opens a hold, and the farm host
+only accepts your key once a systest hold has started (`Permission denied (publickey)` on the
+scp of `netboot_proxy.py`). `hws.py --board vek385-N` is refused: pass the farm host name.
+Release with `hws.py ... down` (`hw_server "stop"`, `power 0`, `exit`).
+Verified 2026-11-22: vek385-6 @ gomphus6 runs netload fine. vek385-1 @ gomphus1 (tag `T20`)
+rejects `vek385_netboot.BIN` with `PLM Error Major 0x326 Minor 0x14`, even right after a
+power cycle. Use another board.
+
+**The array clock on these boards is 1.25 GHz** (core/shim timer 0x340F8 vs host time, xsdb),
+not palmyra's 998 MHz. Any test that hard-codes 998 MHz overstates its % of peak by 1.25x.
+
 ## Procedure (verified on vek385-11 @ crimini1, HEAD ccfcaa2, 2026-11-05)
 
 **Re-verified on vek385-3 @ gomphus3, aiehlc main e570563, 2026-11-06:** the exact

@@ -2861,11 +2861,63 @@ static struct {
 } g_nc[RT_NC_MAX];
 static int g_nc_n;
 
+void *__Runtime_alloc_uncached(size_t bytes);
+/* DDR zones handed out by __Runtime_alloc_zone (whole region, mapped Normal NC). */
+#define RT_ZONE_MAX 8
+static struct {
+    uint64_t base, size, next;
+} g_zone[RT_ZONE_MAX];
+static int g_zone_n;
+
 static int rt_nc_covers(uintptr_t lo, uintptr_t hi) {
     for (int i = 0; i < g_nc_n; i++)
         if (lo >= (uintptr_t)g_nc[i].base && hi <= (uintptr_t)g_nc[i].base + g_nc[i].bytes)
             return 1;
+    for (int i = 0; i < g_zone_n; i++)
+        if (lo >= g_zone[i].base && hi <= g_zone[i].next)
+            return 1;
     return 0;
+}
+
+/* Allocate `bytes` from the DDR region [zone_base, zone_base + zone_size) -- one memory controller's
+ * address window, chosen by the caller from the board profile (e.g. DDR_CH_1 at 0x500_0000_0000).
+ * The buffers are mapped Normal Non-cacheable, like __Runtime_alloc_uncached, so a launch needs no
+ * cache maintenance for them. Above 4 GB the BSP maps 1 GB blocks; each block a buffer touches is
+ * remapped whole, so the zone must hold nothing else (the heap and the ELF live in DDR_LOW_0).
+ * A zone below 4 GB is the heap's own region: that falls back to __Runtime_alloc_uncached.
+ * Bump allocation, 2 MB-aligned; zone buffers live for the whole run (no free). Returns NULL when
+ * the zone is full or not mappable here (simulator, Linux). */
+void *__Runtime_alloc_zone(uint64_t zone_base, uint64_t zone_size, size_t bytes) {
+    if (zone_base < 0x100000000ULL)
+        return __Runtime_alloc_uncached(bytes);
+#ifdef RT_NC_SUPPORTED
+    int z = 0;
+    while (z < g_zone_n && g_zone[z].base != zone_base)
+        z++;
+    if (z == g_zone_n) {
+        if (g_zone_n == RT_ZONE_MAX)
+            return NULL;
+        g_zone[z].base = zone_base;
+        g_zone[z].size = zone_size;
+        g_zone[z].next = zone_base;
+        g_zone_n++;
+    }
+    const uint64_t p = (g_zone[z].next + RT_NC_BLOCK - 1) & ~(uint64_t)(RT_NC_BLOCK - 1);
+    if (p + bytes > zone_base + zone_size)
+        return NULL;
+    const uint64_t blk = 0x40000000ULL; /* 1 GB: the BSP's translation granule above 4 GB */
+    for (uint64_t b = p & ~(blk - 1); b < p + bytes; b += blk)
+        if (b >= g_zone[z].next || b + blk <= p) /* not remapped by an earlier allocation */
+            Xil_SetTlbAttributes((UINTPTR)b, NORM_NONCACHE);
+    g_zone[z].next = p + bytes;
+    AIEHLC_LOG(printf("[aie_runtime] alloc_zone(0x%llx, %zu) = 0x%llx (Normal NC)\n", (unsigned long long)zone_base,
+                      bytes, (unsigned long long)p););
+    return (void *)(uintptr_t)p;
+#else
+    (void)zone_size;
+    (void)bytes;
+    return NULL;
+#endif
 }
 
 void *__Runtime_alloc_uncached(size_t bytes) {
