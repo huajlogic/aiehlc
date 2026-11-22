@@ -572,3 +572,47 @@ Palmyra is DDR-bound, so the faster kernel barely moves it.
 
   A single counting full lock would let a fast consumer take the slower consumer's count and
   read a buffer that is not yet filled.
+
+## 2 x 8 shared-operand layout (`share2x8.py`, VEK385, 2026-11-22)
+
+**Bit-exact, persistent, 74.2 % of the true 1.25 GHz peak** (0.930 ms per 7.05 G MAC; weight-resident B; one tile per output packet; GOLDEN PASS; STRESS: every launch checked, no data errors).
+Build: base = `gemm_kacc_v2.cc` with `KA_R 21`, `KA_NT 2` (+ the README recipe), then
+`share2x8.py <aout/worklocal> --r2 42 --nt2 1 --k 2560 --bres --single --persist [--stress N] [--kcyc]`,
+`rm build/{host.o,routing.o,host}`, and `hostcompile.sh`.
+
+- **Layout.** The logical grid is 2 A strips x 8 B strips (`share_lp.py`).
+  - Column c's tiles host one operand stream each: mesh row 0 = A0, 1 = B_c, 2 = B_{c+4}, 3 = A1.
+  - Every core reads its operands from the host tiles directly below / above it (neighbour
+    memory: north 0x60000, south 0x40000), so each tile receives one stream instead of two.
+- **Bank-split buffers + opposite phases.** Each 8 KB chunk is split: rows 0-31 in bank 2,
+  rows 32-63 in bank 3 (4 x 16 KB programmer banks, AM027). The two readers of a buffer walk
+  its halves in opposite order. Bench: 1120 vs 1113 cycles / chunk unshared; reading the same
+  bank in lockstep costs +60 (single shared operand) or +150 (both operands).
+- **Locks (per hosted channel):**
+  - F (DMA -> first reader);
+  - G (first -> second reader, released right after the first acquire);
+  - one **E per slot** (both readers -> DMA, which acquires -2). A per-channel E let a fast
+    first reader free a slot the second reader was still in: corrupt rows on ~4 of 5 launches.
+- **Generator pieces:**
+  - `share_route.py`: keeps the generated output and control routes, books their ports (and
+    the control fabric's port 0 on data rows), BFS-routes the 32 input nets.
+  - `share_host.py`: rewrites the shim A / B / C BDs for the target shape, with contiguous
+    DDR streams.
+  - KCO hosted-stream DMA in `kernel.cc`; kernel body from `share2x8_chunk.inc`.
+- **Persistent kernel (`--persist`).** Loaded once; later launches only release a go lock
+  (lock 14) on the 16 cores. `kload` / `coreen` 0.03 / 0.01 ms -> 0 (0.961 -> 0.930 ms).
+
+Traps hit on the board (each cost a hang or corrupt data):
+
+| symptom | cause | fix |
+|---|---|---|
+| GOLDEN FAIL, data noise | tile S2MM BD `d0_wrap = 256`: wraps are **8-bit**, 256 = 0 = dimension off | 512 B x 8 instead of 1 KB x 4 |
+| hang (outputs pending) with > 64 tiles / core | generated host loop over output rounds, and `memtile_ab.py`'s "B once" regex hit it | output BD per core with iteration <= 64; two tiles per packet when needed |
+| two tiles per packet: deadlock | a packet waiting mid-route for its 2nd tile holds the row's merged output path -> other cores' outputs back up -> shared inputs not released | ping BD acquires full -2 (packet starts only when both tiles are written); pong BD release-only. Still ~10 % slower than one tile per packet (row contention) |
+| hang exactly halfway through a launch | kernel chunk count came from the BASE build's `KA_K`, not the target K | emit the target count |
+| hang in the first launch, only when `kernel.o` was reused | `hostcompile.sh` reuse kept a **stale control-packet image** (`kernel_<f>_ctrlpkt.h` from the base worklocal) -> the cores ran the OLD kernel | stamp now hashes `kernel.cc`'s `#include`s too, and reuse requires the recorded ctrlpkt sha to match |
+
+Per-core cycle split (k1s, non-persistent; MAC 85.8 %, input wait 9.0 %, convert 1.9 %, other 3.2 %):
+the chunk runs at ~1168 cycles in the shared layout vs 1120 in the bench (DMA bank conflicts).
+Next: fuse chunk boundaries (prologue / epilogue ~90 cycles + call), zero / convert inside the
+first / last chunk, find the 9 % input wait.
