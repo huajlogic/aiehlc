@@ -6,6 +6,11 @@
  * acquired first, its first operands are prefetched during block 15, chunk j is released right after
  * its last reads -- no per-chunk prologue / epilogue / call. */
 typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
+#ifdef SH_QSLOT
+#define SH_QSLOT_ON 1
+#else
+#define SH_QSLOT_ON 0
+#endif
 #define K4_H (KA_KC / 8 * 64)
 #define K4_LD(c, p)                                                                                                    \
     {                                                                                                                  \
@@ -25,6 +30,21 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         aie::store_v((p) + 64, (c##1).to_vector<int32_t>());                                                           \
         aie::store_v((p) + 128, (c##2).to_vector<int32_t>());                                                          \
         aie::store_v((p) + 192, (c##3).to_vector<int32_t>());                                                          \
+    }
+/* last chunk of a tile: the accumulators are final -- int8 straight to the output tile (block bl at logical
+ * L = bl ^ swz, as sh_convert did) and zeros back to acc for the next tile; no separate convert pass */
+#define K4_OUT(p, c, bl)                                                                                               \
+    {                                                                                                                  \
+        const int L_ = (bl) ^ swz;                                                                                     \
+        int8_t *tt_ = y + ((2 * (L_ >> 2)) * 8 + 2 * (L_ & 3)) * 64;                                                   \
+        aie::store_v((p), aie::zeros<int32_t, 64>());                                                                  \
+        aie::store_v((p) + 64, aie::zeros<int32_t, 64>());                                                             \
+        aie::store_v((p) + 128, aie::zeros<int32_t, 64>());                                                            \
+        aie::store_v((p) + 192, aie::zeros<int32_t, 64>());                                                            \
+        aie::store_v(tt_, (c##0).to_vector<int8_t>(0));                                                                \
+        aie::store_v(tt_ + 64, (c##1).to_vector<int8_t>(0));                                                           \
+        aie::store_v(tt_ + 8 * 64, (c##2).to_vector<int8_t>(0));                                                       \
+        aie::store_v(tt_ + 8 * 64 + 64, (c##3).to_vector<int8_t>(0));                                                  \
     }
 /* k-step with ping-pong operand registers: step s uses set (va, vb) if s is even, (wa, wb) if odd, and
  * reloads that set with step s + 2 -- no operand rotation, so no VMOVs (with rotation, 4 VMOVs per 4
@@ -60,6 +80,8 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
 #if defined(SH_DMAONLY) /* share2x8.py --dmaonly: no MACs / accumulator traffic; locks and DMA unchanged */
 #undef K4_LD
 #undef K4_ST
+#undef K4_OUT
+#define K4_OUT(p, c, bl) {}
 #undef K4_STEPX
 #define K4_LD(c, p) {}
 #define K4_ST(p, c) {}
@@ -87,7 +109,8 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
 /* the four half pointers of chunk g, in this core's phase */
 #define SH_HALVES(g, Alo, Ahi, Blo, Bhi)                                                                               \
     {                                                                                                                  \
-        const unsigned q_ = 2 * ((g) & 1) + (((g) >> 1) & 1);                                                          \
+        /* buffer index: 2 ch + slot, or with SH_QSLOT 2 slot + ch (a channel's slots in different banks) */         \
+        const unsigned q_ = SH_QSLOT_ON ? 2 * (((g) >> 1) & 1) + ((g) & 1) : 2 * ((g) & 1) + (((g) >> 1) & 1);        \
         const int8_t *x0_ = (const int8_t *)(vA + 0x8000 + q_ * 4096), *x1_ = (const int8_t *)(vA + 0xc000 + q_ * 4096); \
         const int8_t *y0_ = (const int8_t *)(vB + 0x8000 + q_ * 4096), *y1_ = (const int8_t *)(vB + 0xc000 + q_ * 4096); \
         Alo = (fl & 4) ? x1_ : x0_;                                                                                    \
@@ -96,12 +119,14 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         Bhi = (fl & 8) ? y0_ : y1_;                                                                                    \
     }
 /* 7 iterations: blocks 1 .. 14 of the current chunk (state: X = block 0 done, Y = block 1 loaded) */
-#define SH_INNER()                                                                                                     \
+#define K4_STI(p, c, bl) K4_ST(p, c)
+#define SH_INNER() SH_INNER_W(K4_STI)
+#define SH_INNER_W(ST)                                                                                                 \
     for (int i = 0; i < 7; i++) {                                                                                      \
-        K4_ST(cur, X);                                                                                                 \
+        ST(cur, X, 2 * i);                                                                                             \
         K4_LD(X, nxt);                                                                                                 \
         K4_BLK(Y, aY, bY, aX, bX);                                                                                     \
-        K4_ST(cur + 256, Y);                                                                                           \
+        ST(cur + 256, Y, 2 * i + 1);                                                                                   \
         K4_LD(Y, nxt + 256);                                                                                           \
         const int8_t *aY2 = aX;                                                                                        \
         K4_BLK(X, aX, bX, aY2, bYo);                                                                                   \
@@ -131,10 +156,10 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         bXo = (bl_);                                                                                                   \
     }
 /* One 64 x 64 tile over nkc chunks starting at running chunk index g0; accumulators start at ZERO
- * (acc must be zeroed by the caller: sh_convert leaves it zeroed). fl: 1 A first reader, 2 B first reader, 4 A halves swapped,
+ * (acc must be zero; the last chunk writes the int8 tile to y and re-zeroes acc). fl: 1 A first reader, 2 B first reader, 4 A halves swapped,
  * 8 B halves swapped. */
 __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA, int lB, int fl, unsigned g0, int nkc, int lv,
-                                              int32_t *__restrict ae, int32_t *__restrict ao) {
+                                              int32_t *__restrict ae, int32_t *__restrict ao, int8_t *__restrict y, int swz) {
     KaMM4 X0, X1, X2, X3, Y0, Y1, Y2, Y3;
     const int8_t *Al, *Ah, *Bl, *Bh;
     int32_t *cur, *nxt;
@@ -167,11 +192,11 @@ __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA
         K4_BLK(X, nAl, nBl, nAl, nBl + 2048);
         SH_RESET(nAl, nAh, nBl, nBh);
     }
-    SH_INNER();
-    K4_ST(cur, X);
+    SH_INNER_W(K4_OUT); /* last chunk: blocks go straight to the output tile */
+    K4_OUT(cur, X, 14);
     K4_BLK(Y, aY, bY, Al, Bl);
     SH_REL(g);
-    K4_ST(cur + 256, Y);
+    K4_OUT(cur + 256, Y, 15);
 }
 /* int32 accumulators -> int8 output tile; iteration block bl holds logical block bl ^ swz (phase swap).
  * Own function: inlined into the caller it hit chess's "no mappings for bundle" (SRS + store + add). */
