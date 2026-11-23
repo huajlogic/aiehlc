@@ -38,6 +38,7 @@ ap.add_argument('--kcyc', action='store_true', help='cores stamp cycle split (to
 ap.add_argument('--a2ch', action='store_true', help='A on both shim MM2S channels (odd m tiles on B\'s channel, re-routed once B is loaded); needs --bres, R2 %% 4 == 0')
 ap.add_argument('--dmaonly', action='store_true', help='measurement: the tile kernel does no MACs (locks / DMA unchanged) -- the data-delivery bound; output is garbage (needs --tile)')
 ap.add_argument('--perfcnt', action='store_true', help='measurement: per-core active / memory-stall / lock-stall / vector-instr counters (+ DM bank 4 / 6 conflicts) over launch 3 (build without AIEHLC_PROFILING)')
+ap.add_argument('--qslot', action='store_true', help='buffer address index 2 slot + ch (a channel\'s two slots in different DM banks) instead of 2 ch + slot (--tile, KC 128)')
 ap.add_argument('--stress', type=int, default=0, help='N extra launches, each fully sampled-checked; failures listed per tile')
 args = ap.parse_args()
 wl, bres = args.wl, args.bres
@@ -462,6 +463,10 @@ if args.kc == 256:
     old_bd = "_n = aie_kc_encode_bd_nd(_kc, (uint8_t)_q, (uintptr_t)(0x78000 + _q * 4096), 8192, 2 * _ch + (_k ^ 1),"
     assert old_bd in KCO
     KCO = KCO.replace(old_bd, "_n = aie_kc_encode_bd_nd(_kc, (uint8_t)_q, (uintptr_t)(0x78000 + _ch * 0x4000 + _k * 8192), 8192, 2 * _ch + (_k ^ 1),")
+if args.qslot:  # a channel's two slots in different DM banks (kernel: SH_QSLOT in share2x8_tile.inc)
+    assert args.tile and args.kc == 128
+    KCO = KCO.replace('(uintptr_t)(0x78000 + _q * 4096), 8192,', '(uintptr_t)(0x78000 + (2 * _k + _ch) * 4096), 8192,')
+    assert '(2 * _k + _ch) * 4096' in KCO
 kc = kc[:a] + KCO + kc[b:]
 if not args.single:
     # output: two tiles per packet. The packet must not START before both tiles are written -- a packet
@@ -479,7 +484,7 @@ print('kernel.cc: hosted-stream DMA')
 
 # ---------------------------------------------------------------- gemm_ka.cc: kernel body
 gk = open(wl + '/gemm_ka.cc').read()
-CHUNK = ('#define SH_DMAONLY 1\n' if args.dmaonly else '') + ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile256.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
+CHUNK = ('#define SH_QSLOT 1\n' if args.qslot else '') + ('#define SH_DMAONLY 1\n' if args.dmaonly else '') + ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile256.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
 gk = gk.replace('  void gemm_ka(', CHUNK + '\n  void gemm_ka(', 1)
 a = gk.index('#if defined(__chess__)\n    // On the core')
 b = gk.index('#else\n    // Traced')
@@ -567,7 +572,7 @@ if args.tile:
     b = gk.index('                const uint64_t k4 = ', a)
     gk = gk[:a] + ("""                const uint64_t k2 = (uint64_t)aie::tile::current().cycles();
                 ka_tile(vA, vB, lA, lB, (aFirst ? 1 : 0) | (bFirst ? 2 : 0) | (al ? 4 : 0) | (be ? 8 : 0) | ZF, gc, %d, 1, acc,
-                        acc + 2048); /* whole tile, one pipeline; lock waits inside (KCYC counts them as mac) */
+                        acc + 2048, y, (al << 3) ^ (be << 1)); /* whole tile incl. the int8 output; lock waits inside (KCYC: mac) */
                 gc += %d;
                 k_mac += (uint64_t)aie::tile::current().cycles() - k2;
 """ % (args.k // args.kc, args.k // args.kc)) + gk[b:]
@@ -579,7 +584,7 @@ if args.tile:
         gk = gk.replace('            for (int t = 0; t < %d; t++) {' % T, zero.replace('                ', '            ', 2) + '            for (int t = 0; t < %d; t++) {' % T, 1)
     a = gk.index('                for (int bl = 0; bl < 16; bl++) { /* iteration block bl holds logical block bl ^ 8 al ^ 2 be */')
     b = gk.index('                k_cv += ', a)
-    gk = gk[:a] + '                sh_convert(y, acc, (al << 3) ^ (be << 1));\n' + gk[b:]
+    gk = gk[:a] + ('' if args.kc == 128 else '                sh_convert(y, acc, (al << 3) ^ (be << 1));\n') + gk[b:]
 if args.bench:
     old = '        unsigned gc = 0; /* chunks consumed this launch */\n'
     assert old in gk
@@ -587,10 +592,12 @@ if args.bench:
         { /* BENCH: 2 tiles with no lock waits (lock values 0), DMA live; results discarded */
             const uint64_t b0 = (uint64_t)aie::tile::current().cycles();
             for (int r = 0; r < 2; r++)
-                ka_tile(vA, vB, lA, lB, (aFirst ? 1 : 0) | (bFirst ? 2 : 0) | (al ? 4 : 0) | (be ? 8 : 0), 0, %d, 0, acc, acc + 2048);
+                ka_tile(vA, vB, lA, lB, (aFirst ? 1 : 0) | (bFirst ? 2 : 0) | (al ? 4 : 0) | (be ? 8 : 0), 0, %d, 0, acc, acc + 2048, (int8_t *)acc, 0);
             k_bench = (uint32_t)((uint64_t)aie::tile::current().cycles() - b0);
         }
 """ % NK)
     gk = gk.replace('                    st[5] = (uint32_t)k_cv;\n', '                    st[5] = (uint32_t)k_cv;\n                    st[6] = k_bench;\n')
+if args.kc != 128:  # share2x8_tile256.inc's ka_tile has no output arguments (sh_convert converts)
+    gk = gk.replace(', y, (al << 3) ^ (be << 1)); /*', '); /*').replace(', (int8_t *)acc, 0);', ');')
 open(wl + '/gemm_ka.cc', 'w').write(gk)
 print('gemm_ka.cc: shared-operand kernel')

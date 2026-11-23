@@ -787,4 +787,12 @@ stress launches. Same build line as before; the change is in `share2x8_tile.inc`
   - locks: decoupled readers.
 
   None is a small change. Expect a few points each.
+- **The last chunk writes the output (1.200 -> 1.192 ms, 82.5 %).** In a tile's last chunk, each
+  block's accumulators are final while still in registers. `K4_OUT` stores them as int8
+  straight into the output tile and writes zeros back to `acc` for the next tile. The
+  separate `sh_convert` pass (16 KB of accumulator reloads per tile) is gone.
+  - Inlining the SRS did not trigger chess's "no mappings for bundle" error here.
+- **Moving a channel's two slots into different DM banks (`--qslot`) changed nothing.** Memory
+  stalls stayed at ~75 k and conflicts at ~45 k per bank. The conflicts are between the two
+  reader cores, not with the DMA.
 
