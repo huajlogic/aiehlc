@@ -690,3 +690,21 @@ launch. Build: `share2x8.py ... --r2 42 --nt2 1 --k 2560 --bres --single --persi
 - **Next:** spread the lock work over the 8 iterations (one acquire + one release per
   iteration, ids from a per-chunk table, a dummy lock elsewhere) so the body stays
   branch-free. Expected: about +5-8 points.
+
+### KC = 256, take 2 (`share2x8_tile256.inc`): branch-free lock slots, manual acc overlap -- 0.923 ms
+
+- **The body is ONE basic block.** Every iteration issues the same lock instructions, aimed at
+  own lock 15 (held at 0) when it has nothing to do. `acquire(.., 0)` waits for EQUAL 0, so it
+  is immediate on that lock.
+  - i = 0 / 1: release the previous chunk's A / B halves.
+  - i = 6 / 7: acquire the next chunk's A / B halves.
+- **`K4_BLKS`** interleaves the other register set's 4 accumulator stores and 4 reloads into
+  the first 8 k-steps. With 32-step blocks chess had put all of them before the MACs (355
+  bundles per 256 MACs). The accumulators also became one restrict base with select offsets.
+- **Result: 284 bundles per 256 MACs (static 90 %), 11 KB of program memory, GOLDEN PASS, every
+  stress launch clean -- but 0.923 ms, against 0.891 for KC 128.**
+- **Why it loses: about 15 % lock waiting.** A 16 KB chunk leaves room for only 2 slots per
+  channel. The DMA must refill a slot between its release (i = 0/1 of the next chunk) and its
+  reacquire (i = 6/7), about 1400 cycles for 8 KB per channel. With releases at i = 0..3 and
+  acquires at i = 4..7 it was about 300 cycles (0.953 ms). KC 128 rotates 4 buffers per stream.
+  A 3rd slot (48 KB of buffers) does not fit next to 16 KB of accumulators + 8 KB C + 4 KB stack.

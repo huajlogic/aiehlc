@@ -381,7 +381,7 @@ KCO = r'''  { // SHARE2X8 S2MM: this tile hosts one operand stream; chunk parity
     }
     aie_kc_encode_lock(_kc, 14, 1); // go lock: the first launch runs at once (persistent mode)
     core_reg_write(_kc[0].off, _kc[0].val);
-    aie_kc_encode_lock(_kc, 15, 1); // dummy lock for the tile pipeline's last boundary (always 1)
+    aie_kc_encode_lock(_kc, 15, 0); // dummy lock for the KC 256 tile (held at 0: acquire(..,0) / release(..,0) no-ops)
     core_reg_write(_kc[0].off, _kc[0].val);
   }
 '''
@@ -408,7 +408,7 @@ print('kernel.cc: hosted-stream DMA')
 
 # ---------------------------------------------------------------- gemm_ka.cc: kernel body
 gk = open(wl + '/gemm_ka.cc').read()
-CHUNK = ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile_fold.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
+CHUNK = ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile256.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
 gk = gk.replace('  void gemm_ka(', CHUNK + '\n  void gemm_ka(', 1)
 a = gk.index('#if defined(__chess__)\n    // On the core')
 b = gk.index('#else\n    // Traced')
