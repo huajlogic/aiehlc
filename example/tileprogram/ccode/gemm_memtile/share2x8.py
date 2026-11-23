@@ -40,6 +40,8 @@ ap.add_argument('--dmaonly', action='store_true', help='measurement: the tile ke
 ap.add_argument('--perfcnt', action='store_true', help='measurement: per-core active / memory-stall / lock-stall / vector-instr counters (+ DM bank 4 / 6 conflicts) over launch 3 (build without AIEHLC_PROFILING)')
 ap.add_argument('--qslot', action='store_true', help='buffer address index 2 slot + ch (a channel\'s two slots in different DM banks) instead of 2 ch + slot (--tile, KC 128)')
 ap.add_argument('--afine', action='store_true', help='row-2 MemTile A as a FIFO ring of 10 x 16 KB buffers with counting locks (first chunks flow after 16 KB, not a whole 80 KB m-tile half); needs NT2 1, R2 even')
+ap.add_argument('--phase', default='pm & 1,pm >> 1', help='measurement: C expressions for (al, be), the A / B half phase of mesh row pm')
+ap.add_argument('--aalt', action='store_true', help='A half order flips every chunk (SH_AALT): a reader stays 16 blocks in one A half')
 ap.add_argument('--stress', type=int, default=0, help='N extra launches, each fully sampled-checked; failures listed per tile')
 args = ap.parse_args()
 wl, bres = args.wl, args.bres
@@ -352,36 +354,45 @@ if args.persist:
     assert hs.count(old) == 1
     hs = hs.replace(old, '  if (sh_first) __Runtime_wait(v1, %s);\n' % ev)
     hs = hs.replace('  g_bd_once = 1;\n', '  g_bd_once = 1;\n  sh_launched = 1;\n', 1)
-if args.perfcnt:
+if args.perfcnt:  # counters configured before launch 2; zeroed right before launch 3 and read right after it
     old = '        gemm_ka_run(A2, B2, Ct);\n        XTime_GetTime(&t1);\n'
     assert hs.count(old) == 1, hs.count(old)
     hs = hs.replace(old, """        XAie_DevInst *pdv = __Runtime_get_partition_dev(0);
-        if (it == 3)
+        static u32 pcv[16][6];
+        if (it == 2)
             for (int c = 1; c <= 4; c++)
                 for (int r = 3; r <= 6; r++) { /* SHARE2X8 --perfcnt */
                     const XAie_LocType t = XAie_TileLoc(c, r);
                     const XAie_Events ev[4] = {XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_MEMORY_STALL_CORE, XAIE_EVENT_LOCK_STALL_CORE,
                                                XAIE_EVENT_INSTR_VECTOR_CORE};
-                    for (int k = 0; k < 4; k++) {
-                        XAie_PerfCounterSet(pdv, t, XAIE_CORE_MOD, (u8)k, 0);
+                    for (int k = 0; k < 4; k++)
                         XAie_PerfCounterControlSet(pdv, t, XAIE_CORE_MOD, (u8)k, ev[k], ev[k]);
-                    }
-                    const XAie_Events mv[2] = {XAIE_EVENT_CONFLICT_DM_BANK_4_MEM, XAIE_EVENT_CONFLICT_DM_BANK_6_MEM};
-                    for (int k = 0; k < 2; k++) {
-                        XAie_PerfCounterSet(pdv, t, XAIE_MEM_MOD, (u8)k, 0);
+                    const XAie_Events mv[2] = {XAIE_EVENT_CONFLICT_DM_BANK_4_MEM, XAIE_EVENT_CONFLICT_DM_BANK_5_MEM};
+                    for (int k = 0; k < 2; k++)
                         XAie_PerfCounterControlSet(pdv, t, XAIE_MEM_MOD, (u8)k, mv[k], mv[k]);
-                    }
                 }
-""" + old + """        if (it == 3)
+        if (it == 3)
             for (int c = 1; c <= 4; c++)
                 for (int r = 3; r <= 6; r++) {
                     const XAie_LocType t = XAie_TileLoc(c, r);
-                    u32 v[6] = {0, 0, 0, 0, 0, 0};
+                    for (int k = 0; k < 4; k++) XAie_PerfCounterSet(pdv, t, XAIE_CORE_MOD, (u8)k, 0);
+                    for (int k = 0; k < 2; k++) XAie_PerfCounterSet(pdv, t, XAIE_MEM_MOD, (u8)k, 0);
+                }
+        XTime_GetTime(&t0);
+""" + old + """        if (it == 3) {
+            for (int c = 1; c <= 4; c++)
+                for (int r = 3; r <= 6; r++) {
+                    const XAie_LocType t = XAie_TileLoc(c, r);
+                    u32 *v = pcv[(c - 1) * 4 + r - 3];
                     for (int k = 0; k < 4; k++) XAie_PerfCounterGet(pdv, t, XAIE_CORE_MOD, (u8)k, &v[k]);
                     for (int k = 0; k < 2; k++) XAie_PerfCounterGet(pdv, t, XAIE_MEM_MOD, (u8)k, &v[4 + k]);
-                    printf("PERFCNT core (%d,%d): active %u memstall %u (%.1f %%) lockstall %u (%.1f %%) vec %u | DM conflicts b4 %u b6 %u\\n", c, r,
-                           v[0], v[1], 100.0 * v[1] / (v[0] ? v[0] : 1), v[2], 100.0 * v[2] / (v[0] ? v[0] : 1), v[3], v[4], v[5]);
                 }
+            for (int i = 0; i < 16; i++) {
+                const u32 *v = pcv[i];
+                printf("PERFCNT core (%d,%d): active %u memstall %u (%.1f %%) lockstall %u (%.1f %%) vec %u | DM conflicts b4 %u b5 %u\\n",
+                       i / 4 + 1, i % 4 + 3, v[0], v[1], 100.0 * v[1] / (v[0] ? v[0] : 1), v[2], 100.0 * v[2] / (v[0] ? v[0] : 1), v[3], v[4], v[5]);
+            }
+        }
 """)
 # the launch's cache-maintenance sizes come from the BASE ports; with the target's smaller A the range
 # ran past the non-cacheable mapping and every launch cleaned 13.8 MB of cache (~0.43 ms)
@@ -501,7 +512,7 @@ print('kernel.cc: hosted-stream DMA')
 
 # ---------------------------------------------------------------- gemm_ka.cc: kernel body
 gk = open(wl + '/gemm_ka.cc').read()
-CHUNK = ('#define SH_QSLOT 1\n' if args.qslot else '') + ('#define SH_DMAONLY 1\n' if args.dmaonly else '') + ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile256.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
+CHUNK = ('#define SH_AALT 1\n' if args.aalt else '') + ('#define SH_QSLOT 1\n' if args.qslot else '') + ('#define SH_DMAONLY 1\n' if args.dmaonly else '') + ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile256.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
 gk = gk.replace('  void gemm_ka(', CHUNK + '\n  void gemm_ka(', 1)
 a = gk.index('#if defined(__chess__)\n    // On the core')
 b = gk.index('#else\n    // Traced')
@@ -519,7 +530,7 @@ LOOP = r'''#if defined(__chess__)
         const int lA = (pm == 0 || pm == 3) ? 48 : pm == 1 ? 0 : 32;
         const int lB = pm < 2 ? 32 : 0;
         const int aFirst = (pm == 0 || pm == 2), bFirst = pm < 2;
-        const int al = pm & 1, be = pm >> 1;
+        const int al = %(AL)s, be = %(BE)s;
         unsigned gc = 0; /* chunks consumed this launch */
         for (int launch = 0; PERSIST || launch < 1; launch++) {
             if (PERSIST)
@@ -582,7 +593,7 @@ LOOP = r'''#if defined(__chess__)
             }
     }
     }
-''' % {'T': T, 'NK': NK, 'KCYC': 1 if args.kcyc else 0, 'PERSIST': 1 if args.persist else 0}
+''' % {'T': T, 'NK': NK, 'KCYC': 1 if args.kcyc else 0, 'PERSIST': 1 if args.persist else 0, 'AL': args.phase.split(',')[0], 'BE': args.phase.split(',')[1]}
 gk = gk[:a] + LOOP + gk[b:]
 if args.tile:
     a = gk.index('                for (int j = 0; j < %d; j++, gc++) {' % NK)

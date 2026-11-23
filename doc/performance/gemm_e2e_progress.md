@@ -834,3 +834,39 @@ One 64 x 64 tile (20 chunks of 1024 MACs) as compiled:
   block (1.17-1.22 ms, more variance): less slack before the next chunk is needed.
 - **Program memory:** 16173 of 16384 B used.
 
+### Operand-memory bank bandwidth is the binding limit (2026-11-22, vek385-3)
+
+**Measurement.** `--perfcnt` now configures the counters before launch 2, zeroes them right before
+launch 3 and reads them right after it. The window still spans ~0.1 M cycles of host time, so
+lock stall includes that.
+
+| run | ms | memstall | A-memory conflicts / bank | B-memory / bank |
+|---|---|---|---|---|
+| default | 1.158-1.176 | ~9 % | ~110 k | ~47 k |
+| A readers in phase (`--phase 0,pm>>1`) | 1.346 | 17 % | ~240 k | ~55-65 k |
+| B readers in phase (`--phase "pm&1,0"`) | 1.38 | 14-20 % | ~135 k | ~190 k |
+| A half order flipped per chunk (`--aalt`) | 1.29 | 4-5 % | ~35 k | ~57 k |
+| `--aalt --qslot` | 1.285 | 14 % | ~172 k | ~47 k |
+
+**What the table shows.**
+- Both readers' phases matter: the default opposite phases halve the conflicts, so the two
+  readers of a buffer run nearly in step.
+- `--aalt` cuts reader-reader conflicts to a third, but lock waits rise instead (17-18 %).
+  The cores then wait for data: the DMA writes into the same four banks (4-7) and loses the
+  arbitration.
+- `--qslot` gives the DMA its bank back, and the readers collide again.
+
+**Why the loss only moves.** Per chunk time (~1150 cycles), each operand memory takes:
+- the DMA writing 8 KB (~4.6 B/cycle per channel measured, i.e. a bank access nearly every
+  cycle while a channel writes);
+- two readers making 2 x 512 loads of 64 B (an A pair is re-read by each of its 4 blocks).
+
+Spread over 4 banks, that is more than half of every bank's cycles. Reordering trades
+reader-reader conflicts against DMA-reader conflicts; the total loss stays the same.
+
+**What would help.** Less bank traffic per MAC: more operand reuse in registers (2x4 blocking,
+which leaves no spare accumulators to hide the spill), or more banks for the operands (the
+stack, accumulators and output already occupy banks 0-3).
+
+**Defaults are unchanged.** `--aalt` and `--phase` remain as measurement options.
+
