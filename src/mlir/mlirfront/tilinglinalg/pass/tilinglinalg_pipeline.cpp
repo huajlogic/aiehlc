@@ -1049,6 +1049,14 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             if (auto row = op->getAttrOfType<mlir::IntegerAttr>("row"))
                 planMaxRow = std::max<int>(planMaxRow, (int)row.getInt());
     });
+    {
+        std::string why;
+        if (!dfplan::synthesizeDataflowPlan(module, why)) {
+            llvm::errs() << "[DataflowPlan] ERROR: cannot synthesize the plan from the routing IR: " << why << "\n";
+            return false;
+        }
+        dumpPipelineIRToFile(module, irDir, stage++, "DataflowPlan");
+    }
     if (!dfplan::collectDataflowPlan(module, dfplan::activePlan(), coreRowBase > 1 ? coreRowBase - 1 : 1))
         return false;
     if (reserveControlPlane)

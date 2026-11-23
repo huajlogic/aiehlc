@@ -123,6 +123,13 @@ struct DataflowPlan {
 // plan leaves `plan.present == false` and is untouched.
 bool collectDataflowPlan(mlir::ModuleOp module, DataflowPlan &plan, int memtileRows);
 
+// Routing-level dataflow intent (`dataflow = {share = "neighbor", ...}` on the
+// tensors' routingcreatescheduletensor ops, `routing.persistent_kernel`) ->
+// dmaphop.plan* ops inserted at the top of @main (plansynth.cpp). A module with
+// explicit plan ops or no dataflow attributes is left alone. false + `why` on
+// an unsupported request.
+bool synthesizeDataflowPlan(mlir::ModuleOp module, std::string &why);
+
 // The plan is published to the later stages (routing.cc / host.cc / kernel.cc
 // emission) through this process-wide slot, like ResourceMgr's offload plan.
 DataflowPlan &activePlan();
