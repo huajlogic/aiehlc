@@ -6,6 +6,11 @@
  * acquired first, its first operands are prefetched during block 15, chunk j is released right after
  * its last reads -- no per-chunk prologue / epilogue / call. */
 typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
+#ifdef SH_AALT
+#define SH_AALT_ON 1
+#else
+#define SH_AALT_ON 0
+#endif
 #ifdef SH_QSLOT
 #define SH_QSLOT_ON 1
 #else
@@ -120,8 +125,11 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         const unsigned q_ = SH_QSLOT_ON ? 2 * (((g) >> 1) & 1) + ((g) & 1) : 2 * ((g) & 1) + (((g) >> 1) & 1);        \
         const int8_t *x0_ = (const int8_t *)(vA + 0x8000 + q_ * 4096), *x1_ = (const int8_t *)(vA + 0xc000 + q_ * 4096); \
         const int8_t *y0_ = (const int8_t *)(vB + 0x8000 + q_ * 4096), *y1_ = (const int8_t *)(vB + 0xc000 + q_ * 4096); \
-        Alo = (fl & 4) ? x1_ : x0_;                                                                                    \
-        Ahi = (fl & 4) ? x0_ : x1_;                                                                                    \
+        /* SH_AALT: the A half order flips every chunk, so a reader stays in one A half for 16 blocks   \
+         * across the chunk boundary instead of 8 (fewer bank conflicts with the other reader's lag) */  \
+        const int af_ = (fl & 4) ^ (SH_AALT_ON ? (((g) & 1) << 2) : 0);                                                \
+        Alo = af_ ? x1_ : x0_;                                                                                         \
+        Ahi = af_ ? x0_ : x1_;                                                                                         \
         Blo = (fl & 8) ? y1_ : y0_;                                                                                    \
         Bhi = (fl & 8) ? y0_ : y1_;                                                                                    \
     }
@@ -136,7 +144,7 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         LD(Y, nxt + 256);                                                                                              \
         const int8_t *aY2 = aX;                                                                                        \
         K4_BLK(X, aX, bX, aY2, bYo);                                                                                   \
-        int32_t *t_ = cur + 512;                                                                                       \
+        int32_t *t_ = cur + 512 + ((unsigned)(i - 2) < 2u ? dW : 0); /* SH_AALT odd chunk: offsets wrap */            \
         cur = nxt;                                                                                                     \
         nxt = t_;                                                                                                      \
         aX = aY + 2048 + ((unsigned)(i - 2) < 2u ? dA : 0);                                                            \
@@ -155,21 +163,25 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         SH_ACQ(g + 1);                                                                                                 \
         SH_HALVES(g + 1, nAl, nAh, nBl, nBh);                                                                          \
         K4_ST(cur, X);                                                                                                 \
-        K4_LD(X, ae);                                                                                                  \
+        K4_LD(X, ae + SH_WO(g + 1));                                                                                   \
         K4_BLK(Y, aY, bY, nAl, nBl);                                                                                   \
         SH_REL(g);                                                                                                     \
         K4_ST(cur + 256, Y);                                                                                           \
-        K4_LD(Y, ae + 256);                                                                                            \
+        K4_LD(Y, ae + 256 + SH_WO(g + 1));                                                                             \
         K4_BLK(X, nAl, nBl, nAl, nBl + 2048);                                                                          \
-        SH_RESET(nAl, nAh, nBl, nBh);                                                                                  \
+        SH_RESET(nAl, nAh, nBl, nBh, g + 1);                                                                           \
         g++;                                                                                                           \
     }
-/* pointer state for a chunk whose halves are (al_, ah_, bl_, bh_) */
-#define SH_RESET(al_, ah_, bl_, bh_)                                                                                   \
+/* SH_AALT: an odd chunk's blocks are the even chunk's with A halves swapped (logical block bl ^ 8), so their
+ * accumulators sit 1024 ints further in each 8 KB region (mod 2048) */
+#define SH_WO(g) (SH_AALT_ON && ((g) & 1) ? 1024 : 0)
+/* pointer state for chunk g whose halves are (al_, ah_, bl_, bh_) */
+#define SH_RESET(al_, ah_, bl_, bh_, g)                                                                                \
     {                                                                                                                  \
         dA = (int)((ah_) - (al_)) - 4096;                                                                              \
-        cur = ae;                                                                                                      \
-        nxt = ao;                                                                                                      \
+        dW = SH_WO(g) ? -2048 : 0;                                                                                     \
+        cur = ae + SH_WO(g);                                                                                           \
+        nxt = ao + SH_WO(g);                                                                                           \
         aY = (al_);                                                                                                    \
         aX = (al_);                                                                                                    \
         bY = (bl_) + 2048;                                                                                             \
@@ -186,7 +198,9 @@ __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA
     const int8_t *Al, *Ah, *Bl, *Bh;
     int32_t *cur, *nxt;
     const int8_t *aY, *aX, *bY, *bYo, *bX, *bXo;
-    int dA;
+    int dA, dW;
+    if (SH_AALT_ON) /* the output follows the last chunk's A phase */
+        swz ^= ((g0 + nkc - 1) & 1) << 3;
     unsigned g = g0;
     const int fa_ = fl & 1, fb_ = fl & 2;
     SH_ACQ(g);
@@ -195,7 +209,7 @@ __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA
     aie::vector<int8_t, 64> vb0 = aie::load_v<64>(Bl), vb1 = aie::load_v<64>(Bl + K4_H);
     aie::vector<int8_t, 64> wa0 = aie::load_v<64>(Al + 64), wa1 = aie::load_v<64>(Al + K4_H + 64);
     aie::vector<int8_t, 64> wb0 = aie::load_v<64>(Bl + 64), wb1 = aie::load_v<64>(Bl + K4_H + 64);
-    SH_RESET(Al, Ah, Bl, Bh);
+    SH_RESET(Al, Ah, Bl, Bh, g);
     K4_LDZ(X, ae);
     K4_LDZ(Y, ae + 256);
     K4_BLK(X, Al, Bl, Al, Bl + 2048);
