@@ -48,7 +48,7 @@ BOARDS = {
 # pipeline fill / drain -- R2 42 and R2 60 leave 0.043 / 0.035 ms beyond 1262 cycles a chunk).
 DESIGNS = {
     '4x4': {'cyc_chunk': 1375, 'launch_ms': 0.06},
-    '2x8': {'cyc_chunk': 1200, 'launch_ms': 0.02},  # ping-pong operands, branch-free locks, output from the last chunk
+    '2x8': {'cyc_chunk': 1188, 'launch_ms': 0.02},  # ping-pong operands, branch-free locks, output from the last chunk
 }
 MEMTILE = 512 * 1024
 
@@ -157,7 +157,7 @@ MEASURED = [
     ('palmyra', '2x8', {'R': 42, 'NT': 1, 'K': 2560}, True, 52.2),
     ('vek385', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, True, 71.5),
     ('vek385', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, False, 67.9),
-    ('vek385', '2x8', {'R': 60, 'NT': 1, 'K': 2560}, True, 83.6),  # current tile kernel (R42 / R30: older kernel)
+    ('vek385', '2x8', {'R': 60, 'NT': 1, 'K': 2560}, True, 84.5),  # current tile kernel (R42 / R30: older kernel)
 ]
 
 
