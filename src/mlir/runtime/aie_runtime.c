@@ -7241,6 +7241,59 @@ int __Runtime_ctrl_shim_bd_sync(void) { return rt_sb_ack_wait() == XAIE_OK ? 0 :
  * DMA hardware transpose/reshape during data transfer.
  * @param len  Transfer length in bytes.
  */
+/* ---- dataflow plan switches (dmaphop.plan: bd_once / persistent_go_lock) ----
+ * bd_once: a BD or out-of-order channel write identical to one already made in
+ * this partition generation is skipped (BD / channel registers keep their value
+ * between launches; only the start queues are pushed again). persistent: the
+ * kernel ELF is loaded and the cores enabled on the FIRST launch only; every
+ * later launch releases each core's go lock (the kernel waits on it at the top
+ * of its launch loop). Set once by the generated aiehlc_plan_host_setup(). */
+static int g_rt_plan_bd_once;
+static int g_rt_plan_go_lock = -1;
+#define RT_BD_ONCE_MAX 256
+static struct {
+    XAie_DevInst *dev;
+    unsigned gen;
+    uint8_t col, row, id, kind; /* kind 0 = BD, 1 = ooo channel (id = ch | dir << 4) */
+    uint64_t addr;
+    uint32_t hash;
+} s_bd_once[RT_BD_ONCE_MAX];
+static int s_bd_once_n;
+
+void __Runtime_plan_setup(int bd_once, int persistent_go_lock) {
+    g_rt_plan_bd_once = bd_once;
+    g_rt_plan_go_lock = persistent_go_lock;
+}
+
+/* 1 if the identical write was already made (skip it); records it otherwise */
+static int rt_bd_once_seen(XAie_DevInst *dev, XAie_LocType t, uint8_t kind, uint8_t id, uint64_t addr, uint32_t hash) {
+    if (!g_rt_plan_bd_once)
+        return 0;
+    int slot = -1;
+    for (int i = 0; i < s_bd_once_n; i++)
+        if (s_bd_once[i].dev == dev && s_bd_once[i].col == t.Col && s_bd_once[i].row == t.Row &&
+            s_bd_once[i].kind == kind && s_bd_once[i].id == id) {
+            if (s_bd_once[i].gen == g_partition_gen && s_bd_once[i].addr == addr && s_bd_once[i].hash == hash)
+                return 1;
+            slot = i;
+            break;
+        }
+    if (slot < 0) {
+        if (s_bd_once_n >= RT_BD_ONCE_MAX)
+            return 0;
+        slot = s_bd_once_n++;
+    }
+    s_bd_once[slot].dev = dev;
+    s_bd_once[slot].gen = g_partition_gen;
+    s_bd_once[slot].col = (uint8_t)t.Col;
+    s_bd_once[slot].row = (uint8_t)t.Row;
+    s_bd_once[slot].kind = kind;
+    s_bd_once[slot].id = id;
+    s_bd_once[slot].addr = addr;
+    s_bd_once[slot].hash = hash;
+    return 0;
+}
+
 XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
                                               int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
                                               int32_t acquire_lock_id, int32_t acquire_lock_val,
@@ -7294,9 +7347,12 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
     AieRC bd_rc = XAIE_OK;
     rt_sb_rec aot_rec = {RT_AOT_CALL_BD, 0U, (uint8_t)bd_id, 0U, 0, tile, dma_addr, bd_args};
     unsigned long long __aot_t1 = RT_PROF_TIC();
-    int __aot_hit = rt_sb_aot_take(dev, &aot_rec, rt_aot_bd_hash(aot_args, 19U));
+    const int __once_hit = rt_bd_once_seen(dev, tile, 2U, (uint8_t)bd_id, dma_addr, rt_aot_bd_hash(aot_args, 19U));
+    int __aot_hit = __once_hit ? 0 : rt_sb_aot_take(dev, &aot_rec, rt_aot_bd_hash(aot_args, 19U));
     unsigned long long __aot_t2 = RT_PROF_TIC();
-    if (__aot_hit) {
+    if (__once_hit) {
+        memset(&DmaInst, 0, sizeof(DmaInst));
+    } else if (__aot_hit) {
         memset(&DmaInst, 0, sizeof(DmaInst));
     } else {
         rt_seq_bd_desc(dev, tile, dma_addr, &bd_args, &DmaInst);
@@ -7399,9 +7455,12 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim_ooo(XAie_DevInst *dev, XAie_LocTyp
     AieRC bd_rc = XAIE_OK;
     rt_sb_rec aot_rec = {RT_AOT_CALL_BD_OOO, 0U, (uint8_t)bd_id, 0U, 0, tile, dma_addr, bd_args};
     unsigned long long __aot_t1 = RT_PROF_TIC();
-    int __aot_hit = rt_sb_aot_take(dev, &aot_rec, rt_aot_bd_hash(aot_args, 19U));
+    const int __once_hit = rt_bd_once_seen(dev, tile, 0U, (uint8_t)bd_id, dma_addr, rt_aot_bd_hash(aot_args, 19U));
+    int __aot_hit = __once_hit ? 0 : rt_sb_aot_take(dev, &aot_rec, rt_aot_bd_hash(aot_args, 19U));
     unsigned long long __aot_t2 = RT_PROF_TIC();
-    if (__aot_hit) {
+    if (__once_hit) {
+        memset(&DmaInst, 0, sizeof(DmaInst));
+    } else if (__aot_hit) {
         memset(&DmaInst, 0, sizeof(DmaInst));
     } else {
         rt_seq_bd_desc(dev, tile, dma_addr, &bd_args, &DmaInst);
@@ -7494,6 +7553,8 @@ void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int3
     XAie_DmaChannelDesc DmaChannelDescInst;
     AieRC rc = XAIE_OK;
     rt_sb_rec aot_rec = {RT_AOT_CALL_CH_OOO, (uint8_t)channel, 0U, (uint8_t)dir, 0, tile, 0U, {}};
+    if (rt_bd_once_seen(dev, tile, 1U, (uint8_t)(channel | ((int)dir << 4)), 0U, 0U))
+        return;
     if (!rt_sb_aot_take(dev, &aot_rec, 0U)) {
         rt_seq_channel_ooo_desc(dev, tile, &DmaChannelDescInst);
         RT_SB_CALL(dev, tile, rc, XAie_DmaWriteChannel(dev, &DmaChannelDescInst, tile, (uint8_t)channel, dir));
@@ -8967,6 +9028,17 @@ struct_kernel_group __Runtime_load_kernel_group_16t_ctrl(
     XAie_LocType t9, XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14,
     XAie_LocType t15, int n, int32_t bd_id, int32_t mm2s_ch) {
     XAie_LocType tiles[] = {t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15};
+    if (g_rt_plan_go_lock >= 0) { /* dataflow plan: persistent kernel, loaded on the first launch only */
+        static struct_kernel_group s_kg;
+        static XAie_DevInst *s_kg_dev;
+        static unsigned s_kg_gen;
+        if (s_kg.num_tiles && s_kg_dev == dev && s_kg_gen == g_partition_gen)
+            return s_kg;
+        s_kg = rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
+        s_kg_dev = dev;
+        s_kg_gen = g_partition_gen;
+        return s_kg;
+    }
     return rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
 }
 
@@ -9052,6 +9124,20 @@ struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_Ctr
                (unsigned)(kg.num_tiles));
         evt.num_tiles = 0U;
         return evt;
+    }
+    if (g_rt_plan_go_lock >= 0) { /* dataflow plan: persistent kernel -- later launches release the go lock */
+        static XAie_DevInst *s_run_dev;
+        static unsigned s_run_gen;
+        if (s_run_dev == dev && s_run_gen == g_partition_gen) {
+            unsigned long long tg = RT_PROF_TIC();
+            for (uint32_t i = 0; i < kg.num_tiles; i++)
+                if (__Runtime_is_aie_core_tile(kg.tiles[i]))
+                    XAie_LockSetValue(dev, kg.tiles[i], XAie_LockInit((u8)g_rt_plan_go_lock, 1));
+            RT_PROF_PHASE(PH_COREEN, tg);
+            return evt;
+        }
+        s_run_dev = dev;
+        s_run_gen = g_partition_gen;
     }
     rt_kernel_profile_setup(dev, kg);
     const XAie_CoreMod *core = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;

@@ -5,6 +5,7 @@
 
 #include "passdfscheduletokernelapi.h"
 #include "hw/ResourceManager.h"
+#include "dataflowplan/dataflowplan.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -125,6 +126,9 @@ static void collectAggregatedOutTiles(KernelModuleOp kernelModuleOp, SmallVector
 struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
     KernelModuleToEmitCPattern(const TypeConverter &tc, MLIRContext *ctx, int partStartCol)
         : OpConversionPattern(tc, ctx), partStartCol(partStartCol) {}
+    // MemTile rows below the core rows (the plan's tile kinds); from the plan's own
+    // core tiles: the lowest core row - 1.
+    int planMemtileRows = dfplan::activePlan().memtileRows;
 
     int partStartCol;
 
@@ -594,6 +598,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                                           KernelModuleOp kernelModuleOp,
                                           const llvm::StringMap<WindowInfo> &windowInfoMap,
                                           ArrayRef<CoreOffloadEntry> offloadPlan) const {
+        const std::set<int> planCoreS2mm =
+            dfplan::activePlan().present ? dfplan::activePlan().coreS2mmChannels(planMemtileRows) : std::set<int>();
         for (Operation &inner : kernelModuleOp.getBody().front()) {
             auto windowDefOp = dyn_cast<WindowDefOp>(&inner);
             if (!windowDefOp)
@@ -606,6 +612,16 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
             if (!isOut && w.direction != "in")
                 continue;
 
+            // Dataflow plan (dmaphop.plan*): an input window on a core S2MM channel the
+            // plan programs itself is NOT armed here -- the plan's block below owns that
+            // channel (its BDs, locks and start queue). The window's buffers and
+            // window_init stay, so the kernel signature is unchanged.
+            if (!isOut && planCoreS2mm.count(w.channel)) {
+                rewriter.create<emitc::VerbatimOp>(loc, "// " + windowDefOp.getSymName().str() + ": core S2MM ch " +
+                                                            std::to_string(w.channel) +
+                                                            " programmed by the dataflow plan");
+                continue;
+            }
             if (failed(checkWindowOffloadIds(windowDefOp, w, offloadPlan)))
                 return failure();
 
@@ -680,6 +696,12 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 block += "}";
             }
             rewriter.create<emitc::VerbatimOp>(loc, block);
+        }
+        const dfplan::DataflowPlan &plan = dfplan::activePlan();
+        if (plan.present) {
+            std::string planBlock = dfplan::emitPlanKernelBlock(plan, planMemtileRows, partStartCol);
+            if (!planBlock.empty())
+                rewriter.create<emitc::VerbatimOp>(loc, planBlock);
         }
         return success();
     }

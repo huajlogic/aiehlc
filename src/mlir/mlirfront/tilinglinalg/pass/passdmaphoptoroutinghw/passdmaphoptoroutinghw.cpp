@@ -853,6 +853,13 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
 
     LogicalResult matchAndRewrite(dmaphop::create_path op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
+        // A flow the dataflow plan replaces (dmaphop.plan*, tagged by
+        // collectDataflowPlan) gets no generated stream route: the plan's
+        // aiehlc_plan_routing() routes it, around the ports booked here.
+        if (op->hasAttr("dmaphop.plan_replaced")) {
+            rewriter.eraseOp(op);
+            return success();
+        }
         auto loc = op.getLoc();
         auto output = rewriter.getI32Type();
         // Get producers attribute to determine which tiles should send to DMA (S2MM)

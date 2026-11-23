@@ -407,6 +407,8 @@ void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_til
 
 // Synchronization
 void __Runtime_wait_event(XAie_DevInst *dev, struct_event ev);
+/* dataflow plan (dmaphop.plan): skip identical BD / ooo-channel rewrites; persistent kernel (go lock >= 0) */
+void __Runtime_plan_setup(int bd_once, int persistent_go_lock);
 void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_ev);
 // Wait-idle hook (GHL): host work that is independent of the running launch (e.g. the
 // post-processing of a PREVIOUS launch's output) stepped from __Runtime_wait_io's
