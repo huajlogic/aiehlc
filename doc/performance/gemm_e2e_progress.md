@@ -870,3 +870,22 @@ stack, accumulators and output already occupy banks 0-3).
 
 **Defaults are unchanged.** `--aalt` and `--phase` remain as measurement options.
 
+### Two ways to cut the bank traffic, both measured slower (2026-11-23)
+
+- **2 x 4 register blocking (6 loads per 8 MACs instead of 4 per 4), compiled only.**
+  - The block loop is 169 bundles per 128 MACs, against 131 for the 2 x 2 kernel (75.7 % vs
+    97.7 % static).
+  - With all 8 accumulator registers in one block, the accumulator store / reload between blocks
+    cannot overlap any MAC. That costs far more than the reader traffic it saves.
+- **Operand half-slots spread over 6 banks (`--spread`, vek385-3).**
+  - Each channel's two slots went in four distinct banks; the accumulators shared b1 b2 b5 b6
+    with operand halves.
+  - Result: 1.40 ms (70 %), memstall 17-21 %, against 1.157-1.208 ms for the default on the
+    same board. GOLDEN PASS.
+  - The accumulator load / store traffic is heavy. Mixed into the operand banks it collides with
+    both readers, including the neighbour reading a B memory while its owner works its own
+    accumulators.
+  - So the default layout is right: accumulators alone in b1 b2, operands in b4-b7, stack /
+    data in b0, output buffers in b3. No full 4 KB piece is free elsewhere.
+- The code for both was not kept.
+
