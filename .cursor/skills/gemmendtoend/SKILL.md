@@ -197,7 +197,7 @@ gs90 65.5 %, versus 57.0 % / 64.7 % on palmyra. See `doc/performance/gemm_e2e_pr
   smaller non-cacheable buffer, the range runs past it and every launch cleans the cache (+0.43 ms).
 - VEK385 `DDR_CH_1` (0x500_0000_0000) hangs the A78 on this PDI; `DDR_LOW1` works.
 
-## VEK385: 2 x 8 shared-operand layout, 78.9 % of the 1.25 GHz peak
+## VEK385: 2 x 8 shared-operand layout, 81.9 % of the 1.25 GHz peak (1.200 ms at R2 60)
 `example/tileprogram/ccode/gemm_memtile/share2x8.py <base aout/worklocal> --r2 60 --nt2 1 --k 2560
 --bres --single --persist --tile` -> 1.246 ms per 10.07 G MAC, GOLDEN PASS. R2 60 is the largest
 legal launch (R2 % 3 == 0, T even, at most 64 output tiles per core: the BD iteration count is
@@ -205,3 +205,15 @@ legal launch (R2 % 3 == 0, T even, at most 64 output tiles per core: the BD iter
 "% of peak" against 998 MHz -- rescale by 998 / 1250 on VEK385. Which design per board (MC
 count, DDR zones): `script/perf/gemm_plan.py --board vek385|palmyra`. Details:
 `doc/performance/gemm_e2e_progress.md`.
+Measurement modes of `share2x8.py`:
+- `--dmaonly`: the kernel does no MACs. This is the data-delivery bound (0.85 ms at R2 60, below
+  the 0.983 ms of ideal compute).
+- `--perfcnt`: per-core counters over launch 3 (active, memory stall, lock stall, vector
+  instructions, plus DM bank conflicts). Build without AIEHLC_PROFILING.
+- `--bench --kcyc`: no-wait vs live cycles per chunk.
+
+Kernel traps:
+- **Operand rotation.** Rotating operand registers costs a VMOV per VMAC and saturates the
+  move slot. Ping-pong the register sets instead.
+- **Selects in the hot loop.** Chess un-pipelines a loop that carries a runtime pointer select.
+  Check the `begin_of_loop` bundle count in `kernel.lst` after every kernel change.

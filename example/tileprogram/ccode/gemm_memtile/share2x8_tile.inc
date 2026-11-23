@@ -26,49 +26,56 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         aie::store_v((p) + 128, (c##2).to_vector<int32_t>());                                                          \
         aie::store_v((p) + 192, (c##3).to_vector<int32_t>());                                                          \
     }
-#define K4_STEP(c, l, m)                                                                                               \
+/* k-step with ping-pong operand registers: step s uses set (va, vb) if s is even, (wa, wb) if odd, and
+ * reloads that set with step s + 2 -- no operand rotation, so no VMOVs (with rotation, 4 VMOVs per 4
+ * VMACs saturated the move slot: 135 bundles per 128 MACs). A block has 16 steps, so (va, vb) =
+ * step 0 and (wa, wb) = step 1 at every block start. */
+#define K4_STEPX(c, l, m, A0, A1, B0, B1)                                                                               \
     {                                                                                                                  \
         const aie::vector<int8_t, 64> n0 = aie::load_v<64>(l), n1 = aie::load_v<64>((l) + K4_H);                       \
         const aie::vector<int8_t, 64> m0 = aie::load_v<64>(m), m1 = aie::load_v<64>((m) + K4_H);                       \
-        (c##0).mac(va0, vb0);                                                                                          \
-        (c##1).mac(va0, vb1);                                                                                          \
-        (c##2).mac(va1, vb0);                                                                                          \
-        (c##3).mac(va1, vb1);                                                                                          \
-        va0 = wa0;                                                                                                     \
-        va1 = wa1;                                                                                                     \
-        vb0 = wb0;                                                                                                     \
-        vb1 = wb1;                                                                                                     \
-        wa0 = n0;                                                                                                      \
-        wa1 = n1;                                                                                                      \
-        wb0 = m0;                                                                                                      \
-        wb1 = m1;                                                                                                      \
+        (c##0).mac(A0, B0);                                                                                            \
+        (c##1).mac(A0, B1);                                                                                            \
+        (c##2).mac(A1, B0);                                                                                            \
+        (c##3).mac(A1, B1);                                                                                            \
+        A0 = n0;                                                                                                       \
+        A1 = n1;                                                                                                       \
+        B0 = m0;                                                                                                       \
+        B1 = m1;                                                                                                       \
     }
+#define K4_STEP(c, l, m) K4_STEPX(c, l, m, va0, va1, vb0, vb1)
+#define K4_STEPW(c, l, m) K4_STEPX(c, l, m, wa0, wa1, wb0, wb1)
 #define K4_BLK(c, pa0, pb0, npa, npb)                                                                                  \
     {                                                                                                                  \
         const int8_t *__restrict pa_ = (pa0);                                                                          \
         const int8_t *__restrict pb_ = (pb0);                                                                          \
-        for (int ki = 2; ki < KA_KC / 8; ki++)                                                                         \
-            chess_flatten_loop K4_STEP(c, pa_ + ki * 64, pb_ + ki * 64);                                               \
+        for (int ki = 2; ki < KA_KC / 8; ki += 2)                                                                      \
+            chess_flatten_loop {                                                                                       \
+                K4_STEP(c, pa_ + ki * 64, pb_ + ki * 64);                                                              \
+                K4_STEPW(c, pa_ + ki * 64 + 64, pb_ + ki * 64 + 64);                                                   \
+            }                                                                                                          \
         K4_STEP(c, (npa), (npb));                                                                                      \
-        K4_STEP(c, (npa) + 64, (npb) + 64);                                                                            \
+        K4_STEPW(c, (npa) + 64, (npb) + 64);                                                                           \
     }
+#if defined(SH_DMAONLY) /* share2x8.py --dmaonly: no MACs / accumulator traffic; locks and DMA unchanged */
+#undef K4_LD
+#undef K4_ST
+#undef K4_STEPX
+#define K4_LD(c, p) {}
+#define K4_ST(p, c) {}
+#define K4_STEPX(c, l, m, A0, A1, B0, B1) { chess_memory_fence(); }
+#endif
 /* acquire the chunk with running index g (channel g & 1): first reader takes F and hands G on.
  * lv = 1 normally; 0 for the no-wait bench (acquire >= 0 and release 0 are no-ops). */
 #define SH_ACQ(g)                                                                                                      \
     {                                                                                                                  \
-        const int ch_ = (g) & 1;                                                                                       \
-        if (fl & 1) {                                                                                                  \
-            acquire_greater_equal(lA + 6 + 4 * ch_, lv);                                                               \
-            release(lA + 7 + 4 * ch_, lv);                                                                             \
-        } else {                                                                                                       \
-            acquire_greater_equal(lA + 7 + 4 * ch_, lv);                                                               \
-        }                                                                                                              \
-        if (fl & 2) {                                                                                                  \
-            acquire_greater_equal(lB + 6 + 4 * ch_, lv);                                                               \
-            release(lB + 7 + 4 * ch_, lv);                                                                             \
-        } else {                                                                                                       \
-            acquire_greater_equal(lB + 7 + 4 * ch_, lv);                                                               \
-        }                                                                                                              \
+        /* branch-free (each role branch cost ~5 delay-slot bundles per chunk): the first reader takes F and \
+         * hands G on; the second takes G and "releases" own lock 15 (id 63) by 0 -- a no-op */                     \
+        const int ch4_ = 4 * ((g) & 1);                                                                                \
+        acquire_greater_equal(lA + (fa_ ? 6 : 7) + ch4_, lv);                                                         \
+        release(fa_ ? lA + 7 + ch4_ : 63, fa_ ? lv : 0);                                                               \
+        acquire_greater_equal(lB + (fb_ ? 6 : 7) + ch4_, lv);                                                         \
+        release(fb_ ? lB + 7 + ch4_ : 63, fb_ ? lv : 0);                                                               \
         chess_memory_fence();                                                                                          \
     }
 #define SH_REL(g)                                                                                                      \
@@ -124,7 +131,7 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         bXo = (bl_);                                                                                                   \
     }
 /* One 64 x 64 tile over nkc chunks starting at running chunk index g0; accumulators start at ZERO
- * (acc must be zeroed by the caller). fl: 1 A first reader, 2 B first reader, 4 A halves swapped,
+ * (acc must be zeroed by the caller: sh_convert leaves it zeroed). fl: 1 A first reader, 2 B first reader, 4 A halves swapped,
  * 8 B halves swapped. */
 __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA, int lB, int fl, unsigned g0, int nkc, int lv,
                                               int32_t *__restrict ae, int32_t *__restrict ao) {
@@ -134,6 +141,7 @@ __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA
     const int8_t *aY, *aX, *bY, *bYo, *bX, *bXo;
     int dA;
     unsigned g = g0;
+    const int fa_ = fl & 1, fb_ = fl & 2;
     SH_ACQ(g);
     SH_HALVES(g, Al, Ah, Bl, Bh);
     aie::vector<int8_t, 64> va0 = aie::load_v<64>(Al), va1 = aie::load_v<64>(Al + K4_H);
@@ -167,13 +175,18 @@ __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA
 }
 /* int32 accumulators -> int8 output tile; iteration block bl holds logical block bl ^ swz (phase swap).
  * Own function: inlined into the caller it hit chess's "no mappings for bundle" (SRS + store + add). */
-__attribute__((noinline)) static void sh_convert(int8_t *__restrict y, const int32_t *__restrict acc, int swz) {
+__attribute__((noinline)) static void sh_convert(int8_t *__restrict y, int32_t *__restrict acc, int swz) {
     for (int bl = 0; bl < 16; bl++) {
         const int L = bl ^ swz;
         int8_t *tt = y + ((2 * (L >> 2)) * 8 + 2 * (L & 3)) * 64;
-        const int32_t *ap = acc + ((((bl) >> 1) & 1) * 2048 + (((bl) >> 2) * 2 + ((bl) & 1)) * 256);
+        int32_t *ap = acc + ((((bl) >> 1) & 1) * 2048 + (((bl) >> 2) * 2 + ((bl) & 1)) * 256);
         KaMM4 Z0, Z1, Z2, Z3;
         K4_LD(Z, ap);
+        /* leave the accumulators zeroed for the next tile (saves a separate 16 KB zeroing pass) */
+        aie::store_v((int32_t *)ap, aie::zeros<int32_t, 64>());
+        aie::store_v((int32_t *)ap + 64, aie::zeros<int32_t, 64>());
+        aie::store_v((int32_t *)ap + 128, aie::zeros<int32_t, 64>());
+        aie::store_v((int32_t *)ap + 192, aie::zeros<int32_t, 64>());
         chess_separator_scheduler();
         aie::store_v(tt, Z0.to_vector<int8_t>(0));
         aie::store_v(tt + 64, Z1.to_vector<int8_t>(0));

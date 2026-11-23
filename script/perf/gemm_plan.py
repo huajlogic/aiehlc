@@ -36,19 +36,19 @@ BOARDS = {
         # LOW0 / LOW1 present; DDR_CH_1 (0x500_0000_0000) hangs the A78 on this PDI (probed)
         'zones': [{'name': 'DDR_LOW0', 'base': 0x0, 'size': 0x80000000, 'mc': 'il', 'heap': True},
                   {'name': 'DDR_LOW1', 'base': 0x800000000, 'size': 0x180000000, 'mc': 'il'}],
-        # lower bound: A on 8 shim channels instead of 4 (share2x8 --a2ch) did not speed up R2 60
-        # (1.268 vs 1.246 ms), so 4 channels already deliver >= 15.8 GB/s without binding
-        'shim_ch_gbps': 4.2,
+        # lower bound: the DMA-only twin (share2x8 --dmaonly, no MACs) moves R2 60's 19.7 MB of A over
+        # 4 channels in ~0.85 ms -> >= 5.7 GB/s per channel; A on 8 channels (--a2ch) gained nothing
+        'shim_ch_gbps': 5.7,
     },
 }
 
 # Measured design constants. cyc_chunk: core cycles per 64x64x128 chunk in a live run, input
-# waits included (4x4: 1.446 ms / 1260 chunks at 1.25 GHz; 2x8: KBENCH live 1262); launch_ms:
+# waits included (4x4: 1.446 ms / 1260 chunks at 1.25 GHz; 2x8: 1.200 ms at R2 60); launch_ms:
 # fixed per-launch cost (2x8 is persistent: no ELF reload / core reset; its 0.04 ms is mostly the
 # pipeline fill / drain -- R2 42 and R2 60 leave 0.043 / 0.035 ms beyond 1262 cycles a chunk).
 DESIGNS = {
     '4x4': {'cyc_chunk': 1375, 'launch_ms': 0.06},
-    '2x8': {'cyc_chunk': 1262, 'launch_ms': 0.04},
+    '2x8': {'cyc_chunk': 1208, 'launch_ms': 0.04},  # ping-pong operand registers, branch-free locks
 }
 MEMTILE = 512 * 1024
 
@@ -155,9 +155,7 @@ MEASURED = [
     ('palmyra', '2x8', {'R': 42, 'NT': 1, 'K': 2560}, True, 52.2),
     ('vek385', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, True, 71.5),
     ('vek385', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, False, 67.9),
-    ('vek385', '2x8', {'R': 60, 'NT': 1, 'K': 2560}, True, 78.9),
-    ('vek385', '2x8', {'R': 42, 'NT': 1, 'K': 2560}, True, 77.4),
-    ('vek385', '2x8', {'R': 30, 'NT': 2, 'K': 1792}, True, 76.5),
+    ('vek385', '2x8', {'R': 60, 'NT': 1, 'K': 2560}, True, 81.9),  # current tile kernel (R42 / R30: older kernel)
 ]
 
 

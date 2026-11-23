@@ -748,3 +748,43 @@ launches bad. Build: `share2x8.py ... --r2 60 --nt2 1 --k 2560 --bres --single -
   - So the end-to-end ceiling of this design is in the low-to-mid 80s. 95 % of the true peak
     would need an inner loop faster than the best measured in-core kernel.
 
+### Measuring the limit, then the kernel: 81.9 % (2026-11-22)
+
+**VEK385: 1.200 ms per 10.07 G MAC = 81.9 % of the true peak** (R2 60), GOLDEN PASS, 0 / 3 bad
+stress launches. Same build line as before; the change is in `share2x8_tile.inc`.
+
+- **Data delivery is not the limit (`--dmaonly`).** The kernel keeps every lock acquire /
+  release and the output DMA but does no MACs.
+  - A launch then takes 0.83-0.88 ms, against 0.983 ms of ideal compute and the 1.035 ms
+    budget for 95 %.
+  - The fabric (shim, MemTile, core DMA, locks) feeds about 14 % faster than peak compute.
+    Everything beyond that is the cores.
+- **Ping-pong operand registers.** The k-step used to rotate its operands (`va = wa; wa = load`):
+  4 VMOVs per 4 VMACs saturated the move slot. Now even steps use (va, vb), odd steps (wa, wb),
+  and each reloads its own set.
+  - Inner loop: 135 -> 131 bundles per 128 MACs.
+  - 1.246 -> 1.212 ms.
+- **Branch-free chunk acquire.** The role (first / second reader) selects the lock id; the
+  second reader "releases" own lock 15 by 0 (a no-op).
+  - The `JZ` + delay slots per role branch are gone: 48 bundles less code, 1.212 -> 1.202 ms.
+- **`sh_convert` leaves the accumulators zeroed.** Four zero stores per block it reads,
+  instead of a separate 16 KB pass per tile. 1.202 -> 1.200 ms: the zeroing was mostly hidden.
+  - Tried first and dropped: chunk 0 loading its accumulators from a 2 KB zero buffer through a
+    pointer select. Chess un-pipelined the hot loop (131 -> 147 bundles) and it ran at 1.29 ms.
+- **Where the rest goes (`--perfcnt`).** Core performance counters over one launch, per core,
+  about 1.5 M cycles:
+
+| item | cycles | share |
+|---|---|---|
+| VMAC (60 x 20 x 1024, exact) | 1,228,800 | 81.8 % |
+| other instructions (chunk boundary, convert, tile prologue) | ~118 k | ~8 % |
+| memory stalls (DM bank conflicts: two reader cores + the DMA on each operand memory; ~45 k conflicts per bank per launch) | ~75 k | ~5 % |
+| lock stalls (the shared-buffer coupling) | ~77 k | ~5 % |
+
+- **What 95 % would need.** Each of the three non-MAC rows must shrink to about a third:
+  - instructions: the per-tile overhead is ~1250 cycles, and program memory has ~2 KB left;
+  - memory: a bank-conflict-free placement of the reader phases and the DMA writes;
+  - locks: decoupled readers.
+
+  None is a small change. Expect a few points each.
+

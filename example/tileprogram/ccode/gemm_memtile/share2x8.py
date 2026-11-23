@@ -36,6 +36,8 @@ ap.add_argument('--zones', default='', help='DDR zone per operand, e.g. A=0x5000
 ap.add_argument('--kc', type=int, default=128, choices=(128, 256), help='K chunk of the tile kernel (256: needs --tile; each chunk arrives as two 8 KB halves, one per channel)')
 ap.add_argument('--kcyc', action='store_true', help='cores stamp cycle split (total / input wait / mac / output wait / convert) into their last tile')
 ap.add_argument('--a2ch', action='store_true', help='A on both shim MM2S channels (odd m tiles on B\'s channel, re-routed once B is loaded); needs --bres, R2 %% 4 == 0')
+ap.add_argument('--dmaonly', action='store_true', help='measurement: the tile kernel does no MACs (locks / DMA unchanged) -- the data-delivery bound; output is garbage (needs --tile)')
+ap.add_argument('--perfcnt', action='store_true', help='measurement: per-core active / memory-stall / lock-stall / vector-instr counters (+ DM bank 4 / 6 conflicts) over launch 3 (build without AIEHLC_PROFILING)')
 ap.add_argument('--stress', type=int, default=0, help='N extra launches, each fully sampled-checked; failures listed per tile')
 args = ap.parse_args()
 wl, bres = args.wl, args.bres
@@ -332,6 +334,37 @@ if args.persist:
     assert hs.count(old) == 1
     hs = hs.replace(old, '  if (sh_first) __Runtime_wait(v1, %s);\n' % ev)
     hs = hs.replace('  g_bd_once = 1;\n', '  g_bd_once = 1;\n  sh_launched = 1;\n', 1)
+if args.perfcnt:
+    old = '        gemm_ka_run(A2, B2, Ct);\n        XTime_GetTime(&t1);\n'
+    assert hs.count(old) == 1, hs.count(old)
+    hs = hs.replace(old, """        XAie_DevInst *pdv = __Runtime_get_partition_dev(0);
+        if (it == 3)
+            for (int c = 1; c <= 4; c++)
+                for (int r = 3; r <= 6; r++) { /* SHARE2X8 --perfcnt */
+                    const XAie_LocType t = XAie_TileLoc(c, r);
+                    const XAie_Events ev[4] = {XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_MEMORY_STALL_CORE, XAIE_EVENT_LOCK_STALL_CORE,
+                                               XAIE_EVENT_INSTR_VECTOR_CORE};
+                    for (int k = 0; k < 4; k++) {
+                        XAie_PerfCounterSet(pdv, t, XAIE_CORE_MOD, (u8)k, 0);
+                        XAie_PerfCounterControlSet(pdv, t, XAIE_CORE_MOD, (u8)k, ev[k], ev[k]);
+                    }
+                    const XAie_Events mv[2] = {XAIE_EVENT_CONFLICT_DM_BANK_4_MEM, XAIE_EVENT_CONFLICT_DM_BANK_6_MEM};
+                    for (int k = 0; k < 2; k++) {
+                        XAie_PerfCounterSet(pdv, t, XAIE_MEM_MOD, (u8)k, 0);
+                        XAie_PerfCounterControlSet(pdv, t, XAIE_MEM_MOD, (u8)k, mv[k], mv[k]);
+                    }
+                }
+""" + old + """        if (it == 3)
+            for (int c = 1; c <= 4; c++)
+                for (int r = 3; r <= 6; r++) {
+                    const XAie_LocType t = XAie_TileLoc(c, r);
+                    u32 v[6] = {0, 0, 0, 0, 0, 0};
+                    for (int k = 0; k < 4; k++) XAie_PerfCounterGet(pdv, t, XAIE_CORE_MOD, (u8)k, &v[k]);
+                    for (int k = 0; k < 2; k++) XAie_PerfCounterGet(pdv, t, XAIE_MEM_MOD, (u8)k, &v[4 + k]);
+                    printf("PERFCNT core (%d,%d): active %u memstall %u (%.1f %%) lockstall %u (%.1f %%) vec %u | DM conflicts b4 %u b6 %u\\n", c, r,
+                           v[0], v[1], 100.0 * v[1] / (v[0] ? v[0] : 1), v[2], 100.0 * v[2] / (v[0] ? v[0] : 1), v[3], v[4], v[5]);
+                }
+""")
 # the launch's cache-maintenance sizes come from the BASE ports; with the target's smaller A the range
 # ran past the non-cacheable mapping and every launch cleaned 13.8 MB of cache (~0.43 ms)
 M_, N_, K_ = 2 * 64 * R2, 8 * 64 * NT2, 128 * NK
@@ -446,7 +479,7 @@ print('kernel.cc: hosted-stream DMA')
 
 # ---------------------------------------------------------------- gemm_ka.cc: kernel body
 gk = open(wl + '/gemm_ka.cc').read()
-CHUNK = ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile256.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
+CHUNK = ('#define SH_DMAONLY 1\n' if args.dmaonly else '') + ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile256.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
 gk = gk.replace('  void gemm_ka(', CHUNK + '\n  void gemm_ka(', 1)
 a = gk.index('#if defined(__chess__)\n    // On the core')
 b = gk.index('#else\n    // Traced')
@@ -533,11 +566,17 @@ if args.tile:
     a = gk.index('                for (int j = 0; j < %d; j++, gc++) {' % NK)
     b = gk.index('                const uint64_t k4 = ', a)
     gk = gk[:a] + ("""                const uint64_t k2 = (uint64_t)aie::tile::current().cycles();
-                ka_tile(vA, vB, lA, lB, (aFirst ? 1 : 0) | (bFirst ? 2 : 0) | (al ? 4 : 0) | (be ? 8 : 0), gc, %d, 1, acc,
+                ka_tile(vA, vB, lA, lB, (aFirst ? 1 : 0) | (bFirst ? 2 : 0) | (al ? 4 : 0) | (be ? 8 : 0) | ZF, gc, %d, 1, acc,
                         acc + 2048); /* whole tile, one pipeline; lock waits inside (KCYC counts them as mac) */
                 gc += %d;
                 k_mac += (uint64_t)aie::tile::current().cycles() - k2;
 """ % (args.k // args.kc, args.k // args.kc)) + gk[b:]
+    zero = '                for (int i = 0; i < KA_TM * KA_TN; i += 64)\n                    aie::store_v(acc + i, aie::zeros<int32_t, 64>());\n'
+    gk = gk.replace(' | ZF, gc,', ', gc,')
+    if args.kc == 128:  # sh_convert (share2x8_tile.inc) leaves acc zeroed: zero it once per launch, not per tile
+        assert gk.count(zero) == 1
+        gk = gk.replace(zero, '')
+        gk = gk.replace('            for (int t = 0; t < %d; t++) {' % T, zero.replace('                ', '            ', 2) + '            for (int t = 0; t < %d; t++) {' % T, 1)
     a = gk.index('                for (int bl = 0; bl < 16; bl++) { /* iteration block bl holds logical block bl ^ 8 al ^ 2 be */')
     b = gk.index('                k_cv += ', a)
     gk = gk[:a] + '                sh_convert(y, acc, (al << 3) ^ (be << 1));\n' + gk[b:]
