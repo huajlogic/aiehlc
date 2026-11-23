@@ -1,16 +1,23 @@
 // Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// int8 GEMM on the 4 x 4 mesh in the 2 x 8 SHARED-OPERAND layout, with the data movement taken from
-// an explicit dataflow plan in the dmaphop IR instead of hand edits of the generated host.cc /
-// kernel.cc / routing.cc (README.md; doc/design/dmaphop_dataflow_plan.md):
+// int8 GEMM on the 4 x 4 mesh in the 2 x 8 SHARED-OPERAND layout -- 84.8 % of the VEK385 peak from
+// this source alone (README.md; doc/design/dmaphop_dataflow_plan.md). The data movement is stated
+// where the kernel loads its blocks, and the compiler derives the rest:
 //
-//   1. aiehlc builds this file as usual (its kernel-only ports describe the C output the compiler
-//      generates; A and B are re-routed by the plan);
-//   2. gen_plan.py appends the dmaphop.plan* ops to the dumped dmaphop IR;
-//   3. AIEHLC_DMAPHOP_IR_IN=<plan .mlir> aiehlc ... rebuilds with the plan: the compiler routes the
-//      plan's streams, programs the MemTiles / shim (host.cc), the cores' hosted-stream DMA
-//      (kernel.cc), and writes aiehlc_plan.h, whose constants the kernel below reads.
+//   #pragma persistent_kernel                  load the kernel once; later launches release a go lock
+//   aie::load_buffer(a, ..., {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring,
+//                             .ring = 10})     A: hosted in one neighbour core's memory, staged through
+//                                              a MemTile FIFO ring of 10 buffers
+//   aie::load_buffer(b, ..., {.share = aie::share::neighbor, .stage = aie::stage::memtile,
+//                             .keep = true})   B: hosted likewise, held in a MemTile across launches
+//
+// Those options become `dataflow` attributes on the routing IR's tensors; the dataflow-plan synthesis
+// turns them into dmaphop.plan* ops (host-tile matching, views, locks, MemTile / core / shim BDs,
+// routes), and the compiler emits routing.cc / host.cc / kernel.cc and aiehlc_plan.h -- the
+// constants the chess kernel below reads. The same build also works one level lower: edit the
+// routing IR (AIEHLC_ROUTING_IR_IN) or write the dmaphop plan yourself (gen_plan.py,
+// AIEHLC_DMAPHOP_IR_IN); an explicit plan wins over the options.
 //
 // C[7680 x 512] = A[7680 x 2560] . B[512 x 2560]^T per launch (10.07 G MAC). Logical grid: A in 2
 // strips, B in 8 strips; core (pm, pn) computes A strip pm >> 1 x B strip pn + 4 (pm & 1), 60 tiles
@@ -20,6 +27,7 @@
 #pragma control_packet_mode(aot)
 #pragma KERNELCONFIGOFFLOAD
 #pragma output_tile_major
+#pragma persistent_kernel
 #include "simplegemm_peak.h"
 
 #define KA_TM 64
@@ -81,14 +89,16 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
             int8_t *y = aie::store_buffer(c, {(pm * KA_R + s) * KA_TM, (pn * KA_NT + nt) * KA_TN}, {KA_TM, KA_TN});
             for (int j = 0; j < nk; j++) {
                 if (nt == 0) {
-                    const int8_t *x =
-                        aie::load_buffer(a, {(pm * KA_R + s) * KA_TM, j * KA_KC}, {KA_TM, KA_KC}, {.depth = 2});
+                    const int8_t *x = aie::load_buffer(
+                        a, {(pm * KA_R + s) * KA_TM, j * KA_KC}, {KA_TM, KA_KC},
+                        {.depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile_ring, .ring = 10});
                     (void)x;
                     aie::release(a);
                 }
                 if (s == 0) {
-                    const int8_t *w =
-                        aie::load_buffer(b, {(pn * KA_NT + nt) * KA_TN, j * KA_KC}, {KA_TN, KA_KC}, {.depth = 2});
+                    const int8_t *w = aie::load_buffer(
+                        b, {(pn * KA_NT + nt) * KA_TN, j * KA_KC}, {KA_TN, KA_KC},
+                        {.depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile, .keep = true});
                     (void)w;
                     aie::release(b);
                 }

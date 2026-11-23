@@ -13,6 +13,7 @@
 // Bodies are moved verbatim: only the `static` keyword is removed and the
 // namespace wrapper added. No behavioral change.
 
+#include "dataflowplan/dataflowplan.h"
 #include <cstdlib>
 #include "flowtransfer_internal.h"
 #include "routingmanager.h"
@@ -716,6 +717,10 @@ KernelBlockUse resolveKernelBlock(const routing::TensorRoutingInfoMap &info, int
     // fullconnect_auto = 0 (spatial-halo conv): only a {.resident} input -- a
     // block taken once, e.g. the conv weights -- leaves its schedule to the kernel.
     if (!ti || !ti->kernelBlock || ti->halo || (!fullConnect && !ti->kernelBlock.getResident()))
+        return u;
+    // A port the dataflow plan (dmaphop.plan*) realizes has no generated core / shim
+    // DMA to check against its blocks: the plan programs that data movement itself.
+    if (dfplan::activePlan().present && dfplan::activePlan().replaces(funcArgIdx))
         return u;
     routing::KernelBlockAttr kb = ti->kernelBlock;
     ArrayRef<int64_t> shape = kb.getShape(), tensor = kb.getTensorShape();

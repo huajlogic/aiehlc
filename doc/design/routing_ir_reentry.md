@@ -111,6 +111,13 @@ dmap re-entry is not implemented: `RoutingToDmapPass` occupies links and creates
 DataIOs in `rtopology` that `DmapToDmaphopPass` continues from, so a dmap edit hits
 the same problem one stage earlier.
 
+**Dataflow plans are the safe way to change dmaphop data movement.** `dmaphop.plan*` ops are an
+*addition*, not an edit: `readIROverride` compares the file without them (and, for the routing IR,
+without the derived control-plane placement attributes `control_plan_shim_col / _mm2s_ch /
+_s2mm_ch / _exclusive`), so a plan is accepted together with the control-packet plane, and the
+plan's routes are routed around the generated ones instead of re-pairing them. See
+`doc/design/dmaphop_dataflow_plan.md`.
+
 ## flowcheck: catch a re-paired flow at build time
 
 `script/test/flowcheck.py <worklocal>` (static, well under a second) checks that

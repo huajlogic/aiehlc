@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 
+#include "dataflowplan/dataflowplan.h"
 #include "passdmaphopprovenancemap.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -322,6 +323,7 @@ struct PartitionInfo {
 struct CommPathEntry {
     std::string id;
     std::string direction; // "push" or "pull"
+    int64_t planReplaced = -1; // kernel arg whose flow the dataflow plan realizes instead (-1: none)
 
     // Data info
     std::vector<int64_t> tensorShape;
@@ -425,6 +427,8 @@ static CommPathEntry processPushOp(dmaphop::push pushOp, int &counter) {
     CommPathEntry entry;
     entry.id = "push_" + std::to_string(counter++);
     entry.direction = "push";
+    if (auto r = pushOp->getAttrOfType<IntegerAttr>("dmaphop.plan_replaced"))
+        entry.planReplaced = r.getInt();
 
     // Get data tensor info
     auto dataType = dyn_cast<RankedTensorType>(pushOp.getData().getType());
@@ -715,6 +719,8 @@ static void writeCommPathJson(JsonWriter &jw, const CommPathEntry &entry) {
 
     jw.keyValue("id", entry.id);
     jw.keyValue("direction", entry.direction);
+    if (entry.planReplaced >= 0)
+        jw.keyValue("plan_replaced", entry.planReplaced);
 
     // Data section
     jw.key("data");
@@ -961,6 +967,26 @@ void DmaphopProvenanceMapPass::runOnOperation() {
     jw.keyValue("m_rounds", modAttrs.m_rounds);
     jw.keyValue("n_rounds", modAttrs.n_rounds);
     jw.endObject();
+
+    // Dataflow plan routes (dmaphop.plan_route): flowcheck simulates them through
+    // routing.cc like the generated flows. dsts = "col,row,s2mm_ch col,row,s2mm_ch ..."
+    if (dfplan::activePlan().present) {
+        jw.beginArray("plan_routes");
+        for (const auto &r : dfplan::activePlan().routes) {
+            jw.beginObjectInline();
+            jw.keyValue("src_col", (int64_t)r.src.col);
+            jw.keyValue("src_row", (int64_t)r.src.row);
+            jw.keyValue("src_ch", (int64_t)r.srcCh);
+            jw.keyValue("src_kind", StringRef(r.srcShim ? "shim" : "dma"));
+            std::string d;
+            for (const auto &[t, ch] : r.dsts)
+                d += (d.empty() ? "" : " ") + std::to_string(t.col) + "," + std::to_string(t.row) + "," +
+                     std::to_string(ch);
+            jw.keyValue("dsts", StringRef(d));
+            jw.endObject();
+        }
+        jw.endArray();
+    }
 
     // Communication paths
     jw.beginArray("communication_paths");

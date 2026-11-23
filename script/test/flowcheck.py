@@ -137,8 +137,12 @@ def check(worklocal):
     mm2s, s2mm = shim_ports(prov.get("aie_gen", ""))
     s2mm_port_to_ch = {p: ch for ch, p in s2mm.items()}
     errors, flows, owner = [], [], defaultdict(list)
+    replaced = []
     for path in prov["communication_paths"]:
         fid = path["id"]
+        if "plan_replaced" in path:  # realized by the dataflow plan; its routes are checked below
+            replaced.append(fid)
+            continue
         st = {s["role"]: s for s in path["stages"]}
         prod, cons = st["producer"], st["consumer"]
         if path["direction"] == "push":
@@ -174,10 +178,30 @@ def check(worklocal):
                 errors.append(f"{fid} from {name}: also reaches {sorted(extra)}")
         flows.append({"id": fid, "direction": path["direction"], "want": sorted(map(list, want)),
                       "reached": sorted({tuple(e) for _, g, _ in sources for e in g})})
+    for i, r in enumerate(prov.get("plan_routes", [])):  # dmaphop.plan_route: the plan's own nets
+        fid = f"plan_route_{i}"
+        c, row, ch = r["src_col"], r["src_row"], r["src_ch"]
+        want = {("core", *map(int, d.split(","))) for d in r["dsts"].split()}
+        if r["src_kind"] == "shim":
+            port = mm2s.get(ch)
+            if (c, port) not in sw.shim_in:
+                errors.append(f"{fid}: shim ({c},0) MM2S ch{ch} -> SOUTH {port} is not enabled in routing.cc")
+            got, notes = sw.deliver((c, 0, "SOUTH", port), None, s2mm_port_to_ch)
+        else:
+            got, notes = sw.deliver((c, row, "DMA", ch), None, s2mm_port_to_ch)
+        for n in sorted(set(notes)):
+            errors.append(f"{fid}: {n}")
+        for e in got:
+            owner[e].append(fid)
+        if want - got:
+            errors.append(f"{fid} from ({c},{row}) ch{ch}: does not reach {sorted(want - got)}")
+        if got - want:
+            errors.append(f"{fid} from ({c},{row}) ch{ch}: also reaches {sorted(got - want)}")
+        flows.append({"id": fid, "direction": "plan", "want": sorted(map(list, want)), "reached": sorted(got)})
     for e, fids in owner.items():
         if len(set(fids)) > 1:
             errors.append(f"{e} is reached by several flows: {sorted(set(fids))}")
-    return {"ok": not errors, "errors": errors, "flows": flows}
+    return {"ok": not errors, "errors": errors, "flows": flows, "plan_replaced": replaced}
 
 
 def main():
@@ -191,7 +215,8 @@ def main():
     else:
         for e in r["errors"]:
             print("FLOWCHECK ERROR:", e)
-        print(f"flowcheck: {'OK' if r['ok'] else 'FAIL'} -- {len(r['flows'])} flows, {len(r['errors'])} error(s)")
+        extra = f", {len(r['plan_replaced'])} replaced by the dataflow plan" if r["plan_replaced"] else ""
+        print(f"flowcheck: {'OK' if r['ok'] else 'FAIL'} -- {len(r['flows'])} flows{extra}, {len(r['errors'])} error(s)")
     return 0 if r["ok"] else 1
 
 

@@ -66,6 +66,11 @@ struct KernelBlock {
     int64_t roundsI = 1, roundsJ = 1;  // blocks per core = roundsI * roundsJ
     bool resident = false;             // {.resident = true}
     int64_t tileR = 0, tileC = 0;      // {.tile = {tileR, tileC}}, 0 = none
+    // Dataflow intent (-> `dataflow` dict on the tensor op, doc/design/dmaphop_dataflow_plan.md):
+    int share = 0;     // {.share = aie::share::neighbor} (1)
+    int stage = 0;     // {.stage = aie::stage::memtile} (1) / memtile_ring (2)
+    int ring = 0;      // {.ring = N}: MemTile FIFO ring buffers
+    bool keep = false; // {.keep = true}: loaded on the first launch, kept across launches
     bool empty() const { return shape.empty(); }
 };
 
