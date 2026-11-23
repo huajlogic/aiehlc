@@ -812,3 +812,25 @@ stress launches. Same build line as before; the change is in `share2x8_tile.inc`
   - Loops: chunk 0 146, middle 131, last 139 bundles per 128 MACs; `ka_tile` is 1214 bundles
     and still fits in program memory.
 
+### Static bound of the current kernel (kernel.lst, 2026-11-22)
+
+One 64 x 64 tile (20 chunks of 1024 MACs) as compiled:
+
+| part | bundles |
+|---|---|
+| prologue | 114 |
+| chunk 0: 7 x 146 (zero-start loop) + boundary 155 | 1177 |
+| chunks 1-18: chess unrolls by 2, 9 x (2 x 7 x 131 + 151 + 157) | 19278 |
+| last chunk: 7 x 139 (output loop) + tail 90 | 1063 |
+| **total** | **21632 bundles for 20480 MACs = 94.7 %** |
+
+- **This is the ceiling with zero stalls, zero lock waits and zero launch fill.**
+- **Measured: 84.5 %**, i.e. about 10 % lost dynamically:
+  - memory (bank-conflict) stalls ~5 %;
+  - lock waits ~3 %;
+  - launch fill / drain ~1.5 %.
+- **What 95 % would need:** both a better static schedule and almost no dynamic loss.
+- **Tried and reverted:** acquiring the next chunk after the first 14 steps of the boundary
+  block (1.17-1.22 ms, more variance): less slack before the next chunk is needed.
+- **Program memory:** 16173 of 16384 B used.
+
