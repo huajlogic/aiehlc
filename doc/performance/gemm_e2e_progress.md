@@ -795,4 +795,11 @@ stress launches. Same build line as before; the change is in `share2x8_tile.inc`
 - **Moving a channel's two slots into different DM banks (`--qslot`) changed nothing.** Memory
   stalls stayed at ~75 k and conflicts at ~45 k per bank. The conflicts are between the two
   reader cores, not with the DMA.
+- **A through the MemTile as a fine ring (`--afine`, 1.192 -> 1.176 ms, 83.6 %).** With NT2 = 1 the
+  row-2 MemTile is only a FIFO for A.
+  - Before: whole 80 KB m-tile halves, so the MM2S waited for 80 KB before the first chunk
+    reached a core.
+  - Now: a ring of 10 x 16 KB buffers on counting locks (empty 20 = 10, full 24); the first
+    chunk flows after 16 KB. That shortens the launch fill.
+  - `gemm_plan.py` adds the flag whenever NT2 = 1.
 
