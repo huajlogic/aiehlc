@@ -668,7 +668,7 @@ launch. Build: `share2x8.py ... --r2 42 --nt2 1 --k 2560 --bres --single --persi
 | board | memory system | chosen | model (measured) |
 |---|---|---|---|
 | palmyra | 1 MC, DDR-bound | 4 x 4 MemTile-staged, weight-resident, R 21 NT 3 K 2560 | 62.4 % (64.7 %) |
-| VEK385 | 3 MC interleaved, DDR not binding | 2 x 8 shared, persistent, tile pipeline, R2 42 NT2 1 K 2560 | 76.4 % (77.4 %) |
+| VEK385 | 3 MC interleaved, DDR not binding | 2 x 8 shared, persistent, tile pipeline, R2 60 NT2 1 K 2560 | 76.9 % (78.9 %) |
 | a board with 3 separate MC zones | separate controllers | 2 x 8 with `--zones` (A, C, B on different controllers) | -- (not measured) |
 
 ### KC = 256 (`--kc 256`, `share2x8_tile_fold.inc`): correct, not yet faster
@@ -708,3 +708,16 @@ launch. Build: `share2x8.py ... --r2 42 --nt2 1 --k 2560 --bres --single --persi
   reacquire (i = 6/7), about 1400 cycles for 8 KB per channel. With releases at i = 0..3 and
   acquires at i = 4..7 it was about 300 cycles (0.953 ms). KC 128 rotates 4 buffers per stream.
   A 3rd slot (48 KB of buffers) does not fit next to 16 KB of accumulators + 8 KB C + 4 KB stack.
+
+### Largest launch: R2 60 -- 78.9 % (2026-11-22)
+
+**VEK385: 1.246 ms per 10.07 G MAC = 78.9 % of the true 1.25 GHz peak** (the log's "98.85 %"
+is against the old 998 MHz constant). GOLDEN PASS (187,758 sampled outputs), 0 / 3 stress
+launches bad. Build: `share2x8.py ... --r2 60 --nt2 1 --k 2560 --bres --single --persist --tile`.
+
+- 60 tiles per core is the largest legal shape: R2 must be a multiple of 3 and even, and the
+  output BD iteration count is 6 bits (`--single` needs T <= 64). R2 63 is rejected by the
+  generator's shape assert.
+- The gain over R2 42 (77.4 %) is the per-launch fill / drain spread over 43 % more MACs.
+  `gemm_plan.py --check` stays within 3.0 points (model 76.9 %).
+

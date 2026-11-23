@@ -196,3 +196,12 @@ gs90 65.5 %, versus 57.0 % / 64.7 % on palmyra. See `doc/performance/gemm_e2e_pr
 - `__aie_launch`'s cache-maintenance sizes come from the build's ports: if the host allocates a
   smaller non-cacheable buffer, the range runs past it and every launch cleans the cache (+0.43 ms).
 - VEK385 `DDR_CH_1` (0x500_0000_0000) hangs the A78 on this PDI; `DDR_LOW1` works.
+
+## VEK385: 2 x 8 shared-operand layout, 78.9 % of the 1.25 GHz peak
+`example/tileprogram/ccode/gemm_memtile/share2x8.py <base aout/worklocal> --r2 60 --nt2 1 --k 2560
+--bres --single --persist --tile` -> 1.246 ms per 10.07 G MAC, GOLDEN PASS. R2 60 is the largest
+legal launch (R2 % 3 == 0, T even, at most 64 output tiles per core: the BD iteration count is
+6 bits); larger launches spread the fill / drain (R2 42: 77.4 %). The profiling line prints
+"% of peak" against 998 MHz -- rescale by 998 / 1250 on VEK385. Which design per board (MC
+count, DDR zones): `script/perf/gemm_plan.py --board vek385|palmyra`. Details:
+`doc/performance/gemm_e2e_progress.md`.
