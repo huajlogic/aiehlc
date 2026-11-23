@@ -39,6 +39,7 @@ ap.add_argument('--a2ch', action='store_true', help='A on both shim MM2S channel
 ap.add_argument('--dmaonly', action='store_true', help='measurement: the tile kernel does no MACs (locks / DMA unchanged) -- the data-delivery bound; output is garbage (needs --tile)')
 ap.add_argument('--perfcnt', action='store_true', help='measurement: per-core active / memory-stall / lock-stall / vector-instr counters (+ DM bank 4 / 6 conflicts) over launch 3 (build without AIEHLC_PROFILING)')
 ap.add_argument('--qslot', action='store_true', help='buffer address index 2 slot + ch (a channel\'s two slots in different DM banks) instead of 2 ch + slot (--tile, KC 128)')
+ap.add_argument('--afine', action='store_true', help='row-2 MemTile A as a FIFO ring of 10 x 16 KB buffers with counting locks (first chunks flow after 16 KB, not a whole 80 KB m-tile half); needs NT2 1, R2 even')
 ap.add_argument('--stress', type=int, default=0, help='N extra launches, each fully sampled-checked; failures listed per tile')
 args = ap.parse_args()
 wl, bres = args.wl, args.bres
@@ -48,6 +49,7 @@ assert args.k % 256 == 0 and R2 % (4 if args.a2ch else 3) == 0 and T % 2 == 0 an
 assert not args.single or T <= 64, '--single needs <= 64 tiles per core'
 assert 2 * NT2 * NK * 8192 <= 512 * 1024, 'B strips do not fit the row-1 MemTile'
 NB = 4 if args.a2ch else 3  # A buffers in the row-2 MemTile
+assert not args.afine or (NT2 == 1 and R2 % 2 == 0 and NK == 20 and not args.a2ch), '--afine shape (ring = 2 m-tile halves of 10 chunks)'
 assert not args.a2ch or (bres and R2 % 4 == 0 and NB * NK // 2 * 8192 <= 512 * 1024 and 27 + NB * NT2 <= 48), '--a2ch shape'
 assert R2 <= 64 and NT2 * NK // 2 <= 1023
 
@@ -108,6 +110,8 @@ MT = r'''/* SHARE2X8 MemTiles. Row 2, column c: A strip c >> 1, chunk parity c &
 #define SH_NK %(NK)d
 #define SH_NB %(NB)d /* A buffers (row 2) */
 #define SH_A2 %(A2)d /* A on both shim channels: even m tiles -> S2MM ch1, odd -> ch0 */
+#define SH_FINE %(FINE)d /* A ring: SH_FB buffers of 2 chunks, counting locks E 20 (init SH_FB) / F 24 */
+#define SH_FB 10
 static void sh_mt_bd(XAie_DevInst *dev, XAie_LocType mt, int bd, unsigned addr, unsigned len, int acq, int acqv,
                      int rel, int relv, int next, int nchunk) {
     XAie_DmaDesc d;
@@ -136,7 +140,11 @@ static void sh_memtiles(XAie_DevInst *dev, int col) {
     const unsigned half = SH_NK / 2 * 8192u, strip = SH_NT2 * SH_NK * 8192u;
     static int written[8], b_loaded[8];
     /* A: empty 20+b = 1, full 24+b = 0 */
-    for (int b = 0; b < SH_NB; b++) {
+    for (int b = 0; SH_FINE && b < 1; b++) {
+        XAie_LockSetValue(dev, ma, XAie_LockInit(20, SH_FB));
+        XAie_LockSetValue(dev, ma, XAie_LockInit(24, 0));
+    }
+    for (int b = 0; !SH_FINE && b < SH_NB; b++) {
         XAie_LockSetValue(dev, ma, XAie_LockInit(20 + b, 1));
         XAie_LockSetValue(dev, ma, XAie_LockInit(24 + b, 0));
     }
@@ -146,7 +154,11 @@ static void sh_memtiles(XAie_DevInst *dev, int col) {
     XAie_LockSetValue(dev, mb, XAie_LockInit(7, keep_b ? 0 : 1));
     if (!written[col]) {
         written[col] = 1;
-        for (int b = 0; b < SH_NB; b++) {
+        for (int b = 0; SH_FINE && b < SH_FB; b++) { /* ring: S2MM BDs 24.., MM2S BDs 24 + SH_FB.. */
+            sh_mt_bd(dev, ma, 24 + b, 0x80000 + b * 16384u, 16384, 20, -1, 24, 1, b < SH_FB - 1 ? 25 + b : -1, 0);
+            sh_mt_bd(dev, ma, 24 + SH_FB + b, 0x80000 + b * 16384u, 16384, 24, -1, 20, 1, b < SH_FB - 1 ? 25 + SH_FB + b : -1, 0);
+        }
+        for (int b = 0; !SH_FINE && b < SH_NB; b++) {
             if (SH_A2) { /* chain (0, 2) on ch1 = BDs 24, 25; (1, 3) on ch0 = BDs 0, 1 */
                 const int id = (b & 1) ? (b >> 1) : 24 + (b >> 1);
                 sh_mt_bd(dev, ma, id, 0x80000 + b * half, half, 20 + b, -1, 24 + b, 1, (b >> 1) < SH_NB / 2 - 1 ? id + 1 : -1, 0);
@@ -155,7 +167,7 @@ static void sh_memtiles(XAie_DevInst *dev, int col) {
             }
         }
         int bd = 27;
-        for (int b = 0; b < SH_NB; b++)
+        for (int b = 0; !SH_FINE && b < SH_NB; b++)
             for (int r = 0; r < SH_NT2; r++, bd++) {
                 const int last = (b == SH_NB - 1 && r == SH_NT2 - 1);
                 sh_mt_bd(dev, ma, bd, 0x80000 + b * half, half, 24 + b, -1, r == SH_NT2 - 1 ? 20 + b : 24 + b, 1,
@@ -174,10 +186,15 @@ static void sh_memtiles(XAie_DevInst *dev, int col) {
         for (int m = 0; m < 4; m++)
             XAie_DmaChannelEnable(dev, mb, (u8)m, DMA_MM2S);
     }
+    if (SH_FINE) { /* the ring holds 2 m-tile halves (SH_FB x 2 chunks = NK chunks) */
+        XAie_DmaChannelSetStartQueue(dev, ma, 1, DMA_S2MM, 24, SH_R2 / 2, 0);
+        XAie_DmaChannelSetStartQueue(dev, ma, 1, DMA_MM2S, 24 + SH_FB, SH_R2 / 2, 0);
+    } else
     XAie_DmaChannelSetStartQueue(dev, ma, 1, DMA_S2MM, 24, SH_R2 / SH_NB, 0);
     if (SH_A2)
         XAie_DmaChannelSetStartQueue(dev, ma, 0, DMA_S2MM, 0, SH_R2 / SH_NB, 0);
-    XAie_DmaChannelSetStartQueue(dev, ma, 1, DMA_MM2S, 27, SH_R2 / SH_NB, 0);
+    if (!SH_FINE)
+        XAie_DmaChannelSetStartQueue(dev, ma, 1, DMA_MM2S, 27, SH_R2 / SH_NB, 0);
     if (!keep_b)
         XAie_DmaChannelSetStartQueue(dev, mb, 0, DMA_S2MM, 0, 1, 0);
     b_loaded[col] = 1;
@@ -185,7 +202,7 @@ static void sh_memtiles(XAie_DevInst *dev, int col) {
     for (int m = 0; m < 4; m++)
         XAie_DmaChannelSetStartQueue(dev, mb, (u8)m, DMA_MM2S, (u8)mbd[m], SH_R2, 0);
 }
-''' % {'R2': R2, 'NT2': NT2, 'NK': NK, 'NB': NB, 'A2': 1 if args.a2ch else 0, 'BRES': 1 if bres else 0}
+''' % {'R2': R2, 'NT2': NT2, 'NK': NK, 'NB': NB, 'A2': 1 if args.a2ch else 0, 'FINE': 1 if args.afine else 0, 'BRES': 1 if bres else 0}
 hs = hs.replace('void host_canonicalized(', MT + 'void host_canonicalized(', 1)
 hs, n = re.subn(r'  for \(int mc = 1; mc <= 4; mc\+\+\) memtile_ab\(v1, mc, [^)]*\); /\* MEMTILE B \+ A \*/',
                 '  for (int mc = 1; mc <= 4; mc++) sh_memtiles(v1, mc); /* SHARE2X8 MemTiles */', hs)
