@@ -33,6 +33,7 @@ ap.add_argument('--persist', action='store_true', help='kernel stays loaded: lat
 ap.add_argument('--tile', action='store_true', help='one software pipeline per tile across chunk boundaries (share2x8_tile.inc)')
 ap.add_argument('--bench', action='store_true', help='before launch 0 each core runs 2 tiles of ka_tile with no lock waits; cycles stamped (needs --tile --kcyc)')
 ap.add_argument('--zones', default='', help='DDR zone per operand, e.g. A=0x50000000000:0x200000000,C=0x60000000000:0x100000000 (base:size); default heap (DDR_LOW0)')
+ap.add_argument('--kc', type=int, default=128, choices=(128, 256), help='K chunk of the tile kernel (256: needs --tile; each chunk arrives as two 8 KB halves, one per channel)')
 ap.add_argument('--kcyc', action='store_true', help='cores stamp cycle split (total / input wait / mac / output wait / convert) into their last tile')
 ap.add_argument('--stress', type=int, default=0, help='N extra launches, each fully sampled-checked; failures listed per tile')
 args = ap.parse_args()
@@ -322,6 +323,31 @@ if args.zones:
     hs = hs.replace(old, 'int8_t *Ct = %s;' % zal('C', 'M * N', '(int8_t *)__Runtime_Alloc(M * N)'))
     hs = hs.replace('void *__Runtime_alloc_uncached(size_t bytes);', 'void *__Runtime_alloc_uncached(size_t bytes);\nvoid *__Runtime_alloc_zone(uint64_t zone_base, uint64_t zone_size, size_t bytes);', 1)
     hs = hs.replace('int main() {', 'int main() {\n    printf("[share2x8] zones: %s\\n");' % args.zones, 1)
+if args.kc == 256:
+    n_ = hs.count('#define KA_KC 128')
+    assert n_ >= 1, n_
+    hs = hs.replace('#define KA_KC 128', '#define KA_KC 256 /* SHARE2X8: packed in 256-wide chunks */')
+    a_ = hs.index('static void sh_arrange(')
+    b_ = hs.index('\n}\n', a_) + 3
+    hs = hs[:a_] + """static void sh_arrange(const int8_t *Ap, const int8_t *Bp, int8_t *A2, int8_t *B2, long M, long K) {
+    /* KC 256: a chunk = 64 rows x 256 (packed); column c's A stream = the (c & 1) half (rows 32 (c & 1) ..
+       + 31, 8 KB) of every chunk of strip c >> 1; column c's B = strips c, c+4, whole 16 KB chunks. */
+    const long nk = K / 256;
+    int8_t *a = A2;
+    for (int c = 0; c < 4; c++)
+        for (long s = 0; s < SH_R2; s++)
+            for (long j = 0; j < nk; j++)
+                for (int r = 0; r < 32; r++, a += 256)
+                    memcpy(a, Ap + ((c >> 1) * (M / 2) + s * 64 + 32 * (c & 1) + r) * K + j * 256, 256);
+    int8_t *b = B2;
+    for (int c = 0; c < 4; c++)
+        for (int half = 0; half < 2; half++)
+            for (long nt = 0; nt < SH_NT2; nt++)
+                for (long j = 0; j < nk; j++)
+                    for (int r = 0; r < 64; r++, b += 256)
+                        memcpy(b, Bp + (((c + 4 * half) * SH_NT2 + nt) * 64 + r) * K + j * 256, 256);
+}
+""" + hs[b_:]
 open(wl + '/host.cc', 'w').write(hs)
 print('host: MemTiles, DDR layout, golden mapping%s' % (', weight-resident B' if bres else ''))
 
@@ -355,8 +381,16 @@ KCO = r'''  { // SHARE2X8 S2MM: this tile hosts one operand stream; chunk parity
     }
     aie_kc_encode_lock(_kc, 14, 1); // go lock: the first launch runs at once (persistent mode)
     core_reg_write(_kc[0].off, _kc[0].val);
+    aie_kc_encode_lock(_kc, 15, 1); // dummy lock for the tile pipeline's last boundary (always 1)
+    core_reg_write(_kc[0].off, _kc[0].val);
   }
 '''
+if args.kc == 256:
+    KCO = KCO.replace("const AieKcDims _d = {1, 128, 128, 8, 4096, 0, 0}; // 512 B x 8 = 4 KB, then +16 KB (wraps are 8-bit: 256 = off)",
+                      "const AieKcDims _d = {0, 0, 0, 0, 0, 0, 0}; // KC 256: channel c's 8 KB half, contiguous in bank 2 + c")
+    old_bd = "_n = aie_kc_encode_bd_nd(_kc, (uint8_t)_q, (uintptr_t)(0x78000 + _q * 4096), 8192, 2 * _ch + (_k ^ 1),"
+    assert old_bd in KCO
+    KCO = KCO.replace(old_bd, "_n = aie_kc_encode_bd_nd(_kc, (uint8_t)_q, (uintptr_t)(0x78000 + _ch * 0x4000 + _k * 8192), 8192, 2 * _ch + (_k ^ 1),")
 kc = kc[:a] + KCO + kc[b:]
 if not args.single:
     # output: two tiles per packet. The packet must not START before both tiles are written -- a packet
@@ -374,7 +408,7 @@ print('kernel.cc: hosted-stream DMA')
 
 # ---------------------------------------------------------------- gemm_ka.cc: kernel body
 gk = open(wl + '/gemm_ka.cc').read()
-CHUNK = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share2x8_tile.inc' if args.tile else 'share2x8_chunk.inc')).read()
+CHUNK = ('#define K4_KC %d\n' % args.kc if args.tile else '') + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ('share2x8_tile_fold.inc' if args.kc == 256 else 'share2x8_tile.inc') if args.tile else 'share2x8_chunk.inc')).read()
 gk = gk.replace('  void gemm_ka(', CHUNK + '\n  void gemm_ka(', 1)
 a = gk.index('#if defined(__chess__)\n    // On the core')
 b = gk.index('#else\n    // Traced')
@@ -465,7 +499,7 @@ if args.tile:
                         acc + 2048); /* whole tile, one pipeline; lock waits inside (KCYC counts them as mac) */
                 gc += %d;
                 k_mac += (uint64_t)aie::tile::current().cycles() - k2;
-""" % (NK, NK)) + gk[b:]
+""" % (args.k // args.kc, args.k // args.kc)) + gk[b:]
     a = gk.index('                for (int bl = 0; bl < 16; bl++) { /* iteration block bl holds logical block bl ^ 8 al ^ 2 be */')
     b = gk.index('                k_cv += ', a)
     gk = gk[:a] + '                sh_convert(y, acc, (al << 3) ^ (be << 1));\n' + gk[b:]

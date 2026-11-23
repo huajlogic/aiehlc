@@ -670,3 +670,23 @@ launch. Build: `share2x8.py ... --r2 42 --nt2 1 --k 2560 --bres --single --persi
 | palmyra | 1 MC, DDR-bound | 4 x 4 MemTile-staged, weight-resident, R 21 NT 3 K 2560 | 62.4 % (64.7 %) |
 | VEK385 | 3 MC interleaved, DDR not binding | 2 x 8 shared, persistent, tile pipeline, R2 42 NT2 1 K 2560 | 76.4 % (77.4 %) |
 | a board with 3 separate MC zones | separate controllers | 2 x 8 with `--zones` (A, C, B on different controllers) | -- (not measured) |
+
+### KC = 256 (`--kc 256`, `share2x8_tile_fold.inc`): correct, not yet faster
+
+- **The data path is byte-identical; only the kernel and its locks change.** A 256-wide chunk is
+  two consecutive 8 KB pieces: rows 0-31 arrive on channel 0 (bank 2), rows 32-63 on channel 1
+  (bank 3), both into slot g & 1. MemTiles, shim walks and routing stay the same; the host packs
+  at 256 and lays out the pieces. GOLDEN PASS, every stress launch clean.
+- **Program memory decides the shape.** With the peeled chunk boundary, 32-step blocks need
+  26 KB (limit 16 KB).
+- **Folding the boundary into the loop** (iteration 7 = boundary, selects for the switch, lock
+  work at the top of the body) fits in 11.9 KB, but runs at 462 bundles per 256 MACs:
+  - branch tests with delay slots on every iteration;
+  - pointer spills to the stack.
+
+  1.17 ms against 0.891 for KC 128.
+- **An acquire with lock value 0 waits for the lock to EQUAL 0**, not ">= 0". A dummy acquire
+  hung once the next chunk was already filled. Use a private lock held at 1 (own 15) instead.
+- **Next:** spread the lock work over the 8 iterations (one acquire + one release per
+  iteration, ids from a per-chunk table, a dummy lock elsewhere) so the body stays
+  branch-free. Expected: about +5-8 points.
