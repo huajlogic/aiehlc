@@ -802,4 +802,13 @@ stress launches. Same build line as before; the change is in `share2x8_tile.inc`
   - Now: a ring of 10 x 16 KB buffers on counting locks (empty 20 = 10, full 24); the first
     chunk flows after 16 KB. That shortens the launch fill.
   - `gemm_plan.py` adds the flag whenever NT2 = 1.
+- **Chunk 0 starts from zero registers (`K4_LDZ`), so `acc` is never zeroed (1.176 -> 1.163 ms,
+  ~84.5 %; best launch 84.9 %).**
+  - The zero stores in the output loop had run in a serial block with no MACs: chess could not
+    prove they did not alias the accumulator loads. That loop also spilled (208 bundles per
+    128 MACs).
+  - Now the tile is peeled explicitly: chunk 0 is `SH_INNER_W(K4_STI, K4_LDZ)`, the middle
+    chunks are the plain loop, and the last chunk is `SH_INNER_W(K4_OUT, K4_LD)`.
+  - Loops: chunk 0 146, middle 131, last 139 bundles per 128 MACs; `ka_tile` is 1214 bundles
+    and still fits in program memory.
 

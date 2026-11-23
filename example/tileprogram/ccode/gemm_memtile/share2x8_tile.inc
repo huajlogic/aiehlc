@@ -24,6 +24,15 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         c##2 = KaMM4(q2_);                                                                                             \
         c##3 = KaMM4(q3_);                                                                                             \
     }
+/* chunk 0 of a tile: the accumulators start at zero -- no load, and nobody has to zero acc */
+#define K4_LDZ(c, p)                                                                                                   \
+    {                                                                                                                  \
+        const aie::accum<acc32, 64> z_ = aie::zeros<acc32, 64>();                                                      \
+        c##0 = KaMM4(z_);                                                                                              \
+        c##1 = KaMM4(z_);                                                                                              \
+        c##2 = KaMM4(z_);                                                                                              \
+        c##3 = KaMM4(z_);                                                                                              \
+    }
 #define K4_ST(p, c)                                                                                                    \
     {                                                                                                                  \
         aie::store_v((p), (c##0).to_vector<int32_t>());                                                                \
@@ -32,15 +41,11 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         aie::store_v((p) + 192, (c##3).to_vector<int32_t>());                                                          \
     }
 /* last chunk of a tile: the accumulators are final -- int8 straight to the output tile (block bl at logical
- * L = bl ^ swz, as sh_convert did) and zeros back to acc for the next tile; no separate convert pass */
+ * L = bl ^ swz, as sh_convert did); no separate convert pass, and acc is never re-zeroed (chunk 0: K4_LDZ) */
 #define K4_OUT(p, c, bl)                                                                                               \
     {                                                                                                                  \
         const int L_ = (bl) ^ swz;                                                                                     \
         int8_t *tt_ = y + ((2 * (L_ >> 2)) * 8 + 2 * (L_ & 3)) * 64;                                                   \
-        aie::store_v((p), aie::zeros<int32_t, 64>());                                                                  \
-        aie::store_v((p) + 64, aie::zeros<int32_t, 64>());                                                             \
-        aie::store_v((p) + 128, aie::zeros<int32_t, 64>());                                                            \
-        aie::store_v((p) + 192, aie::zeros<int32_t, 64>());                                                            \
         aie::store_v(tt_, (c##0).to_vector<int8_t>(0));                                                                \
         aie::store_v(tt_ + 64, (c##1).to_vector<int8_t>(0));                                                           \
         aie::store_v(tt_ + 8 * 64, (c##2).to_vector<int8_t>(0));                                                       \
@@ -82,6 +87,8 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
 #undef K4_ST
 #undef K4_OUT
 #define K4_OUT(p, c, bl) {}
+#undef K4_LDZ
+#define K4_LDZ(c, p) {}
 #undef K4_STEPX
 #define K4_LD(c, p) {}
 #define K4_ST(p, c) {}
@@ -120,14 +127,13 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
     }
 /* 7 iterations: blocks 1 .. 14 of the current chunk (state: X = block 0 done, Y = block 1 loaded) */
 #define K4_STI(p, c, bl) K4_ST(p, c)
-#define SH_INNER() SH_INNER_W(K4_STI)
-#define SH_INNER_W(ST)                                                                                                 \
+#define SH_INNER_W(ST, LD)                                                                                             \
     for (int i = 0; i < 7; i++) {                                                                                      \
         ST(cur, X, 2 * i);                                                                                             \
-        K4_LD(X, nxt);                                                                                                 \
+        LD(X, nxt);                                                                                                    \
         K4_BLK(Y, aY, bY, aX, bX);                                                                                     \
         ST(cur + 256, Y, 2 * i + 1);                                                                                   \
-        K4_LD(Y, nxt + 256);                                                                                           \
+        LD(Y, nxt + 256);                                                                                              \
         const int8_t *aY2 = aX;                                                                                        \
         K4_BLK(X, aX, bX, aY2, bYo);                                                                                   \
         int32_t *t_ = cur + 512;                                                                                       \
@@ -141,6 +147,22 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         tb = bX;                                                                                                       \
         bX = bXo;                                                                                                      \
         bXo = tb;                                                                                                      \
+    }
+/* boundary: blocks 14, 15 of chunk g, blocks 0, 1 of chunk g+1; then g = g + 1 */
+#define SH_BOUND()                                                                                                     \
+    {                                                                                                                  \
+        const int8_t *nAl, *nAh, *nBl, *nBh;                                                                           \
+        SH_ACQ(g + 1);                                                                                                 \
+        SH_HALVES(g + 1, nAl, nAh, nBl, nBh);                                                                          \
+        K4_ST(cur, X);                                                                                                 \
+        K4_LD(X, ae);                                                                                                  \
+        K4_BLK(Y, aY, bY, nAl, nBl);                                                                                   \
+        SH_REL(g);                                                                                                     \
+        K4_ST(cur + 256, Y);                                                                                           \
+        K4_LD(Y, ae + 256);                                                                                            \
+        K4_BLK(X, nAl, nBl, nAl, nBl + 2048);                                                                          \
+        SH_RESET(nAl, nAh, nBl, nBh);                                                                                  \
+        g++;                                                                                                           \
     }
 /* pointer state for a chunk whose halves are (al_, ah_, bl_, bh_) */
 #define SH_RESET(al_, ah_, bl_, bh_)                                                                                   \
@@ -156,7 +178,7 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         bXo = (bl_);                                                                                                   \
     }
 /* One 64 x 64 tile over nkc chunks starting at running chunk index g0; accumulators start at ZERO
- * (acc must be zero; the last chunk writes the int8 tile to y and re-zeroes acc). fl: 1 A first reader, 2 B first reader, 4 A halves swapped,
+ * (acc is scratch: chunk 0 starts from zero registers, the last chunk writes the int8 tile to y). fl: 1 A first reader, 2 B first reader, 4 A halves swapped,
  * 8 B halves swapped. */
 __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA, int lB, int fl, unsigned g0, int nkc, int lv,
                                               int32_t *__restrict ae, int32_t *__restrict ao, int8_t *__restrict y, int swz) {
@@ -174,25 +196,17 @@ __attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA
     aie::vector<int8_t, 64> wa0 = aie::load_v<64>(Al + 64), wa1 = aie::load_v<64>(Al + K4_H + 64);
     aie::vector<int8_t, 64> wb0 = aie::load_v<64>(Bl + 64), wb1 = aie::load_v<64>(Bl + K4_H + 64);
     SH_RESET(Al, Ah, Bl, Bh);
-    K4_LD(X, ae);
-    K4_LD(Y, ae + 256);
+    K4_LDZ(X, ae);
+    K4_LDZ(Y, ae + 256);
     K4_BLK(X, Al, Bl, Al, Bl + 2048);
-    for (int j = 0; j < nkc - 1; j++, g++) {
-        SH_INNER();
-        /* boundary: blocks 14, 15 of chunk g, blocks 0, 1 of chunk g+1 */
-        const int8_t *nAl, *nAh, *nBl, *nBh;
-        SH_ACQ(g + 1);
-        SH_HALVES(g + 1, nAl, nAh, nBl, nBh);
-        K4_ST(cur, X);
-        K4_LD(X, ae);
-        K4_BLK(Y, aY, bY, nAl, nBl);
-        SH_REL(g);
-        K4_ST(cur + 256, Y);
-        K4_LD(Y, ae + 256);
-        K4_BLK(X, nAl, nBl, nAl, nBl + 2048);
-        SH_RESET(nAl, nAh, nBl, nBh);
+    /* chunk 0 (accumulators from zero), chunks 1 .. nkc-2, then the last chunk (output); nkc >= 2 */
+    SH_INNER_W(K4_STI, K4_LDZ);
+    SH_BOUND();
+    for (int j = 1; j < nkc - 1; j++) {
+        SH_INNER_W(K4_STI, K4_LD);
+        SH_BOUND();
     }
-    SH_INNER_W(K4_OUT); /* last chunk: blocks go straight to the output tile */
+    SH_INNER_W(K4_OUT, K4_LD); /* last chunk: blocks go straight to the output tile */
     K4_OUT(cur, X, 14);
     K4_BLK(Y, aY, bY, Al, Bl);
     SH_REL(g);
