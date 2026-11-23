@@ -721,3 +721,30 @@ launches bad. Build: `share2x8.py ... --r2 60 --nt2 1 --k 2560 --bres --single -
 - The gain over R2 42 (77.4 %) is the per-launch fill / drain spread over 43 % more MACs.
   `gemm_plan.py --check` stays within 3.0 points (model 76.9 %).
 
+### A on both shim channels (`--a2ch`): works, not faster -- the cores bind, not the shim
+
+- **What it does.** B is resident after launch 0, so its shim MM2S channel is idle from then on.
+  - Launch 0 loads B, waits until the row-1 MemTile's S2MM has finished, and then re-routes
+    that channel once (shim SOUTH 3 -> row-2 MemTile S2MM ch0).
+  - A alternates m tiles: even tiles on ch1, odd tiles on ch0 (shim BD 14).
+  - The row-2 MemTile gets 4 buffers: (0, 2) fed by S2MM ch1, (1, 3) by ch0, one MM2S chain over
+    all four. This needs R2 % 4 == 0.
+- **Result.** GOLDEN PASS, 0 / 3 bad stress launches, but **1.268 ms** against 1.246 ms with A
+  on one channel per column. A is therefore not shim-bound at R2 60: four channels already
+  deliver >= 15.8 GB/s.
+  - `gemm_plan.py` was saying "shim-A-bound" because 3.9 GB/s per channel had been fitted to
+    the same runs.
+  - It now uses 4.2 GB/s (a lower bound) and 0.04 ms launch + fill / drain for 2 x 8. VEK385
+    comes out core-bound and the worst error drops to 2.3 points.
+- **Routing trap found on the way.** A MemTile passes SOUTH / NORTH slave k only to master k.
+  - The first re-route (MemTile SOUTH 1 -> NORTH 5) was silently not connected, and every
+    column hung.
+  - `share_route.route_net` now searches (tile, incoming slave) and ties the lane;
+    `sh_reroute` checks every return code. Skill **memtilepassthroughlane**.
+- **Where the time goes at R2 60.** 60 tiles x 20 chunks x 1262 cycles = 1.212 ms of core
+  time, plus about 0.035 ms of fill / drain.
+  - The no-wait kernel bench is ~1190 cycles / chunk (85.5 %). The single-core peak kernel
+    `simplegemm_peak.cc` reaches 91.5 % with both operands resident.
+  - So the end-to-end ceiling of this design is in the low-to-mid 80s. 95 % of the true peak
+    would need an inner loop faster than the best measured in-core kernel.
+

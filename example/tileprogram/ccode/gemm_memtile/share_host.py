@@ -30,7 +30,9 @@ def packet_cores(routing):
     return out
 
 
-def patch_shim_bds(hs, routing, R2, NT2, NK, T, per_pkt=2):
+def patch_shim_bds(hs, routing, R2, NT2, NK, T, per_pkt=2, a2=False):
+    """a2: this BD streams only the even m tiles (the odd ones go out on channel 0, a_odd_block)"""
+    ra = 2 if a2 else 1
     tiles, root = _vars(hs)
     pkt = packet_cores(routing)
     a_len, b_len = NK // 2 * 8192, NT2 * NK * 8192
@@ -45,7 +47,7 @@ def patch_shim_bds(hs, routing, R2, NT2, NK, T, per_pkt=2):
         if base == 'v2':  # A: column col's stream, contiguous
             kind, off = 'A', (col - 1) * R2 * a_len
             a[1] = str(a_len)
-            a[-9:] = ['3', '4', '32', '128', '64', '8192', str(NK // 2), str(a_len), str(R2)]
+            a[-9:] = ['3', '4', '32', '128', '64', '8192', str(NK // 2), str(ra * a_len), str(R2 // ra)]
         elif base == 'v3':  # B: strip c, strip c+4
             kind, off = 'B', (col - 1) * 2 * b_len
             a[1] = str(b_len)
@@ -79,7 +81,7 @@ def patch_shim_bds(hs, routing, R2, NT2, NK, T, per_pkt=2):
 
     def rep_start(m):
         k = io_kind.get(m.group(1))
-        rep = {'A': R2, 'B': 2, 'C': 4 * T // per_pkt}.get(k or '')
+        rep = {'A': R2 // ra, 'B': 2, 'C': 4 * T // per_pkt}.get(k or '')
         if rep is None:
             return m.group(0)
         return '__Runtime_startio(v1, %s, %s, %d)' % (m.group(1), m.group(2), rep)
@@ -87,3 +89,25 @@ def patch_shim_bds(hs, routing, R2, NT2, NK, T, per_pkt=2):
     hs = re.sub(r'__Runtime_startio\(v1, (v\d+), (\d+), (\d+)\)', rep_start, hs)
     assert n['A'] == 4 and n['B'] == 4 and n['C'] == 16, n
     return hs
+
+
+def a_odd_block(hs, R2, NK, bd=14):
+    """host code: the odd m tiles of each column's A stream on shim MM2S channel 0 (B's channel,
+    free once B is resident), into the row-2 MemTile's S2MM ch0; re-routes on first use"""
+    _, root = _vars(hs)
+    root_var = next(v for v, r in root.items() if r == 'v2' and re.search(
+        r'void\* %s = __runtime_buffer_offset\(v2, 0\);' % v, hs))
+    a_len = NK // 2 * 8192
+    return '''  /* SHARE2X8 --a2ch: odd m tiles of A on shim MM2S ch0 (B's channel; re-routed once B is resident) */
+  static int sh_rerouted;
+  if (!sh_rerouted) {
+    sh_rerouted = 1;
+    sh_reroute(v1);
+  }
+  ioevent sh_ao[4];
+  for (int c = 1; c <= 4; c++) {
+    XAie_DmaDesc d = g_bd_once ? XAie_DmaDesc() : __Runtime_dma_bd_config_multidim_ooo(v1, XAie_TileLoc(c, 0), __runtime_buffer_offset(__runtime_buffer_arg(%(rv)s), (int64_t)((c - 1) * %(R2)dLL * %(al)d + %(al)d)), %(bd)d, %(al)d, -1, 0, 0, 0, 0, 0, 0, -1, 3, 4, 32, 128, 64, 8192, %(hk)d, %(al2)d, %(r2h)d);
+    io o = __Runtime_dma_createio_4(XAie_TileLoc(c, 0), d, 0, %(bd)d, DMA_MM2S);
+    sh_ao[c - 1] = __Runtime_startio(v1, o, %(bd)d, %(r2h)d);
+  }
+''' % {'rv': root_var, 'R2': R2, 'al': a_len, 'bd': bd, 'hk': NK // 2, 'al2': 2 * a_len, 'r2h': R2 // 2}
