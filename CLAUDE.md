@@ -1031,6 +1031,7 @@ Read the matching skill when the task fits:
 | Plug a user-written kernel into a TVM layer (`AIEK_ENTRY`/`AIEK_SPEC`, `--aie-kernel`, `aiekernel check/offload`); an L0xx lint code, calibrate MISMATCH, emulate FAIL, or `rejected at link -- ... routing()` | aieuserkernel |
 | An offloaded layer is slow: attribute its measured ms (MMIO kernel+BSS load, config writes, teardown, console printf in the timed adapter, scalar compute) and rank fixes; `emod.AI_perf_analysis` / `AI_kernel_accelerate` | kernelperfcheck |
 | `AI_kernel_accelerate` / `offload_AI_proto` FileNotFoundError in `_stage` and an EMPTY `aiopt/` dir (kernel deleted); recovering it from Claude transcripts | aistagenodelete |
+| Hand-routed stream through a MemTile never arrives (upstream DMA backpressured, MemTile switch config reads 0): SOUTH/NORTH lane must stay the same index | memtilepassthroughlane |
 | Run/extend the persistent ResNet-18 engine (`resnetengine`: gen_engine.py model mismatch, core memory overflow, ENG FAIL, new layer kind) | resnetengine |
 | resnetengine eager layer-major hangs ~1 run in 3 in a residual layer: `shim_bd_ctrl TIMEOUT ... owing an ack`, input shim with no task; or a few wrong logits | shimctrlpushloss |
 | AIE kernel: +1 errors / constant garbage right after ADDING a code path; statics above `DM_stack` overwritten | aiecorestackoverflow |

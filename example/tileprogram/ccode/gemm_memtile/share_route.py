@@ -36,13 +36,17 @@ class Fabric:
         assert self.free(c, r, ms, t, i), ('port taken', c, r, ms, t, i)
         self.used.add((c, r, ms, t, i))
 
-    def lane(self, c, r, d):
-        """lowest index k with master d k free here and the matching slave free on the neighbour"""
+    def lane(self, c, r, d, need=None):
+        """lowest index k with master d k free here and the matching slave free on the neighbour;
+        need: the only allowed k (a MemTile passes SOUTH / NORTH slave k only to SOUTH / NORTH master k --
+        _XAie2PS_MemTile_StrmSwCheckPortValidity; anything else is silently not connected)"""
         dc, dr = STEP[d]
         nc, nr = c + dc, r + dr
         if not (nc in self.cols and 0 <= nr < self.rows):
             return None
         for k in range(kind(r)['m'].get(d, 0)):
+            if need is not None and k != need:
+                continue
             if self.free(c, r, 'm', d, k) and self.free(nc, nr, 's', OPP[d], k):
                 return k
         return None
@@ -112,27 +116,43 @@ def route_net(fab, src, dests):
     out = []
     for (dc, dr, ch) in dests:
         if (dc, dr) not in tree:
-            # BFS from all tree tiles
-            prev: dict = {t: None for t in tree}
-            q = deque(tree)
-            while q and (dc, dr) not in prev:
-                c, r = q.popleft()
+            # BFS from all tree tiles; state = (tile, incoming slave), since a MemTile's pass-through
+            # lane is tied to the lane it came in on
+            start = [(t[0], t[1], tree[t]) for t in tree]
+            prev: dict = {st: None for st in start}
+            q = deque(start)
+            goal = None
+            while q and goal is None:
+                st = q.popleft()
+                c, r, sl = st
                 for d in ('NORTH', 'EAST', 'WEST', 'SOUTH'):
-                    k = fab.lane(c, r, d)
-                    if k is None:
-                        continue
                     nc, nr = c + STEP[d][0], r + STEP[d][1]
-                    if (nc, nr) in prev:
+                    if (nc, nr) in tree or not (nc in fab.cols and 0 <= nr < fab.rows):
                         continue
-                    prev[(nc, nr)] = (c, r, d, k)
-                    q.append((nc, nr))
-            if (dc, dr) not in prev:
+                    tied = r in (1, 2) and sl[0] in ('SOUTH', 'NORTH') and d in ('SOUTH', 'NORTH')
+                    for k in range(kind(r)['m'].get(d, 0)):
+                        if tied and k != sl[1]:
+                            continue
+                        if not (fab.free(c, r, 'm', d, k) and fab.free(nc, nr, 's', OPP[d], k)):
+                            continue
+                        ns = (nc, nr, (OPP[d], k))
+                        if ns in prev:
+                            continue
+                        prev[ns] = (st, d, k)
+                        if (nc, nr) == (dc, dr):
+                            goal = ns
+                            break
+                        q.append(ns)
+                    if goal is not None:
+                        break
+            if goal is None:
                 raise RuntimeError('no route %s -> %s' % (src, (dc, dr, ch)))
             path = []
-            t = (dc, dr)
-            while prev[t] is not None:
-                path.append(prev[t])
-                t = (prev[t][0], prev[t][1])
+            st = goal
+            while prev[st] is not None:
+                ps, d, k = prev[st]
+                path.append((ps[0], ps[1], d, k))
+                st = ps
             for (c, r, d, k) in reversed(path):
                 sl = tree[(c, r)]
                 fab.book(c, r, 'm', d, k)
