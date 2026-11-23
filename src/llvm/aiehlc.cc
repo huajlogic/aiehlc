@@ -211,6 +211,11 @@ static bool parsedKernelConfigOffload = false;
 // all rounds), no per-round host loop re-programming BDs mid-launch. The host
 // owns the layout conversion. Absent (default) => dense image, byte-identical.
 static bool parsedOutputTileMajor = false;
+// Set by #pragma persistent_kernel: the kernel ELF is loaded and the cores
+// started on the first launch only; later launches release a go lock the
+// kernel waits on (dataflow plan, doc/design/dmaphop_dataflow_plan.md).
+// Published as routing.persistent_kernel only when set.
+static bool parsedPersistentKernel = false;
 static bool parsedControlPlanDedicatedShim = false;
 static bool parsedControlPlanShimBdCtrl = false;
 static int parsedControlPacketMode = 0;
@@ -271,6 +276,10 @@ static KernelBlock kernelBlockFor(const std::string &kernel, const std::string &
     kb.resident = p->second.opts.resident;
     kb.tileR = p->second.opts.tile[0];
     kb.tileC = p->second.opts.tile[1];
+    kb.share = p->second.opts.share;
+    kb.stage = p->second.opts.stage;
+    kb.ring = p->second.opts.ring;
+    kb.keep = p->second.opts.keep;
     return kb;
 }
 // Trace-routed kernel-only kernels: kernel -> port var -> traced block bytes
@@ -3882,6 +3891,18 @@ class AieOutputTileMajorPragmaHandler : public clang::PragmaHandler {
     }
 };
 
+// Bare marker pragma: #pragma persistent_kernel. See parsedPersistentKernel.
+class AiePersistentKernelPragmaHandler : public clang::PragmaHandler {
+  public:
+    AiePersistentKernelPragmaHandler() : PragmaHandler("persistent_kernel") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedPersistentKernel = true;
+        llvm::outs() << "[aiehlc] Detected #pragma persistent_kernel\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
 // Bare marker pragma: #pragma KERNELCONFIGOFFLOAD (no arguments). Its presence
 // opts the pipeline into offloading core-tile DMA configuration (S2MM/MM2S BDs,
 // lock inits, channel start) from the HOST into the AIE CORE kernel, which
@@ -3991,6 +4012,7 @@ public:
             PP.AddPragmaHandler(new AieControlPlanGroupRegWritePragmaHandler());
             PP.AddPragmaHandler(new AieKernelConfigOffloadPragmaHandler());
             PP.AddPragmaHandler(new AieOutputTileMajorPragmaHandler());
+            PP.AddPragmaHandler(new AiePersistentKernelPragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanDedicatedShimPragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanShimBdCtrlPragmaHandler());
             PP.AddPragmaHandler(new AieControlPacketModePragmaHandler());
@@ -5415,6 +5437,8 @@ public:
                         // Opt-in tile-major conv output (see #pragma output_tile_major).
                         module->setAttr("routing.output_tile_major",
                                         fcAttrBuilder.getI64IntegerAttr(parsedOutputTileMajor ? 1 : 0));
+                        if (parsedPersistentKernel) // #pragma persistent_kernel (dataflow plan)
+                            module->setAttr("routing.persistent_kernel", fcAttrBuilder.getI64IntegerAttr(1));
                         module->setAttr("routing.control_plan_dedicated_shim",
                                         fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                         module->setAttr("routing.control_plan_shim_bd_ctrl",
@@ -6172,6 +6196,8 @@ public:
                     // Opt-in tile-major conv output (see #pragma output_tile_major).
                     module->setAttr("routing.output_tile_major",
                                     fcAttrBuilder.getI64IntegerAttr(parsedOutputTileMajor ? 1 : 0));
+                    if (parsedPersistentKernel) // #pragma persistent_kernel (dataflow plan)
+                        module->setAttr("routing.persistent_kernel", fcAttrBuilder.getI64IntegerAttr(1));
                     module->setAttr("routing.control_plan_dedicated_shim",
                                     fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                     module->setAttr("routing.control_plan_shim_bd_ctrl",

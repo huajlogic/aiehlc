@@ -244,8 +244,14 @@ struct AnyPtr { void *p; template <class T> operator T *() const { return (T *)p
 namespace aie {
 enum class pad_value { none, zero };
 // Block options; designated initializers in this order (all optional).
+// Dataflow intent (doc/design/dmaphop_dataflow_plan.md): .share = share::neighbor hosts the
+// stream in ONE core's memory that its neighbours read; .stage stages it through a MemTile
+// (memtile_ring: a FIFO ring of .ring buffers); .keep = true loads it on the first launch only.
+enum class share { none, neighbor };
+enum class stage { none, memtile, memtile_ring };
 struct load_opts { int reuse = 0; pad_value pad = pad_value::none; int depth = 0; bool resident = false;
-                   int tile[2] = {0, 0}; };
+                   int tile[2] = {0, 0}; aie::share share = aie::share::none; aie::stage stage = aie::stage::none;
+                   int ring = 0; bool keep = false; };
 using store_opts = load_opts;
 } // namespace aie
 namespace aiehlc_trace {
@@ -258,11 +264,16 @@ static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_li
     int o[4] = {0, 0, 0, 0}, s[4] = {0, 0, 0, 0}, ro = 0, rs = 0;
     for (int v : off) { if (ro < 4) o[ro] = v; ro++; }
     for (int v : shape) { if (rs < 4) s[rs] = v; rs++; }
-    fprintf(g_out, "%c %d %d %s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", st ? 'S' : 'L', g_p0, g_p1,
-            p.name, p.n, ro, rs, o[0], o[1], o[2], o[3], s[0], s[1], s[2], s[3], opt.reuse, pad, opt.depth,
-            opt.resident ? 1 : 0, opt.tile[0], opt.tile[1], line);
+    fprintf(g_out, "%c %d %d %s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", st ? 'S' : 'L',
+            g_p0, g_p1, p.name, p.n, ro, rs, o[0], o[1], o[2], o[3], s[0], s[1], s[2], s[3], opt.reuse, pad,
+            opt.depth, opt.resident ? 1 : 0, opt.tile[0], opt.tile[1], (int)opt.share, (int)opt.stage, opt.ring,
+            opt.keep ? 1 : 0, line);
     if (st && !p.out) AIEHLC_E(p, "aie::store_buffer on an input port");
     if (!st && p.out) AIEHLC_E(p, "aie::load_buffer on an output port");
+    if (st && (opt.share != aie::share::none || opt.stage != aie::stage::none || opt.ring || opt.keep))
+        AIEHLC_E(p, "aie::store_buffer takes no dataflow options (.share / .stage / .ring / .keep)");
+    if (!st && opt.stage == aie::stage::memtile_ring && opt.ring <= 0)
+        AIEHLC_E(p, "{.stage = aie::stage::memtile_ring} needs {.ring = N} (MemTile ring buffers)");
     if (st && (opt.reuse || pad || opt.resident || opt.tile[0] || opt.tile[1]))
         AIEHLC_E(p, "aie::store_buffer takes only {.depth}; .reuse / .pad / .resident / .tile are load options");
     if (ro != p.rank || rs != p.rank)
@@ -473,9 +484,11 @@ std::vector<Event> parseTrace(const std::string &text) {
             for (int &v : ev.shape)
                 ls >> v;
             ls >> ev.reuse >> ev.pad;
-            int resident = 0;
-            ls >> ev.opts.depth >> resident >> ev.opts.tile[0] >> ev.opts.tile[1] >> ev.line;
+            int resident = 0, keep = 0;
+            ls >> ev.opts.depth >> resident >> ev.opts.tile[0] >> ev.opts.tile[1] >> ev.opts.share >> ev.opts.stage >>
+                ev.opts.ring >> keep >> ev.line;
             ev.opts.resident = resident != 0;
+            ev.opts.keep = keep != 0;
         }
         out.push_back(ev);
     }

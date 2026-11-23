@@ -95,9 +95,14 @@ struct BlockOpts {
     int depth = 0;
     bool resident = false;
     int tile[2] = {0, 0};
-    bool any() const { return depth || resident || tile[0] || tile[1]; }
+    // dataflow intent (dataflow plan): .share = aie::share::neighbor (1), .stage = aie::stage::memtile (1) /
+    // memtile_ring (2), .ring = MemTile ring buffers, .keep = kept across launches
+    int share = 0, stage = 0, ring = 0;
+    bool keep = false;
+    bool any() const { return depth || resident || tile[0] || tile[1] || share || stage || ring || keep; }
     bool operator==(const BlockOpts &o) const {
-        return depth == o.depth && resident == o.resident && tile[0] == o.tile[0] && tile[1] == o.tile[1];
+        return depth == o.depth && resident == o.resident && tile[0] == o.tile[0] && tile[1] == o.tile[1] &&
+               share == o.share && stage == o.stage && ring == o.ring && keep == o.keep;
     }
 };
 

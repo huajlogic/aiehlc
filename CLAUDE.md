@@ -546,6 +546,23 @@ per core = 768 MAC instructions in **839 cycles** (91.5 %), 64x64x128 = 75.4 %
 around the compute (validated: 2 passes = 2.09x); the ~226 ms launch is kernel
 load, not compute.
 
+### Explicit dataflow plans (C / routing / dmaphop -> code, no hand edits)
+
+The 2 x 8 shared-operand GEMM that `share2x8.py` reached by rewriting the generated files now
+comes from the compiler: **84.9 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
+alone** (1.158 ms per 10.07 G MAC, GOLDEN PASS). Three ways in, each lowering to the next:
+`load_buffer {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring|memtile, .ring = N,
+.keep = true}` + `#pragma persistent_kernel` -> routing IR `dataflow = {...}` on the tensor's
+`routingcreatescheduletensor` + `routing.persistent_kernel` -> plan synthesis
+(`pass/dataflowplan/plansynth.cpp`: host-tile matching, views, locks, MemTile ring / resident B,
+shim walks; dump `4_DataflowPlan.mlir`) -> `dmaphop.plan*` ops (`collectDataflowPlan` validates,
+tags replaced flows `dmaphop.plan_replaced`) -> `aiehlc_plan_routing()` (routing.cc, routed around
+the kept ports), `aiehlc_plan_host_setup/launch/wait` (host.cc), a `DATAFLOW PLAN` KCO block
+(kernel.cc), `aiehlc_plan.h` (kernel constants). Runtime `__Runtime_plan_setup`: BD write-once,
+persistent kernel (go lock). A build without a plan is byte-identical; round trips stay identical;
+flowcheck simulates the plan routes. Design **[doc/design/dmaphop_dataflow_plan.md](doc/design/dmaphop_dataflow_plan.md)**;
+skill **dmaphopdataflowplan**.
+
 ### bfloat16 ports (`input_window_bfloat16`)
 
 A kernel-only kernel can take / produce bf16 tensors
@@ -930,6 +947,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
 - **[doc/modelsupportevaluate.md](doc/modelsupportevaluate.md)** — Gap analysis for Gemma / ResNet-50 / YOLO / MobileNet / BERT / ViT (none run on AIE today); proposed `aiephase` + `aiecfg` dialects (phase-based control-plane reconfiguration, overlay kernels), new Depthwise/Eltwise/Reduce/Attention/Pipeline/Move spaces, milestones M0–M8
 - **[doc/design/resnet_aie_engine.md](doc/design/resnet_aie_engine.md)** — whole int8 ResNet-18 on the AIE in 2.81 ms, bit-exact: persistent engine architecture, exactness proofs (fusions, 8-bit tensors, on-core residuals), measured optimization steps 1270 → 2.81 ms, what did not help, remaining limits
+- **[doc/design/dmaphop_dataflow_plan.md](doc/design/dmaphop_dataflow_plan.md)** — explicit dataflow plans: C `load_buffer` options / routing `dataflow` attrs / `dmaphop.plan*` ops -> routing.cc + host.cc + kernel.cc; the 2 x 8 GEMM at 84.9 % with no hand edits
 - **[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** — `#pragma KERNELCONFIGOFFLOAD`: core self-configured DMA, lock asymmetry, BD-id reservation
 - **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)** — `--aie-offload`: TVM BYOC → `libconv2dstem.a`, fused boundary, uint8 shift, weight-fingerprint layer mapping
 - **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
@@ -999,6 +1017,7 @@ Read the matching skill when the task fits:
 | Kernel-only kernel: `hand-written GemmSpaces checked ...` + `parameter `aie::port<..., aie::port<..., ...` is not an aie::port<T, <GemmSpace>>` (whole list as one parameter); `the `<` of aie::port is never closed` — a port missing its closing `>` | portunclosedangle |
 | `data used without being loaded` and WHICH constant causes it (`oc_t = 15` vs loops walking 16); `cause (static analysis)` / `out-of-block access (static analysis)` lines; extending `kernel_static.cpp` | blockstaticbounds |
 | Edit the routing / dmaphop IR and feed it back (`AIEHLC_ROUTING_IR_IN`, `AIEHLC_DMAPHOP_IR_IN`, `aiebackend.routing_ir`: view / set_level / lint / check / build), round-trip test, an IR edit that does nothing or is silently accepted although illegal; `flowcheck FAILED` / `FLOWCHECK ERROR ... does not reach / also reaches` after a build | routingirreentry |
+| Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `dataflow = {...}`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
 | Kernel-only kernel without options hangs in `wait_io TIMEOUT ... dir=0` (output) but works with `{.depth = 2}`; output `pp_depth=1`, one output MM2S BD with `next_bd=-1` vs ping/pong `window_init`; `{.depth = 1} on aie::store_buffer` error | outputpingponghang |
 | A dialect attribute's dumped IR does not parse back (`expected integer value`, `failed to parse ...Attr parameter ... ArrayRef<int64_t>`, `AIEHLC_*_IR_IN ... does not parse / verify`, roundtrip FAIL at the re-entry build): `struct(params)` with an `ArrayRefParameter` | mlirattrarrayroundtrip |
 | Adding/reading tiling or per-tensor DMA info in routing IR (halo, shim_dma, pp_depth, kernel rounds); "where did `tensor_N.halo` / `routing.spatial_out_rounds` go"; value reads 0 inside a conversion pattern | routingirtilingcarriers |

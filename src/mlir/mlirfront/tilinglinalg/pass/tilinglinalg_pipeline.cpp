@@ -587,6 +587,19 @@ static void attachTensorRoutingInfo(OpBuilder &builder, ArrayRef<routing::create
             decl.setKernelBlockAttr(routing::KernelBlockAttr::get(ctx, kb.tensorShape, kb.shape, kb.roundsI, kb.roundsJ,
                                                                   kb.stepI, kb.stepJ, kb.resident, kb.tileR, kb.tileC));
             llvm::outs() << "[TilingLinalg] tensor_" << i << " kernel_block=" << decl.getKernelBlockAttr() << "\n";
+            if (kb.share) { // load_buffer {.share / .stage / .ring / .keep} -> routing-level dataflow intent
+                llvm::SmallVector<mlir::NamedAttribute> df;
+                df.push_back(builder.getNamedAttr("share", builder.getStringAttr("neighbor")));
+                if (kb.stage)
+                    df.push_back(builder.getNamedAttr(
+                        "stage", builder.getStringAttr(kb.stage == 2 ? "memtile_ring" : "memtile")));
+                if (kb.ring)
+                    df.push_back(builder.getNamedAttr("ring", builder.getI64IntegerAttr(kb.ring)));
+                if (kb.keep)
+                    df.push_back(builder.getNamedAttr("resident", builder.getStringAttr("launches")));
+                decl->setAttr("dataflow", builder.getDictionaryAttr(df));
+                llvm::outs() << "[TilingLinalg] tensor_" << i << " dataflow=" << decl->getAttr("dataflow") << "\n";
+            }
         }
     }
 }
@@ -730,10 +743,20 @@ static bool readIROverride(mlir::MLIRContext &ctx, mlir::ModuleOp module, const 
         llvm::errs() << "[TilingLinalg] ERROR: " << envName << ": " << path << " does not parse / verify\n";
         return false;
     }
+    // The control-plane placement is DERIVED (publishControlPlacement runs after
+    // the routing IR is dumped and again after re-entry), so a dump that carries
+    // it is not an edit: compare without it.
+    auto stripDerivedAttrs = [](mlir::ModuleOp m) {
+        for (const char *k : {"routing.control_plan_shim_col", "routing.control_plan_mm2s_ch",
+                              "routing.control_plan_s2mm_ch", "routing.control_plan_exclusive"})
+            m->removeAttr(k);
+    };
     std::string before, after;
     {
+        mlir::OwningOpRef<mlir::ModuleOp> gen = mlir::cast<mlir::ModuleOp>(module->clone());
+        stripDerivedAttrs(gen.get());
         llvm::raw_string_ostream os(before);
-        module.print(os);
+        gen->print(os);
     }
     module->setAttrs(in.get()->getAttrDictionary());
     module.getBody()->getOperations().clear();
@@ -752,6 +775,7 @@ static bool readIROverride(mlir::MLIRContext &ctx, mlir::ModuleOp module, const 
         planOps = planOpsList.size();
         for (auto *op : planOpsList)
             op->erase();
+        stripDerivedAttrs(noPlan.get());
         llvm::raw_string_ostream os(after);
         noPlan->print(os);
     }
@@ -763,7 +787,9 @@ static bool readIROverride(mlir::MLIRContext &ctx, mlir::ModuleOp module, const 
             bool ga = (bool)std::getline(a, la), gb = (bool)std::getline(b, lb);
             if (!ga && !gb)
                 break;
-            differ += !(ga && gb && la == lb);
+            if (!(ga && gb && la == lb) && differ++ == 0)
+                llvm::outs() << "[TilingLinalg] " << envName << ": first difference\n  generated: " << la
+                             << "\n  read     : " << lb << "\n";
         }
     }
     if (differOut)
