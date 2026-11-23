@@ -4,6 +4,7 @@
  ******************************************************************************/
 
 #include "passblueprinttoschedule.h"
+#include "dataflowplan/dataflowplan.h"
 #include "dfscheblueprintmanager.h"
 #include "dfschedulemanager.h"
 #include "../helper/flowtransfer_internal.h"
@@ -186,7 +187,15 @@ LogicalResult FlowTransferConversion::matchAndRewrite(dfscheblueprint::FlowTrans
         return failure();
     applyKernelBlockShim(c);
 
-    if (c.useOOO && c.numCoreTiles > 1) {
+    // Dataflow plan (dmaphop.plan*): a replaced argument keeps its core-tile
+    // buffers / windows (the kernel signature is unchanged), but its shim BDs,
+    // create_io / start_io and waits come from the plan's aiehlc_plan_host_launch.
+    const int planArg = traceFlowConfigToFuncArgIndex(c.shimFlowConfig);
+    const bool planReplaced = dfplan::activePlan().present && planArg >= 0 && dfplan::activePlan().replaces(planArg);
+    if (planReplaced) {
+        llvm::errs() << "[DataflowPlan] flowIdx=" << c.flowIndex << " (arg " << planArg
+                     << "): shim DMA + schedule replaced by the plan\n";
+    } else if (c.useOOO && c.numCoreTiles > 1) {
         emitShimBdOoo(c);
     } else {
         emitShimBdNonOoo(c);
@@ -194,14 +203,15 @@ LogicalResult FlowTransferConversion::matchAndRewrite(dfscheblueprint::FlowTrans
 
     // Shim create_io (consumes last shim BD in SSA chain). Shared across
     // OOO / non-OOO paths so it lives in the orchestrator.
-    c.createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
-        loc, dfschedule::IoHandleType::get(rewriter.getContext()),
-        c.lastShimBdHandle,                        // BD handle (first BD in chain or single)
-        c.shimTileOp.getTile(),                    // tile
-        rewriter.getI32IntegerAttr(c.shimChannel), // channel
-        rewriter.getStringAttr(c.dmaDirection),    // direction (MM2S or S2MM)
-        rewriter.getStringAttr(c.ioOperation),     // io_operation (SEND or RECV)
-        rewriter.getBoolAttr(c.useOOO));           // enable_out_of_order
+    if (!planReplaced)
+        c.createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
+            loc, dfschedule::IoHandleType::get(rewriter.getContext()),
+            c.lastShimBdHandle,                        // BD handle (first BD in chain or single)
+            c.shimTileOp.getTile(),                    // tile
+            rewriter.getI32IntegerAttr(c.shimChannel), // channel
+            rewriter.getStringAttr(c.dmaDirection),    // direction (MM2S or S2MM)
+            rewriter.getStringAttr(c.ioOperation),     // io_operation (SEND or RECV)
+            rewriter.getBoolAttr(c.useOOO));           // enable_out_of_order
 
     // --- KERNELCONFIGOFFLOAD gate (routing.kernel_config_offload) ---
     // Decide once, here in the orchestrator, whether this flow's core-tile DMA
@@ -248,6 +258,10 @@ LogicalResult FlowTransferConversion::matchAndRewrite(dfscheblueprint::FlowTrans
     }
 
     finalizeKernelConfig(c);
+    if (planReplaced) {
+        rewriter.eraseOp(op);
+        return success();
+    }
 
     // --- HOST: schedule classify + emit ---
     classifyScheduleMode(c);

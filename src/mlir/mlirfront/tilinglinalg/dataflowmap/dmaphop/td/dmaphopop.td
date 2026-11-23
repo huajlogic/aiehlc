@@ -384,5 +384,32 @@ def dmaphop_dealloc_buffer : dmaphopop<"dealloc_buffer"> {
   let arguments = (ins AnyTensor:$buffer);
   let assemblyFormat = "$buffer `:` type($buffer) attr-dict";
 }
- 
+
+// --- 9. Explicit dataflow plan (doc/design/dmaphop_dataflow_plan.md) ---
+// A plan replaces the generated data movement of some kernel arguments with an
+// explicit one: stream routes, MemTile / core-tile buffer descriptors, locks,
+// channel start queues, shim BDs over the DDR arguments, and the constants the
+// kernel body needs to find its operands. All plan ops carry only attributes
+// (attr-dict); the plan reader (pass/dataflowplan) validates them and reports
+// errors with the op's location. Collected right after the dmaphop stage and
+// erased before the blueprint, so no downstream pass ever sees them.
+class dmaphop_PlanOp<string mnemonic, string sum> : dmaphopop<mnemonic> {
+  let summary = sum;
+  let assemblyFormat = "attr-dict";
+}
+def dmaphop_plan : dmaphop_PlanOp<"plan",
+  "Plan header: replaced kernel args, persistent launch, BD write-once">;
+def dmaphop_plan_route : dmaphop_PlanOp<"plan_route",
+  "Circuit-switched stream route from a shim / MemTile / core DMA MM2S channel to S2MM channels">;
+def dmaphop_plan_lock : dmaphop_PlanOp<"plan_lock",
+  "Lock initial value on one or more tiles (re-initialised every launch, or once)">;
+def dmaphop_plan_bd : dmaphop_PlanOp<"plan_bd",
+  "MemTile or core-tile buffer descriptor (address, length, dims, locks, next BD)">;
+def dmaphop_plan_channel : dmaphop_PlanOp<"plan_channel",
+  "Enable a MemTile / core-tile DMA channel and push its start queue">;
+def dmaphop_plan_shim_bd : dmaphop_PlanOp<"plan_shim_bd",
+  "Shim DMA transfer over a kernel argument (offset, length, dims, iteration, repeat)">;
+def dmaphop_plan_kernel_param : dmaphop_PlanOp<"plan_kernel_param",
+  "Per-mesh-row constant exposed to the kernel body as AIEHLC_PLAN_<name>">;
+
 #endif // DMAPHOP_OPS

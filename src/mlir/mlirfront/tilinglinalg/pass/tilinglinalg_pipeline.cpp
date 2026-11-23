@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 #include "tilinglinalg_pipeline.h"
+#include "dataflowplan/dataflowplan.h"
 #include "../../../../llvm/convautotile/block_io_names.h"
 
 #include "dmaptodmaphop.h"
@@ -737,9 +738,22 @@ static bool readIROverride(mlir::MLIRContext &ctx, mlir::ModuleOp module, const 
     module->setAttrs(in.get()->getAttrDictionary());
     module.getBody()->getOperations().clear();
     module.getBody()->getOperations().splice(module.getBody()->end(), in.get().getBody()->getOperations());
+    size_t planOps = 0;
     {
+        // A dataflow plan (dmaphop.plan*) is an addition, not an edit of the
+        // generated flows: compare without it, so "identical" still means the
+        // generated data plane (and the control-plane placement) is untouched.
+        mlir::OwningOpRef<mlir::ModuleOp> noPlan = mlir::cast<mlir::ModuleOp>(module->clone());
+        llvm::SmallVector<mlir::Operation *> planOpsList;
+        noPlan->walk([&](mlir::Operation *op) {
+            if (op->getName().getStringRef().starts_with("dmaphop.plan"))
+                planOpsList.push_back(op);
+        });
+        planOps = planOpsList.size();
+        for (auto *op : planOpsList)
+            op->erase();
         llvm::raw_string_ostream os(after);
-        module.print(os);
+        noPlan->print(os);
     }
     size_t differ = 0;
     {
@@ -757,7 +771,90 @@ static bool readIROverride(mlir::MLIRContext &ctx, mlir::ModuleOp module, const 
     llvm::outs() << "[TilingLinalg] IR read from " << path << " (" << envName << "): "
                  << (differ ? std::to_string(differ) + " line(s) differ from the generated IR"
                             : std::string("identical to the generated IR"))
-                 << "\n";
+                 << (planOps ? " + " + std::to_string(planOps) + " dataflow plan op(s)" : std::string()) << "\n";
+    return true;
+}
+
+// ---- dataflow plan (dmaphop.plan*): emission hooks --------------------------
+// The plan's routes go into routing.cc as aiehlc_plan_routing(), called at the
+// end of routing(); they are routed around the ports the generated routes took
+// (routingresourcemap.json, written by RoutingResourceMapPass just before).
+static bool applyPlanToRouting(mlir::ModuleOp routingModule, const std::string &outputDir, int colLo, int colHi,
+                               int numRows, std::string &prefix) {
+    const dfplan::DataflowPlan &plan = dfplan::activePlan();
+    if (!plan.present || plan.routes.empty())
+        return true;
+    dfplan::PortBook book;
+    if (!dfplan::loadPortBook(outputDir + "/routingresourcemap.json", book)) {
+        llvm::errs() << "[DataflowPlan] ERROR: cannot read " << outputDir
+                     << "/routingresourcemap.json to route the plan around the generated routes\n";
+        return false;
+    }
+    if (!dfplan::emitPlanRouting(plan, book, colLo < 0 ? 0 : colLo, colHi, numRows, plan.memtileRows, prefix))
+        return false;
+    bool inserted = false;
+    for (auto func : routingModule.getOps<mlir::func::FuncOp>()) {
+        if (func.getName() != "routing" || func.getBody().empty())
+            continue;
+        mlir::Block &entry = func.getBody().front();
+        mlir::OpBuilder b(entry.getTerminator());
+        b.create<mlir::emitc::CallOpaqueOp>(func.getLoc(), mlir::TypeRange{}, "aiehlc_plan_routing",
+                                            mlir::ValueRange{entry.getArgument(0)});
+        inserted = true;
+    }
+    if (!inserted)
+        llvm::errs() << "[DataflowPlan] ERROR: no routing() function to call aiehlc_plan_routing() from\n";
+    return inserted;
+}
+
+// Host side: aiehlc_plan_host_setup() before the kernel load (persistent /
+// BD-once switches), aiehlc_plan_host_launch(dev, args...) right after the
+// kernel launch (MemTile + shim programming), aiehlc_plan_host_wait() before
+// every return. Also writes aiehlc_plan.h for the kernel body.
+static bool applyPlanToHost(mlir::ModuleOp hostModule, const std::string &outputDir) {
+    const dfplan::DataflowPlan &plan = dfplan::activePlan();
+    if (!plan.present)
+        return true;
+    mlir::emitc::FuncOp host;
+    mlir::Operation *loadCall = nullptr, *launchCall = nullptr;
+    hostModule.walk([&](mlir::emitc::CallOpaqueOp call) {
+        llvm::StringRef callee = call.getCallee();
+        if (callee.starts_with("__Runtime_load_kernel_group") && !loadCall)
+            loadCall = call;
+        if (callee.starts_with("__Runtime_launch_kernel_group") && !launchCall) {
+            launchCall = call;
+            host = call->getParentOfType<mlir::emitc::FuncOp>();
+        }
+    });
+    if (!host || !launchCall) {
+        llvm::errs() << "[DataflowPlan] ERROR: no kernel launch found in the host module\n";
+        return false;
+    }
+    mlir::Block &entry = host.getBody().front();
+    mlir::Value dev = entry.getArgument(0);
+    llvm::SmallVector<mlir::Value> args(entry.getArguments().begin(), entry.getArguments().end());
+    mlir::OpBuilder b(host);
+    b.create<mlir::emitc::VerbatimOp>(host.getLoc(),
+                                      dfplan::emitPlanHost(plan, plan.memtileRows, (int)args.size() - 1));
+    b.setInsertionPoint(loadCall ? loadCall : launchCall);
+    b.create<mlir::emitc::CallOpaqueOp>(host.getLoc(), mlir::TypeRange{}, "aiehlc_plan_host_setup",
+                                        mlir::ValueRange{dev});
+    b.setInsertionPointAfter(launchCall);
+    b.create<mlir::emitc::CallOpaqueOp>(host.getLoc(), mlir::TypeRange{}, "aiehlc_plan_host_launch", args);
+    host.walk([&](mlir::emitc::ReturnOp ret) {
+        mlir::OpBuilder rb(ret);
+        rb.create<mlir::emitc::CallOpaqueOp>(ret.getLoc(), mlir::TypeRange{}, "aiehlc_plan_host_wait",
+                                             mlir::ValueRange{dev});
+    });
+    std::error_code ec;
+    llvm::raw_fd_ostream hdr(outputDir + "/aiehlc_plan.h", ec, llvm::sys::fs::OF_None);
+    if (ec) {
+        llvm::errs() << "[DataflowPlan] ERROR: cannot write aiehlc_plan.h: " << ec.message() << "\n";
+        return false;
+    }
+    hdr << dfplan::emitPlanHeader(plan);
+    llvm::outs() << "[DataflowPlan] host: plan setup / launch / wait wired into " << host.getName()
+                 << "; aiehlc_plan.h written\n";
     return true;
 }
 
@@ -773,6 +870,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     std::vector<TraceTileSpec> traceTiles = traceTilesIn;
     if (!readIROverride(ctx, module, userKernelFuncName, "AIEHLC_ROUTING_IR_IN"))
         return false;
+    dfplan::activePlan() = dfplan::DataflowPlan(); // a plan belongs to one pipeline run
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
@@ -942,6 +1040,17 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         coreRowBase = coreRowBase < 0 ? (int)row.getInt() : std::min(coreRowBase, (int)row.getInt());
         coreColBase = coreColBase < 0 ? absCol : std::min(coreColBase, absCol);
     });
+    // Explicit dataflow plan (dmaphop.plan*, doc/design/dmaphop_dataflow_plan.md):
+    // read + validated here, the flows it replaces tagged, the ops erased -- the
+    // routing clone below and every later pass see only the tags.
+    int planMaxRow = 0;
+    module.walk([&](mlir::Operation *op) {
+        if (op->getName().getStringRef() == "dmaphop.tile")
+            if (auto row = op->getAttrOfType<mlir::IntegerAttr>("row"))
+                planMaxRow = std::max<int>(planMaxRow, (int)row.getInt());
+    });
+    if (!dfplan::collectDataflowPlan(module, dfplan::activePlan(), coreRowBase > 1 ? coreRowBase - 1 : 1))
+        return false;
     if (reserveControlPlane)
         finalizeControlPlacement(module, rtopology.getRM(), dataStartCol, ctrlPlacement);
 
@@ -1358,6 +1467,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                     op->erase();
             }
         }
+        if (!appendMode && !applyPlanToHost(hostModule, outputDir))
+            return false;
         if (failed(mlir::emitc::translateToCpp(hostModule, stream))) {
             llvm::errs() << "Failed to translate host MLIR to C++.\n";
             return false;
@@ -2209,6 +2320,10 @@ after_host_emit:
                                   "RoutingResourceMapPass");
         }
 
+        std::string planRoutingText;
+        if (!applyPlanToRouting(routingDmaphopModule, outputDir, dataStartCol, relEndCol, planMaxRow + 1,
+                                planRoutingText))
+            return false;
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(routingPathTopology),
                                    routingIrDir, rstage, "RoutingHWLowerPass"))
             return false;
@@ -2266,6 +2381,7 @@ after_host_emit:
         }
         // Emit #include before the translated C++ so int32_t etc. are declared
         stream << "#include <xaiengine.h>\n\n";
+        stream << planRoutingText;
         if (failed(mlir::emitc::translateToCpp(routingDmaphopModule, stream))) {
             llvm::errs() << "Failed to translate routing MLIR to C++.\n";
             return false;

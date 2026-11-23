@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 
+#include "dataflowplan/dataflowplan.h"
 #include "passschedulecanonicalize.h"
 #include "dfschedulemanager.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -343,6 +344,14 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
                 }
             });
         });
+        // Dataflow plan: a replaced argument's flows no longer reference it, but
+        // the plan's aiehlc_plan_host_launch reads it and the launch passes every
+        // tensor -- keep all of @main's memref arguments, in order.
+        if (dfplan::activePlan().present)
+            for (BlockArgument ba : mainFunc.getArguments())
+                if (isa<MemRefType>(ba.getType()) &&
+                    llvm::none_of(blockArgs, [&](auto &p) { return p.second == Value(ba); }))
+                    blockArgs.push_back({ba.getArgNumber(), ba});
         llvm::sort(blockArgs, [](auto &a, auto &b) { return a.first < b.first; });
         for (auto &[argNum, operand] : blockArgs) {
             auto memrefType = cast<MemRefType>(operand.getType());
