@@ -26,12 +26,14 @@
 //     of `ring` 2-chunk buffers -> broadcast to the strip's host row.
 //   * stage = "memtile" + resident = "launches": B is loaded into the bottom
 //     MemTile row once (first launch) and replayed every launch.
-//   * persistent kernel: go lock 14, a lock 15 held at 0 for no-op releases.
+//   * persistent kernel: `persistent = true` (the go lock, like every BD / lock id and buffer address, is
+//     allocated later in dfschedule against the generated flows -- planresource.cpp).
 // The result is the same dmaphop.plan* text gen_plan.py writes by hand, parsed
 // and inserted at the top of @main, so the dmaphop dump shows exactly what the
 // compiler decided.
 
 #include "dataflowplan.h"
+#include "plantarget.h"
 
 #include "routingmanager.h"
 
@@ -132,16 +134,20 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     if (g.TM != g.TN)
         return fail("A and B blocks must have the same row count (one chunk size)");
     const int64_t chunk = g.TM * g.KC, NK = g.K / g.KC, R2 = g.M / SA / g.TM, NT2 = g.N / SB / g.TN;
-    if (NT2 != 1 || R2 * NT2 != g.tiles || NK % 2 || R2 > 64)
-        return fail("shape: need N = 2 x cols x block rows, M / (rows/2) / block rows = output tiles per core (<= 64), "
-                    "K / chunk even");
+    const int maxIter = planTarget().bdMaxIterWrap; // the shim walks a column's tiles as one BD's iterations
+    if (NT2 != 1 || R2 * NT2 != g.tiles || NK % 2 || R2 > maxIter)
+        return fail("shape: need N = 2 x cols x block rows, M / (rows/2) / block rows = output tiles per core (<= " +
+                    std::to_string(maxIter) + ", a shim BD's iterations), K / chunk even");
     // The kernel's shared-port state restarts every launch (a register copy, see resolveBlockIoBuiltins):
     // a launch must take a whole number of slot periods (2 channels x 2 slots = 4 chunks).
     if ((R2 * NK) % 4)
         return fail("chunks per launch (" + std::to_string(R2 * NK) +
                     ") must be a multiple of 4 (2 channels x 2 slots)");
     const int64_t half = chunk / 2, aLen = NK / 2 * chunk, bLen = NK * chunk;
-    const int64_t ring = dint(A.df, "ring", 10), aRounds = R2 * aLen / (ring * 2 * chunk);
+    const int64_t ring = dint(A.df, "ring", 0);
+    if (ring <= 0)
+        return fail("stage = \"memtile_ring\" needs ring = N (MemTile FIFO buffers)");
+    const int64_t aRounds = R2 * aLen / (ring * 2 * chunk);
     if (R2 * aLen % (ring * 2 * chunk))
         return fail("the A ring (" + std::to_string(ring) + " x 2 chunks) does not divide one strip's stream");
     const bool bLaunches = dstr(B.df, "resident") == "launches";
@@ -158,24 +164,26 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     if (host.empty())
         return fail("no host-tile matching for the shared streams");
     os << "dmaphop.plan {replace_args = [" << A.arg << ", " << B.arg << "], share_args = [" << A.arg << ", " << B.arg
-       << "], persistent_go_lock = " << (persistent ? 14 : -1) << ", bd_once = true}\n";
+       << "], persistent = " << (persistent ? "true" : "false") << ", bd_once = true}\n";
     // ---- routes
     for (int c = 0; c < g.meshCols; c++) {
-        os << "dmaphop.plan_route {src = [" << col(c) << ", 0, 1], src_kind = \"shim\", dsts = [[" << col(c) << ", "
-           << mtA << ", 1]]}\n";
-        os << "dmaphop.plan_route {src = [" << col(c) << ", 0, 0], src_kind = \"shim\", dsts = [[" << col(c) << ", "
-           << mtB << ", 0]]}\n";
+        os << "dmaphop.plan_route {arg = " << A.arg << ", src = [" << col(c) << ", 0, 1], src_kind = \"shim\", "
+           << "dsts = [[" << col(c) << ", " << mtA << ", 1]]}\n";
+        os << "dmaphop.plan_route {arg = " << B.arg << ", src = [" << col(c) << ", 0, 0], src_kind = \"shim\", "
+           << "dsts = [[" << col(c) << ", " << mtB << ", 0]]}\n";
     }
     for (int c = 0; c < g.meshCols; c++) { // column c's MemTile carries A strip c / 2, chunk parity c % 2
         int h = c / 2, p = c % 2, hr = row(host[h]);
-        os << "dmaphop.plan_route {src = [" << col(c) << ", " << mtA << ", 1], src_kind = \"dma\", dsts = [";
+        os << "dmaphop.plan_route {arg = " << A.arg << ", src = [" << col(c) << ", " << mtA
+           << ", 1], src_kind = \"dma\", dsts = [";
         for (int x = 0; x < g.meshCols; x++)
             os << (x ? ", " : "") << "[" << col(x) << ", " << hr << ", " << p << "]";
         os << "]}\n";
     }
     for (int c = 0; c < g.meshCols; c++)
         for (int m = 0; m < 4; m++) // MM2S m = (B strip c + C (m / 2), parity m % 2)
-            os << "dmaphop.plan_route {src = [" << col(c) << ", " << mtB << ", " << m << "], src_kind = \"dma\", "
+            os << "dmaphop.plan_route {arg = " << B.arg << ", src = [" << col(c) << ", " << mtB << ", " << m
+               << "], src_kind = \"dma\", "
                << "dsts = [[" << col(c) << ", " << row(host[SA + m / 2]) << ", " << m % 2 << "]]}\n";
     // ---- the streams: what the DMA program (derived in dfschedule, plandma.cpp) realizes
     auto list = [](std::initializer_list<int64_t> v) {

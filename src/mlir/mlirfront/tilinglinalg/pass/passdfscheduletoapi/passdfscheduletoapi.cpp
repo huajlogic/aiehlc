@@ -1950,7 +1950,7 @@ struct PlanTileOpsInnerPattern : public ConversionPattern {
                          i32(u32(bd.getAcquireLockVal())), i32(u32(bd.getReleaseLockId())),
                          i32(u32(bd.getReleaseLockVal())), i32(u32(bd.getNextBd()))});
         } else if (auto l = dyn_cast<dfschedule::ConfigLockSetOp>(op)) {
-            fn = "__Runtime_tile_lock_set";
+            fn = l.getRestored() ? "__Runtime_tile_lock_set_restored" : "__Runtime_tile_lock_set";
             args.append({i32(u32(l.getLockId())), i32(u32(l.getValue())), i32(u32(l.getLaterValue()))});
         } else if (auto e = dyn_cast<dfschedule::ConfigChannelEnableOp>(op)) {
             fn = "__Runtime_dma_channel_enable";

@@ -414,6 +414,8 @@ void __Runtime_tile_bd_config(XAie_DevInst *dev, XAie_LocType t, int bd, int add
                               int s1, int w1, int s2, int w2, int iter_step, int iter_wrap, int acq, int acqv, int rel,
                               int relv, int next);
 void __Runtime_tile_lock_set(XAie_DevInst *dev, XAie_LocType t, int id, int value, int later);
+/* a lock the dataflow hands back at its launch-start value: written only when that value changes */
+void __Runtime_tile_lock_set_restored(XAie_DevInst *dev, XAie_LocType t, int id, int value, int later);
 void __Runtime_dma_channel_enable(XAie_DevInst *dev, XAie_LocType t, int ch, int mm2s);
 void __Runtime_dma_channel_start(XAie_DevInst *dev, XAie_LocType t, int ch, int mm2s, int bd, int repeat,
                                  int first_only);

@@ -286,12 +286,55 @@ static std::string dropBlockOptions(const std::string &body, const std::string &
     return out;
 }
 
+// Text position of the `{` opening the kernel function's body (the text may start with the source's
+// macros): `<kernel>(` not inside an identifier, its matching `)`, then `{`.
+static size_t kernelBodyOpen(const std::string &out, const std::string &kernel) {
+    for (size_t k = out.find(kernel + "("); k != std::string::npos; k = out.find(kernel + "(", k + 1)) {
+        if (k > 0 && (std::isalnum((unsigned char)out[k - 1]) || out[k - 1] == '_'))
+            continue;
+        int depth = 0;
+        size_t i = k + kernel.size();
+        for (; i < out.size(); ++i) {
+            if (out[i] == '(')
+                depth++;
+            else if (out[i] == ')' && --depth == 0)
+                break;
+        }
+        size_t b = i < out.size() ? out.find_first_not_of(" \t\r\n", i + 1) : std::string::npos;
+        if (b != std::string::npos && out[b] == '{')
+            return b;
+    }
+    return std::string::npos;
+}
+
 static std::string resolveBlockIoBuiltins(const std::string &body, const std::string &kernel, int coreRowBase,
-                                          int coreColBase, const std::vector<std::string> &portVarNames = {}) {
+                                          int coreColBase) {
     std::string out = dropBlockOptions(dropBlockOptions(body, "aie::load_buffer("), "aie::store_buffer(");
     auto replaceAll = [&out](const std::string &from, const std::string &to) {
         for (size_t pos = 0; (pos = out.find(from, pos)) != std::string::npos; pos += to.size())
             out.replace(pos, from.size(), to);
+    };
+    auto portArg = [&out](size_t argStart, size_t end) {
+        std::string port = out.substr(argStart, end - argStart);
+        while (!port.empty() && std::isspace((unsigned char)port.front()))
+            port.erase(0, 1);
+        while (!port.empty() && std::isspace((unsigned char)port.back()))
+            port.pop_back();
+        return port;
+    };
+    // A dataflow plan's kernel (dmaphop_dataflow_plan.md) passes every block call the port's cursor as a
+    // LOCAL copy (aiehlc_cursor_local, declared at the top of the body) -- its counts then stay in registers
+    // across the kernel's loops -- and release / commit get the port's descriptor and cursor too, which is
+    // how aie_block_io_plan.h tells a shared operand's call from a window's. Without a plan the calls stay
+    // as they were (a build without a plan is byte-identical).
+    const bool plan = dfplan::activePlan().present;
+    std::vector<std::string> ports;
+    auto cursor = [&](const std::string &port) {
+        if (!plan)
+            return convautotile::blockCurVar(kernel, port);
+        if (std::find(ports.begin(), ports.end(), port) == ports.end())
+            ports.push_back(port);
+        return "aiehlc_lc_" + convautotile::blockIoKey(kernel, port) + ".c";
     };
     for (const char *fn : {"load_buffer", "store_buffer"}) {
         const std::string from = std::string("aie::") + fn + "(";
@@ -300,91 +343,97 @@ static std::string resolveBlockIoBuiltins(const std::string &body, const std::st
             size_t comma = out.find(',', argStart);
             if (comma == std::string::npos)
                 break;
-            std::string port = out.substr(argStart, comma - argStart);
-            while (!port.empty() && std::isspace((unsigned char)port.front()))
-                port.erase(0, 1);
-            while (!port.empty() && std::isspace((unsigned char)port.back()))
-                port.pop_back();
-            std::string to = std::string("aiehlc_") + fn + "(" + port + ", " + convautotile::blockDescVar(kernel, port) +
-                             ", " + convautotile::blockCurVar(kernel, port) + ", aie::program_id(0), aie::program_id(1)";
+            std::string port = portArg(argStart, comma);
+            std::string to = std::string("aiehlc_") + fn + "(" + port + ", " +
+                             convautotile::blockDescVar(kernel, port) + ", " + cursor(port) +
+                             ", aie::program_id(0), aie::program_id(1)";
             out.replace(pos, comma - pos, to);
             pos += to.size();
         }
     }
-    // Dataflow plan (dmaphop_dataflow_plan.md): a port whose data movement the plan realizes
-    // ({.share}) takes its blocks from the plan's hosted slots -- aiehlc_plan.h's lean lock /
-    // slot-rotation acquire and release -- not from its DMA window.
-    // Each shared port's state (view, lock base, role, chunk counters) is copied into a LOCAL at kernel
-    // entry so it lives in registers across the chunk boundaries -- read from the global it sat on the
-    // acquire -> slot address -> prefetch path (78.7 % instead of 84.8 % of peak). The counters restart
-    // per call: the plan guarantees every launch takes a multiple of the slot period (share_period).
-    const dfplan::DataflowPlan &plan = dfplan::activePlan();
-    std::string locals;
-    for (size_t k = 0; plan.present && k < portVarNames.size(); k++) {
-        if (!plan.replaces((int)k) || !plan.sharesArg((int)k))
-            continue;
-        const std::string P = portVarNames[k], st = "aiehlc_sp_" + std::to_string(k);
-        locals += "\n    aiehlc_share_port " + st + " = aiehlc_plan_share[" + std::to_string(k) +
-                  "]; // dataflow plan: shared port " + P;
-        replaceAll("aiehlc_load_buffer(" + P + ", ", "aiehlc_share_load(" + st + ", ");
-        for (const std::string &rel : {"aie::release(" + P + ")", "aie::release( " + P + " )"})
-            replaceAll(rel, "aiehlc_share_release(" + st + ")");
-    }
-    // One memory fence per run of shared releases (the reads of the chunk must complete before its
-    // slots are handed back to the DMA; one fence covers every port released together).
-    for (size_t pos = 0; (pos = out.find("aiehlc_share_release(", pos)) != std::string::npos;) {
-        size_t ls = out.rfind('\n', pos);
-        const std::string before =
-            out.substr(ls == std::string::npos ? 0 : ls + 1, pos - (ls == std::string::npos ? 0 : ls + 1));
-        // previous statement already a shared release (or its fence)? then no new fence
-        size_t prevEnd = ls == std::string::npos ? 0 : out.rfind(';', ls);
-        size_t prevStart = prevEnd == std::string::npos ? 0 : out.rfind('\n', prevEnd);
-        const std::string prev = out.substr(prevStart == std::string::npos ? 0 : prevStart,
-                                            prevEnd == std::string::npos ? 0 : prevEnd - prevStart);
-        if (prev.find("aiehlc_share_release(") == std::string::npos) {
-            out.insert(pos, "chess_memory_fence(); ");
-            pos += 22;
-        }
-        pos += 21;
-    }
-    // ... and one after a run of shared loads (no read of a block may move above its acquire).
-    for (size_t pos = 0; (pos = out.find("aiehlc_share_load(", pos)) != std::string::npos;) {
-        int depth = 0;
-        size_t e = pos;
-        for (; e < out.size(); ++e) { // end of this statement
-            char ch = out[e];
-            if (ch == '(' || ch == '{' || ch == '[')
-                depth++;
-            else if (ch == ')' || ch == '}' || ch == ']')
-                depth--;
-            else if (ch == ';' && depth == 0)
+    for (const char *fn : {"release", "commit"}) {
+        const std::string from = std::string("aie::") + fn + "(";
+        for (size_t pos = 0; (pos = out.find(from, pos)) != std::string::npos;) {
+            size_t argStart = pos + from.size(), close = out.find(')', argStart);
+            if (close == std::string::npos)
                 break;
+            std::string port = portArg(argStart, close), to = std::string("aiehlc_") + fn + "(" + port;
+            if (plan)
+                to += ", " + convautotile::blockDescVar(kernel, port) + ", " + cursor(port) +
+                      ", aie::program_id(0), aie::program_id(1)";
+            out.replace(pos, close - pos, to);
+            pos += to.size();
         }
-        if (e >= out.size())
-            break;
-        size_t next = out.find_first_not_of(" \t\r\n\\", e + 1);
-        size_t nextEnd = next == std::string::npos ? next : out.find(';', next);
-        const bool more = nextEnd != std::string::npos &&
-                          out.substr(next, nextEnd - next).find("aiehlc_share_load(") != std::string::npos;
-        if (!more) {
-            out.insert(e + 1, " chess_memory_fence();");
-            e += 22;
+    }
+    if (!ports.empty()) {
+        size_t open = kernelBodyOpen(out, kernel);
+        if (open != std::string::npos) {
+            // (program_id stays an inline get_coreid() read at each call: hoisting it -- and the per-core
+            // choices the plan runtime derives from it -- into locals measured ~4 % slower, from register
+            // pressure across the kernel's loops)
+            std::string decls;
+            for (auto &p : ports)
+                decls += "\n    aiehlc_cursor_local aiehlc_lc_" + convautotile::blockIoKey(kernel, p) + "(" +
+                         convautotile::blockCurVar(kernel, p) + ");";
+            out.insert(open + 1, decls);
         }
-        pos = e + 1;
     }
-    if (!locals.empty()) { // after the kernel function's opening brace
-        size_t f = out.find(" " + kernel + "(");
-        size_t open = f == std::string::npos ? std::string::npos : out.find('{', out.find(')', f));
-        if (open != std::string::npos)
-            out.insert(open + 1, locals);
-    }
-    replaceAll("aie::release(", "aiehlc_release(");
-    replaceAll("aie::commit(", "aiehlc_commit(");
     if (coreRowBase >= 0)
         replaceAll("aie::program_id(0)", "((int)(get_coreid() & 0x1F) - " + std::to_string(coreRowBase) + ")");
     if (coreColBase >= 0)
         replaceAll("aie::program_id(1)", "((int)(get_coreid() >> 16) - " + std::to_string(coreColBase) + ")");
     return out;
+}
+
+// Kernel side of a plan with neighbour-shared operands (load_buffer {.share}): the block calls are bound to
+// the plan by aie_block_io_plan.h (constants from aiehlc_plan.h). The kernel TU gets aiehlc_plan.h ahead
+// of aie_block_io.h and, after the port descriptors, aiehlc_plan_operand(), which names the plan's shared
+// operand o (share_args order, the index AIEHLC_PLAN_VIEW(o, pm) & co. take) by descriptor -- a compile-
+// time constant once inlined. A plan without shared operands only gets the include.
+static bool bindPlanSharedOperands(std::string &body, const std::string &kernel,
+                                   const std::vector<std::string> &portVarNames) {
+    const dfplan::DataflowPlan &plan = dfplan::activePlan();
+    if (!plan.present)
+        return true;
+    const std::string inc = "#include \"aie_block_io.h\"\n";
+    const std::string planInc = "#include \"aiehlc_plan.h\" /* the dataflow plan's kernel side (constants) */\n";
+    const size_t at = body.find(inc);
+    if (at == std::string::npos) {
+        body.insert(0, planInc);
+        return true;
+    }
+    body.insert(at, planInc);
+    if (plan.shareArgs.empty())
+        return true;
+    std::string fn = "AIEHLC_PLAN_INLINE int aiehlc_plan_operand(const aiehlc_blk_desc &d) { return ";
+    for (size_t o = 0; o < plan.shareArgs.size(); o++) {
+        const int arg = plan.shareArgs[o];
+        if (arg < 0 || arg >= (int)portVarNames.size()) {
+            llvm::errs() << "[DataflowPlan] ERROR: share_args names argument " << arg << ", the kernel has "
+                         << portVarNames.size() << " port(s)\n";
+            return false;
+        }
+        const std::string desc = convautotile::blockDescVar(kernel, portVarNames[arg]);
+        if (body.find("aiehlc_blk_desc " + desc + " ") == std::string::npos) {
+            llvm::errs() << "[DataflowPlan] ERROR: shared operand " << portVarNames[arg]
+                         << " has no block descriptor in the kernel (is it loaded with aie::load_buffer?)\n";
+            return false;
+        }
+        fn += "&d == &" + desc + " ? " + std::to_string(o) + " : ";
+    }
+    fn += "-1; } /* the plan's shared operands */\n";
+    size_t last = std::string::npos;
+    for (size_t p = body.find("static const aiehlc_blk_desc "); p != std::string::npos;
+         p = body.find("static const aiehlc_blk_desc ", p + 1))
+        last = body.find(";\n", p) + 2;
+    if (last == std::string::npos) {
+        llvm::errs() << "[DataflowPlan] ERROR: no port descriptors in the kernel text\n";
+        return false;
+    }
+    body.insert(last, fn);
+    llvm::outs() << "[DataflowPlan] kernel: block calls on " << plan.shareArgs.size()
+                 << " shared operand(s) bound to the plan (aie_block_io_plan.h)\n";
+    return true;
 }
 
 // Resolve IR-sourced builtin calls `<fnName>(<dim>, <portvar>)` in the kernel body
@@ -2214,11 +2263,10 @@ after_host_emit:
             resolvedKernelBody = resolveArgDimBuiltin(resolvedKernelBody, "aie::get_arg_total_rounds_in_dim",
                                                       portVarNames, perTensorRounds);
             resolvedKernelBody =
-                resolveBlockIoBuiltins(resolvedKernelBody, computeKernelName, coreRowBase, coreColBase, portVarNames);
+                resolveBlockIoBuiltins(resolvedKernelBody, computeKernelName, coreRowBase, coreColBase);
+            if (!bindPlanSharedOperands(resolvedKernelBody, computeKernelName, portVarNames))
+                return false;
             stream << "// User-provided compute kernel (extracted from __global__ function)\n";
-            if (dfplan::activePlan().present)
-                stream
-                    << "#include \"aiehlc_plan.h\" // the dataflow plan's kernel side (hosted-slot loads, constants)\n";
             stream << resolvedKernelBody << "\n";
             std::cout << "Compute kernel (user-provided) written to " << computePath << std::endl;
         } else {

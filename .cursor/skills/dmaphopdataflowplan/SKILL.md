@@ -8,7 +8,8 @@ description: Explicit dataflow plans -- replacing hand edits of generated host.c
 # Dataflow plans (C -> routing -> dmaphop -> code)
 
 Design: `doc/design/dmaphop_dataflow_plan.md`. Example: `example/tileprogram/ccode/gemm_plan/`
-(2 x 8 shared-operand GEMM, 84.9 % of the VEK385 peak from the C source, GOLDEN PASS).
+(2 x 8 shared-operand GEMM, 85.5 % of the VEK385 peak from the C source, every launch 85.3-85.7 %,
+GOLDEN PASS).
 
 ## Three ways in, one lowering
 | level | write | compiler entry |
@@ -17,6 +18,18 @@ Design: `doc/design/dmaphop_dataflow_plan.md`. Example: `example/tileprogram/cco
 | routing IR | `dataflow = {...}` on `routingcreatescheduletensor`, `routing.persistent_kernel` | `plansynth.cpp` (dump `4_DataflowPlan.mlir`) |
 | dmaphop IR | `dmaphop.plan` / `plan_route` / `plan_stream` (dataflow decisions) | `collectDataflowPlan` (`dataflowplan.cpp`) |
 | dfschedule IR (derived) | `config.tile_bd` / `lock_set` / `channel_enable` / `channel_start`, shim `config.dma_bd` + `start_io` | `plandma.cpp` derive + materialize; lowered by DfscheduleToApi / DfscheduleToKernelApi |
+
+## Nothing in the plan is a literal
+- Device facts: `pass/dataflowplan/plantarget.h` (AIE2PS) -- counts, MemTile BD banks, views, lock
+  biases, per-tile-kind BD wrap limits, shim MM2S -> SOUTH port, switch port counts.
+- BD / lock ids, MemTile buffers, the core chunk slots, the go / sync locks: `planresource.cpp`
+  allocates them against the host module's flows, `ResourceMgr::coreOffloadPlan` (replaced args
+  skipped via `funcArgIdx`) and the control plane's shim BDs; the slots are the memory the allocator
+  gave the replaced windows (`CoreMemSlot.ownerId`). Read the choice in the log:
+  `[DataflowPlan] resources (aie2ps): core BDs ..., core locks F .. E .. go .. sync .., ...`.
+- Channels / MemTiles / replay targets come from the stream's `plan_route`s (`arg = N` required).
+- Kernel side: `src/mlir/runtime/aie_block_io_plan.h` (always_inline, operand by descriptor, tile
+  sync at commit); `aiehlc_plan.h` is constants only.
 
 ## Checks that it worked (the build log)
 - `[DataflowPlan] synthesized from the routing IR: ...` (C / routing level only)
@@ -54,7 +67,11 @@ Design: `doc/design/dmaphop_dataflow_plan.md`. Example: `example/tileprogram/cco
   PM > 0x4000): do not.
 - `aie::mmul` at file scope in the prologue breaks the aiehlc front-end parse: prologue headers
   must hold macros only; declare the typedef in the body.
-- Board noise: both builds see occasional 1.20-1.26 ms launches; compare typical launches.
+- The occasional 1.20-1.26 ms launches were NOT board noise: a stream's follower drifted half a chunk
+  behind its leader (3x bank conflicts). Tile sync at `commit` (AIEHLC_PLAN_LOCK_SYNC) removed them.
+- **Core BD wraps are 8 bits** (MemTile / shim 10). A 512-word wrap in a core BD truncates silently:
+  GOLDEN FAIL with a deterministic match count (24,728 / 187,758) and perf unchanged. Every derived
+  wrap goes through `splitWords(words, <kind>BdMaxWrap)`.
 
 ## The DMA program lives in dfschedule
 - dmaphop has no BD / lock / channel ops any more (`plan_bd` etc. are gone: "unknown plan op").

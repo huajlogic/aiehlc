@@ -529,6 +529,7 @@ struct CoreOffloadTileConfig {
     int bdLenBytes = 0;
     int ppDepth = 1;
     int flowIndex = -1;
+    int funcArgIdx = -1; // kernel argument the flow moves (a dataflow plan's replaced args are not resources)
     // --- BD chain detail, so the debug provenance map can describe the DMA the
     // core programs for itself exactly as it describes a host-programmed one.
     // Without these the aiedbg device map shows a core tile with no channels.

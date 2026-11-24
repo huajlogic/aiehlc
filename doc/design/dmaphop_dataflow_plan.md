@@ -26,7 +26,8 @@ outputs) every time:
 | dmaphop plan | 1.160 (best 1.154) | 84.8 (85.2) |
 | routing IR attributes | 1.160 (best 1.154) | 84.7 (85.2) |
 | C source alone | 1.158 (best 1.154) | 84.9 (85.2) |
-| C source, one `load_buffer` body, DMA program as dfschedule ops (current) | 1.156-1.162 typical (best 1.156) | 84.6-85.0 (85.0) |
+| C source, one `load_buffer` body, DMA program as dfschedule ops | 1.156-1.162 typical (best 1.156) | 84.6-85.0 (85.0) |
+| + resources allocated, device table, inlined plan runtime with tile sync (current) | 1.147-1.153, every launch (mean 1.150) | 85.3-85.7 (mean 85.5) |
 
 ## 1. C level
 
@@ -53,10 +54,8 @@ carried as `BlockOpts` -> `KernelBlock` (`tilinglinalg_pipeline.h`) and attached
 `attachTensorRoutingInfo` as the `dataflow` dictionary. `src/aiegraph/kemu.py` mirrors
 `load_opts` so such kernels still emulate on x86.
 
-The kernel body reads what the compiler decided from the generated `aiehlc_plan.h`
-(`AIEHLC_PLAN_A_VIEW(pm)`, `_A_LOCK`, `_A_FIRST`, `_A_PHASE`, `_SLOT_LO`, `_LOCK_F`, ...,
-`AIEHLC_PLAN_PERSISTENT`, `AIEHLC_PLAN_GO_LOCK`); include it in the kernel prologue
-(`// AIEHLC_KERNEL_PROLOGUE_BEGIN ... #include "aiehlc_plan.h"`), under `__chess__`.
+The kernel body is a plain block-load kernel; it never names a lock, a view or an address. The
+compiler binds its block calls on the shared ports to the plan (section 4, "Kernel side").
 
 ### One kernel body, no `#if defined(__chess__)` (2026-11-23, later)
 
@@ -69,7 +68,7 @@ The kernel body reads what the compiler decided from the generated `aiehlc_plan.
 | `.parts = n` -> `block.part(i)`: the block's row parts (the plan puts them in different DM banks) | harness / kemu `AnyPtr`, `aie_block_io.h`, plan `aiehlc_share_block` |
 | `.align = N`: the port's core buffers N-aligned (64-byte `load_v` / `store_v` on a window) | harness / kemu allocation, `block_align` attr -> `flowtransfer_kernel.cpp` allocator |
 | kernel analysis accepts blocks affine in the shared-operand grid (p0 / 2, p1 + C (p0 % 2)) when a port has `.share`; the true fit checks the core (`aiehlc_blk_desc.remap_cols`), an equivalent R x C tiling feeds the routing derivation | `kernel_trace.cpp remapSharedGrid`, `trace_routing.cpp` |
-| a shared port's `load_buffer` / `release` -> `aiehlc_share_load` / `_release` (lock role, slot rotation, bank-split parts), its state copied to a LOCAL at kernel entry (registers), one `chess_memory_fence()` per run of loads / releases | `resolveBlockIoBuiltins`, `planemit.cpp shareRuntime` |
+| a shared port's block calls served by the plan: `aie_block_io_plan.h` (always_inline), operand chosen by descriptor (`aiehlc_plan_operand`), cursors as locals (registers) | `aie_block_io_plan.h`, `resolveBlockIoBuiltins`, `bindPlanSharedOperands` |
 | `#pragma persistent_kernel` -> `main()` calls the kernel in a go-lock loop | `passdfscheduletokernelapi.cpp` |
 | on-core block check off for plan builds (`AIEHLC_BLOCK_CHECK 0`, the analysis proved every block); the check no longer divides | `aie_block_io.h` |
 | the trace harness `-I` the source dir (prologue headers), `-O2` (the full compute traces in 53 s) | `kernel_trace.cpp` |
@@ -103,21 +102,24 @@ and `deriveDmaProgram` turns the streams into the dfschedule DMA program (sectio
 * **Host-tile matching.** Per column, each stream gets one host core within one row of both
   consumers, one stream per core (backtracking matching; 4 x 4: A0 -> row 0, B_c -> 1,
   B_{c+4} -> 2, A1 -> 3).
-* **Views and roles** (dfschedule / kernel side). A consumer reads its stream through `own` (0x70000, locks 48..), `north`
-  (0x60000, 32..) or `south` (0x40000, 0..). The lower consumer reads first and hands the buffer on;
-  the two walk its halves in opposite phase (bank conflicts).
-* **Hosted buffers** (dfschedule). 2 channels x 2 slots of one chunk at the top 32 KB of the host's memory, each
-  chunk split over two DM banks; locks per channel F (DMA -> first reader), G (first -> second),
-  E per slot (both readers -> DMA, acquired -2).
+* **Views and roles** (dfschedule / kernel side). A consumer reads its stream through its own, north
+  or south memory view (addresses and lock-id biases from `plantarget.h`). The lower consumer reads
+  first and hands the buffer on; the two walk its halves in opposite phase (bank conflicts).
+* **Hosted buffers** (dfschedule). 2 channels x 2 slots of one chunk in the memory the allocator gave
+  the replaced ports' windows, each chunk split in two parts (different DM banks); locks per channel
+  F (DMA -> first reader), G (first -> second), a no-op pair, E per buffer (both readers -> DMA,
+  acquired -2), plus a go and a tile-sync lock -- ids allocated (section 4).
 * **MemTiles** (routes: dmaphop; BDs / locks / channels: dfschedule). A: top MemTile row, a FIFO ring (counting locks), column c carries strip c / 2,
   chunk parity c % 2, broadcast to the strip's host row. B: bottom MemTile row, strips c and c + C,
   4 MM2S channels replay them; `resident = "launches"` loads B on the first launch only.
-* **Shim** (dfschedule). One BD per stream (A ch 1, B ch 0), the DDR layout one contiguous stream per column
-  (the host app arranges it, `sh_arrange` in `gemm_plan.cc`).
+* **Shim** (dfschedule). One BD per stream and column on the channel its `plan_route` names; the DDR
+  layout is one contiguous chunk stream per column (the host app arranges it, `sh_arrange` in
+  `gemm_plan.cc` -- the plan's DDR contract).
 
 Limits (errors name them): exactly two shared operands, mesh rows = 2 x A strips and mesh columns =
 2 x A strips (4 x 4), N = 2C block rows (one n tile per core), output tiles per core = M / (R/2) /
-block rows <= 64, K / chunk even, the ring must divide one strip's stream.
+block rows <= the shim BD's iteration limit (64), K / chunk even, the ring must divide one strip's
+stream.
 
 ## 3. dmaphop level: the dataflow decisions
 
@@ -126,31 +128,79 @@ Attribute-only ops (`assemblyFormat = "attr-dict"`, `td/dmaphopop.td`), read and
 Columns are partition-relative, rows absolute; `host_rows` / `first_rows` are mesh rows.
 
 ```mlir
-dmaphop.plan {replace_args = [0, 1], share_args = [0, 1], persistent_go_lock = 14, bd_once = true}
-dmaphop.plan_route {src = [1, 0, 1], src_kind = "shim", dsts = [[1, 2, 1]]}
-dmaphop.plan_route {src = [1, 2, 1], src_kind = "dma", dsts = [[1, 3, 0], [2, 3, 0], [3, 3, 0], [4, 3, 0]]}
+dmaphop.plan {replace_args = [0, 1], share_args = [0, 1], persistent = true, bd_once = true}
+dmaphop.plan_route {arg = 0, src = [1, 0, 1], src_kind = "shim", dsts = [[1, 2, 1]]}
+dmaphop.plan_route {arg = 0, src = [1, 2, 1], src_kind = "dma", dsts = [[1, 3, 0], [2, 3, 0], [3, 3, 0], [4, 3, 0]]}
 dmaphop.plan_stream {arg = 0, role = "a", share = "neighbor", stage = "memtile_ring", ring = 10, resident = "launch",
                      chunk = [64, 128], chunks = 20, rounds = 60, tensor = [7680, 2560], host_rows = [0, 3], first_rows = [0, 2]}
 dmaphop.plan_stream {arg = 1, role = "b", share = "neighbor", stage = "memtile", resident = "launches",
                      chunk = [64, 128], chunks = 20, rounds = 60, tensor = [512, 2560], host_rows = [1, 2], first_rows = [0, 1]}
 ```
 
-Edit a stream (e.g. `ring = 8`) and the DMA program follows; nothing BD-level is written here.
+Edit a stream (e.g. `ring = 8`) and the DMA program follows; nothing BD-level is written here. Every
+route names the stream it carries (`arg`); the derivation takes each stream's channels, MemTiles and
+replay targets from its routes. (`persistent_go_lock = N` from older plans still reads as
+`persistent = true`; the go lock is allocated.)
 
 ## 4. dfschedule level: the DMA program (derived)
 
-`deriveDmaProgram` (`plandma.cpp`) turns the streams into locks, BDs, channels, shim transfers and
-the kernel constants; `materializeHostPlan` / `materializeKernelPlan` write them as dfschedule ops,
-dumped as `ir/dfschedule/NN_DataflowPlanToDfschedule.mlir` and `..(kernel).mlir`:
+### Resources: allocated, never written down
+
+`assignPlanResources` (`planresource.cpp`, at the start of `materializeHostPlan`, before the plan's own
+ops exist) collects what the generated flows use -- `config.dma_bd` / `create_io` in the host module
+(BD ids, lock ids, channels per tile), `ResourceMgr::coreOffloadPlan` (the cores' self-programmed
+DMA; entries of a replaced argument are skipped) and the control plane's runtime shim BDs -- and
+allocates against the device limits of
+`plantarget.h`:
+
+| resource | rule |
+|---|---|
+| core BDs | two chained pairs, the same ids on every core (one ELF) |
+| core locks | F / G / no-op: three pairs `handDelta` (2) apart; E: four in a row; go; sync |
+| chunk slots | the core memory the allocator gave the replaced ports' windows (`CoreMemSlot.ownerId` = kernel arg): must be contiguous and hold 4 chunks, else an error |
+| MemTile | per stream: 2 locks, BDs in the bank of each channel (`memBdBank`), memory bump-allocated with a capacity check; a MemTile with a generated flow is refused |
+| shim | one free BD per stream and column, from the top |
+
+The log line `[DataflowPlan] resources (aie2ps): ...` prints the choice. `plantarget.h` is the one
+place for device facts: lock / BD / channel counts, MemTile BD banks, memory views and lock-id biases,
+BD word size and **per-tile-kind wrap limits** (8-bit core, 10-bit MemTile / shim -- a wider wrap is
+silently truncated by the hardware), iteration limit, shim MM2S -> SOUTH port, switch port counts.
+
+### The program
+
+`deriveDmaProgram` (`plandma.cpp`) turns the streams + routes + resources into locks, BDs, channels,
+shim transfers and the kernel constants (BD dimensions from the chunk shape, split to the tile kind's
+wrap limit); `materializeHostPlan` / `materializeKernelPlan` write them as dfschedule ops, dumped as
+`ir/dfschedule/NN_DataflowPlanToDfschedule.mlir` and `..(kernel).mlir`:
 
 | op | where | lowered by | to |
 |---|---|---|---|
 | `config.tile_bd` (local address, byte strides, hw lock ids: MemTile own locks 64..) | host (MemTiles), kernel (cores, `declaretile.self`) | DfscheduleToApi / DfscheduleToKernelApi | `__Runtime_tile_bd_config` / `aie_kc_encode_bd_nd` |
-| `config.lock_set {value, later_value}` | host, kernel | same | `__Runtime_tile_lock_set` / `aie_kc_encode_lock` |
+| `config.lock_set {value, later_value, restored}` | host, kernel | same | `__Runtime_tile_lock_set(_restored)` / `aie_kc_encode_lock` |
 | `config.channel_enable` | host | DfscheduleToApi | `__Runtime_dma_channel_enable` |
 | `config.channel_start {repeat_count, first_launch_only}` | host, kernel | same | `__Runtime_dma_channel_start` / `aie_kc_encode_s2mm_start` |
 | `config.dma_bd` + `config.create_io` + `schedule.start_io` (+ `dfschedule.first_launch_only`) + `schedule.wait` | host (shim) | DfscheduleToApi | `__Runtime_dma_bd_config_multidim_ooo`, `__Runtime_startio(_first)` |
 | module `dfschedule.plan_bd_once` / `dfschedule.plan_go_lock` | host, kernel | LoadKernelGroup lowering / kernel main | `__Runtime_plan_setup(..)` before the load; `for (;;) { acquire(go); kernel(); }` |
+
+`restored` (the MemTile locks): every launch moves the same data through the lock's buffers, so the
+lock ends each launch at its start value; it is written on the first launch (and on the second if
+`later_value` differs) instead of every launch (~372 ns per MMIO write).
+
+### Kernel side
+
+The generated `aiehlc_plan.h` (constants only: `AIEHLC_PLAN_VIEW(o, pm)` / `_LOCK(o, pm)` /
+`_FIRST(o, pm)` as select chains -- a table would be a data-memory load per use -- `_SLOT_*`,
+`_PART_STRIDE`, `_LOCK_F/G/E/SYNC`, `_SYNC_OPERAND`, `AIEHLC_PLAN_SHARED`) is included ahead of
+`aie_block_io.h`, which then takes `aiehlc_load_buffer` / `_release` / `_store_buffer` / `_commit` from
+`src/mlir/runtime/aie_block_io_plan.h`: forced inline (plain `static inline` was emitted as a call,
+1.21 vs 1.17 ms), the operand chosen by descriptor (`aiehlc_plan_operand`, generated after the
+descriptors), chunk g in buffer `g & 3`, both readers acquire one lock and release the one
+`HAND_DELTA` above it (G, or the no-op lock by 0) -- branch-free -- and `x.part(i)` is `PART_STRIDE`
+apart. **Tile sync**: at every `commit` the leader of an A stream waits for its follower (one release
+and one acquire of the host's sync lock per tile); without it a follower drifting half a chunk behind
+read the leader's bank half on every access, 3x the bank conflicts and the occasional 1.20-1.26 ms
+launch that had looked like board noise. The pipeline's only text change is generic: block calls get
+the port's descriptor, a local cursor copy and the program id.
 
 Runtime: `__Runtime_plan_setup` counts launches (first-launch-only starts, `later_value` locks);
 under BD write-once the tile program is written on the first launch only (constant time) and
@@ -168,7 +218,7 @@ every core's go lock.
 | `ScheduleCanonicalizePass` | `host_canonicalized` keeps every memref argument (the plan's shim transfers read them) |
 | routing.cc | `aiehlc_plan_routing()` -- BFS over the AIE2PS port model around the ports the generated routes took (`routingresourcemap.json`) and the control-packet row fabric; MemTile SOUTH/NORTH lanes kept tied (skill memtilepassthroughlane) |
 | kernel.cc | the KCO input blocks on core S2MM channels the plan's `channel_start` ops own are dropped |
-| aiehlc_plan.h | the shared ports' kernel side (`aiehlc_share_load` / `_release`, per-core init) and `AIEHLC_PLAN_*` constants |
+| aiehlc_plan.h | `AIEHLC_PLAN_*` constants for `aie_block_io_plan.h` and the persistent loop |
 | flowcheck | replaced flows are listed; every `plan_route` is simulated through routing.cc (`plan_routes` in `dmaphopprovenacemap.json`) |
 
 A build with no plan is byte-identical to before; the C-level and dmaphop-level builds of
@@ -177,16 +227,16 @@ dmaphop IR round trips stay byte-identical (`script/test/routing_ir_roundtrip.sh
 
 ## 5. Traps
 
-* **The kernel must agree with the plan's protocol.** The plan programs DMA, locks and buffers; the
-  kernel body acquires / releases those locks and reads those buffers. `gemm_plan_tile.h` takes
-  every offset and lock id from `aiehlc_plan.h`; a kernel with literals silently breaks when the plan
-  changes.
+* **The kernel never names the plan's resources.** Ids and addresses are allocated per build; only
+  `aie_block_io_plan.h` reads them (from `aiehlc_plan.h`).
 * **A build without a plan cannot compile the kernel** (`aiehlc_plan.h` missing). Intended: the
   kernel needs the plan.
-* **Host BD ids.** Plan shim BDs (14, 15) must not collide with the generated output BDs (2..11 here);
-  check `host.cc` after changing the shape.
-* **The replaced inputs' core buffers stay allocated** (`buf_in_*` at 0x78000..0x7FFFF) and the
-  hosted streams reuse exactly that range -- the window buffers are never touched by the plan
-  kernel. A layout with fewer / smaller input windows must move the hosted region.
+* **BD wrap fields differ per tile kind.** A core BD's dimension wrap is 8 bits; splitting a 4 KB half
+  chunk as 512 x 2 words (fine for a MemTile) truncated silently and every output was wrong
+  (GOLDEN FAIL 24,728 / 187,758, deterministic). `plantarget.h` has the limit per kind and
+  `checkPlanLayout` refuses a chunk that does not fit.
+* **Runtime-programmed shim BDs are not in the host IR.** The control plane's BDs
+  (`aie_runtime_resource.h`) are added to the used set from the `routing.control_plan_*` switches, the
+  same reservation the blueprint lowering makes.
 * **Persistent + KCO**: the plan's core block runs once at kernel start; locks the kernel needs at
   every launch must be re-armed by the kernel itself (go lock).

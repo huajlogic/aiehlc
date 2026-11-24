@@ -7,8 +7,8 @@
 // selected kernel arguments by an explicit one, in two IR levels.
 //
 // dmaphop -- the dataflow decisions (attribute-only ops):
-//   dmaphop.plan        {replace_args = [0, 1], share_args = [0, 1], persistent_go_lock = 14, bd_once = true}
-//   dmaphop.plan_route  {src = [col, row, ch], src_kind = "shim"|"dma", dsts = [[col, row, ch], ...]}
+//   dmaphop.plan        {replace_args = [0, 1], share_args = [0, 1], persistent = true, bd_once = true}
+//   dmaphop.plan_route  {arg = 0, src = [col, row, ch], src_kind = "shim"|"dma", dsts = [[col, row, ch], ...]}
 //   dmaphop.plan_stream {arg = 0, role = "a", share = "neighbor", stage = "memtile_ring", ring = 10,
 //                        resident = "launch"|"launches", chunk = [64, 128], chunks = 20, rounds = 60,
 //                        tensor = [7680, 2560], host_rows = [0, 3], first_rows = [0, 2]}
@@ -17,6 +17,10 @@
 //   MemTiles (host module) and the cores (kernel module, declaretile.self), config.dma_bd + create_io
 //   + start_io + wait for the shim transfers, module switches dfschedule.plan_bd_once /
 //   dfschedule.plan_go_lock. DfscheduleToApiPass / DfscheduleToKernelApiPass lower them.
+//
+// Ids (BDs, locks), MemTile / core buffer addresses and the go / sync locks are not part of either
+// level: assignPlanResources (planresource.cpp) allocates them against what the generated flows already
+// use, and every device fact comes from plantarget.h.
 //
 // Columns are partition-relative, rows absolute. Lifecycle: synthesizeDataflowPlan (routing-level
 // `dataflow` attrs -> dmaphop ops) and collectDataflowPlan (read + validate + derive, tag the
@@ -48,6 +52,10 @@ struct PlanLock {
     int init = 0;
     int later = -1; // value from the second launch on (-1 = init every launch)
     bool once = false;
+    // the dataflow hands the lock back at its launch-start value (balanced acquires / releases per launch):
+    // the host writes it only when that value changes -- launch 0, and launch 1 when `later` differs (each
+    // MMIO lock write is ~372 ns on the launch's critical path).
+    bool restored = false;
 };
 
 struct PlanBd {
@@ -78,6 +86,7 @@ struct PlanShimBd {
 };
 
 struct PlanRoute {
+    int arg = -1; // the stream (plan_stream arg) the route carries
     Tile src;
     int srcCh = 0;
     bool srcShim = true;                    // shim MM2S channel, else a MemTile / core DMA MM2S channel
@@ -86,8 +95,31 @@ struct PlanRoute {
 
 struct PlanKernelParam {
     std::string name;
-    std::vector<int64_t> perMeshRow;
-    bool scalar = false; // `value = N`: AIEHLC_PLAN_<name> is a plain constant
+    std::vector<int64_t> perMeshRow; // per shared operand o: perMeshRow[o * meshRows + pm] (perOperand)
+    bool scalar = false;             // AIEHLC_PLAN_<name> is a plain constant
+    bool perOperand = false;         // AIEHLC_PLAN_<name>(o, pm)
+};
+
+// What assignPlanResources picked (planresource.cpp): ids and addresses, never literals in the derivation.
+struct PlanResources {
+    bool assigned = false;
+    // core tiles (the same on every core: one kernel ELF reads them as constants)
+    int coreBd[2][2] = {{-1, -1}, {-1, -1}}; // [S2MM channel slot][buffer]: two chained BDs per channel
+    int lockF = -1;                          // F(ch) = lockF + ch; G = F + handDelta; no-op pair G + handDelta
+    int handDelta = 2;
+    int lockE = -1; // E(ch, k) = lockE + ch + 2 k
+    int lockGo = -1, lockSync = -1;
+    int64_t slotBase = 0, slotBytes = 0; // core memory (core view) the hosted chunks occupy
+    // MemTiles: per stream (index into DataflowPlan::streams)
+    struct Mem {
+        int lockA = -1, lockB = -1; // ring: empty / full; resident: ready / free
+        int bdIn = -1;              // S2MM BD (ring: first of `ring`)
+        std::vector<int> bdOut;     // ring: first MM2S BD; resident: one BD per MM2S route
+        int64_t addr = 0;
+    };
+    std::vector<Mem> mem;
+    // shim: per stream, per column
+    std::vector<std::vector<int>> shimBd;
 };
 
 // One shared operand's stream (dmaphop.plan_stream): a sequence of chunk x chunks blocks per
@@ -109,7 +141,8 @@ struct DataflowPlan {
     int memtileRows = 2; // rows 1..memtileRows are MemTiles; set by collectDataflowPlan
     int colLo = 1, meshCols = 4, meshRows = 4;
     std::vector<int> replacedArgs;
-    int persistentGoLock = -1; // >= 0: kernel loaded once, later launches release this core lock
+    bool persistent = false;   // kernel loaded once, later launches release a go lock (res.lockGo)
+    int persistentGoLock = -1; // the go lock's core lock id once assigned
     bool bdOnce = false;       // identical BD / channel writes are skipped after the first launch
     std::vector<PlanRoute> routes;
     std::vector<PlanStream> streams;
@@ -119,6 +152,7 @@ struct DataflowPlan {
     std::vector<PlanChannel> channels;
     std::vector<PlanShimBd> shimBds;
     std::vector<PlanKernelParam> params;
+    PlanResources res;
 
     // Arguments whose blocks the kernel takes from hosted slots (aiehlc_share_load): the kernel body's
     // aie::load_buffer / aie::release on them are rewritten (kernel params S<arg>_VIEW / _LOCK /
@@ -135,8 +169,20 @@ struct DataflowPlan {
 // erases the ops. false (diagnostics on llvm::errs) on a malformed plan; no plan -> !present.
 bool collectDataflowPlan(mlir::ModuleOp module, DataflowPlan &plan, int memtileRows);
 
-// The streams -> the DMA program (locks, BDs, channels, shim transfers, kernel params).
+// The plan's streams + routes are a layout this compiler implements (checked here, at the dmaphop level).
+bool checkPlanLayout(const DataflowPlan &plan, std::string &why);
+
+// Ids and addresses for the DMA program, allocated against the host module's generated flows, the
+// cores' self-programmed DMA (ResourceMgr) and the core buffer allocator (planresource.cpp).
+bool assignPlanResources(mlir::ModuleOp hostModule, DataflowPlan &plan, std::string &why);
+
+// The streams + routes + assigned resources -> the DMA program (locks, BDs, channels, shim transfers,
+// kernel params).
 bool deriveDmaProgram(DataflowPlan &plan, std::string &why);
+
+// Route lookups shared by the derivation and the resource assignment.
+const PlanStream *streamOfRole(const DataflowPlan &p, const char *role);
+std::vector<const PlanRoute *> routesOf(const DataflowPlan &p, int arg, bool fromShim, int col);
 
 // Routing-level dataflow intent (`dataflow = {share = "neighbor", ...}` on the tensors'
 // routingcreatescheduletensor ops, `routing.persistent_kernel`) -> dmaphop.plan / plan_route /
@@ -145,7 +191,7 @@ bool synthesizeDataflowPlan(mlir::ModuleOp module, std::string &why);
 
 // The DMA program as dfschedule ops: MemTile + shim on the host module (after the kernel launch,
 // waits before the final wait), cores on the kernel module (declaretile.self).
-bool materializeHostPlan(mlir::ModuleOp hostModule, const DataflowPlan &plan);
+bool materializeHostPlan(mlir::ModuleOp hostModule, DataflowPlan &plan);
 bool materializeKernelPlan(mlir::ModuleOp kernelModule, const DataflowPlan &plan);
 
 // The plan is published to the later stages through this process-wide slot.

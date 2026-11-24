@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// int8 GEMM on the 4 x 4 mesh in the 2 x 8 SHARED-OPERAND layout -- 84.8 % of the VEK385 peak from
+// int8 GEMM on the 4 x 4 mesh in the 2 x 8 SHARED-OPERAND layout -- 85.5 % of the VEK385 peak from
 // this source alone (README.md; doc/design/dmaphop_dataflow_plan.md). The data movement is stated
 // where the kernel loads its blocks, and the compiler derives the rest:
 //

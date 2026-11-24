@@ -549,8 +549,8 @@ load, not compute.
 ### Explicit dataflow plans (C / routing / dmaphop -> code, no hand edits)
 
 The 2 x 8 shared-operand GEMM that `share2x8.py` reached by rewriting the generated files now
-comes from the compiler: **~85 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
-alone** (1.156-1.162 ms per 10.07 G MAC typical, GOLDEN PASS). Three ways in, each lowering to the next:
+comes from the compiler: **85.5 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
+alone** (1.147-1.153 ms per 10.07 G MAC, every launch, GOLDEN PASS). Three ways in, each lowering to the next:
 `load_buffer {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring|memtile, .ring = N,
 .keep = true}` + `#pragma persistent_kernel` -> routing IR `dataflow = {...}` on the tensor's
 `routingcreatescheduletensor` + `routing.persistent_kernel` -> plan synthesis
@@ -562,8 +562,12 @@ derived (`plandma.cpp`) as **dfschedule** ops `config.tile_bd` / `lock_set` / `c
 shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernelApi; routes as
 `aiehlc_plan_routing()` (routing.cc, routed around the kept ports); `aiehlc_plan.h` (shared-port
 loads, constants). The kernel is ONE body of `load_buffer` / `store_buffer` (no `#if __chess__`):
-`.parts` / `.align` options, the kernel analysis accepts the shared-operand grid. Runtime `__Runtime_plan_setup`: BD write-once,
-persistent kernel (go lock). A build without a plan is byte-identical; round trips stay identical;
+`.parts` / `.align` options, the kernel analysis accepts the shared-operand grid; its block calls on the shared ports
+are served by `src/mlir/runtime/aie_block_io_plan.h` (always_inline, operand by descriptor, tile sync at commit).
+**No literals:** device facts in `pass/dataflowplan/plantarget.h` (incl. per-tile-kind BD wrap limits -- core 8 bits),
+every BD / lock id, MemTile buffer and the core chunk slots allocated by `planresource.cpp` against the generated
+flows (`[DataflowPlan] resources (aie2ps): ...`), channels from the `plan_route`s (`arg = N`). Runtime
+`__Runtime_plan_setup`: BD write-once, persistent kernel (go lock), `restored` MemTile locks written once. A build without a plan is byte-identical; round trips stay identical;
 flowcheck simulates the plan routes. Design **[doc/design/dmaphop_dataflow_plan.md](doc/design/dmaphop_dataflow_plan.md)**;
 skill **dmaphopdataflowplan**.
 
@@ -1021,6 +1025,7 @@ Read the matching skill when the task fits:
 | Kernel-only kernel: `hand-written GemmSpaces checked ...` + `parameter `aie::port<..., aie::port<..., ...` is not an aie::port<T, <GemmSpace>>` (whole list as one parameter); `the `<` of aie::port is never closed` — a port missing its closing `>` | portunclosedangle |
 | `data used without being loaded` and WHICH constant causes it (`oc_t = 15` vs loops walking 16); `cause (static analysis)` / `out-of-block access (static analysis)` lines; extending `kernel_static.cpp` | blockstaticbounds |
 | Edit the routing / dmaphop IR and feed it back (`AIEHLC_ROUTING_IR_IN`, `AIEHLC_DMAPHOP_IR_IN`, `aiebackend.routing_ir`: view / set_level / lint / check / build), round-trip test, an IR edit that does nothing or is silently accepted although illegal; `flowcheck FAILED` / `FLOWCHECK ERROR ... does not reach / also reaches` after a build | routingirreentry |
+| GOLDEN FAIL with an identical match count every run and unchanged perf after changing BD dims; core BD wrap > 255 (8-bit field, MemTile / shim 10-bit) | bdwrapfieldwidth |
 | Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `dataflow = {...}`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
 | Kernel-only kernel without options hangs in `wait_io TIMEOUT ... dir=0` (output) but works with `{.depth = 2}`; output `pp_depth=1`, one output MM2S BD with `next_bd=-1` vs ping/pong `window_init`; `{.depth = 1} on aie::store_buffer` error | outputpingponghang |
 | A dialect attribute's dumped IR does not parse back (`expected integer value`, `failed to parse ...Attr parameter ... ArrayRef<int64_t>`, `AIEHLC_*_IR_IN ... does not parse / verify`, roundtrip FAIL at the re-entry build): `struct(params)` with an `ArrayRefParameter` | mlirattrarrayroundtrip |

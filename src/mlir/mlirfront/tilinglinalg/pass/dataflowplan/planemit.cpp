@@ -7,6 +7,7 @@
 // (the DMA program is dfschedule ops: plandma.cpp).
 
 #include "dataflowplan.h"
+#include "plantarget.h"
 
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -21,22 +22,11 @@ namespace dfplan {
 
 namespace {
 
-// ---------------------------------------------------------------- port model
-// AIE2PS stream-switch port counts (xaie2psgbl_reginit.c): masters / slaves per direction.
+// ---------------------------------------------------------------- port model (plantarget.h)
 enum class Kind { Shim, Mem, Core };
 
 int portCount(Kind k, char ms, const std::string &dir) {
-    static const std::map<std::string, int> coreM = {{"NORTH", 6}, {"SOUTH", 4}, {"EAST", 4}, {"WEST", 4}, {"DMA", 2}};
-    static const std::map<std::string, int> coreS = {{"SOUTH", 6}, {"NORTH", 4}, {"EAST", 4}, {"WEST", 4}, {"DMA", 2}};
-    static const std::map<std::string, int> memM = {{"NORTH", 6}, {"SOUTH", 4}, {"DMA", 6}};
-    static const std::map<std::string, int> memS = {{"SOUTH", 6}, {"NORTH", 4}, {"DMA", 6}};
-    static const std::map<std::string, int> shimM = {{"NORTH", 6}, {"SOUTH", 6}, {"EAST", 4}, {"WEST", 4}};
-    static const std::map<std::string, int> shimS = {{"SOUTH", 8}, {"NORTH", 4}, {"EAST", 4}, {"WEST", 4}};
-    const auto &m = k == Kind::Core  ? (ms == 'm' ? coreM : coreS)
-                    : k == Kind::Mem ? (ms == 'm' ? memM : memS)
-                                     : (ms == 'm' ? shimM : shimS);
-    auto it = m.find(dir);
-    return it == m.end() ? 0 : it->second;
+    return planTarget().portCount(k == Kind::Core ? "core" : k == Kind::Mem ? "mem" : "shim", ms, dir);
 }
 
 const char *kDirs[] = {"NORTH", "EAST", "WEST", "SOUTH"};
@@ -206,8 +196,12 @@ bool emitPlanRouting(const DataflowPlan &plan, PortBook &book, int colLo, int co
     for (const auto &rt : plan.routes) {
         Slave s;
         if (rt.srcShim) {
-            // Gen5 shim MM2S ch0 / ch1 enter the switch on SOUTH 3 / 7
-            int port = rt.srcCh == 0 ? 3 : 7;
+            // a shim MM2S channel enters the switch on a fixed SOUTH slave port (plantarget.h)
+            if (rt.srcCh < 0 || rt.srcCh > 1) {
+                llvm::errs() << "[DataflowPlan] ERROR: shim MM2S channel " << rt.srcCh << " does not exist\n";
+                return false;
+            }
+            int port = planTarget().shimMm2sSouth[rt.srcCh];
             s = {"SOUTH", port};
             lines.push_back("AIEHLC_PLAN_RT(XAie_EnableShimDmaToAieStrmPort(v1, XAie_TileLoc(" +
                             std::to_string(rt.src.col) + ",0), " + std::to_string(port) + "));");
@@ -241,68 +235,47 @@ bool emitPlanRouting(const DataflowPlan &plan, PortBook &book, int colLo, int co
     return true;
 }
 
-// Kernel side of the shared ports: aie::load_buffer / aie::release on a share_args port become
-// these (the pipeline's body rewrite). One block = one chunk of the hosted stream: the first reader
-// acquires F and hands the chunk on through G, the second acquires G (and "releases" a lock held at
-// 0, branch-free); slot q = 2 (chunk & 1) + ((chunk >> 1) & 1) (channel = chunk parity, 2 slots each);
-// the two parts sit in different memory banks (SLOT_LO / SLOT_HI). Release frees the slot's E lock.
-static std::string shareRuntime(const DataflowPlan &plan) {
-    std::ostringstream os;
-    os << "#ifndef AIEHLC_BLOCK_CHECK // blocks proved by the kernel analysis (aie_block_io.h)\n"
-       << "#define AIEHLC_BLOCK_CHECK 0\n#endif\n"
-       << "#include \"aie_block_io.h\"\n"
-       << "struct aiehlc_share_port {\n  uintptr_t view;\n  int lock, first;\n  unsigned g, r;\n};\n"
-       << "static aiehlc_share_port aiehlc_plan_share["
-       << *std::max_element(plan.shareArgs.begin(), plan.shareArgs.end()) + 1 << "];\n"
-       << "struct aiehlc_share_block {\n  int8_t *p0, *p1;\n"
-       << "  template <typename T> operator T *() const { return (T *)p0; }\n"
-       << "  int8_t *part(int i) const { return i ? p1 : p0; }\n};\n"
-       << "// the block's offset / shape are the kernel's (checked by the kernel analysis); the slot is the plan's\n"
-       << "static inline aiehlc_share_block aiehlc_share_load(aiehlc_share_port &s, const aiehlc_blk_desc &,\n"
-       << "                                                   aiehlc_blk_cursor &, int, int, aiehlc_blk, aiehlc_blk,\n"
-       << "                                                   int = 1) {\n"
-       << "  const unsigned g = s.g++;\n"
-       << "  const int ch_ = AIEHLC_PLAN_LOCK_CH_STRIDE * (int)(g & 1u);\n"
-       << "  acquire_greater_equal(s.lock + (s.first ? AIEHLC_PLAN_LOCK_F : AIEHLC_PLAN_LOCK_G) + ch_, 1);\n"
-       << "  release(s.first ? s.lock + AIEHLC_PLAN_LOCK_G + ch_ : AIEHLC_PLAN_LOCK_NOP, s.first ? 1 : 0);\n"
-       << "  // no fence here: the rewrite puts ONE chess_memory_fence() after a run of shared loads\n"
-       << "  const unsigned q_ = 2u * (g & 1u) + ((g >> 1) & 1u);\n"
-       << "  return {(int8_t *)(s.view + AIEHLC_PLAN_SLOT_LO + q_ * AIEHLC_PLAN_SLOT_STRIDE),\n"
-       << "          (int8_t *)(s.view + AIEHLC_PLAN_SLOT_HI + q_ * AIEHLC_PLAN_SLOT_STRIDE)};\n}\n"
-       << "// no fence here: the rewrite puts ONE chess_memory_fence() before a run of shared releases\n"
-       << "static inline void aiehlc_share_release(aiehlc_share_port &s) {\n"
-       << "  const unsigned g = s.r++;\n"
-       << "  release(s.lock + AIEHLC_PLAN_LOCK_E + AIEHLC_PLAN_LOCK_CH_STRIDE * (int)(g & 1u) + (int)((g >> 1) & 1u), "
-          "1);\n"
-       << "}\n"
-       << "static inline void aiehlc_plan_share_init(int pm) {\n";
-    for (int a : plan.shareArgs)
-        os << "  aiehlc_plan_share[" << a << "] = {(uintptr_t)AIEHLC_PLAN_S" << a << "_VIEW(pm), (int)AIEHLC_PLAN_S"
-           << a << "_LOCK(pm), (int)AIEHLC_PLAN_S" << a << "_FIRST(pm), 0u, 0u};\n";
-    os << "}\n";
-    return os.str();
-}
-
+// aiehlc_plan.h: the constants the kernel side of the plan reads -- the block calls on the shared ports
+// (src/mlir/runtime/aie_block_io_plan.h, bound to them when AIEHLC_PLAN_SHARED is defined) and the
+// persistent kernel loop. Per-operand / per-row values are select chains, not tables: pm and the operand
+// are register values / compile-time constants on the core, and a table would be a data-memory load at
+// every use. Emitted in name order, so a plan gives the same header whichever way it came in.
 std::string emitPlanHeader(const DataflowPlan &plan) {
+    const PlanTarget &T = planTarget();
     std::ostringstream os;
-    os << "/* aiehlc_plan.h -- generated from the dmaphop dataflow plan; do not edit. */\n"
+    os << "/* aiehlc_plan.h -- generated from the dataflow plan (" << T.name << "); do not edit. */\n"
        << "#ifndef AIEHLC_PLAN_H\n#define AIEHLC_PLAN_H\n"
        << "#define AIEHLC_PLAN 1\n"
        << "#define AIEHLC_PLAN_PERSISTENT " << (plan.persistentGoLock >= 0 ? 1 : 0) << "\n"
-       << "#define AIEHLC_PLAN_GO_LOCK " << (plan.persistentGoLock >= 0 ? 48 + plan.persistentGoLock : -1)
-       << " /* kernel lock id (own locks are 48 + hw id) */\n";
-    for (const auto &p : plan.params) {
+       << "#define AIEHLC_PLAN_GO_LOCK "
+       << (plan.persistentGoLock >= 0 ? T.coreOwnLockBias + plan.persistentGoLock : -1)
+       << " /* the core program's id of its own go lock */\n";
+    std::vector<const PlanKernelParam *> params;
+    for (const auto &p : plan.params)
+        params.push_back(&p);
+    std::stable_sort(params.begin(), params.end(),
+                     [](const PlanKernelParam *a, const PlanKernelParam *b) { return a->name < b->name; });
+    const int rows = std::max(plan.meshRows, 1);
+    for (const PlanKernelParam *pp : params) {
+        const PlanKernelParam &p = *pp;
         if (p.scalar) {
             os << "#define AIEHLC_PLAN_" << p.name << " " << p.perMeshRow[0] << "\n";
             continue;
         }
-        os << "static const long aiehlc_plan_" << p.name << "[" << std::max<size_t>(p.perMeshRow.size(), 1) << "] = {";
-        for (size_t i = 0; i < p.perMeshRow.size(); i++)
-            os << (i ? ", " : "") << p.perMeshRow[i];
-        os << "};\n#define AIEHLC_PLAN_" << p.name << "(pm) (aiehlc_plan_" << p.name << "[(pm)])\n";
+        const size_t n = p.perMeshRow.size();
+        os << "#define AIEHLC_PLAN_" << p.name << (p.perOperand ? "(o, pm) (" : "(pm) (");
+        for (size_t i = 0; i + 1 < n; i++) {
+            if (p.perOperand)
+                os << "((o) == " << i / rows << " && (pm) == " << i % rows << ") ? " << p.perMeshRow[i] << "L : ";
+            else
+                os << "(pm) == " << i << " ? " << p.perMeshRow[i] << "L : ";
+        }
+        os << (n ? p.perMeshRow.back() : 0) << "L)\n";
     }
     if (!plan.shareArgs.empty())
-        os << shareRuntime(plan);
+        os << "#define AIEHLC_PLAN_SHARED 1 /* aie_block_io.h binds the block calls (aie_block_io_plan.h) */\n"
+           << "#ifndef AIEHLC_BLOCK_CHECK /* blocks proved by the kernel analysis on x86 */\n"
+           << "#define AIEHLC_BLOCK_CHECK 0\n#endif\n";
     os << "#endif\n";
     return os.str();
 }

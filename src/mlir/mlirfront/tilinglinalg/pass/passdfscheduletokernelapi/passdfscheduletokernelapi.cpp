@@ -6,6 +6,7 @@
 #include "passdfscheduletokernelapi.h"
 #include "hw/ResourceManager.h"
 #include "dataflowplan/dataflowplan.h"
+#include "dataflowplan/plantarget.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -813,8 +814,9 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     rewriter.create<emitc::VerbatimOp>(
                         loc, "for (;;) { // persistent kernel: one call per launch, released by go lock " +
                                  std::to_string(goLock));
-                    rewriter.create<emitc::VerbatimOp>(loc, "  acquire_greater_equal(" + std::to_string(48 + goLock) +
-                                                                ", 1);");
+                    rewriter.create<emitc::VerbatimOp>(
+                        loc, "  acquire_greater_equal(" +
+                                 std::to_string(dfplan::planTarget().coreOwnLockBias + goLock) + ", 1);");
                     rewriter.create<emitc::VerbatimOp>(loc, "  " + callee + "(" + argList + ");");
                     rewriter.create<emitc::VerbatimOp>(loc, "}");
                     continue;
