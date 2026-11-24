@@ -913,45 +913,12 @@ static bool applyPlanToRouting(mlir::ModuleOp routingModule, const std::string &
     return inserted;
 }
 
-// Host side: aiehlc_plan_host_setup() before the kernel load (persistent /
-// BD-once switches), aiehlc_plan_host_launch(dev, args...) right after the
-// kernel launch (MemTile + shim programming), aiehlc_plan_host_wait() before
-// every return. Also writes aiehlc_plan.h for the kernel body.
-static bool applyPlanToHost(mlir::ModuleOp hostModule, const std::string &outputDir) {
+// The plan's kernel-side header (aiehlc_plan.h: shared-port loads, constants). The DMA program itself
+// is dfschedule ops (materializeHostPlan / materializeKernelPlan), lowered by the API passes.
+static bool applyPlanToHost(mlir::ModuleOp, const std::string &outputDir) {
     const dfplan::DataflowPlan &plan = dfplan::activePlan();
     if (!plan.present)
         return true;
-    mlir::emitc::FuncOp host;
-    mlir::Operation *loadCall = nullptr, *launchCall = nullptr;
-    hostModule.walk([&](mlir::emitc::CallOpaqueOp call) {
-        llvm::StringRef callee = call.getCallee();
-        if (callee.starts_with("__Runtime_load_kernel_group") && !loadCall)
-            loadCall = call;
-        if (callee.starts_with("__Runtime_launch_kernel_group") && !launchCall) {
-            launchCall = call;
-            host = call->getParentOfType<mlir::emitc::FuncOp>();
-        }
-    });
-    if (!host || !launchCall) {
-        llvm::errs() << "[DataflowPlan] ERROR: no kernel launch found in the host module\n";
-        return false;
-    }
-    mlir::Block &entry = host.getBody().front();
-    mlir::Value dev = entry.getArgument(0);
-    llvm::SmallVector<mlir::Value> args(entry.getArguments().begin(), entry.getArguments().end());
-    mlir::OpBuilder b(host);
-    b.create<mlir::emitc::VerbatimOp>(host.getLoc(),
-                                      dfplan::emitPlanHost(plan, plan.memtileRows, (int)args.size() - 1));
-    b.setInsertionPoint(loadCall ? loadCall : launchCall);
-    b.create<mlir::emitc::CallOpaqueOp>(host.getLoc(), mlir::TypeRange{}, "aiehlc_plan_host_setup",
-                                        mlir::ValueRange{dev});
-    b.setInsertionPointAfter(launchCall);
-    b.create<mlir::emitc::CallOpaqueOp>(host.getLoc(), mlir::TypeRange{}, "aiehlc_plan_host_launch", args);
-    host.walk([&](mlir::emitc::ReturnOp ret) {
-        mlir::OpBuilder rb(ret);
-        rb.create<mlir::emitc::CallOpaqueOp>(ret.getLoc(), mlir::TypeRange{}, "aiehlc_plan_host_wait",
-                                             mlir::ValueRange{dev});
-    });
     std::error_code ec;
     llvm::raw_fd_ostream hdr(outputDir + "/aiehlc_plan.h", ec, llvm::sys::fs::OF_None);
     if (ec) {
@@ -959,8 +926,7 @@ static bool applyPlanToHost(mlir::ModuleOp hostModule, const std::string &output
         return false;
     }
     hdr << dfplan::emitPlanHeader(plan);
-    llvm::outs() << "[DataflowPlan] host: plan setup / launch / wait wired into " << host.getName()
-                 << "; aiehlc_plan.h written\n";
+    llvm::outs() << "[DataflowPlan] aiehlc_plan.h written\n";
     return true;
 }
 
@@ -1363,6 +1329,12 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                "APIToControlPacketPass"))
         return false;
 
+    // Dataflow plan: its MemTile + shim DMA program as dfschedule ops, lowered with everything else below.
+    if (dfplan::activePlan().present) {
+        if (!dfplan::materializeHostPlan(hostModule, dfplan::activePlan()))
+            return false;
+        dumpPipelineIRToFile(hostModule, irDir, stage++, "DataflowPlanToDfschedule");
+    }
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
                                irDir, stage, "DfscheduleToApiPass"))
@@ -1476,6 +1448,12 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         computeKernelName = userKernelFuncName;
     }
 
+    // Dataflow plan: the cores' DMA program as dfschedule ops in the kernel module.
+    if (dfplan::activePlan().present) {
+        if (!dfplan::materializeKernelPlan(kernelModule, dfplan::activePlan()))
+            return false;
+        dumpPipelineIRToFile(kernelModule, irDir, stage++, "DataflowPlanToDfschedule(kernel)");
+    }
     if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::DfscheduleToKernelApiPass>(partStartCol),
                                irDir, stage, "DfscheduleToKernelApiPass"))
         return false;

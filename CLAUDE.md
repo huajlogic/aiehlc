@@ -549,16 +549,20 @@ load, not compute.
 ### Explicit dataflow plans (C / routing / dmaphop -> code, no hand edits)
 
 The 2 x 8 shared-operand GEMM that `share2x8.py` reached by rewriting the generated files now
-comes from the compiler: **84.9 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
-alone** (1.158 ms per 10.07 G MAC, GOLDEN PASS). Three ways in, each lowering to the next:
+comes from the compiler: **~85 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
+alone** (1.156-1.162 ms per 10.07 G MAC typical, GOLDEN PASS). Three ways in, each lowering to the next:
 `load_buffer {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring|memtile, .ring = N,
 .keep = true}` + `#pragma persistent_kernel` -> routing IR `dataflow = {...}` on the tensor's
 `routingcreatescheduletensor` + `routing.persistent_kernel` -> plan synthesis
 (`pass/dataflowplan/plansynth.cpp`: host-tile matching, views, locks, MemTile ring / resident B,
-shim walks; dump `4_DataflowPlan.mlir`) -> `dmaphop.plan*` ops (`collectDataflowPlan` validates,
-tags replaced flows `dmaphop.plan_replaced`) -> `aiehlc_plan_routing()` (routing.cc, routed around
-the kept ports), `aiehlc_plan_host_setup/launch/wait` (host.cc), a `DATAFLOW PLAN` KCO block
-(kernel.cc), `aiehlc_plan.h` (kernel constants). Runtime `__Runtime_plan_setup`: BD write-once,
+dump `4_DataflowPlan.mlir`) -> dmaphop dataflow ops `dmaphop.plan` / `plan_route` / `plan_stream`
+(`collectDataflowPlan` validates, tags replaced flows `dmaphop.plan_replaced`) -> the DMA program
+derived (`plandma.cpp`) as **dfschedule** ops `config.tile_bd` / `lock_set` / `channel_enable` /
+`channel_start` (MemTiles on the host module, cores on the kernel module via `declaretile.self`) +
+shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernelApi; routes as
+`aiehlc_plan_routing()` (routing.cc, routed around the kept ports); `aiehlc_plan.h` (shared-port
+loads, constants). The kernel is ONE body of `load_buffer` / `store_buffer` (no `#if __chess__`):
+`.parts` / `.align` options, the kernel analysis accepts the shared-operand grid. Runtime `__Runtime_plan_setup`: BD write-once,
 persistent kernel (go lock). A build without a plan is byte-identical; round trips stay identical;
 flowcheck simulates the plan routes. Design **[doc/design/dmaphop_dataflow_plan.md](doc/design/dmaphop_dataflow_plan.md)**;
 skill **dmaphopdataflowplan**.

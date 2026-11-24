@@ -409,6 +409,15 @@ void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_til
 void __Runtime_wait_event(XAie_DevInst *dev, struct_event ev);
 /* dataflow plan (dmaphop.plan): skip identical BD / ooo-channel rewrites; persistent kernel (go lock >= 0) */
 void __Runtime_plan_setup(int bd_once, int persistent_go_lock);
+int __Runtime_plan_first(void);
+void __Runtime_tile_bd_config(XAie_DevInst *dev, XAie_LocType t, int bd, int addr, int len, int nd, int s0, int w0,
+                              int s1, int w1, int s2, int w2, int iter_step, int iter_wrap, int acq, int acqv, int rel,
+                              int relv, int next);
+void __Runtime_tile_lock_set(XAie_DevInst *dev, XAie_LocType t, int id, int value, int later);
+void __Runtime_dma_channel_enable(XAie_DevInst *dev, XAie_LocType t, int ch, int mm2s);
+void __Runtime_dma_channel_start(XAie_DevInst *dev, XAie_LocType t, int ch, int mm2s, int bd, int repeat,
+                                 int first_only);
+struct_ioevent __Runtime_startio_first(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
 void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_ev);
 // Wait-idle hook (GHL): host work that is independent of the running launch (e.g. the
 // post-processing of a PREVIOUS launch's output) stepped from __Runtime_wait_io's

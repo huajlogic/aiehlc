@@ -222,6 +222,61 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
   let hasVerifier = 1;
 }
 
+// ============================================================================
+// DATAFLOW PLAN: tile-local DMA program (doc/design/dmaphop_dataflow_plan.md)
+// Written by DataflowPlanToDfschedule into the host module (MemTiles, on
+// declaretile) and the kernel module (cores, on declaretile.self -- lowered to
+// the core's own KERNELCONFIGOFFLOAD block). Hardware values: lock ids are the
+// tile's DMA lock numbers (a MemTile's own locks are 64..), addresses are the
+// tile's own view (MemTile 0x80000.., core 0x70000..), strides / steps BYTES.
+// ============================================================================
+def dfschedule_ConfigTileBdOp : dfscheduleop<"config.tile_bd"> {
+  let summary = "Buffer descriptor over a MemTile's / core's own memory";
+  let arguments = (ins
+    dfschedule_TileHandleType:$tile,
+    I32Attr:$bd_id,
+    I64Attr:$addr,
+    I32Attr:$len,
+    DefaultValuedAttr<I32ArrayAttr, "{}">:$dim_strides,
+    DefaultValuedAttr<I32ArrayAttr, "{}">:$dim_wraps,
+    DefaultValuedAttr<I32Attr, "0">:$iter_step_size,
+    DefaultValuedAttr<I32Attr, "0">:$iter_wrap,
+    DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_id,
+    DefaultValuedAttr<I32Attr, "0">:$acquire_lock_val,
+    DefaultValuedAttr<I32Attr, "-1">:$release_lock_id,
+    DefaultValuedAttr<I32Attr, "0">:$release_lock_val,
+    DefaultValuedAttr<I32Attr, "-1">:$next_bd
+  );
+  let assemblyFormat = "`(` $tile `)` attr-dict `:` type($tile)";
+}
+def dfschedule_ConfigLockSetOp : dfscheduleop<"config.lock_set"> {
+  let summary = "Set a tile lock's value every launch (later_value from the second launch on, -1 = same)";
+  let arguments = (ins
+    dfschedule_TileHandleType:$tile,
+    I32Attr:$lock_id,
+    I32Attr:$value,
+    DefaultValuedAttr<I32Attr, "-1">:$later_value
+  );
+  let assemblyFormat = "`(` $tile `)` attr-dict `:` type($tile)";
+}
+def dfschedule_ConfigChannelEnableOp : dfscheduleop<"config.channel_enable"> {
+  let summary = "Enable a tile DMA channel";
+  let arguments = (ins dfschedule_TileHandleType:$tile, I32Attr:$channel, StrAttr:$direction);
+  let assemblyFormat = "`(` $tile `)` attr-dict `:` type($tile)";
+}
+def dfschedule_ConfigChannelStartOp : dfscheduleop<"config.channel_start"> {
+  let summary = "Push a tile DMA channel's start queue (optionally on the first launch only)";
+  let arguments = (ins
+    dfschedule_TileHandleType:$tile,
+    I32Attr:$channel,
+    StrAttr:$direction,
+    I32Attr:$start_bd,
+    DefaultValuedAttr<I32Attr, "1">:$repeat_count,
+    DefaultValuedAttr<BoolAttr, "false">:$first_launch_only
+  );
+  let assemblyFormat = "`(` $tile `)` attr-dict `:` type($tile)";
+}
+
 // Create IO handle
 def dfschedule_ConfigCreateIoOp : dfscheduleop<"config.create_io"> {
   let summary = "Create an IO handle for DMA operations";

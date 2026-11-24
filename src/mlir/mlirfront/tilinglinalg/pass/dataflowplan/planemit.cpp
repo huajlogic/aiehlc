@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 
-// Dataflow plan -> C text for routing.cc, host.cc, kernel.cc and aiehlc_plan.h.
+// Dataflow plan -> the C text that is not a DMA program: routing.cc routes and aiehlc_plan.h
+// (the DMA program is dfschedule ops: plandma.cpp).
 
 #include "dataflowplan.h"
 
@@ -149,28 +150,6 @@ bool routeNet(Fabric &f, Tile src, Slave srcSlave, const std::vector<std::pair<T
     return true;
 }
 
-std::string tileCond(const std::vector<Tile> &tiles, const std::set<Tile> &allCores) {
-    std::set<Tile> s(tiles.begin(), tiles.end());
-    if (s == allCores)
-        return "";
-    std::string c;
-    for (const auto &t : s)
-        c += (c.empty() ? "" : " || ") + std::string("(_pcol == ") + std::to_string(t.col) +
-             " && _prow == " + std::to_string(t.row) + ")";
-    return c;
-}
-
-std::string dimsInit(const Dims &d, int64_t itStep, int64_t itWrap) {
-    // AieKcDims {d0_step, d0_wrap, d1_step, d1_wrap, d2_step, iter_step, iter_wrap} (words)
-    auto g = [&](size_t i, bool wrap) -> int64_t { return i < d.size() ? (wrap ? d[i].second : d[i].first) : 0; };
-    std::ostringstream os;
-    os << "{" << g(0, false) << ", " << g(0, true) << ", " << g(1, false) << ", " << g(1, true) << ", " << g(2, false)
-       << ", " << itStep << ", " << itWrap << "}";
-    return os.str();
-}
-
-bool isMem(const Tile &t, int memRows) { return t.row >= 1 && t.row <= memRows; }
-
 } // namespace
 
 bool loadPortBook(const std::string &path, PortBook &book) {
@@ -260,186 +239,6 @@ bool emitPlanRouting(const DataflowPlan &plan, PortBook &book, int colLo, int co
     llvm::outs() << "[DataflowPlan] routed " << plan.routes.size() << " plan net(s): " << lines.size()
                  << " switch connections\n";
     return true;
-}
-
-static void emitMemtileBds(const DataflowPlan &plan, int memRows, std::ostringstream &os) {
-    for (const auto &b : plan.bds)
-        for (const auto &t : b.tiles) {
-            if (!isMem(t, memRows))
-                continue;
-            os << "    { const unsigned d_[] = {";
-            for (size_t i = 0; i < b.dims.size(); i++)
-                os << (i ? ", " : "") << b.dims[i].first << ", " << b.dims[i].second;
-            if (b.dims.empty())
-                os << "0";
-            os << "}; aiehlc_plan_mt_bd(v1, XAie_TileLoc(" << t.col << ", " << t.row << "), " << b.bd << ", 0x"
-               << std::hex << b.addr << std::dec << "u, " << b.len << "u, " << b.dims.size() << ", d_, " << b.iterStep
-               << ", " << b.iterWrap << ", " << b.acqLock << ", " << b.acqVal << ", " << b.relLock << ", " << b.relVal
-               << ", " << b.next << "); }\n";
-        }
-}
-
-std::string emitPlanHost(const DataflowPlan &plan, int memRows, int nargs) {
-    std::ostringstream os;
-    os << "/* ===== dataflow plan host side (dmaphop.plan*), generated ===== */\n"
-       << "static void aiehlc_plan_mt_bd(XAie_DevInst *dev, XAie_LocType t, int bd, unsigned addr, unsigned len,\n"
-       << "                              int nd, const unsigned *dims, int it_step, int it_wrap, int acq, int acqv,\n"
-       << "                              int rel, int relv, int next) {\n"
-       << "  /* MemTile BD: own memory at 0x80000, own locks 64.. (neighbourhood-relative addressing) */\n"
-       << "  XAie_DmaDesc d;\n"
-       << "  XAie_DmaDescInit(dev, &d, t);\n"
-       << "  if (nd > 0) {\n"
-       << "    XAie_DmaDimDesc dd[3];\n"
-       << "    for (int i = 0; i < nd; i++) {\n"
-       << "      dd[i].AieMlDimDesc.StepSize = dims[2 * i];\n"
-       << "      dd[i].AieMlDimDesc.Wrap = (u16)dims[2 * i + 1];\n"
-       << "    }\n"
-       << "    XAie_DmaTensor ts = {(u8)nd, dd};\n"
-       << "    XAie_DmaSetMultiDimAddr(&d, &ts, addr, len);\n"
-       << "  } else {\n"
-       << "    XAie_DmaSetAddrLen(&d, addr, len);\n"
-       << "  }\n"
-       << "  if (it_wrap > 1)\n"
-       << "    XAie_DmaSetBdIteration(&d, (u32)it_step, (u16)it_wrap, 0);\n"
-       << "  if (acq >= 0 && rel >= 0)\n"
-       << "    XAie_DmaSetLock(&d, XAie_LockInit(64 + acq, acqv), XAie_LockInit(64 + rel, relv));\n"
-       << "  if (next >= 0)\n"
-       << "    XAie_DmaSetNextBd(&d, (u16)next, XAIE_ENABLE);\n"
-       << "  XAie_DmaEnableBd(&d);\n"
-       << "  if (XAie_DmaWriteBd(dev, &d, t, (u8)bd) != XAIE_OK)\n"
-       << "    printf(\"[dataflow plan] MemTile BD %d on (%d,%d) FAILED\\n\", bd, t.Col, t.Row);\n"
-       << "}\n"
-       << "static unsigned aiehlc_plan_nlaunch;\n"
-       << "static ioevent aiehlc_plan_ev[" << std::max<size_t>(plan.shimBds.size(), 1) << "];\n"
-       << "static int aiehlc_plan_nev;\n"
-       << "static void aiehlc_plan_host_setup(XAie_DevInst *v1) {\n"
-       << "  (void)v1;\n"
-       << "  __Runtime_plan_setup(" << (plan.bdOnce ? 1 : 0) << ", " << plan.persistentGoLock << ");\n"
-       << "}\n"
-       << "static void aiehlc_plan_host_launch(XAie_DevInst *v1";
-    for (int i = 0; i < nargs; i++)
-        os << ", void *a" << i;
-    os << ") {\n  void *const args[] = {";
-    for (int i = 0; i < nargs; i++)
-        os << (i ? ", " : "") << "a" << i;
-    if (nargs == 0)
-        os << "0";
-    os << "};\n"
-       << "  const int first = aiehlc_plan_nlaunch == 0;\n"
-       << "  (void)args;\n";
-    os << "  /* MemTile locks (every launch; `later` from the second launch on) */\n";
-    for (const auto &l : plan.locks)
-        for (const auto &t : l.tiles) {
-            if (!isMem(t, memRows))
-                continue;
-            os << "  " << (l.once ? "if (first) " : "") << "XAie_LockSetValue(v1, XAie_TileLoc(" << t.col << ", "
-               << t.row << "), XAie_LockInit(" << l.id << ", ";
-            if (l.later >= 0 && l.later != l.init)
-                os << "first ? " << l.init << " : " << l.later;
-            else
-                os << l.init;
-            os << "));\n";
-        }
-    os << "  if (" << (plan.bdOnce ? "first" : "1") << ") { /* MemTile BDs + channel enables */\n";
-    emitMemtileBds(plan, memRows, os);
-    for (const auto &c : plan.channels)
-        for (const auto &t : c.tiles)
-            if (isMem(t, memRows))
-                os << "    XAie_DmaChannelEnable(v1, XAie_TileLoc(" << t.col << ", " << t.row << "), " << c.ch << ", "
-                   << (c.s2mm ? "DMA_S2MM" : "DMA_MM2S") << ");\n";
-    os << "  }\n  /* MemTile start queues */\n";
-    for (const auto &c : plan.channels)
-        for (const auto &t : c.tiles)
-            if (isMem(t, memRows))
-                os << "  " << (c.firstLaunchOnly ? "if (first) " : "")
-                   << "XAie_DmaChannelSetStartQueue(v1, XAie_TileLoc(" << t.col << ", " << t.row << "), " << c.ch
-                   << ", " << (c.s2mm ? "DMA_S2MM" : "DMA_MM2S") << ", " << c.startBd << ", " << c.repeat << ", 0);\n";
-    os << "  /* shim transfers over the kernel arguments */\n";
-    for (const auto &s : plan.shimBds) {
-        auto g = [&](size_t i, bool wrap) -> int64_t {
-            return i < s.dims.size() ? (wrap ? s.dims[i].second : s.dims[i].first) : 0;
-        };
-        os << "  " << (s.firstLaunchOnly ? "if (first) " : "") << "{\n"
-           << "    XAie_DmaDesc d = __Runtime_dma_bd_config_multidim_ooo(v1, XAie_TileLoc(" << s.col << ", 0), "
-           << "__runtime_buffer_offset(args[" << s.arg << "], (int64_t)" << s.offset << "LL), " << s.bd << ", " << s.len
-           << ", -1, 0, 0, -1, 0, -1, 0, -1, " << s.dims.size() << ", " << g(0, false) << ", " << g(0, true) << ", "
-           << g(1, false) << ", " << g(1, true) << ", " << g(2, false) << ", " << g(2, true) << ", " << s.iterStep
-           << ", " << s.iterWrap << ");\n"
-           << "    io o = __Runtime_dma_createio_4(XAie_TileLoc(" << s.col << ", 0), d, " << s.ch << ", " << s.bd
-           << ", " << (s.mm2s ? "DMA_MM2S" : "DMA_S2MM") << ");\n"
-           << "    aiehlc_plan_ev[aiehlc_plan_nev++] = __Runtime_startio(v1, o, " << s.bd << ", " << s.repeat << ");\n"
-           << "  }\n";
-    }
-    os << "  aiehlc_plan_nlaunch++;\n}\n"
-       << "static void aiehlc_plan_host_wait(XAie_DevInst *v1) {\n"
-       << "  for (int i = 0; i < aiehlc_plan_nev; i++)\n"
-       << "    __Runtime_wait(v1, aiehlc_plan_ev[i]);\n"
-       << "  aiehlc_plan_nev = 0;\n"
-       << "}\n\n";
-    return os.str();
-}
-
-std::string emitPlanKernelBlock(const DataflowPlan &plan, int memRows, int partStartCol) {
-    std::set<Tile> cores;
-    for (const auto &b : plan.bds)
-        for (auto &t : b.tiles)
-            if (t.row > memRows)
-                cores.insert(t);
-    for (const auto &l : plan.locks)
-        for (auto &t : l.tiles)
-            if (t.row > memRows)
-                cores.insert(t);
-    for (const auto &c : plan.channels)
-        for (auto &t : c.tiles)
-            if (t.row > memRows)
-                cores.insert(t);
-    if (cores.empty())
-        return "";
-    std::ostringstream os;
-    os << "{ // DATAFLOW PLAN core-tile DMA (dmaphop.plan_bd / plan_lock / plan_channel), generated\n"
-       << "  AieKcReg _kc[8];\n  int _n;\n"
-       << "  const unsigned _pcid = get_coreid();\n"
-       << "  const int _pcol = (int)(_pcid >> 16) - " << partStartCol << ", _prow = (int)(_pcid & 0x1F);\n"
-       << "  (void)_pcol; (void)_prow; (void)_n;\n";
-    auto open = [&](const std::vector<Tile> &tiles) {
-        std::vector<Tile> ct;
-        for (auto &t : tiles)
-            if (t.row > memRows)
-                ct.push_back(t);
-        std::string c = tileCond(ct, cores);
-        os << (c.empty() ? "  {\n" : "  if (" + c + ") {\n");
-        return !ct.empty();
-    };
-    for (const auto &b : plan.bds) {
-        if (!open(b.tiles)) {
-            os << "  }\n";
-            continue;
-        }
-        os << "    const AieKcDims _d = " << dimsInit(b.dims, b.iterStep, b.iterWrap) << ";\n"
-           << "    _n = aie_kc_encode_bd_nd(_kc, " << b.bd << ", (uintptr_t)0x" << std::hex << b.addr << std::dec
-           << ", " << b.len << ", " << b.next << ", " << b.acqLock << ", " << b.acqVal << ", " << b.relLock << ", "
-           << b.relVal << ", 0, 0, 0, -1, &_d);\n    core_reg_write_block(_kc, _n);\n  }\n";
-    }
-    for (const auto &l : plan.locks) {
-        if (!open(l.tiles)) {
-            os << "  }\n";
-            continue;
-        }
-        os << "    aie_kc_encode_lock(_kc, " << l.id << ", " << l.init << ");\n"
-           << "    core_reg_write(_kc[0].off, _kc[0].val);\n  }\n";
-    }
-    for (const auto &c : plan.channels) {
-        if (!open(c.tiles)) {
-            os << "  }\n";
-            continue;
-        }
-        os << "    aie_kc_encode_" << (c.s2mm ? "s2mm" : "mm2s") << "_start(_kc, " << c.ch << ", " << c.startBd << ", "
-           << c.repeat << ", 0);\n    core_reg_write(_kc[0].off, _kc[0].val);\n  }\n";
-    }
-    if (!plan.shareArgs.empty()) // this core's view / lock base / role of every shared port
-        os << "  aiehlc_plan_share_init(_prow - " << plan.coreRowBase << ");\n";
-    os << "}\n";
-    return os.str();
 }
 
 // Kernel side of the shared ports: aie::load_buffer / aie::release on a share_args port become

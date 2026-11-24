@@ -124,11 +124,15 @@ static void collectAggregatedOutTiles(KernelModuleOp kernelModuleOp, SmallVector
 /// Always matches and does full conversion so we do not depend on nested patterns
 /// firing first (conversion may try the parent before descending into regions).
 struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
-    KernelModuleToEmitCPattern(const TypeConverter &tc, MLIRContext *ctx, int partStartCol)
-        : OpConversionPattern(tc, ctx), partStartCol(partStartCol) {}
+    KernelModuleToEmitCPattern(const TypeConverter &tc, MLIRContext *ctx, int partStartCol,
+                               std::string planKernelBlock = "", int planGoLock = -1, std::set<int> planS2mm = {})
+        : OpConversionPattern(tc, ctx), partStartCol(partStartCol), planKernelBlock(std::move(planKernelBlock)),
+          planGoLock(planGoLock), planS2mm(std::move(planS2mm)) {}
+    std::string planKernelBlock; // lowered dataflow-plan ops of the kernel module (dfplan::lowerKernelPlanOps)
+    int planGoLock;              // dfschedule.plan_go_lock: persistent kernel go lock, -1 = none
+    std::set<int> planS2mm;      // S2MM channels of the plan's core channel_start ops
     // MemTile rows below the core rows (the plan's tile kinds); from the plan's own
     // core tiles: the lowest core row - 1.
-    int planMemtileRows = dfplan::activePlan().memtileRows;
 
     int partStartCol;
 
@@ -598,8 +602,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                                           KernelModuleOp kernelModuleOp,
                                           const llvm::StringMap<WindowInfo> &windowInfoMap,
                                           ArrayRef<CoreOffloadEntry> offloadPlan) const {
-        const std::set<int> planCoreS2mm =
-            dfplan::activePlan().present ? dfplan::activePlan().coreS2mmChannels(planMemtileRows) : std::set<int>();
+        const std::set<int> &planCoreS2mm = planS2mm; // core S2MM channels the plan's channel_start ops own
         for (Operation &inner : kernelModuleOp.getBody().front()) {
             auto windowDefOp = dyn_cast<WindowDefOp>(&inner);
             if (!windowDefOp)
@@ -697,12 +700,10 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
             }
             rewriter.create<emitc::VerbatimOp>(loc, block);
         }
-        const dfplan::DataflowPlan &plan = dfplan::activePlan();
-        if (plan.present) {
-            std::string planBlock = dfplan::emitPlanKernelBlock(plan, planMemtileRows, partStartCol);
-            if (!planBlock.empty())
-                rewriter.create<emitc::VerbatimOp>(loc, planBlock);
-        }
+        // The dataflow plan's core DMA program (dfschedule.config.tile_bd / lock_set / channel_start
+        // on declaretile.self, lowered before the conversion -- runOnOperation).
+        if (!planKernelBlock.empty())
+            rewriter.create<emitc::VerbatimOp>(loc, planKernelBlock);
         return success();
     }
 
@@ -804,7 +805,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     }
                 }
                 rewriter.create<emitc::VerbatimOp>(loc, "// kernel_invoke " + callee);
-                const int goLock = dfplan::activePlan().present ? dfplan::activePlan().persistentGoLock : -1;
+                const int goLock = planGoLock;
                 if (goLock >= 0) {
                     // #pragma persistent_kernel (dataflow plan): the kernel stays loaded; every launch
                     // is one call, released by the host through the go lock (initialised to 1 by the
@@ -855,8 +856,21 @@ void DfscheduleToKernelApiPass::runOnOperation() {
     TypeConverter typeConverter;
     typeConverter.addConversion([](Type type) { return type; });
 
+    // Dataflow plan ops in a kernel module (DataflowPlanToDfschedule) -> the core's own DMA config text,
+    // emitted with the KERNELCONFIGOFFLOAD blocks; the ops are erased here.
+    std::string planBlock;
+    std::set<int> planS2mm;
+    moduleOp.walk([&](dfschedule::ConfigChannelStartOp c) {
+        if (c.getDirection() == "S2MM")
+            planS2mm.insert((int)c.getChannel());
+    });
+    moduleOp.walk([&](KernelModuleOp km) { planBlock += dfplan::lowerKernelPlanOps(km, partStartCol); });
+    int goLock = -1;
+    if (auto a = moduleOp->getAttrOfType<IntegerAttr>("dfschedule.plan_go_lock"))
+        goLock = (int)a.getInt();
+
     RewritePatternSet patterns(ctx);
-    patterns.add<KernelModuleToEmitCPattern>(typeConverter, ctx, partStartCol);
+    patterns.add<KernelModuleToEmitCPattern>(typeConverter, ctx, partStartCol, planBlock, goLock, planS2mm);
 
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns))))
         signalPassFailure();

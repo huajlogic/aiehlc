@@ -177,111 +177,22 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
         for (int m = 0; m < 4; m++) // MM2S m = (B strip c + C (m / 2), parity m % 2)
             os << "dmaphop.plan_route {src = [" << col(c) << ", " << mtB << ", " << m << "], src_kind = \"dma\", "
                << "dsts = [[" << col(c) << ", " << row(host[SA + m / 2]) << ", " << m % 2 << "]]}\n";
-    // ---- A MemTile ring
-    std::vector<std::pair<int, int>> ta, tb, cores;
-    for (int c = 0; c < g.meshCols; c++) {
-        ta.push_back({col(c), mtA});
-        tb.push_back({col(c), mtB});
-        for (int pm = 0; pm < g.meshRows; pm++)
-            cores.push_back({col(c), row(pm)});
-    }
-    const std::string TA = tilesText(ta), TB = tilesText(tb), TC = tilesText(cores);
-    os << "dmaphop.plan_lock {tiles = " << TA << ", id = 20, init = " << ring << "}\n";
-    os << "dmaphop.plan_lock {tiles = " << TA << ", id = 24, init = 0}\n";
-    for (int b = 0; b < ring; b++) {
-        int nx = b < ring - 1 ? b + 1 : -1;
-        int64_t addr = 0x80000 + b * 2 * chunk;
-        os << "dmaphop.plan_bd {tiles = " << TA << ", bd = " << 24 + b << ", addr = " << addr << ", len = " << 2 * chunk
-           << ", acq = [20, -1], rel = [24, 1], next = " << (nx >= 0 ? 24 + nx : -1) << "}\n";
-        os << "dmaphop.plan_bd {tiles = " << TA << ", bd = " << 24 + ring + b << ", addr = " << addr
-           << ", len = " << 2 * chunk << ", acq = [24, -1], rel = [20, 1], next = " << (nx >= 0 ? 24 + ring + nx : -1)
-           << "}\n";
-    }
-    os << "dmaphop.plan_channel {tiles = " << TA << ", dir = \"s2mm\", ch = 1, start_bd = 24, repeat = " << aRounds
-       << "}\n";
-    os << "dmaphop.plan_channel {tiles = " << TA << ", dir = \"mm2s\", ch = 1, start_bd = " << 24 + ring
-       << ", repeat = " << aRounds << "}\n";
-    // ---- B MemTile (strips c and c + C), resident across launches when asked
-    os << "dmaphop.plan_lock {tiles = " << TB << ", id = 6, init = 0" << (bLaunches ? ", later = 4" : "") << "}\n";
-    os << "dmaphop.plan_lock {tiles = " << TB << ", id = 7, init = 1" << (bLaunches ? ", later = 0" : "") << "}\n";
-    os << "dmaphop.plan_bd {tiles = " << TB << ", bd = 0, addr = 524288, len = " << 2 * bLen
-       << ", acq = [7, -1], rel = [6, 4], next = -1}\n";
-    os << "dmaphop.plan_channel {tiles = " << TB << ", dir = \"s2mm\", ch = 0, start_bd = 0, repeat = 1"
-       << (bLaunches ? ", first_launch_only = true" : "") << "}\n";
-    const int mbd[4] = {1, 24, 2, 25}; // odd MemTile channels use BDs 24..47
-    for (int m = 0; m < 4; m++)
-        os << "dmaphop.plan_bd {tiles = " << TB << ", bd = " << mbd[m]
-           << ", addr = " << 0x80000 + (m / 2) * bLen + (m % 2) * chunk << ", len = " << bLen / 2 << ", dims = [[1, "
-           << chunk / 16 << "], [" << chunk / 16 << ", 4], [" << chunk / 2 << ", " << NK / 2
-           << "]], acq = [6, -1], rel = [6, 1], next = -1}\n";
-    for (int m = 0; m < 4; m++)
-        os << "dmaphop.plan_channel {tiles = " << TB << ", dir = \"mm2s\", ch = " << m << ", start_bd = " << mbd[m]
-           << ", repeat = " << R2 << "}\n";
-    // ---- cores: hosted stream, 2 channels x 2 slots, each chunk split over two DM banks
-    const int64_t hostBase = 0x80000 - 4 * chunk; // top 4 chunks of the core's own memory (view 0x70000)
-    for (int ch = 0; ch < 2; ch++)
-        for (int k = 0; k < 2; k++) {
-            int q = 2 * ch + k;
-            os << "dmaphop.plan_bd {tiles = " << TC << ", bd = " << q << ", addr = " << hostBase + q * half
-               << ", len = " << chunk << ", dims = [[1, 128], [128, " << half / 512 << "], [" << half
-               << ", 0]], acq = [" << 8 + 4 * ch + k << ", -2], rel = [" << 6 + 4 * ch
-               << ", 1], next = " << 2 * ch + (k ^ 1) << "}\n";
-        }
-    for (int ch = 0; ch < 2; ch++) {
-        for (int k = 0; k < 2; k++)
-            os << "dmaphop.plan_lock {tiles = " << TC << ", id = " << 8 + 4 * ch + k << ", init = 2}\n";
-        os << "dmaphop.plan_lock {tiles = " << TC << ", id = " << 6 + 4 * ch << ", init = 0}\n";
-        os << "dmaphop.plan_lock {tiles = " << TC << ", id = " << 7 + 4 * ch << ", init = 0}\n";
-    }
-    if (persistent)
-        os << "dmaphop.plan_lock {tiles = " << TC << ", id = 14, init = 1}\n";
-    os << "dmaphop.plan_lock {tiles = " << TC << ", id = 15, init = 0}\n";
-    for (int ch = 0; ch < 2; ch++)
-        os << "dmaphop.plan_channel {tiles = " << TC << ", dir = \"s2mm\", ch = " << ch << ", start_bd = " << 2 * ch
-           << ", repeat = 1}\n";
-    // ---- shim: streams laid out contiguously in DDR (the host arranges them; README)
-    for (int c = 0; c < g.meshCols; c++) {
-        os << "dmaphop.plan_shim_bd {col = " << col(c) << ", ch = 1, dir = \"mm2s\", arg = " << A.arg
-           << ", bd = 14, offset = " << c * R2 * aLen << ", len = " << aLen << ", dims = [[4, 32], [128, 64], ["
-           << chunk << ", " << NK / 2 << "]], iter = [" << aLen << ", " << R2 << "], repeat = " << R2 << "}\n";
-        os << "dmaphop.plan_shim_bd {col = " << col(c) << ", ch = 0, dir = \"mm2s\", arg = " << B.arg
-           << ", bd = 15, offset = " << c * 2 * bLen << ", len = " << bLen << ", dims = [[4, 32], [128, 64], [" << chunk
-           << ", " << NK << "]], iter = [" << bLen << ", 2], repeat = 2"
-           << (bLaunches ? ", first_launch_only = true" : "") << "}\n";
-    }
-    // ---- kernel parameters: per mesh row, the view / lock base / role / phase of each operand
-    auto view = [&](int pm, int hostRow, bool lock) -> int64_t {
-        if (hostRow == pm)
-            return lock ? 48 : 0x70000;
-        return hostRow == pm + 1 ? (lock ? 32 : 0x60000) : (lock ? 0 : 0x40000);
+    // ---- the streams: what the DMA program (derived in dfschedule, plandma.cpp) realizes
+    auto list = [](std::initializer_list<int64_t> v) {
+        std::string t = "[";
+        for (int64_t x : v)
+            t += (t.size() > 1 ? ", " : "") + std::to_string(x);
+        return t + "]";
     };
-    std::map<std::string, std::vector<int64_t>> prm;
-    const std::string sa = "S" + std::to_string(A.arg), sb = "S" + std::to_string(B.arg);
-    for (int pm = 0; pm < g.meshRows; pm++) {
-        int a = pm / 2, b = SA + pm % 2;
-        prm[sa + "_VIEW"].push_back(view(pm, host[a], false));
-        prm[sa + "_LOCK"].push_back(view(pm, host[a], true));
-        prm[sa + "_FIRST"].push_back(cons[a].first == pm);
-        prm[sb + "_VIEW"].push_back(view(pm, host[b], false));
-        prm[sb + "_LOCK"].push_back(view(pm, host[b], true));
-        prm[sb + "_FIRST"].push_back(cons[b].first == pm);
-    }
-    for (auto &[n, v] : prm) {
-        os << "dmaphop.plan_kernel_param {name = \"" << n << "\", per_mesh_row = [";
-        for (size_t i = 0; i < v.size(); i++)
-            os << (i ? ", " : "") << v[i];
-        os << "]}\n";
-    }
-    const std::pair<const char *, int64_t> scal[] = {{"SLOT_LO", hostBase - 0x70000},
-                                                     {"SLOT_HI", hostBase - 0x70000 + 4 * half},
-                                                     {"SLOT_STRIDE", half},
-                                                     {"LOCK_F", 6},
-                                                     {"LOCK_G", 7},
-                                                     {"LOCK_E", 8},
-                                                     {"LOCK_CH_STRIDE", 4},
-                                                     {"LOCK_NOP", 48 + 15}};
-    for (auto &[n, v] : scal)
-        os << "dmaphop.plan_kernel_param {name = \"" << n << "\", value = " << v << "}\n";
+    os << "dmaphop.plan_stream {arg = " << A.arg << ", role = \"a\", share = \"neighbor\", stage = \"memtile_ring\", "
+       << "ring = " << ring << ", resident = \"launch\", chunk = " << list({g.TM, g.KC}) << ", chunks = " << NK
+       << ", rounds = " << R2 << ", tensor = " << list({g.M, g.K}) << ", host_rows = " << list({host[0], host[1]})
+       << ", first_rows = " << list({cons[0].first, cons[1].first}) << "}\n";
+    os << "dmaphop.plan_stream {arg = " << B.arg << ", role = \"b\", share = \"neighbor\", stage = \"memtile\", "
+       << "resident = \"" << (bLaunches ? "launches" : "launch") << "\", chunk = " << list({g.TN, g.KC})
+       << ", chunks = " << NK << ", rounds = " << R2 << ", tensor = " << list({g.N, g.K})
+       << ", host_rows = " << list({host[2], host[3]}) << ", first_rows = " << list({cons[2].first, cons[3].first})
+       << "}\n";
     llvm::outs() << "[DataflowPlan] synthesized from the routing IR: A strips " << SA << " x B strips " << SB << ", "
                  << R2 << " tiles / core, K chunks " << NK << ", A ring " << ring << ", B "
                  << (bLaunches ? "resident across launches" : "per launch") << ", host rows A" << host[0] << "/"

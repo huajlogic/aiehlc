@@ -216,113 +216,35 @@ void readRoute(Reader &r, DataflowPlan &p) {
     p.routes.push_back(rt);
 }
 
-void readLock(Reader &r, DataflowPlan &p, int memtileRows) {
-    PlanLock l;
-    l.tiles = r.tiles();
-    l.id = (int)r.i64("id", 0, true);
-    l.init = (int)r.i64("init", 0, true);
-    l.later = (int)r.i64("later", -1);
-    l.once = r.flag("once");
-    for (auto &t : l.tiles) {
-        int maxId = (t.row >= 1 && t.row <= memtileRows) ? 63 : 15;
-        if (t.row == 0 || l.id < 0 || l.id > maxId)
-            r.err() << "lock " << l.id << " is not valid on tile (" << t.col << "," << t.row << ")";
+// dmaphop.plan_stream: one shared operand's stream -- the dataflow decisions the DMA program is
+// derived from (deriveDmaProgram, plandma.cpp).
+void readStream(Reader &r, DataflowPlan &p) {
+    PlanStream st;
+    st.arg = (int)r.i64("arg", -1, true);
+    st.role = r.str("role", "");
+    if (st.role != "a" && st.role != "b")
+        r.err() << "role must be \"a\" (strips over mesh-row pairs) or \"b\" (strips over columns x 2)";
+    if (r.str("share", "neighbor") != "neighbor")
+        r.err() << "only share = \"neighbor\" is implemented";
+    st.stage = r.str("stage", "");
+    st.ring = (int)r.i64("ring", 0);
+    st.residentLaunches = r.str("resident", "launch") == "launches";
+    auto chunk = r.ints("chunk"), tensor = r.ints("tensor");
+    if (chunk.size() != 2 || tensor.size() != 2)
+        r.err() << "'chunk' and 'tensor' must be [rows, cols]";
+    else {
+        st.chunkRows = (int)chunk[0], st.chunkCols = (int)chunk[1];
+        st.tensorRows = tensor[0], st.tensorCols = tensor[1];
     }
-    p.locks.push_back(l);
-}
-
-void readBd(Reader &r, DataflowPlan &p, int memtileRows) {
-    PlanBd b;
-    b.tiles = r.tiles();
-    b.bd = (int)r.i64("bd", 0, true);
-    b.addr = r.i64("addr", 0, true);
-    b.len = r.i64("len", 0, true);
-    b.dims = r.dims("dims");
-    if (r.has("iter")) {
-        auto it = r.ints("iter");
-        if (it.size() != 2)
-            r.err() << "'iter' must be [step, wrap]";
-        else {
-            b.iterStep = it[0];
-            b.iterWrap = it[1];
-        }
-    }
-    r.lockPair("acq", b.acqLock, b.acqVal);
-    r.lockPair("rel", b.relLock, b.relVal);
-    b.next = (int)r.i64("next", -1);
-    for (auto &t : b.tiles) {
-        bool mem = t.row >= 1 && t.row <= memtileRows;
-        int maxBd = mem ? 47 : 15;
-        if (t.row == 0)
-            r.err() << "use dmaphop.plan_shim_bd for shim tiles";
-        if (b.bd < 0 || b.bd > maxBd || b.next > maxBd)
-            r.err() << "BD id out of range on tile (" << t.col << "," << t.row << ")";
-        for (auto &d : b.dims)
-            if (d.second > (mem ? 1023 : 255))
-                r.err() << "wrap " << d.second << " does not fit the " << (mem ? "10" : "8")
-                        << "-bit BD wrap field (it would silently turn the dimension off)";
-    }
-    if (b.len <= 0 || b.len % 4)
-        r.err() << "len must be a positive multiple of 4 bytes";
-    p.bds.push_back(b);
-}
-
-void readChannel(Reader &r, DataflowPlan &p) {
-    PlanChannel c;
-    c.tiles = r.tiles();
-    std::string dir = r.str("dir", "");
-    if (dir != "s2mm" && dir != "mm2s")
-        r.err() << "dir must be \"s2mm\" or \"mm2s\"";
-    c.s2mm = dir == "s2mm";
-    c.ch = (int)r.i64("ch", 0, true);
-    c.startBd = (int)r.i64("start_bd", 0, true);
-    c.repeat = (int)r.i64("repeat", 1);
-    c.firstLaunchOnly = r.flag("first_launch_only");
-    if (c.repeat < 1 || c.repeat > 256)
-        r.err() << "repeat " << c.repeat << " outside 1..256 (8-bit start-queue repeat field)";
-    p.channels.push_back(c);
-}
-
-void readShimBd(Reader &r, DataflowPlan &p) {
-    PlanShimBd s;
-    s.col = (int)r.i64("col", 0, true);
-    s.ch = (int)r.i64("ch", 0, true);
-    s.bd = (int)r.i64("bd", 0, true);
-    s.arg = (int)r.i64("arg", 0, true);
-    s.mm2s = r.str("dir", "mm2s") == "mm2s";
-    s.offset = r.i64("offset", 0);
-    s.len = r.i64("len", 0, true);
-    s.dims = r.dims("dims");
-    if (r.has("iter")) {
-        auto it = r.ints("iter");
-        if (it.size() != 2)
-            r.err() << "'iter' must be [step, wrap]";
-        else {
-            s.iterStep = it[0];
-            s.iterWrap = it[1];
-        }
-    }
-    s.repeat = (int)r.i64("repeat", 1);
-    s.firstLaunchOnly = r.flag("first_launch_only");
-    if (s.bd < 0 || s.bd > 15)
-        r.err() << "shim BD id " << s.bd << " outside 0..15";
-    if (s.iterWrap > 64)
-        r.err() << "iteration wrap " << s.iterWrap << " exceeds the 6-bit field (64)";
-    if (!p.replaces(s.arg))
-        r.err() << "arg " << s.arg << " is not in the plan's replace_args";
-    p.shimBds.push_back(s);
-}
-
-void readParam(Reader &r, DataflowPlan &p) {
-    PlanKernelParam k;
-    k.name = r.str("name", "");
-    if (k.name.empty())
-        r.err() << "missing 'name'";
-    if (r.has("value"))
-        k.perMeshRow = {r.i64("value", 0)}, k.scalar = true;
-    else
-        k.perMeshRow = r.ints("per_mesh_row");
-    p.params.push_back(k);
+    st.chunks = (int)r.i64("chunks", 0, true);
+    st.rounds = (int)r.i64("rounds", 0, true);
+    for (int64_t v : r.ints("host_rows"))
+        st.hostRows.push_back((int)v);
+    for (int64_t v : r.ints("first_rows"))
+        st.firstRows.push_back((int)v);
+    if (!p.replaces(st.arg))
+        r.err() << "arg " << st.arg << " is not in the plan's replace_args";
+    p.streams.push_back(st);
 }
 
 // Tag every create_path / push that moves a replaced argument.
@@ -375,24 +297,35 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
         StringRef n = op->getName().getStringRef();
         if (n == "dmaphop.plan_route")
             readRoute(r, plan);
-        else if (n == "dmaphop.plan_lock")
-            readLock(r, plan, memtileRows);
-        else if (n == "dmaphop.plan_bd")
-            readBd(r, plan, memtileRows);
-        else if (n == "dmaphop.plan_channel")
-            readChannel(r, plan);
-        else if (n == "dmaphop.plan_shim_bd")
-            readShimBd(r, plan);
-        else if (n == "dmaphop.plan_kernel_param")
-            readParam(r, plan);
+        else if (n == "dmaphop.plan_stream")
+            readStream(r, plan);
+        else if (n != "dmaphop.plan")
+            r.err() << "unknown plan op (the DMA program lives in dfschedule, derived from plan_stream)";
         ok &= r.ok;
     }
     if (!ok)
         return false;
-    for (const auto &c : plan.bds)
-        for (const auto &t : c.tiles)
-            if (t.row > memtileRows && (plan.coreRowBase < 0 || t.row < plan.coreRowBase))
-                plan.coreRowBase = t.row;
+    // the mesh the dmaphop stage placed: partition-relative columns, absolute rows
+    int colHi = -1, rowHi = -1;
+    plan.colLo = plan.coreRowBase = 1 << 20;
+    module.walk([&](Operation *op) {
+        if (op->getName().getStringRef() != "dmaphop.tile")
+            return;
+        auto t = op->getAttrOfType<StringAttr>("tiletype");
+        auto c = op->getAttrOfType<IntegerAttr>("col"), rw = op->getAttrOfType<IntegerAttr>("row");
+        if (!t || t.getValue() != "core" || !c || !rw)
+            return;
+        plan.colLo = std::min<int>(plan.colLo, (int)c.getInt()), colHi = std::max<int>(colHi, (int)c.getInt());
+        plan.coreRowBase = std::min<int>(plan.coreRowBase, (int)rw.getInt()),
+        rowHi = std::max<int>(rowHi, (int)rw.getInt());
+    });
+    plan.meshCols = colHi - plan.colLo + 1;
+    plan.meshRows = rowHi - plan.coreRowBase + 1;
+    std::string why;
+    if (!deriveDmaProgram(plan, why)) {
+        ops.front()->emitError() << "[dataflow plan] " << why;
+        return false;
+    }
     for (int a : plan.shareArgs)
         for (const char *suf : {"_VIEW", "_LOCK", "_FIRST"}) {
             std::string n = "S" + std::to_string(a) + suf;
@@ -407,11 +340,11 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
     module->setAttr("dmaphop.plan_replaced_args", b.getI64ArrayAttr(args));
     for (Operation *op : ops)
         op->erase();
-    llvm::outs() << "[DataflowPlan] plan: " << plan.routes.size() << " routes, " << plan.bds.size() << " BDs, "
-                 << plan.locks.size() << " locks, " << plan.channels.size() << " channels, " << plan.shimBds.size()
-                 << " shim BDs, " << plan.params.size() << " kernel params"
-                 << (plan.persistentGoLock >= 0 ? ", persistent kernel" : "") << (plan.bdOnce ? ", BD write-once" : "")
-                 << "\n";
+    llvm::outs() << "[DataflowPlan] plan: " << plan.routes.size() << " routes, " << plan.streams.size()
+                 << " streams -> DMA program " << plan.bds.size() << " BDs, " << plan.locks.size() << " locks, "
+                 << plan.channels.size() << " channels, " << plan.shimBds.size() << " shim BDs, " << plan.params.size()
+                 << " kernel params" << (plan.persistentGoLock >= 0 ? ", persistent kernel" : "")
+                 << (plan.bdOnce ? ", BD write-once" : "") << "\n";
     return true;
 }
 

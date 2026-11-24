@@ -15,7 +15,8 @@ Design: `doc/design/dmaphop_dataflow_plan.md`. Example: `example/tileprogram/cco
 |---|---|---|
 | C | `load_buffer(..., {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring, .ring = 10})`, `{.keep = true}`, `#pragma persistent_kernel` | trace harness -> `KernelBlock` -> `dataflow` dict |
 | routing IR | `dataflow = {...}` on `routingcreatescheduletensor`, `routing.persistent_kernel` | `plansynth.cpp` (dump `4_DataflowPlan.mlir`) |
-| dmaphop IR | `dmaphop.plan*` ops | `collectDataflowPlan` (`dataflowplan.cpp`) + `planemit.cpp` |
+| dmaphop IR | `dmaphop.plan` / `plan_route` / `plan_stream` (dataflow decisions) | `collectDataflowPlan` (`dataflowplan.cpp`) |
+| dfschedule IR (derived) | `config.tile_bd` / `lock_set` / `channel_enable` / `channel_start`, shim `config.dma_bd` + `start_io` | `plandma.cpp` derive + materialize; lowered by DfscheduleToApi / DfscheduleToKernelApi |
 
 ## Checks that it worked (the build log)
 - `[DataflowPlan] synthesized from the routing IR: ...` (C / routing level only)
@@ -54,3 +55,11 @@ Design: `doc/design/dmaphop_dataflow_plan.md`. Example: `example/tileprogram/cco
 - `aie::mmul` at file scope in the prologue breaks the aiehlc front-end parse: prologue headers
   must hold macros only; declare the typedef in the body.
 - Board noise: both builds see occasional 1.20-1.26 ms launches; compare typical launches.
+
+## The DMA program lives in dfschedule
+- dmaphop has no BD / lock / channel ops any more (`plan_bd` etc. are gone: "unknown plan op").
+  Edit `plan_stream` (ring, resident, host rows) and the dfschedule program follows; read it in
+  `ir/dfschedule/NN_DataflowPlanToDfschedule.mlir`.
+- MemTile lock ids: `config.lock_set` takes 0..63, a BD's acquire / release take 64.. (own locks).
+- Write-once must stay constant time: a per-call lookup over 100 MemTile BDs cost tens of us per
+  launch -- `__Runtime_tile_bd_config` returns at once after the first launch under bd_once.

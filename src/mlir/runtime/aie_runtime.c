@@ -7260,10 +7260,17 @@ static struct {
 } s_bd_once[RT_BD_ONCE_MAX];
 static int s_bd_once_n;
 
+static unsigned g_rt_plan_launch; /* launches (calls of __Runtime_plan_setup, one per host call) */
+
+/* Called by the host schedule at the top of every launch (dfschedule.plan_bd_once / plan_go_lock). */
 void __Runtime_plan_setup(int bd_once, int persistent_go_lock) {
     g_rt_plan_bd_once = bd_once;
     g_rt_plan_go_lock = persistent_go_lock;
+    g_rt_plan_launch++;
 }
+
+/* 1 on the first launch of a dataflow plan (dfschedule first_launch_only / later_value). */
+int __Runtime_plan_first(void) { return g_rt_plan_launch <= 1; }
 
 /* 1 if the identical write was already made (skip it); records it otherwise */
 static int rt_bd_once_seen(XAie_DevInst *dev, XAie_LocType t, uint8_t kind, uint8_t id, uint64_t addr, uint32_t hash) {
@@ -7292,6 +7299,60 @@ static int rt_bd_once_seen(XAie_DevInst *dev, XAie_LocType t, uint8_t kind, uint
     s_bd_once[slot].addr = addr;
     s_bd_once[slot].hash = hash;
     return 0;
+}
+
+/* ---- dataflow plan DMA program (dfschedule.config.tile_bd / lock_set / channel_enable / channel_start) ----
+ * Tile-local BDs over a MemTile's / core's own memory: hardware values (a MemTile's own locks are 64.. in a
+ * BD), strides / steps in BYTES as in config.dma_bd. Identical rewrites are skipped under BD write-once. */
+void __Runtime_tile_bd_config(XAie_DevInst *dev, XAie_LocType t, int bd, int addr, int len, int nd, int s0, int w0,
+                              int s1, int w1, int s2, int w2, int iter_step, int iter_wrap, int acq, int acqv, int rel,
+                              int relv, int next) {
+    /* a plan's tile program is the same every launch: under write-once, write it on the first launch only
+     * (constant time -- a lookup per BD per launch cost tens of microseconds over 100 MemTile BDs) */
+    if (g_rt_plan_bd_once && g_rt_plan_launch > 1)
+        return;
+    XAie_DmaDesc d;
+    XAie_DmaDescInit(dev, &d, t);
+    if (nd > 0) {
+        XAie_DmaDimDesc dd[3];
+        const int st[3] = {s0, s1, s2}, wr[3] = {w0, w1, w2};
+        for (int i = 0; i < nd && i < 3; i++) {
+            dd[i].AieMlDimDesc.StepSize = (u32)(st[i] / 4);
+            dd[i].AieMlDimDesc.Wrap = (u16)wr[i];
+        }
+        XAie_DmaTensor ts = {(u8)(nd < 3 ? nd : 3), dd};
+        XAie_DmaSetMultiDimAddr(&d, &ts, (u64)(uint32_t)addr, (u32)len);
+    } else {
+        XAie_DmaSetAddrLen(&d, (u64)(uint32_t)addr, (u32)len);
+    }
+    if (iter_wrap > 1)
+        XAie_DmaSetBdIteration(&d, (u32)(iter_step / 4), (u16)iter_wrap, 0);
+    if (acq >= 0 && rel >= 0)
+        XAie_DmaSetLock(&d, XAie_LockInit((u8)acq, (s8)acqv), XAie_LockInit((u8)rel, (s8)relv));
+    if (next >= 0)
+        XAie_DmaSetNextBd(&d, (u16)next, XAIE_ENABLE);
+    XAie_DmaEnableBd(&d);
+    if (XAie_DmaWriteBd(dev, &d, t, (u8)bd) != XAIE_OK)
+        printf("[aie_runtime] plan tile BD %d on (%u,%u) FAILED\n", bd, (unsigned)t.Col, (unsigned)t.Row);
+}
+
+void __Runtime_tile_lock_set(XAie_DevInst *dev, XAie_LocType t, int id, int value, int later) {
+    const int v = later >= 0 && !__Runtime_plan_first() ? later : value;
+    XAie_LockSetValue(dev, t, XAie_LockInit((u8)id, (s8)v));
+}
+
+void __Runtime_dma_channel_enable(XAie_DevInst *dev, XAie_LocType t, int ch, int mm2s) {
+    if (g_rt_plan_bd_once && g_rt_plan_launch > 1)
+        return;
+    XAie_DmaChannelEnable(dev, t, (u8)ch, mm2s ? DMA_MM2S : DMA_S2MM);
+}
+
+void __Runtime_dma_channel_start(XAie_DevInst *dev, XAie_LocType t, int ch, int mm2s, int bd, int repeat,
+                                 int first_only) {
+    if (first_only && !__Runtime_plan_first())
+        return;
+    if (XAie_DmaChannelSetStartQueue(dev, t, (u8)ch, mm2s ? DMA_MM2S : DMA_S2MM, (u8)bd, (u32)repeat, 0) != XAIE_OK)
+        printf("[aie_runtime] plan channel start (%u,%u) ch %d FAILED\n", (unsigned)t.Col, (unsigned)t.Row, ch);
 }
 
 XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
@@ -7581,6 +7642,18 @@ void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int3
  * @return struct_ioevent wrapping @p io with a default 10000us wait timeout;
  *         pass it to __Runtime_wait_io/__Runtime_wait to block until completion.
  */
+/* dfschedule.first_launch_only: start on the first launch of a dataflow plan only; later launches get an
+ * event with timeout_us 0, which __Runtime_wait_io skips. */
+struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
+struct_ioevent __Runtime_startio_first(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
+    if (__Runtime_plan_first())
+        return __Runtime_startio(dev, io, bd_id, repeat);
+    struct_ioevent evt;
+    evt.io = io;
+    evt.timeout_us = 0;
+    return evt;
+}
+
 struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
     rt_dsync_drain_inputs(); /* CPU-written launch args clean before any DMA starts */
 #if AIEHLC_PROFILING
@@ -9264,6 +9337,8 @@ void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
      * unless pending, i.e. only before the launch's first wait_io's rt_sb_commit (off took A at startio) */
     rt_core_perf_launch_snap(0);
 #endif
+    if (io_event.timeout_us == 0U) /* dataflow plan: a first-launch-only transfer not started this launch */
+        return;
     rt_sb_commit();
     (void)rt_sb_ack_wait();
 #if AIEHLC_PROFILING && AIEHLC_CORE_PERF_WIN

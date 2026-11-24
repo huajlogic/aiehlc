@@ -385,31 +385,23 @@ def dmaphop_dealloc_buffer : dmaphopop<"dealloc_buffer"> {
   let assemblyFormat = "$buffer `:` type($buffer) attr-dict";
 }
 
-// --- 9. Explicit dataflow plan (doc/design/dmaphop_dataflow_plan.md) ---
-// A plan replaces the generated data movement of some kernel arguments with an
-// explicit one: stream routes, MemTile / core-tile buffer descriptors, locks,
-// channel start queues, shim BDs over the DDR arguments, and the constants the
-// kernel body needs to find its operands. All plan ops carry only attributes
-// (attr-dict); the plan reader (pass/dataflowplan) validates them and reports
-// errors with the op's location. Collected right after the dmaphop stage and
-// erased before the blueprint, so no downstream pass ever sees them.
+// --- 9. Dataflow plan (doc/design/dmaphop_dataflow_plan.md) ---
+// The dataflow-level decisions of a plan that replaces the generated data movement of some kernel
+// arguments: which arguments, the stream routes, and per shared operand its stream (staging, ring,
+// residency, chunk geometry, the cores that host it). The DMA program that realizes it (MemTile /
+// core / shim BDs, locks, channels) is NOT here: DataflowPlanToDfschedule derives it and writes it as
+// dfschedule ops (config.tile_bd / lock_set / channel_enable / channel_start, config.dma_bd ...).
+// Attribute-only ops (attr-dict), read and validated by pass/dataflowplan with errors at the op's
+// location, then erased before the blueprint.
 class dmaphop_PlanOp<string mnemonic, string sum> : dmaphopop<mnemonic> {
   let summary = sum;
   let assemblyFormat = "attr-dict";
 }
 def dmaphop_plan : dmaphop_PlanOp<"plan",
-  "Plan header: replaced kernel args, persistent launch, BD write-once">;
+  "Plan header: replaced / shared kernel args, persistent launch, BD write-once">;
 def dmaphop_plan_route : dmaphop_PlanOp<"plan_route",
   "Circuit-switched stream route from a shim / MemTile / core DMA MM2S channel to S2MM channels">;
-def dmaphop_plan_lock : dmaphop_PlanOp<"plan_lock",
-  "Lock initial value on one or more tiles (re-initialised every launch, or once)">;
-def dmaphop_plan_bd : dmaphop_PlanOp<"plan_bd",
-  "MemTile or core-tile buffer descriptor (address, length, dims, locks, next BD)">;
-def dmaphop_plan_channel : dmaphop_PlanOp<"plan_channel",
-  "Enable a MemTile / core-tile DMA channel and push its start queue">;
-def dmaphop_plan_shim_bd : dmaphop_PlanOp<"plan_shim_bd",
-  "Shim DMA transfer over a kernel argument (offset, length, dims, iteration, repeat)">;
-def dmaphop_plan_kernel_param : dmaphop_PlanOp<"plan_kernel_param",
-  "Per-mesh-row constant exposed to the kernel body as AIEHLC_PLAN_<name>">;
+def dmaphop_plan_stream : dmaphop_PlanOp<"plan_stream",
+  "One shared operand's stream: staging, ring, residency, chunk geometry, host mesh rows">;
 
 #endif // DMAPHOP_OPS

@@ -3,34 +3,24 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 
-// Explicit dataflow plan carried in the dmaphop IR (doc/design/dmaphop_dataflow_plan.md).
+// Dataflow plans (doc/design/dmaphop_dataflow_plan.md): replace the generated data movement of
+// selected kernel arguments by an explicit one, in two IR levels.
 //
-// A plan replaces the generated data movement of selected kernel arguments with
-// an explicit one, written as attribute-only `dmaphop.plan*` ops:
+// dmaphop -- the dataflow decisions (attribute-only ops):
+//   dmaphop.plan        {replace_args = [0, 1], share_args = [0, 1], persistent_go_lock = 14, bd_once = true}
+//   dmaphop.plan_route  {src = [col, row, ch], src_kind = "shim"|"dma", dsts = [[col, row, ch], ...]}
+//   dmaphop.plan_stream {arg = 0, role = "a", share = "neighbor", stage = "memtile_ring", ring = 10,
+//                        resident = "launch"|"launches", chunk = [64, 128], chunks = 20, rounds = 60,
+//                        tensor = [7680, 2560], host_rows = [0, 3], first_rows = [0, 2]}
+// dfschedule -- the DMA program that realizes them (deriveDmaProgram -> materializeHostPlan /
+//   materializeKernelPlan): config.tile_bd / lock_set / channel_enable / channel_start on the
+//   MemTiles (host module) and the cores (kernel module, declaretile.self), config.dma_bd + create_io
+//   + start_io + wait for the shim transfers, module switches dfschedule.plan_bd_once /
+//   dfschedule.plan_go_lock. DfscheduleToApiPass / DfscheduleToKernelApiPass lower them.
 //
-//   dmaphop.plan              {replace_args = [0, 1], persistent_go_lock = 14, bd_once = true}
-//   dmaphop.plan_route        {src = [col, row, ch], src_kind = "shim"|"dma", dsts = [[col, row, ch], ...]}
-//   dmaphop.plan_lock         {tiles = [[col, row], ...], id = 6, init = 0, later = 4}
-//   dmaphop.plan_bd           {tiles = [...], bd = 24, addr = 0x80000, len = 16384, dims = [[1, 512], ...],
-//                              acq = [20, -1], rel = [24, 1], next = 25}
-//   dmaphop.plan_channel      {tiles = [...], dir = "s2mm"|"mm2s", ch = 1, start_bd = 24, repeat = 30,
-//                              first_launch_only = false}
-//   dmaphop.plan_shim_bd      {col = 1, ch = 1, dir = "mm2s", arg = 0, offset = 0, len = 81920, bd = 1,
-//                              dims = [[4, 32], [128, 64], [8192, 10]], iter = [81920, 60], repeat = 60,
-//                              first_launch_only = false}
-//   dmaphop.plan_kernel_param {name = "A_VIEW", per_mesh_row = [0x70000, 0x40000, 0x60000, 0x70000]}
-//
-// Columns are partition-relative (as in routing.cc / host.cc). MemTile and core
-// BD dims / addresses are in the tile's own units (32-bit words for steps and
-// wraps, byte addresses in the core's / MemTile's own view); shim dims are in
-// bytes (the runtime's __Runtime_dma_bd_config_multidim_ooo convention).
-//
-// Lifecycle: collectDataflowPlan() reads + validates the ops right after the
-// dmaphop stage, tags the replaced flows (create_path / push get
-// `dmaphop.plan_replaced`), publishes `dmaphop.plan_replaced_args` /
-// `dmaphop.plan_core_s2mm` on the module and erases the plan ops. The routing,
-// host and kernel paths then skip the replaced flows, and the emitters below
-// add the plan's code to routing.cc / host.cc / kernel.cc.
+// Columns are partition-relative, rows absolute. Lifecycle: synthesizeDataflowPlan (routing-level
+// `dataflow` attrs -> dmaphop ops) and collectDataflowPlan (read + validate + derive, tag the
+// replaced flows, erase the ops) run right after the dmaphop stage.
 
 #ifndef TILINGLINALG_DATAFLOWPLAN_H
 #define TILINGLINALG_DATAFLOWPLAN_H
@@ -100,13 +90,30 @@ struct PlanKernelParam {
     bool scalar = false; // `value = N`: AIEHLC_PLAN_<name> is a plain constant
 };
 
+// One shared operand's stream (dmaphop.plan_stream): a sequence of chunk x chunks blocks per
+// output tile (rounds tiles per core), hosted in one core's memory per (column, strip group).
+struct PlanStream {
+    int arg = -1;
+    std::string role;              // "a": strips over mesh-row pairs; "b": strips over columns x 2
+    std::string stage;             // "memtile_ring" | "memtile"
+    int ring = 0;                  // memtile_ring: FIFO buffers of 2 chunks
+    bool residentLaunches = false; // loaded on the first launch only
+    int chunkRows = 0, chunkCols = 0, chunks = 0, rounds = 0;
+    int64_t tensorRows = 0, tensorCols = 0;
+    std::vector<int> hostRows;  // mesh row hosting strip group g
+    std::vector<int> firstRows; // mesh row that reads strip group g first
+};
+
 struct DataflowPlan {
     bool present = false;
     int memtileRows = 2; // rows 1..memtileRows are MemTiles; set by collectDataflowPlan
+    int colLo = 1, meshCols = 4, meshRows = 4;
     std::vector<int> replacedArgs;
     int persistentGoLock = -1; // >= 0: kernel loaded once, later launches release this core lock
     bool bdOnce = false;       // identical BD / channel writes are skipped after the first launch
     std::vector<PlanRoute> routes;
+    std::vector<PlanStream> streams;
+    // ---- the derived DMA program (deriveDmaProgram) ----
     std::vector<PlanLock> locks;
     std::vector<PlanBd> bds;
     std::vector<PlanChannel> channels;
@@ -114,33 +121,37 @@ struct DataflowPlan {
     std::vector<PlanKernelParam> params;
 
     // Arguments whose blocks the kernel takes from hosted slots (aiehlc_share_load): the kernel body's
-    // aie::load_buffer / aie::release on them are rewritten (plan header `share_args`, kernel params
-    // S<arg>_VIEW / _LOCK / _FIRST per mesh row).
+    // aie::load_buffer / aie::release on them are rewritten (kernel params S<arg>_VIEW / _LOCK /
+    // _FIRST per mesh row).
     std::vector<int> shareArgs;
-    int coreRowBase = -1; // absolute row of mesh row 0 (the plan's lowest core row)
+    int coreRowBase = -1; // absolute row of mesh row 0
     bool replaces(int arg) const;
     bool sharesArg(int arg) const;
     // core-tile (row >= 2 and not a MemTile) S2MM channels the plan programs itself
     std::set<int> coreS2mmChannels(int memtileRows) const;
 };
 
-// Reads, validates and erases the plan ops; tags the replaced flows. Returns
-// false (with diagnostics on llvm::errs) on a malformed plan. A module with no
-// plan leaves `plan.present == false` and is untouched.
+// Reads + validates the dmaphop plan ops, derives the DMA program, tags the replaced flows and
+// erases the ops. false (diagnostics on llvm::errs) on a malformed plan; no plan -> !present.
 bool collectDataflowPlan(mlir::ModuleOp module, DataflowPlan &plan, int memtileRows);
 
-// Routing-level dataflow intent (`dataflow = {share = "neighbor", ...}` on the
-// tensors' routingcreatescheduletensor ops, `routing.persistent_kernel`) ->
-// dmaphop.plan* ops inserted at the top of @main (plansynth.cpp). A module with
-// explicit plan ops or no dataflow attributes is left alone. false + `why` on
-// an unsupported request.
+// The streams -> the DMA program (locks, BDs, channels, shim transfers, kernel params).
+bool deriveDmaProgram(DataflowPlan &plan, std::string &why);
+
+// Routing-level dataflow intent (`dataflow = {share = "neighbor", ...}` on the tensors'
+// routingcreatescheduletensor ops, `routing.persistent_kernel`) -> dmaphop.plan / plan_route /
+// plan_stream ops at the top of @main (plansynth.cpp). Explicit plan ops or no dataflow attrs: no-op.
 bool synthesizeDataflowPlan(mlir::ModuleOp module, std::string &why);
 
-// The plan is published to the later stages (routing.cc / host.cc / kernel.cc
-// emission) through this process-wide slot, like ResourceMgr's offload plan.
+// The DMA program as dfschedule ops: MemTile + shim on the host module (after the kernel launch,
+// waits before the final wait), cores on the kernel module (declaretile.self).
+bool materializeHostPlan(mlir::ModuleOp hostModule, const DataflowPlan &plan);
+bool materializeKernelPlan(mlir::ModuleOp kernelModule, const DataflowPlan &plan);
+
+// The plan is published to the later stages through this process-wide slot.
 DataflowPlan &activePlan();
 
-// ---- emitters (C text) ----
+// ---- C text that is not a DMA program ----
 
 // Ports already taken by the generated (kept) routes, from routingresourcemap.json.
 struct PortBook {
@@ -152,17 +163,13 @@ bool loadPortBook(const std::string &resourceMapJson, PortBook &book);
 bool emitPlanRouting(const DataflowPlan &plan, PortBook &book, int dataColLo, int dataColHi, int numRows,
                      int memtileRows, std::string &out);
 
-// Host functions: `aiehlc_plan_host_setup(dev)` (persistent / BD-once switches,
-// before the kernel load) and `aiehlc_plan_host_launch(dev, args, nargs)`
-// (MemTile locks + BDs + start queues, shim BDs + start queues), and
-// `aiehlc_plan_host_wait(dev)`.
-std::string emitPlanHost(const DataflowPlan &plan, int memtileRows, int nargs);
-
-// KERNELCONFIGOFFLOAD-style block run by every core at kernel start.
-std::string emitPlanKernelBlock(const DataflowPlan &plan, int memtileRows, int partStartCol);
-
-// aiehlc_plan.h: AIEHLC_PLAN_<name>(pm) and AIEHLC_PLAN_PERSISTENT / _GO_LOCK.
+// aiehlc_plan.h: the kernel side of the shared ports (aiehlc_share_load / _release, per-core init,
+// AIEHLC_PLAN_<name> constants, AIEHLC_PLAN_PERSISTENT / _GO_LOCK).
 std::string emitPlanHeader(const DataflowPlan &plan);
+
+// The kernel-side lowering of the plan ops in a kernel module (KERNELCONFIGOFFLOAD text) -- used by
+// DfscheduleToKernelApiPass; erases the ops.
+std::string lowerKernelPlanOps(mlir::Operation *kernelModuleOp, int partStartCol);
 
 } // namespace dfplan
 
