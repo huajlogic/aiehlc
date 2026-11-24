@@ -9,18 +9,18 @@
 // id and buffer offset below is a constant of the plan (AIEHLC_PLAN_*), allocated by the compiler
 // (planresource.cpp) -- none is written here.
 //
-// What a load means here. Each shared operand stream is hosted in ONE core's memory; that core and a
-// neighbour read it through their own / north / south memory view (AIEHLC_PLAN_VIEW(o, pm)), on the host
-// tile's locks (bias AIEHLC_PLAN_LOCK(o, pm)). Chunk g is in buffer g & 3 (channel g & 1, slot (g >> 1) & 1):
-// part 0 at SLOT_LO + buffer SLOT_STRIDE, part 1 PART_STRIDE further on (a different memory bank) -- what
-// x.part(i) of a {.parts = 2} block returns. Locks, relative to the bias, channel ch = g & 1:
-//   LOCK_F + ch                         DMA -> first reader
-//   LOCK_G + ch = F + ch + HAND_DELTA   first -> second reader
-//   G + ch + HAND_DELTA                 no-op (held at 0): the second reader "hands on" here, by 0
-//   LOCK_E + (g & 3)                    both readers -> DMA (it acquires 2)
-// Both readers acquire one lock and release the one HAND_DELTA above it -- branch-free. The order of
-// loads and releases is the kernel's: taking the next chunk before giving the current one back is what
-// overlaps a chunk boundary with compute.
+// What a load means here. Each shared operand stream is hosted in ONE core's memory; that core and its
+// neighbours read it through their own / north / south memory view (AIEHLC_PLAN_VIEW(o, pm)), on the host
+// tile's locks (bias AIEHLC_PLAN_LOCK(o, pm)). The protocol is the plan's (dmaphop.plan_stream channels /
+// slots / readers / parts, all AIEHLC_PLAN_* constants): chunk g arrives on channel ch = g mod CHANNELS
+// into buffer b = g mod BUFFERS (BUFFERS = CHANNELS x SLOTS); part i of it is at
+// SLOT_LO + b SLOT_STRIDE + i PART_STRIDE (x.part(i) of a {.parts = n} block). Locks, relative to the bias:
+//   LOCK_F + i HAND_DELTA + ch     reader i's turn (i = AIEHLC_PLAN_READER(o, pm); the DMA releases i = 0)
+//   LOCK_F + READERS HAND_DELTA + ch   the no-op row (held at 0)
+//   LOCK_E + b                     every reader -> DMA (it acquires READERS)
+// Reader i acquires its lock and releases the one HAND_DELTA above -- reader i + 1's, or (the last) the
+// no-op lock by 0 -- branch-free. The order of loads and releases is the kernel's: taking the next chunk
+// before giving the current one back is what overlaps a chunk boundary with compute.
 //
 // Which operand a call is about: aiehlc_plan_operand(desc), emitted by the pipeline after the port
 // descriptors (index into the plan's shared operands, -1 = not shared). The block offsets are not checked
@@ -37,33 +37,19 @@ AIEHLC_PLAN_INLINE int aiehlc_plan_operand(const aiehlc_blk_desc &d);
 
 AIEHLC_PLAN_INLINE uintptr_t aiehlc_plan_view(int o, int pm) { return (uintptr_t)AIEHLC_PLAN_VIEW(o, pm); }
 AIEHLC_PLAN_INLINE int aiehlc_plan_lockbase(int o, int pm) { return (int)AIEHLC_PLAN_LOCK(o, pm); }
-AIEHLC_PLAN_INLINE int aiehlc_plan_first(int o, int pm) { return (int)AIEHLC_PLAN_FIRST(o, pm); }
+AIEHLC_PLAN_INLINE int aiehlc_plan_reader(int o, int pm) { return (int)AIEHLC_PLAN_READER(o, pm); }
 
-// Chunk g's lock / buffer terms; the plan lays both out so they are one AND (CH_STRIDE 1, slots 2 apart);
-// the generic forms remain for other layouts.
-AIEHLC_PLAN_INLINE int aiehlc_plan_ch_lock(unsigned g) {
-#if AIEHLC_PLAN_LOCK_CH_STRIDE == 1
-    return (int)(g & 1);
-#else
-    return AIEHLC_PLAN_LOCK_CH_STRIDE * (int)(g & 1);
-#endif
+// Chunk g's channel and buffer: one AND when the counts are powers of two (the constants fold).
+AIEHLC_PLAN_INLINE int aiehlc_plan_ch(unsigned g) {
+    return (AIEHLC_PLAN_CHANNELS & (AIEHLC_PLAN_CHANNELS - 1)) == 0 ? (int)(g & (AIEHLC_PLAN_CHANNELS - 1))
+                                                                    : (int)(g % AIEHLC_PLAN_CHANNELS);
 }
 AIEHLC_PLAN_INLINE unsigned aiehlc_plan_buffer(unsigned g) {
-#if AIEHLC_PLAN_SLOT_CH_STRIDE == 1 && AIEHLC_PLAN_SLOT_SLOT_STRIDE == 2
-    return g & 3;
-#else
-    return AIEHLC_PLAN_SLOT_CH_STRIDE * (g & 1) + AIEHLC_PLAN_SLOT_SLOT_STRIDE * ((g >> 1) & 1);
-#endif
-}
-AIEHLC_PLAN_INLINE int aiehlc_plan_e_index(unsigned r) {
-#if AIEHLC_PLAN_LOCK_CH_STRIDE == 1 && AIEHLC_PLAN_LOCK_E_SLOT_STRIDE == 2
-    return (int)(r & 3);
-#else
-    return AIEHLC_PLAN_LOCK_CH_STRIDE * (int)(r & 1) + AIEHLC_PLAN_LOCK_E_SLOT_STRIDE * (int)((r >> 1) & 1);
-#endif
+    return (AIEHLC_PLAN_BUFFERS & (AIEHLC_PLAN_BUFFERS - 1)) == 0 ? g & (AIEHLC_PLAN_BUFFERS - 1)
+                                                                  : g % AIEHLC_PLAN_BUFFERS;
 }
 
-// A load: acquire F (first reader) or G (second), hand on HAND_DELTA above -- G, or the no-op lock by 0.
+// A load: reader i takes its turn lock and hands on HAND_DELTA above (reader i + 1, or the no-op by 0).
 template <typename W>
 AIEHLC_PLAN_INLINE aiehlc_block_ptr aiehlc_load_buffer(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int pm,
                                                        int p1, aiehlc_blk off, aiehlc_blk shape, int parts = 1) {
@@ -71,11 +57,11 @@ AIEHLC_PLAN_INLINE aiehlc_block_ptr aiehlc_load_buffer(W *win, const aiehlc_blk_
     if (o < 0) /* not a shared operand: its generated window */
         return aiehlc_window_load(win, d, cur, pm, p1, off, shape, parts);
     const unsigned g = (unsigned)cur.n++;
-    const int first = aiehlc_plan_first(o, pm);
+    const int i = aiehlc_plan_reader(o, pm);
     const int acq =
-        aiehlc_plan_lockbase(o, pm) + (first ? AIEHLC_PLAN_LOCK_F : AIEHLC_PLAN_LOCK_G) + aiehlc_plan_ch_lock(g);
+        aiehlc_plan_lockbase(o, pm) + AIEHLC_PLAN_LOCK_F + i * AIEHLC_PLAN_LOCK_HAND_DELTA + aiehlc_plan_ch(g);
     acquire_greater_equal(acq, 1);
-    release(acq + AIEHLC_PLAN_LOCK_HAND_DELTA, first);
+    release(acq + AIEHLC_PLAN_LOCK_HAND_DELTA, i < AIEHLC_PLAN_READERS - 1);
     chess_memory_fence();
     return {(int8_t *)(aiehlc_plan_view(o, pm) + AIEHLC_PLAN_SLOT_LO + aiehlc_plan_buffer(g) * AIEHLC_PLAN_SLOT_STRIDE),
             AIEHLC_PLAN_PART_STRIDE};
@@ -91,7 +77,7 @@ AIEHLC_PLAN_INLINE void aiehlc_release(W *win, const aiehlc_blk_desc &d, aiehlc_
     }
     const unsigned r = (unsigned)cur.r++;
     chess_memory_fence();
-    release(aiehlc_plan_lockbase(o, pm) + AIEHLC_PLAN_LOCK_E + aiehlc_plan_e_index(r), 1);
+    release(aiehlc_plan_lockbase(o, pm) + AIEHLC_PLAN_LOCK_E + (int)aiehlc_plan_buffer(r), 1);
 }
 // The output is the generated window (ping-pong, its own locks); only the block check is dropped.
 template <typename W>
@@ -99,22 +85,22 @@ AIEHLC_PLAN_INLINE aiehlc_block_ptr aiehlc_store_buffer(W *win, const aiehlc_blk
                                                         aiehlc_blk, aiehlc_blk) {
     return {(int8_t *)acquire_output_window(win), 0};
 }
-// Tile sync (AIEHLC_PLAN_LOCK_SYNC, on the streams of operand AIEHLC_PLAN_SYNC_OPERAND). A stream's two
-// readers run at the same speed, so nothing pulls them back together once apart; a follower lagging by
-// about half a chunk reads the same bank half as the leader on every access (measured: 3x the bank
-// conflicts, 1.265 vs 1.17 ms per launch). So at the end of every output tile the leader waits for its
-// follower to finish the same tile: the follower releases the host tile's sync lock (init 0), the leader
-// takes it. Two lock operations per tile; the other operand's pairs are not synced (measured: no gain).
+// Tile sync (AIEHLC_PLAN_LOCK_SYNC, on the streams of operand AIEHLC_PLAN_SYNC_OPERAND). A stream's readers
+// run at the same speed, so nothing pulls them back together once apart; a follower lagging by about half
+// a chunk reads the same bank half as the leader on every access (measured: 3x the bank conflicts, 1.265
+// vs 1.17 ms per launch). So at the end of every output tile the leader (reader 0) waits for its followers
+// to finish the same tile: each follower releases the host tile's sync lock (init 0) once, the leader takes
+// READERS - 1. Two lock operations per tile; the other operand's readers are not synced (measured: no gain).
 template <typename W>
 AIEHLC_PLAN_INLINE void aiehlc_commit(W *win, const aiehlc_blk_desc &, aiehlc_blk_cursor &cur, int pm, int) {
     cur.r++;
     release_output_window(win);
-#if defined(AIEHLC_PLAN_LOCK_SYNC) && AIEHLC_PLAN_SYNC_OPERAND >= 0
-    const int lead = aiehlc_plan_first(AIEHLC_PLAN_SYNC_OPERAND, pm);
+#if defined(AIEHLC_PLAN_LOCK_SYNC) && AIEHLC_PLAN_SYNC_OPERAND >= 0 && AIEHLC_PLAN_READERS > 1
+    const int lead = aiehlc_plan_reader(AIEHLC_PLAN_SYNC_OPERAND, pm) == 0;
     const int s = aiehlc_plan_lockbase(AIEHLC_PLAN_SYNC_OPERAND, pm) + AIEHLC_PLAN_LOCK_SYNC;
-    const int nop = AIEHLC_PLAN_OWN_LOCK_BIAS + AIEHLC_PLAN_LOCK_G + AIEHLC_PLAN_LOCK_HAND_DELTA; /* held at 0 */
+    const int nop = AIEHLC_PLAN_OWN_LOCK_BIAS + AIEHLC_PLAN_LOCK_F + AIEHLC_PLAN_READERS * AIEHLC_PLAN_LOCK_HAND_DELTA;
     release(lead ? nop : s, lead ? 0 : 1);
-    acquire_greater_equal(lead ? s : nop, lead ? 1 : 0);
+    acquire_greater_equal(lead ? s : nop, lead ? AIEHLC_PLAN_READERS - 1 : 0);
 #else
     (void)pm;
 #endif

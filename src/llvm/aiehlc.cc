@@ -281,6 +281,7 @@ static KernelBlock kernelBlockFor(const std::string &kernel, const std::string &
     kb.ring = p->second.opts.ring;
     kb.keep = p->second.opts.keep;
     kb.align = p->second.opts.align;
+    kb.parts = p->second.opts.parts;
     return kb;
 }
 // Trace-routed kernel-only kernels: kernel -> port var -> traced block bytes
@@ -4476,12 +4477,22 @@ public:
                     std::string currentDefine;
                     bool inMultiLine = false;
                     int ifDepth = 0; // nesting depth of #if/#ifdef/#ifndef
+                    // A top-level conditional block is buffered; if it holds a #define (e.g. `#ifndef X` /
+                    // `#define X default` / `#endif`, so an including file can set X first) the kernel TU gets
+                    // the block with its directives, else nothing (as before).
+                    std::vector<std::string> condBlock;
+                    bool condHasDefine = false;
+                    auto emit = [&](const std::string &l) {
+                        if (ifDepth > 0)
+                            condBlock.push_back(l);
+                        else
+                            userMacroDefines.push_back(l);
+                    };
                     while (std::getline(iss, line)) {
                         if (inMultiLine) {
                             currentDefine += "\n" + line;
                             if (line.empty() || line.back() != '\\') {
-                                if (ifDepth == 0)
-                                    userMacroDefines.push_back(currentDefine);
+                                emit(currentDefine);
                                 inMultiLine = false;
                             }
                             continue;
@@ -4493,14 +4504,25 @@ public:
                         // Track preprocessor conditional nesting
                         if (trimmed.substr(0, 3) == "#if") {
                             ifDepth++;
+                            condBlock.push_back(line);
                             continue;
                         }
                         if (trimmed.substr(0, 5) == "#else" || trimmed.substr(0, 5) == "#elif") {
+                            if (ifDepth > 0)
+                                condBlock.push_back(line);
                             continue;
                         }
                         if (trimmed.substr(0, 6) == "#endif") {
-                            if (ifDepth > 0)
-                                ifDepth--;
+                            if (ifDepth > 0) {
+                                condBlock.push_back(line);
+                                if (--ifDepth == 0) {
+                                    if (condHasDefine)
+                                        userMacroDefines.insert(userMacroDefines.end(), condBlock.begin(),
+                                                                condBlock.end());
+                                    condBlock.clear();
+                                    condHasDefine = false;
+                                }
+                            }
                             continue;
                         }
                         if (trimmed.substr(0, 7) == "#define") {
@@ -4509,14 +4531,12 @@ public:
                                 line.find("AIEHLC_TILING_STUBS_DEFINED") != std::string::npos) {
                                 continue;
                             }
-                            // Skip macros inside #if/#else blocks
-                            if (ifDepth > 0)
-                                continue;
+                            condHasDefine |= ifDepth > 0;
                             currentDefine = line;
                             if (!line.empty() && line.back() == '\\') {
                                 inMultiLine = true;
                             } else {
-                                userMacroDefines.push_back(currentDefine);
+                                emit(currentDefine);
                             }
                         }
                     }

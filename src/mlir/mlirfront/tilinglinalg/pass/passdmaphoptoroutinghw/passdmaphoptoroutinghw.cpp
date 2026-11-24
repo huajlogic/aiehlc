@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 
+#include "planroutes.h"
 #include "passdmaphoptoroutinghw.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -854,8 +855,8 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
     LogicalResult matchAndRewrite(dmaphop::create_path op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
         // A flow the dataflow plan replaces (dmaphop.plan*, tagged by
-        // collectDataflowPlan) gets no generated stream route: the plan's
-        // aiehlc_plan_routing() routes it, around the ports booked here.
+        // collectDataflowPlan) gets no generated stream route: its dmaphop.plan_route
+        // ops are lowered after the conversion (lowerDataflowPlanRoutes).
         if (op->hasAttr("dmaphop.plan_replaced")) {
             rewriter.eraseOp(op);
             return success();
@@ -1324,8 +1325,11 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     */
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();
+        return;
     }
-    
+    // Dataflow plan routes: lowered here like every other flow, around the connections just created.
+    if (failed(lowerDataflowPlanRoutes(cast<ModuleOp>(module), rtopology_)))
+        signalPassFailure();
 }
 
 DmaphopToRoutinghwPass::DmaphopToRoutinghwPass(RoutingTopology& rtopology):rtopology_(rtopology) {

@@ -204,14 +204,23 @@ std::vector<TraceKernel> findKernels(const std::string &src, const std::map<std:
     return out;
 }
 
-// The object-like #define lines of the .cc itself (what the kernel TU sees).
+// The #define lines of the .cc itself (what the kernel TU sees), with the preprocessor conditionals around
+// them -- a `#ifndef X` / `#define X default` / `#endif` keeps a value an including file set first.
 std::string sourceDefines(const std::string &src) {
     std::istringstream is(src);
     std::string line, out;
     bool cont = false;
+    auto starts = [](const std::string &t, const char *d) {
+        if (t.empty() || t[0] != '#')
+            return false;
+        size_t p = t.find_first_not_of(" \t", 1);
+        return p != std::string::npos && t.compare(p, strlen(d), d) == 0 &&
+               (p + strlen(d) == t.size() || !isalnum((unsigned char)t[p + strlen(d)]));
+    };
     while (std::getline(is, line)) {
         std::string t = trim(line);
-        if (cont || t.compare(0, 7, "#define") == 0) {
+        if (cont || starts(t, "define") || starts(t, "if") || starts(t, "ifdef") || starts(t, "ifndef") ||
+            starts(t, "elif") || starts(t, "else") || starts(t, "endif")) {
             out += line + "\n";
             cont = !line.empty() && line.back() == '\\';
         }

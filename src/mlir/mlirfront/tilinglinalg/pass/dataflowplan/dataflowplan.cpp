@@ -35,6 +35,16 @@ std::set<int> DataflowPlan::coreS2mmChannels(int memtileRows) const {
     return out;
 }
 
+void erasePlanRoutes(ModuleOp module) {
+    SmallVector<Operation *> routes;
+    module.walk([&](Operation *op) {
+        if (op->getName().getStringRef() == "dmaphop.plan_route")
+            routes.push_back(op);
+    });
+    for (Operation *op : routes)
+        op->erase();
+}
+
 DataflowPlan &activePlan() {
     static DataflowPlan p;
     return p;
@@ -244,6 +254,18 @@ void readStream(Reader &r, DataflowPlan &p) {
         st.hostRows.push_back((int)v);
     for (int64_t v : r.ints("first_rows"))
         st.firstRows.push_back((int)v);
+    // the hosted-stream protocol (defaults: the values plans written before these attributes used)
+    st.channels = (int)r.i64("channels", 2);
+    st.slots = (int)r.i64("slots", 2);
+    st.readers = (int)r.i64("readers", 2);
+    st.parts = (int)r.i64("parts", 2);
+    st.elemBytes = (int)r.i64("elem_bytes", 1);
+    for (int64_t v : r.ints("row_groups", false))
+        st.rowGroups.push_back((int)v);
+    for (int64_t v : r.ints("strips", false))
+        st.strips.push_back((int)v);
+    if (st.channels < 1 || st.slots < 1 || st.readers < 1 || st.parts < 1 || st.elemBytes < 1)
+        r.err() << "channels / slots / readers / parts / elem_bytes must be >= 1";
     if (!p.replaces(st.arg))
         r.err() << "arg " << st.arg << " is not in the plan's replace_args";
     p.streams.push_back(st);
@@ -301,6 +323,8 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
             readRoute(r, plan);
         else if (n == "dmaphop.plan_stream")
             readStream(r, plan);
+        else if (n == "dmaphop.plan_resources") // pinned (read back from a dfschedule program)
+            readPlanResources(op, plan);
         else if (n != "dmaphop.plan")
             r.err() << "unknown plan op (the DMA program lives in dfschedule, derived from plan_stream)";
         ok &= r.ok;
@@ -323,6 +347,17 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
     });
     plan.meshCols = colHi - plan.colLo + 1;
     plan.meshRows = rowHi - plan.coreRowBase + 1;
+    // plans written before row_groups / strips: the 2 x 8 shared-operand grid they all used
+    for (auto &st : plan.streams) {
+        const int groups = (int)st.hostRows.size();
+        if (st.rowGroups.empty())
+            for (int pm = 0; pm < plan.meshRows; pm++)
+                st.rowGroups.push_back(st.role == "a" ? pm / 2 : pm % 2);
+        if (st.strips.empty())
+            for (int c = 0; c < plan.meshCols; c++)
+                for (int g = 0; g < groups; g++)
+                    st.strips.push_back(st.role == "a" ? g : c + plan.meshCols * g);
+    }
     std::string why;
     if (!checkPlanLayout(plan, why)) {
         ops.front()->emitError() << "[dataflow plan] " << why;
@@ -332,8 +367,9 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
     Builder b(module.getContext());
     SmallVector<int64_t> args(plan.replacedArgs.begin(), plan.replacedArgs.end());
     module->setAttr("dmaphop.plan_replaced_args", b.getI64ArrayAttr(args));
-    for (Operation *op : ops)
-        op->erase();
+    for (Operation *op : ops) // the routes stay: the routing path lowers them (DmaphopToRoutinghwPass)
+        if (op->getName().getStringRef() != "dmaphop.plan_route")
+            op->erase();
     llvm::outs() << "[DataflowPlan] plan: " << plan.routes.size() << " routes, " << plan.streams.size() << " streams"
                  << (plan.persistent ? ", persistent kernel" : "") << (plan.bdOnce ? ", BD write-once" : "")
                  << " (DMA program derived in dfschedule once the resources are assigned)\n";

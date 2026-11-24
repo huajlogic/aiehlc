@@ -4,17 +4,16 @@
  ******************************************************************************/
 
 // The device facts a dataflow plan is built on (doc/design/dmaphop_dataflow_plan.md), in ONE place:
-// tile resource counts, address views, lock numbering, DMA descriptor limits and the stream-switch
-// port model. Everything in pass/dataflowplan/ that is a property of the silicon reads it from here;
-// everything else is derived from the plan's streams or allocated against what the generated flows
-// already use (planresource.cpp). Values: AIE2PS (xaie2psgbl_reginit.c, the AIE2PS register map).
+// tile resource counts, address views, lock numbering and DMA descriptor limits. (The stream-switch
+// port model is the router's own -- hwresource.cpp -- the plan's routes go through DmaphopToRoutinghwPass.) Everything
+// in pass/dataflowplan/ that is a property of the silicon reads it from here; everything else is derived from the
+// plan's streams or allocated against what the generated flows already use (planresource.cpp). Values: AIE2PS
+// (xaie2psgbl_reginit.c, the AIE2PS register map).
 
 #ifndef TILINGLINALG_DATAFLOWPLAN_TARGET_H
 #define TILINGLINALG_DATAFLOWPLAN_TARGET_H
 
 #include <cstdint>
-#include <map>
-#include <string>
 
 namespace dfplan {
 
@@ -24,7 +23,7 @@ struct PlanTarget {
     int coreLocks, coreBds, coreS2mmChannels;
     int memLocks, memBds, memChannels; // MemTile: per direction
     int memBdBank;                     // a MemTile channel c may only use BDs [memBdBank (c & 1), + memBdBank)
-    int shimBds;
+    int shimBds, shimMm2sChannels;
     // ---- memories, as the DMAs and the core address them
     int64_t memOwnBase; // a MemTile BD's address of its own memory (the window covers its neighbours too)
     int64_t memBytes;   // MemTile data memory
@@ -39,20 +38,6 @@ struct PlanTarget {
     // MemTile's / shim's: xaie2psgbl_params.h *_D0_WRAP_MASK); a wider wrap is silently truncated
     int coreBdMaxWrap, memBdMaxWrap, shimBdMaxWrap;
     int bdMaxIterWrap; // largest BD iteration count
-    // ---- stream switch
-    // shim MM2S channel ch enters the switch at SOUTH slave port shimMm2sSouth[ch]
-    int shimMm2sSouth[2];
-    // master / slave port counts per direction, per tile kind ("core" / "mem" / "shim")
-    std::map<std::string, std::map<std::string, int>> masters, slaves;
-
-    int portCount(const std::string &kind, char ms, const std::string &dir) const {
-        const auto &m = ms == 'm' ? masters : slaves;
-        auto k = m.find(kind);
-        if (k == m.end())
-            return 0;
-        auto it = k->second.find(dir);
-        return it == k->second.end() ? 0 : it->second;
-    }
     int memBankLo(int ch) const { return memBdBank * (ch & 1); }
 };
 
@@ -68,6 +53,7 @@ inline const PlanTarget &planTarget() {
         /*memChannels*/ 6,
         /*memBdBank*/ 24,
         /*shimBds*/ 16,
+        /*shimMm2sChannels*/ 2,
         /*memOwnBase*/ 0x80000,
         /*memBytes*/ 0x80000,
         /*memLockBdBias*/ 64,
@@ -82,15 +68,6 @@ inline const PlanTarget &planTarget() {
         /*memBdMaxWrap*/ 1023,
         /*shimBdMaxWrap*/ 1023,
         /*bdMaxIterWrap*/ 64,
-        /*shimMm2sSouth*/ {3, 7},
-        /*masters*/
-        {{"core", {{"NORTH", 6}, {"SOUTH", 4}, {"EAST", 4}, {"WEST", 4}, {"DMA", 2}}},
-         {"mem", {{"NORTH", 6}, {"SOUTH", 4}, {"DMA", 6}}},
-         {"shim", {{"NORTH", 6}, {"SOUTH", 6}, {"EAST", 4}, {"WEST", 4}}}},
-        /*slaves*/
-        {{"core", {{"SOUTH", 6}, {"NORTH", 4}, {"EAST", 4}, {"WEST", 4}, {"DMA", 2}}},
-         {"mem", {{"SOUTH", 6}, {"NORTH", 4}, {"DMA", 6}}},
-         {"shim", {{"SOUTH", 8}, {"NORTH", 4}, {"EAST", 4}, {"WEST", 4}}}},
     };
     return t;
 }

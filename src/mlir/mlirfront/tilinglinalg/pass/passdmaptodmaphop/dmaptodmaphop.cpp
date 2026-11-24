@@ -334,9 +334,20 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     
     // Determine DMA direction based on dataflow direction
     DMADIRECTION dmaDirection = (direction == DataflowDirection::Push) ? DMADIRECTION::MM2S : DMADIRECTION::S2MM;
-    
-    // Create DataIO - this allocates the optimal shim column and channel
-    auto dio = router.createDataIO(dioNameStream.str(), dstcoreloc, dmaDirection);
+
+    // Create DataIO - this allocates the optimal shim column and channel. A flow a dataflow plan replaces
+    // (its tensor carries `dataflow`, doc/design/dmaphop_dataflow_plan.md) books no shim DMA channel: the
+    // plan programs its own shim transfers on the channels its routes name, so the generated placement of
+    // such a flow is only a stand-in in the target core's column (a narrow mesh would otherwise run out of
+    // shim channels before the plan replaces anything).
+    bool planned = false;
+    if (auto fn = op->getParentOfType<func::FuncOp>())
+        fn.walk([&](routing::createscheduletensor t) {
+            if (t->hasAttr("dataflow") && funcArgIdx >= 0 && traceToFuncArgIndex(t->getOperand(0)) == funcArgIdx)
+                planned = true;
+        });
+    auto dio = planned ? router.createDataIOAtPoint(dioNameStream.str(), Point{0, targetCoreTile.c}, dmaDirection, 0)
+                       : router.createDataIO(dioNameStream.str(), dstcoreloc, dmaDirection);
     int shimcol = dio->colpos();
     int dioid = dio->id();
     int channel = dio->channel();

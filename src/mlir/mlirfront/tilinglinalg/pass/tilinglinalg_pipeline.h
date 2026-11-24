@@ -72,6 +72,7 @@ struct KernelBlock {
     int ring = 0;      // {.ring = N}: MemTile FIFO ring buffers
     bool keep = false; // {.keep = true}: loaded on the first launch, kept across launches
     int align = 0;     // {.align = N}: the port's core buffers N-byte aligned (-> block_align attr)
+    int parts = 0;     // {.parts = n}: the kernel addresses a block as n row parts (-> dataflow parts)
     bool empty() const { return shape.empty(); }
 };
 

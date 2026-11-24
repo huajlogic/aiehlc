@@ -28,6 +28,13 @@
 #pragma KERNELCONFIGOFFLOAD
 #pragma output_tile_major
 #pragma persistent_kernel
+// The mesh (an including file may set the width first: gemm_plan_4x2.cc).
+#ifndef GP_HW_ROWS
+#define GP_HW_ROWS 4
+#endif
+#ifndef GP_HW_COLS
+#define GP_HW_COLS 4
+#endif
 #include "simplegemm_peak.h"
 
 #define KA_TM 64
@@ -37,8 +44,8 @@
 #define KA_K 2560
 #define KA_R 30
 #define KA_NT 2
-#define KA_M (4 * KA_TM * KA_R)
-#define KA_N (4 * KA_TN * KA_NT)
+#define KA_M (GP_HW_ROWS * KA_TM * KA_R)
+#define KA_N (GP_HW_COLS * KA_TN * KA_NT)
 #define SH_R2 60
 #define SH_NT2 1
 #define SH_NK 20
@@ -57,7 +64,7 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
     typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4; // one mac_8x8_8x8: 512 int8 MAC / cycle
     // 2 x 8 logical grid on the 4 x 4 mesh: core (pm, pn) computes A strip sa x B strip sb.
     const int pm = aie::program_id(0), pn = aie::program_id(1);
-    const int sa = pm >> 1, sb = pn + 4 * (pm & 1), brow = sb * KA_TN;
+    const int sa = pm >> 1, sb = pn + GP_HW_COLS * (pm & 1), brow = sb * KA_TN;
     // The two cores reading one block walk its two parts in opposite order (different memory banks).
     const int pa = pm & 1, pb = pm >> 1, swz = (pa << 3) ^ (pb << 1);
     alignas(8192) static int32_t acc[KA_TM * KA_TN];
@@ -133,7 +140,8 @@ static void gemm_ka_run(int8_t *A, int8_t *B, int8_t *C) {
     __Runtime_ctrl_pmap_enable(0);
     aieSetDevice(0);
     aieArray device;
-    aieMesh mesh = device.partition({2, 6, 0, 6}, GP_HW_ROWS, GP_HW_COLS);
+    // the control-packet column + the mesh's columns
+    aieMesh mesh = device.partition({2, 2 + GP_HW_COLS, 0, 6}, GP_HW_ROWS, GP_HW_COLS);
     gemm_ka<<<mesh>>>(A, B, C);
 }
 
@@ -162,30 +170,17 @@ static void ka_pack(const int8_t *src, int8_t *dst, long rows, long K, int br, i
                         }
 }
 
-// A / B laid out in DDR in the order the plan's shim BDs stream them, contiguously:
-// A column c: m-tiles s = 0..R2-1 x chunks jj = 0..NK/2-1 of strip c >> 1, k-chunk 2 jj + (c & 1);
-// B column c: strip c then strip c+4, each NT2 n-tiles x NK chunks. Chunk = 64 rows x 128 B of the
-// packed operand (already in mmul order).
-static void sh_arrange(const int8_t *Ap, const int8_t *Bp, int8_t *A2, int8_t *B2, long M, long K) {
-    const long nk = K / 128, hk = nk / 2;
-    int8_t *a = A2;
-    for (int c = 0; c < 4; c++)
-        for (long s = 0; s < SH_R2; s++)
-            for (long jj = 0; jj < hk; jj++)
-                for (int r = 0; r < 64; r++, a += 128)
-                    memcpy(a, Ap + ((c >> 1) * (M / 2) + s * 64 + r) * K + (2 * jj + (c & 1)) * 128, 128);
-    int8_t *b = B2;
-    for (int c = 0; c < 4; c++)
-        for (int half = 0; half < 2; half++)
-            for (long nt = 0; nt < SH_NT2; nt++)
-                for (long kc = 0; kc < nk; kc++)
-                    for (int r = 0; r < 64; r++, b += 128)
-                        memcpy(b, Bp + (((c + 4 * half) * SH_NT2 + nt) * 64 + r) * K + kc * 128, 128);
-}
+// A / B laid out in DDR in the order the plan's shim BDs stream them: aiehlc_plan_arrange, generated from
+// the plan into aiehlc_plan.h (the front end parses this file before the plan exists: a declaration).
+#if __has_include("aiehlc_plan.h")
+#include "aiehlc_plan.h"
+#else
+void aiehlc_plan_arrange(int arg, const void *src, void *dst);
+#endif
 
 int main() {
-    const long M = 2L * 64 * SH_R2, N = 8L * 64 * SH_NT2, K = 128L * SH_NK, R = SH_R2 * SH_NT2, blk = KA_TM * KA_TN,
-               nti = KA_TN / 8;
+    const long M = (GP_HW_ROWS / 2) * 64L * SH_R2, N = 2L * GP_HW_COLS * 64 * SH_NT2, K = 128L * SH_NK,
+               R = SH_R2 * SH_NT2, blk = KA_TM * KA_TN, nti = KA_TN / 8;
     printf("=== gemm_plan: C[%ld x %ld] = A[%ld x %ld] . B^T, int8, 2 x 8 shared operands from the dmaphop "
            "dataflow plan, %.3f GMAC ===\n",
            M, N, M, K, (double)M * N * K / 1e9);
@@ -196,7 +191,8 @@ int main() {
     gp_init(A, B, M, N, K);
     ka_pack(A, Ap, M, K, KA_TM, 0);
     ka_pack(B, Bp, N, K, KA_TN, 1);
-    sh_arrange(Ap, Bp, A2, B2, M, K);
+    aiehlc_plan_arrange(0, Ap, A2);
+    aiehlc_plan_arrange(1, Bp, B2);
     memset(Ct, 0, M * N);
     __Runtime_buffer_device_written(Ct, M * N);
     double pmu_ghz = 0;
@@ -209,13 +205,13 @@ int main() {
         while (gp_ms(a0, a1) < 20.0);
         pmu_ghz = (double)(pmu() - p0) / (gp_ms(a0, a1) * 1e6);
     }
-    /* peak = 16 cores x 512 MAC/cycle; the array clock is GEMM_AIE_MHZ (VEK385: 1250, palmyra: 998) */
+    /* peak = rows x cols cores x 512 MAC/cycle; the array clock is GEMM_AIE_MHZ (VEK385: 1250, palmyra: 998) */
 #ifndef GEMM_AIE_MHZ
 #define GEMM_AIE_MHZ 1250.0
 #endif
-    const double peak_ms = (double)M * N * K / (16.0 * 512.0 * GEMM_AIE_MHZ * 1e6) * 1e3;
-    printf("[gemm_plan] PMU clock %.3f GHz; ideal (16 x 512 MAC/cycle @ %.0f MHz) %.4f ms\n", pmu_ghz, GEMM_AIE_MHZ,
-           peak_ms);
+    const double peak_ms = (double)M * N * K / (GP_HW_ROWS * GP_HW_COLS * 512.0 * GEMM_AIE_MHZ * 1e6) * 1e3;
+    printf("[gemm_plan] PMU clock %.3f GHz; ideal (%d x 512 MAC/cycle @ %.0f MHz) %.4f ms\n", pmu_ghz,
+           GP_HW_ROWS * GP_HW_COLS, GEMM_AIE_MHZ, peak_ms);
     double sum = 0, best = 1e9;
     const int iters = 8;
     for (int it = 0; it < iters; it++) {
@@ -238,9 +234,9 @@ int main() {
         const long h = i / (M / 2), s = (i % (M / 2)) / KA_TM, rr = i % KA_TM;
         for (long jj = 0; jj < N; jj += 3) {
             const long nt2 = SH_NT2, sj = jj / (KA_TN * nt2), nt = (jj % (KA_TN * nt2)) / KA_TN, cj = jj % KA_TN;
-            const long pn = sj & 3, pm = 2 * h + (sj >> 2);
+            const long pn = sj % GP_HW_COLS, pm = 2 * h + sj / GP_HW_COLS;
             const long q = ((rr / 8) * nti + cj / 8) * 64 + (rr % 8) * 8 + cj % 8;
-            const int8_t got = Ct[((pm * 4 + pn) * R + s * nt2 + nt) * blk + q];
+            const int8_t got = Ct[((pm * GP_HW_COLS + pn) * R + s * nt2 + nt) * blk + q];
             int acc = 0;
             for (long k = 0; k < K; k++)
                 acc += A[i * K + k] * B[jj * K + k];

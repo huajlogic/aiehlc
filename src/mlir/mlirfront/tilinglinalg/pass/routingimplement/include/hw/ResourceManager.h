@@ -562,6 +562,8 @@ public:
   /// Call before any allocation. When not set, full mesh is used.
   void setPartitionBounds(int startCol, int endCol, int startRow, int endRow);
   bool hasPartition() const { return partitionStartCol_ >= 0; }
+  /// Tile (r, c) lies in the partition (or no partition is set) -- for routers outside this class.
+  bool tileInPartition(int r, int c) const { return isTileInPartition(r, c); }
   static std::shared_ptr<ResourceMgr> instance();
   uint32_t allocdioid();
 

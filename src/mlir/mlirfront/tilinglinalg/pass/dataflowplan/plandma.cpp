@@ -43,9 +43,45 @@ std::vector<const PlanRoute *> routesOf(const DataflowPlan &p, int arg, bool fro
     return out;
 }
 
+MemtileUse memtileUse(const DataflowPlan &p, const PlanStream &s, int col) {
+    MemtileUse u;
+    auto in = routesOf(p, s.arg, true, col);
+    if (in.size() != 1 || in[0]->dsts.size() != 1)
+        return u;
+    u.shimRoute = in[0];
+    u.mt = in[0]->dsts[0].first;
+    u.s2mm = in[0]->dsts[0].second;
+    for (const PlanRoute *r : routesOf(p, s.arg, false, u.mt.col))
+        if (r->src == u.mt && !r->dsts.empty())
+            u.out.push_back(r);
+    const int64_t chunk = s.chunkBytes();
+    if (s.stage == "memtile_ring") {
+        for (const PlanRoute *r : u.out)
+            u.parities.push_back(r->dsts[0].second);
+        const int k = (int)u.parities.size();
+        u.chunksPerTile = (int64_t)s.chunks * k / s.channels;
+        if (k == 1) { // one parity: buffers of 2 chunks, one chain each way
+            u.s2mmBds = s.ring, u.mm2sBds = {s.ring}, u.locks = 2, u.bytes = (int64_t)s.ring * 2 * chunk;
+        } else { // k parities: per parity `ring` one-chunk buffers and an (empty, full) lock pair
+            u.s2mmBds = s.ring * k, u.mm2sBds.assign(k, s.ring), u.locks = 2 * k;
+            u.bytes = (int64_t)s.ring * k * chunk;
+        }
+    } else {
+        u.chunksPerTile = s.chunks;
+        u.s2mmBds = 1, u.mm2sBds.assign(u.out.size(), 1), u.locks = 2;
+        u.bytes = (int64_t)s.hostRows.size() * s.chunks * chunk;
+    }
+    u.present = !u.out.empty();
+    return u;
+}
+
 namespace {
 
-int64_t chunkBytes(const PlanStream &s) { return (int64_t)s.chunkRows * s.chunkCols; }
+// Role tag of a MemTile op of stream si, column c: "mem/<si>/<c>/<what>/<i>[/<j>]" (dfplan.tag).
+std::string mtag(size_t si, int c, const char *what, int i, int j = -1) {
+    std::string t = "mem/" + std::to_string(si) + "/" + std::to_string(c) + "/" + what + "/" + std::to_string(i);
+    return j >= 0 ? t + "/" + std::to_string(j) : t;
+}
 
 // A contiguous run of `words` 32-bit words as two BD dimensions {1, in} {in, out} (in * out = words),
 // both wraps within the tile kind's limit (maxW); {0, 0} when it cannot be split.
@@ -56,52 +92,112 @@ std::pair<int64_t, int64_t> splitWords(int64_t words, int64_t maxW) {
     return {0, 0};
 }
 
-// The chunk stream a shim BD reads from DDR, chunk by chunk (bytes): rows of chunkCols, chunkRows rows,
-// then n chunks. The host lays the stream out contiguously in this order (the plan's DDR contract).
+// The chunk stream a shim BD reads from DDR, chunk by chunk (bytes): rows of chunkCols elements,
+// chunkRows rows, then n chunks. The host lays the stream out contiguously in this order
+// (aiehlc_plan_arrange in aiehlc_plan.h).
 Dims shimChunkDims(const PlanStream &s, int64_t n) {
     const int w = planTarget().bdWordBytes;
-    return {{w, s.chunkCols / w}, {s.chunkCols, s.chunkRows}, {chunkBytes(s), n}};
+    const int64_t row = (int64_t)s.chunkCols * s.elemBytes;
+    return {{w, row / w}, {row, s.chunkRows}, {s.chunkBytes(), n}};
 }
 
-// MemTile side of a memtile_ring stream, per column: the shim's chunks enter a FIFO ring of `ring`
-// buffers of 2 chunks (counting locks: lockA = empty, lockB = full) and leave on the MemTile's MM2S route.
-bool deriveRing(DataflowPlan &p, size_t si, std::string &why) {
+// MemTile side of a memtile_ring stream, per column: the shim's chunks enter a FIFO ring and leave on
+// the MemTile's MM2S routes. One served parity: `ring` buffers of 2 chunks, counting locks (empty, full).
+// Several: chunks alternate parities, so the S2MM chain alternates per-parity (empty, full) lock pairs over
+// one-chunk buffers and every MM2S route walks its parity's buffers.
+void deriveRing(DataflowPlan &p, size_t si) {
     const PlanStream &A = p.streams[si];
-    const PlanResources::Mem &m = p.res.mem[si];
-    const int64_t chunk = chunkBytes(A), buf = 2 * chunk, aLen = (int64_t)A.chunks / 2 * chunk;
-    const int ring = A.ring, rounds = (int)(A.rounds * aLen / (ring * buf));
+    const int64_t chunk = A.chunkBytes();
     for (int c = 0; c < p.meshCols; c++) {
-        auto in = routesOf(p, A.arg, true, p.colLo + c);
-        if (in.size() != 1 || in[0]->dsts.size() != 1) {
-            why = "stream " + std::to_string(A.arg) + ": column " + std::to_string(c) +
-                  " needs one shim route to one MemTile";
-            return false;
+        const MemtileUse u = memtileUse(p, A, p.colLo + c);
+        if (!u.present)
+            continue;
+        const PlanResources::Mem &m = p.res.mem[si][c];
+        const std::vector<Tile> t{u.mt};
+        const int ring = A.ring, k = (int)u.parities.size();
+        for (int j = 0; j < k; j++) {
+            p.locks.push_back({t, m.locks[2 * j], ring, -1, false, true});
+            p.locks.back().tag = mtag(si, c, "lock", 2 * j);
+            p.locks.push_back({t, m.locks[2 * j + 1], 0, -1, false, true});
+            p.locks.back().tag = mtag(si, c, "lock", 2 * j + 1);
         }
-        const Tile mt = in[0]->dsts[0].first;
-        const int s2mm = in[0]->dsts[0].second;
-        const PlanRoute *out = nullptr;
-        for (const PlanRoute *r : routesOf(p, A.arg, false, mt.col))
-            if (r->src == mt)
-                out = r;
-        if (!out) {
-            why = "stream " + std::to_string(A.arg) + ": no route out of MemTile (" + std::to_string(mt.col) + ", " +
-                  std::to_string(mt.row) + ")";
-            return false;
+        if (k == 1) {
+            const int rounds = (int)(A.rounds * u.chunksPerTile / (2 * ring));
+            for (int b = 0; b < ring; b++) {
+                const bool last = b == ring - 1;
+                const int64_t addr = m.addr + b * 2 * chunk;
+                p.bds.push_back({t,
+                                 m.bdIn + b,
+                                 addr,
+                                 2 * chunk,
+                                 {},
+                                 0,
+                                 0,
+                                 m.locks[0],
+                                 -1,
+                                 m.locks[1],
+                                 1,
+                                 last ? -1 : m.bdIn + b + 1});
+                p.bds.back().tag = mtag(si, c, "in", b);
+                p.bds.push_back({t,
+                                 m.bdOut[0] + b,
+                                 addr,
+                                 2 * chunk,
+                                 {},
+                                 0,
+                                 0,
+                                 m.locks[1],
+                                 -1,
+                                 m.locks[0],
+                                 1,
+                                 last ? -1 : m.bdOut[0] + b + 1});
+                p.bds.back().tag = mtag(si, c, "out", 0, b);
+            }
+            p.channels.push_back({t, true, u.s2mm, m.bdIn, rounds, false});
+            p.channels.back().tag = mtag(si, c, "ch_in", 0);
+            p.channels.push_back({t, false, u.out[0]->srcCh, m.bdOut[0], rounds, false});
+            p.channels.back().tag = mtag(si, c, "ch_out", 0);
+            continue;
         }
-        const std::vector<Tile> t{mt};
-        p.locks.push_back({t, m.lockA, ring, -1, false, true});
-        p.locks.push_back({t, m.lockB, 0, -1, false, true});
-        for (int b = 0; b < ring; b++) {
-            const bool last = b == ring - 1;
-            const int64_t addr = m.addr + b * buf;
-            p.bds.push_back({t, m.bdIn + b, addr, buf, {}, 0, 0, m.lockA, -1, m.lockB, 1, last ? -1 : m.bdIn + b + 1});
-            p.bds.push_back(
-                {t, m.bdOut[0] + b, addr, buf, {}, 0, 0, m.lockB, -1, m.lockA, 1, last ? -1 : m.bdOut[0] + b + 1});
+        for (int i = 0; i < ring * k; i++) { // buffer i: chunk parity j = i % k
+            const int j = i % k;
+            p.bds.push_back({t,
+                             m.bdIn + i,
+                             m.addr + i * chunk,
+                             chunk,
+                             {},
+                             0,
+                             0,
+                             m.locks[2 * j],
+                             -1,
+                             m.locks[2 * j + 1],
+                             1,
+                             i + 1 < ring * k ? m.bdIn + i + 1 : -1});
+            p.bds.back().tag = mtag(si, c, "in", i);
         }
-        p.channels.push_back({t, true, s2mm, m.bdIn, rounds, false});
-        p.channels.push_back({t, false, out->srcCh, m.bdOut[0], rounds, false});
+        p.channels.push_back({t, true, u.s2mm, m.bdIn, (int)(A.rounds * u.chunksPerTile / (ring * k)), false});
+        p.channels.back().tag = mtag(si, c, "ch_in", 0);
+        for (int j = 0; j < k; j++) {
+            for (int b = 0; b < ring; b++) {
+                p.bds.push_back({t,
+                                 m.bdOut[j] + b,
+                                 m.addr + (b * k + j) * chunk,
+                                 chunk,
+                                 {},
+                                 0,
+                                 0,
+                                 m.locks[2 * j + 1],
+                                 -1,
+                                 m.locks[2 * j],
+                                 1,
+                                 b + 1 < ring ? m.bdOut[j] + b + 1 : -1});
+                p.bds.back().tag = mtag(si, c, "out", j, b);
+            }
+            p.channels.push_back(
+                {t, false, u.out[j]->srcCh, m.bdOut[j], (int)(A.rounds * u.chunksPerTile / k / ring), false});
+            p.channels.back().tag = mtag(si, c, "ch_out", j);
+        }
     }
-    return true;
 }
 
 // Strip group of a core row for a stream: the g with hostRows[g] == mesh row.
@@ -113,104 +209,116 @@ int groupOfHostRow(const PlanStream &s, int meshRow) {
 }
 
 // MemTile side of a memtile (resident) stream, per column: the column's strips held whole (one S2MM load,
-// on the first launch only when resident across launches; lockA = ready, lockB = free), replayed by one
-// MM2S BD per route -- the route's destination says which strip (its host row) and which chunk parity
-// (its S2MM channel).
+// on the first launch only when resident across launches; locks ready, free), replayed by one MM2S BD per
+// route -- the route's destination says which strip group (its host row) and which chunk parity (its
+// S2MM channel); a replay takes every `channels`-th chunk.
 bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
     const PlanStream &B = p.streams[si];
-    const PlanResources::Mem &m = p.res.mem[si];
-    const int64_t chunk = chunkBytes(B), bLen = (int64_t)B.chunks * chunk, groups = B.hostRows.size();
+    const PlanTarget &T = planTarget();
+    const int64_t chunk = B.chunkBytes(), bLen = (int64_t)B.chunks * chunk, groups = B.hostRows.size();
     const bool keep = B.residentLaunches;
-    const auto [in, out] = splitWords(chunk / planTarget().bdWordBytes, planTarget().memBdMaxWrap);
-    const int64_t chunkW = chunk / planTarget().bdWordBytes;
+    const auto [in, out] = splitWords(chunk / T.bdWordBytes, T.memBdMaxWrap);
+    const int64_t chunkW = chunk / T.bdWordBytes;
     for (int c = 0; c < p.meshCols; c++) {
-        auto load = routesOf(p, B.arg, true, p.colLo + c);
-        if (load.size() != 1 || load[0]->dsts.size() != 1) {
-            why = "stream " + std::to_string(B.arg) + ": column " + std::to_string(c) +
-                  " needs one shim route to one MemTile";
-            return false;
-        }
-        const Tile mt = load[0]->dsts[0].first;
-        const std::vector<Tile> t{mt};
-        const int replays = (int)groups * 2;
-        p.locks.push_back({t, m.lockA, 0, keep ? replays : -1, false, true});
-        p.locks.push_back({t, m.lockB, 1, keep ? 0 : -1, false, true});
-        p.bds.push_back({t, m.bdIn, m.addr, groups * bLen, {}, 0, 0, m.lockB, -1, m.lockA, replays, -1});
-        p.channels.push_back({t, true, load[0]->dsts[0].second, m.bdIn, 1, keep});
-        size_t k = 0;
-        for (const PlanRoute *r : routesOf(p, B.arg, false, mt.col)) {
-            if (!(r->src == mt))
-                continue;
-            if (r->dsts.size() != 1 || k >= m.bdOut.size()) {
-                why = "stream " + std::to_string(B.arg) + ": each MemTile replay route has one destination";
-                return false;
-            }
+        const MemtileUse u = memtileUse(p, B, p.colLo + c);
+        if (!u.present)
+            continue;
+        const PlanResources::Mem &m = p.res.mem[si][c];
+        const std::vector<Tile> t{u.mt};
+        const int replays = (int)u.out.size();
+        p.locks.push_back({t, m.locks[0], 0, keep ? replays : -1, false, true});
+        p.locks.back().tag = mtag(si, c, "lock", 0);
+        p.locks.push_back({t, m.locks[1], 1, keep ? 0 : -1, false, true});
+        p.locks.back().tag = mtag(si, c, "lock", 1);
+        p.bds.push_back({t, m.bdIn, m.addr, groups * bLen, {}, 0, 0, m.locks[1], -1, m.locks[0], replays, -1});
+        p.bds.back().tag = mtag(si, c, "in", 0);
+        p.channels.push_back({t, true, u.s2mm, m.bdIn, 1, keep});
+        p.channels.back().tag = mtag(si, c, "ch_in", 0);
+        for (size_t k = 0; k < u.out.size(); k++) {
+            const PlanRoute *r = u.out[k];
             const int g = groupOfHostRow(B, r->dsts[0].first.row - p.coreRowBase), q = r->dsts[0].second;
-            if (g < 0 || q > 1) {
-                why = "stream " + std::to_string(B.arg) + ": a replay route ends on a core that hosts no strip";
+            if (r->dsts.size() != 1 || g < 0 || q >= B.channels) {
+                why = "stream " + std::to_string(B.arg) +
+                      ": a replay route must end on one core hosting a strip, "
+                      "on a channel below `channels`";
                 return false;
             }
-            // every other chunk of strip g, from chunk q
-            Dims d = {{1, in}, {in, out}, {2 * chunkW, B.chunks / 2}};
-            p.bds.push_back(
-                {t, m.bdOut[k], m.addr + g * bLen + q * chunk, bLen / 2, d, 0, 0, m.lockA, -1, m.lockA, 1, -1});
+            Dims d = {{1, in}, {in, out}, {B.channels * chunkW, B.chunks / B.channels}};
+            p.bds.push_back({t, m.bdOut[k], m.addr + g * bLen + q * chunk, bLen / B.channels, d, 0, 0, m.locks[0], -1,
+                             m.locks[0], 1, -1});
+            p.bds.back().tag = mtag(si, c, "out", (int)k, 0);
             p.channels.push_back({t, false, r->srcCh, m.bdOut[k], B.rounds, false});
-            k++;
-        }
-        if ((int)k != replays) {
-            why = "stream " + std::to_string(B.arg) + ": MemTile (" + std::to_string(mt.col) + ", " +
-                  std::to_string(mt.row) + ") has " + std::to_string(k) + " replay routes, the layout needs " +
-                  std::to_string(replays);
-            return false;
+            p.channels.back().tag = mtag(si, c, "ch_out", (int)k);
         }
     }
     return true;
 }
 
-// Every core hosts one stream: per S2MM channel (chunk parity) two buffers, each chunk split in two parts
-// (SLOT_LO / SLOT_HI halves of the slot region -- different memory banks). Buffer index = channel + 2 slot
-// = chunk g & 3, one AND on the core. Locks (res): F (DMA -> first reader) and G = F + delta (first ->
-// second reader) per channel, the no-op pair G + delta (held at 0), E per buffer (both readers -> DMA).
+// Every core hosts at most one stream: per S2MM channel `slots` buffers, each chunk in `parts` row parts
+// PART_STRIDE apart (different memory banks). Buffer index = channel + channels x slot = chunk g mod
+// buffers. Locks (res): per channel a reader lock per reader + the no-op row, handDelta (= channels)
+// apart; E per buffer (all readers -> DMA, acquired by `readers`).
 void deriveCoreSlots(DataflowPlan &p, const PlanStream &s, const std::vector<Tile> &cores) {
     const PlanResources &r = p.res;
     const PlanTarget &T = planTarget();
-    const int64_t chunk = chunkBytes(s), half = chunk / 2, part = 4 * half;
-    const auto [in, out] = splitWords(half / T.bdWordBytes, T.coreBdMaxWrap);
-    for (int ch = 0; ch < 2; ch++)
-        for (int k = 0; k < 2; k++) {
-            const int buf = ch + 2 * k;
-            Dims d = {{1, in}, {in, out}, {part / T.bdWordBytes, 0}}; // half, then the other half one part on
-            p.bds.push_back({cores, r.coreBd[ch][k], r.slotBase + buf * half, chunk, d, 0, 0, r.lockE + ch + 2 * k, -2,
-                             r.lockF + ch, 1, r.coreBd[ch][k ^ 1]});
+    const int64_t chunk = s.chunkBytes(), part = chunk / s.parts, stride = (int64_t)s.buffers() * part;
+    const auto [in, out] = splitWords(part / T.bdWordBytes, T.coreBdMaxWrap);
+    for (int ch = 0; ch < s.channels; ch++)
+        for (int k = 0; k < s.slots; k++) {
+            const int buf = ch + s.channels * k;
+            Dims d = {{1, in}, {in, out}, {stride / T.bdWordBytes, 0}}; // part 0, then the next part a stride on
+            p.bds.push_back({cores, r.coreBd[ch] + k, r.slotBase + buf * part, chunk, d, 0, 0, r.lockE + buf,
+                             -s.readers, r.lockF + ch, 1, r.coreBd[ch] + (k + 1) % s.slots});
+            p.bds.back().tag = "core/bd/" + std::to_string(ch) + "/" + std::to_string(k);
         }
-    for (int ch = 0; ch < 2; ch++) {
-        for (int k = 0; k < 2; k++)
-            p.locks.push_back({cores, r.lockE + ch + 2 * k, 2, -1, false});
-        for (int j = 0; j < 3; j++) // F, G, no-op
-            p.locks.push_back({cores, r.lockF + ch + j * r.handDelta, 0, -1, false});
+    for (int b = 0; b < s.buffers(); b++) {
+        p.locks.push_back({cores, r.lockE + b, s.readers, -1, false});
+        p.locks.back().tag = "core/E/" + std::to_string(b);
     }
-    if (p.persistent)
+    for (int i = 0; i <= s.readers; i++) // reader locks + the no-op row
+        for (int ch = 0; ch < s.channels; ch++) {
+            p.locks.push_back({cores, r.lockF + i * r.handDelta + ch, 0, -1, false});
+            p.locks.back().tag = "core/R/" + std::to_string(i) + "/" + std::to_string(ch);
+        }
+    if (p.persistent) {
         p.locks.push_back({cores, r.lockGo, 1, -1, false});
+        p.locks.back().tag = "core/go";
+    }
     p.locks.push_back({cores, r.lockSync, 0, -1, false});
-    for (int ch = 0; ch < 2; ch++)
-        p.channels.push_back({cores, true, ch, r.coreBd[ch][0], 1, false});
-    const int64_t lo = r.slotBase - T.coreOwnView;
-    const std::pair<const char *, int64_t> scal[] = {{"SLOT_LO", lo},          {"SLOT_HI", lo + part},
-                                                     {"SLOT_STRIDE", half},    {"SLOT_CH_STRIDE", 1},
-                                                     {"SLOT_SLOT_STRIDE", 2},  {"PART_STRIDE", part},
-                                                     {"LOCK_F", r.lockF},      {"LOCK_G", r.lockF + r.handDelta},
-                                                     {"LOCK_E", r.lockE},      {"LOCK_HAND_DELTA", r.handDelta},
-                                                     {"LOCK_CH_STRIDE", 1},    {"LOCK_E_SLOT_STRIDE", 2},
+    p.locks.back().tag = "core/sync";
+    for (int ch = 0; ch < s.channels; ch++) {
+        p.channels.push_back({cores, true, ch, r.coreBd[ch], 1, false});
+        p.channels.back().tag = "core/ch/" + std::to_string(ch);
+    }
+    const std::pair<const char *, int64_t> scal[] = {{"SLOT_LO", r.slotBase - T.coreOwnView},
+                                                     {"SLOT_STRIDE", part},
+                                                     {"PART_STRIDE", stride},
+                                                     {"CHANNELS", s.channels},
+                                                     {"SLOTS", s.slots},
+                                                     {"BUFFERS", s.buffers()},
+                                                     {"READERS", s.readers},
+                                                     {"LOCK_F", r.lockF},
+                                                     {"LOCK_E", r.lockE},
+                                                     {"LOCK_HAND_DELTA", r.handDelta},
                                                      {"LOCK_SYNC", r.lockSync}};
     for (auto &[n, v] : scal)
         p.params.push_back({n, {v}, true, false});
 }
 
+// Reader order of strip group g of a stream: its first row, then the group's other rows ascending.
+std::vector<int> readersOf(const PlanStream &s, int g) {
+    std::vector<int> rows{s.firstRows[g]};
+    for (size_t pm = 0; pm < s.rowGroups.size(); pm++)
+        if (s.rowGroups[pm] == g && (int)pm != s.firstRows[g])
+            rows.push_back((int)pm);
+    return rows;
+}
+
 // The kernel's view of the hosted streams, per shared operand o and mesh row: the host core's memory view
-// (own / north / south), its lock-id bias and whether this row reads first.
+// (own / north / south), its lock-id bias and the row's reader index.
 bool deriveKernelParams(DataflowPlan &p, std::string &why) {
     const PlanTarget &T = planTarget();
-    PlanKernelParam v{"VIEW", {}, false, true}, l{"LOCK", {}, false, true}, f{"FIRST", {}, false, true};
+    PlanKernelParam v{"VIEW", {}, false, true}, l{"LOCK", {}, false, true}, rd{"READER", {}, false, true};
     int syncOperand = -1;
     for (size_t o = 0; o < p.shareArgs.size(); o++) {
         const PlanStream *s = nullptr;
@@ -221,10 +329,10 @@ bool deriveKernelParams(DataflowPlan &p, std::string &why) {
             why = "share_args has " + std::to_string(p.shareArgs[o]) + " but no plan_stream for it";
             return false;
         }
-        if (s->role == "a")
+        if (s->stage == "memtile_ring" && syncOperand < 0)
             syncOperand = (int)o;
         for (int pm = 0; pm < p.meshRows; pm++) {
-            const int g = s->role == "a" ? pm / 2 : pm % 2, host = s->hostRows[g];
+            const int g = s->rowGroups[pm], host = s->hostRows[g];
             if (host < pm - 1 || host > pm + 1) {
                 why = "mesh row " + std::to_string(pm) + " reads stream " + std::to_string(s->arg) + " hosted on row " +
                       std::to_string(host) + ", which is not a neighbour";
@@ -234,42 +342,90 @@ bool deriveKernelParams(DataflowPlan &p, std::string &why) {
             l.perMeshRow.push_back(host == pm       ? T.coreOwnLockBias
                                    : host == pm + 1 ? T.coreNorthLockBias
                                                     : T.coreSouthLockBias);
-            f.perMeshRow.push_back(s->firstRows[g] == pm);
+            const std::vector<int> order = readersOf(*s, g);
+            rd.perMeshRow.push_back(std::find(order.begin(), order.end(), pm) - order.begin());
         }
     }
     p.params.push_back(v);
     p.params.push_back(l);
-    p.params.push_back(f);
+    p.params.push_back(rd);
     p.params.push_back({"OPERANDS", {(int64_t)p.shareArgs.size()}, true, false});
     p.params.push_back({"SYNC_OPERAND", {syncOperand}, true, false});
     p.params.push_back({"OWN_LOCK_BIAS", {T.coreOwnLockBias}, true, false});
     return true;
 }
 
+std::string str(int v) { return std::to_string(v); }
+
+bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
+    const PlanTarget &T = planTarget();
+    const std::string S = "stream " + str(s.arg) + ": ";
+    const size_t groups = s.hostRows.size();
+    if (s.stage != "memtile_ring" && s.stage != "memtile") {
+        why = S + "implemented stages: memtile_ring, memtile";
+        return false;
+    }
+    if (s.stage == "memtile_ring" && s.ring <= 0) {
+        why = S + "stage memtile_ring needs ring > 0";
+        return false;
+    }
+    if ((int)s.rowGroups.size() != p.meshRows || s.firstRows.size() != groups || groups == 0 ||
+        s.strips.size() != groups * p.meshCols) {
+        why = S + "row_groups needs one entry per mesh row, host_rows / first_rows one per strip group, strips one "
+                  "per column and group";
+        return false;
+    }
+    for (size_t g = 0; g < groups; g++)
+        if ((int)readersOf(s, (int)g).size() != s.readers) {
+            why = S + "strip group " + str((int)g) + " has " + str((int)readersOf(s, (int)g).size()) +
+                  " reader rows, the stream says readers = " + str(s.readers);
+            return false;
+        }
+    if (s.channels > T.coreS2mmChannels || s.chunks % s.channels || s.chunkBytes() % (s.parts * T.bdWordBytes)) {
+        why = S + "channels must fit the core's S2MM channels and divide the chunks; parts must divide a chunk";
+        return false;
+    }
+    if (splitWords(s.chunkBytes() / s.parts / T.bdWordBytes, T.coreBdMaxWrap).first == 0 ||
+        splitWords(s.chunkBytes() / T.bdWordBytes, T.memBdMaxWrap).first == 0 ||
+        (int64_t)s.chunkCols * s.elemBytes / T.bdWordBytes > T.shimBdMaxWrap || s.chunkRows > T.shimBdMaxWrap) {
+        why = S + "a chunk does not fit the core / MemTile / shim BD wrap limits";
+        return false;
+    }
+    int served = 0;
+    for (int c = 0; c < p.meshCols; c++) {
+        const MemtileUse u = memtileUse(p, s, p.colLo + c);
+        if (!u.present)
+            continue;
+        if (u.mt.row < 1 || u.mt.row > p.memtileRows) {
+            why = S + "its shim route must end on a MemTile";
+            return false;
+        }
+        if (s.stage == "memtile_ring") {
+            const int k = (int)u.parities.size();
+            served += k;
+            const int64_t perTile = u.chunksPerTile;
+            if (k == 1 ? (s.rounds * perTile) % (2 * s.ring) : (s.rounds * perTile) % (s.ring * k)) {
+                why = S + "the ring does not divide column " + str(c) + "'s chunk stream";
+                return false;
+            }
+        } else if ((int)u.out.size() != (int)groups * s.channels) {
+            why = S + "MemTile of column " + str(c) + " needs one replay route per strip group and channel";
+            return false;
+        }
+    }
+    if (s.stage == "memtile_ring" && served != (int)groups * s.channels) {
+        why = S + "the MemTile rings serve " + str(served) + " (strip group, parity) streams, the layout needs " +
+              str((int)groups * s.channels);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool checkPlanLayout(const DataflowPlan &p, std::string &why) {
-    const PlanStream *A = streamOfRole(p, "a"), *B = streamOfRole(p, "b");
-    if (!A || !B) {
-        why = "the plan needs one plan_stream of role \"a\" and one of role \"b\"";
-        return false;
-    }
-    if (A->stage != "memtile_ring" || B->stage != "memtile" || A->ring <= 0) {
-        why = "implemented: role a stage memtile_ring (ring > 0), role b stage memtile";
-        return false;
-    }
-    // The neighbour-shared layout: core (pm, pn) reads A strip pm / 2 and B strip pn + C (pm % 2), so
-    // each stream has 2 strip groups and the mesh has 2 x 2 rows.
-    if (A->chunkRows != B->chunkRows || A->chunkCols != B->chunkCols || A->chunks != B->chunks ||
-        A->rounds != B->rounds || A->hostRows.size() != 2 || B->hostRows.size() != 2 || A->firstRows.size() != 2 ||
-        B->firstRows.size() != 2 || p.meshRows != 4 || A->chunks % 2) {
-        why = "streams a / b must share chunk shape, chunks and rounds, with 2 strip groups each on 4 mesh rows "
-              "(the neighbour-shared layout)";
-        return false;
-    }
-    const int64_t chunk = chunkBytes(*A);
-    if ((A->rounds * (int64_t)A->chunks / 2 * chunk) % (A->ring * 2 * chunk)) {
-        why = "the A ring does not divide one strip's stream";
+    if (p.streams.empty()) {
+        why = "the plan has no plan_stream";
         return false;
     }
     for (const auto &r : p.routes)
@@ -277,16 +433,23 @@ bool checkPlanLayout(const DataflowPlan &p, std::string &why) {
             why = "every plan_route names the stream it carries (arg = N)";
             return false;
         }
-    const PlanTarget &T = planTarget();
-    if (splitWords(chunk / 2 / T.bdWordBytes, T.coreBdMaxWrap).first == 0 ||
-        splitWords(chunk / T.bdWordBytes, T.memBdMaxWrap).first == 0) {
-        why = "a chunk does not split into two BD dimensions within the core / MemTile wrap limits";
-        return false;
-    }
-    if (A->chunkCols / T.bdWordBytes > T.shimBdMaxWrap || A->chunkRows > T.shimBdMaxWrap ||
-        A->chunks > T.shimBdMaxWrap) {
-        why = "a chunk row / chunk count exceeds the shim BD wrap limit";
-        return false;
+    const PlanStream &s0 = p.streams[0];
+    std::set<int> hosts;
+    for (const auto &s : p.streams) {
+        if (!checkStream(p, s, why))
+            return false;
+        // one kernel ELF: every core runs the same hosted-stream program
+        if (s.chunkBytes() != s0.chunkBytes() || s.channels != s0.channels || s.slots != s0.slots ||
+            s.readers != s0.readers || s.parts != s0.parts || s.chunks != s0.chunks || s.rounds != s0.rounds) {
+            why = "the shared streams must agree on chunk bytes, chunks, rounds, channels, slots, readers and parts "
+                  "(every core runs the same program)";
+            return false;
+        }
+        for (int h : s.hostRows)
+            if (!hosts.insert(h).second) {
+                why = "mesh row " + str(h) + " hosts two streams; a core hosts at most one";
+                return false;
+            }
     }
     return true;
 }
@@ -305,20 +468,28 @@ bool deriveDmaProgram(DataflowPlan &p, std::string &why) {
             cores.push_back({p.colLo + c, p.coreRowBase + pm});
     for (size_t si = 0; si < p.streams.size(); si++) {
         const PlanStream &s = p.streams[si];
-        if (!(s.stage == "memtile_ring" ? deriveRing(p, si, why) : deriveResident(p, si, why)))
+        if (s.stage == "memtile_ring")
+            deriveRing(p, si);
+        else if (!deriveResident(p, si, why))
             return false;
-        // shim: the column's part of the stream, contiguous in DDR in the order the MemTile takes it
-        const int64_t chunk = chunkBytes(s);
+        // shim: each column's part of the stream, contiguous in DDR in the order the MemTile takes it,
+        // the columns one after the other (aiehlc_plan_arrange)
+        const int64_t chunk = s.chunkBytes();
         const bool ring = s.stage == "memtile_ring";
-        const int64_t len = ring ? (int64_t)s.chunks / 2 * chunk : (int64_t)s.chunks * chunk;
-        const int reps = ring ? s.rounds : (int)s.hostRows.size();
+        int64_t off = 0;
         for (int c = 0; c < p.meshCols; c++) {
-            const PlanRoute *r = routesOf(p, s.arg, true, p.colLo + c)[0];
-            p.shimBds.push_back({p.colLo + c, r->srcCh, p.res.shimBd[si][c], s.arg, true, c * reps * len, len,
-                                 shimChunkDims(s, len / chunk), len, reps, reps, !ring && s.residentLaunches});
+            const MemtileUse u = memtileUse(p, s, p.colLo + c);
+            if (!u.present)
+                continue;
+            const int64_t len = u.chunksPerTile * chunk;
+            const int reps = ring ? s.rounds : (int)s.hostRows.size();
+            p.shimBds.push_back({p.colLo + c, u.shimRoute->srcCh, p.res.shimBd[si][c], s.arg, true, off, len,
+                                 shimChunkDims(s, u.chunksPerTile), len, reps, reps, !ring && s.residentLaunches});
+            p.shimBds.back().tag = "shim/" + std::to_string(si) + "/" + std::to_string(c);
+            off += reps * len;
         }
     }
-    deriveCoreSlots(p, *streamOfRole(p, "a"), cores);
+    deriveCoreSlots(p, p.streams[0], cores);
     if (!deriveKernelParams(p, why))
         return false;
     p.persistentGoLock = p.persistent ? p.res.lockGo : -1;
@@ -353,6 +524,12 @@ ArrayAttr dimsAttr(OpBuilder &b, const Dims &d, bool wraps, int64_t scale) {
 
 bool isMem(const DataflowPlan &p, const Tile &t) { return t.row >= 1 && t.row <= p.memtileRows; }
 
+// The op's role in the plan (dfplan.tag): what liftDfschedulePlan reads it back into.
+void tagOp(Operation *op, const std::string &tag) {
+    if (!tag.empty())
+        op->setAttr("dfplan.tag", StringAttr::get(op->getContext(), tag));
+}
+
 void emitMemtileProgram(HostBuilder &h, const DataflowPlan &p) {
     OpBuilder &b = h.b;
     const PlanTarget &T = planTarget();
@@ -363,15 +540,17 @@ void emitMemtileProgram(HostBuilder &h, const DataflowPlan &p) {
                 auto op = b.create<dfschedule::ConfigLockSetOp>(h.loc, h.tile(t), l.id, l.init, l.later);
                 if (l.restored)
                     op.setRestored(true);
+                tagOp(op, l.tag);
             }
     for (const auto &bd : p.bds)
         for (const auto &t : bd.tiles)
             if (isMem(p, t)) // a MemTile BD names its own locks with a bias (neighbourhood-relative ids)
-                b.create<dfschedule::ConfigTileBdOp>(
-                    h.loc, h.tile(t), bd.bd, bd.addr, (int32_t)bd.len, dimsAttr(b, bd.dims, false, W),
-                    dimsAttr(b, bd.dims, true, 1), (int32_t)(bd.iterStep * W), (int32_t)bd.iterWrap,
-                    bd.acqLock >= 0 ? T.memLockBdBias + bd.acqLock : -1, bd.acqVal,
-                    bd.relLock >= 0 ? T.memLockBdBias + bd.relLock : -1, bd.relVal, bd.next);
+                tagOp(b.create<dfschedule::ConfigTileBdOp>(
+                          h.loc, h.tile(t), bd.bd, bd.addr, (int32_t)bd.len, dimsAttr(b, bd.dims, false, W),
+                          dimsAttr(b, bd.dims, true, 1), (int32_t)(bd.iterStep * W), (int32_t)bd.iterWrap,
+                          bd.acqLock >= 0 ? T.memLockBdBias + bd.acqLock : -1, bd.acqVal,
+                          bd.relLock >= 0 ? T.memLockBdBias + bd.relLock : -1, bd.relVal, bd.next),
+                      bd.tag);
     for (const auto &c : p.channels)
         for (const auto &t : c.tiles)
             if (isMem(p, t))
@@ -379,8 +558,9 @@ void emitMemtileProgram(HostBuilder &h, const DataflowPlan &p) {
     for (const auto &c : p.channels)
         for (const auto &t : c.tiles)
             if (isMem(p, t))
-                b.create<dfschedule::ConfigChannelStartOp>(h.loc, h.tile(t), c.ch, c.s2mm ? "S2MM" : "MM2S", c.startBd,
-                                                           c.repeat, c.firstLaunchOnly);
+                tagOp(b.create<dfschedule::ConfigChannelStartOp>(h.loc, h.tile(t), c.ch, c.s2mm ? "S2MM" : "MM2S",
+                                                                 c.startBd, c.repeat, c.firstLaunchOnly),
+                      c.tag);
 }
 
 void emitShimProgram(HostBuilder &h, const DataflowPlan &p, Block &host, SmallVector<Value> &events) {
@@ -399,7 +579,9 @@ void emitShimProgram(HostBuilder &h, const DataflowPlan &p, Block &host, SmallVe
         st.addAttribute("iter_step_size", b.getI32IntegerAttr((int32_t)s.iterStep));
         st.addAttribute("iter_wrap", b.getI32IntegerAttr((int32_t)s.iterWrap));
         st.addTypes(dfschedule::BdHandleType::get(ctx));
-        Value bd = b.create(st)->getResult(0);
+        Operation *bdOp = b.create(st);
+        tagOp(bdOp, s.tag);
+        Value bd = bdOp->getResult(0);
         Value io = b.create<dfschedule::ConfigCreateIoOp>(h.loc, dfschedule::IoHandleType::get(ctx), bd, t,
                                                           b.getI32IntegerAttr(s.ch), b.getStringAttr("MM2S"),
                                                           b.getStringAttr("SEND"), b.getBoolAttr(false));
@@ -418,7 +600,8 @@ bool materializeHostPlan(ModuleOp hostModule, DataflowPlan &p) {
         return true;
     // ids and addresses against the generated flows (before the plan's own ops exist), then the program
     std::string why;
-    if (!assignPlanResources(hostModule, p, why) || !deriveDmaProgram(p, why)) {
+    if (!readBackDfscheduleFiles(hostModule.getContext(), p, why) || !assignPlanResources(hostModule, p, why) ||
+        !deriveDmaProgram(p, why)) {
         llvm::errs() << "[DataflowPlan] ERROR: " << why << "\n";
         return false;
     }
@@ -507,17 +690,20 @@ bool materializeKernelPlan(ModuleOp kernelModule, const DataflowPlan &p) {
     for (const auto &bd : p.bds)
         forTiles(bd.tiles, [&](Value t) {
             const int W = planTarget().bdWordBytes;
-            b.create<dfschedule::ConfigTileBdOp>(loc, t, bd.bd, bd.addr, (int32_t)bd.len,
-                                                 dimsAttr(b, bd.dims, false, W), dimsAttr(b, bd.dims, true, 1),
-                                                 (int32_t)(bd.iterStep * W), (int32_t)bd.iterWrap, bd.acqLock,
-                                                 bd.acqVal, bd.relLock, bd.relVal, bd.next);
+            tagOp(b.create<dfschedule::ConfigTileBdOp>(loc, t, bd.bd, bd.addr, (int32_t)bd.len,
+                                                       dimsAttr(b, bd.dims, false, W), dimsAttr(b, bd.dims, true, 1),
+                                                       (int32_t)(bd.iterStep * W), (int32_t)bd.iterWrap, bd.acqLock,
+                                                       bd.acqVal, bd.relLock, bd.relVal, bd.next),
+                  bd.tag);
         });
     for (const auto &l : p.locks)
-        forTiles(l.tiles, [&](Value t) { b.create<dfschedule::ConfigLockSetOp>(loc, t, l.id, l.init, -1); });
+        forTiles(l.tiles,
+                 [&](Value t) { tagOp(b.create<dfschedule::ConfigLockSetOp>(loc, t, l.id, l.init, -1), l.tag); });
     for (const auto &c : p.channels)
         forTiles(c.tiles, [&](Value t) {
-            b.create<dfschedule::ConfigChannelStartOp>(loc, t, c.ch, c.s2mm ? "S2MM" : "MM2S", c.startBd, c.repeat,
-                                                       false);
+            tagOp(b.create<dfschedule::ConfigChannelStartOp>(loc, t, c.ch, c.s2mm ? "S2MM" : "MM2S", c.startBd,
+                                                             c.repeat, false),
+                  c.tag);
         });
     kernelModule->setAttr("dfschedule.plan_go_lock", b.getI64IntegerAttr(p.persistentGoLock));
     llvm::outs() << "[DataflowPlan] kernel dfschedule: cores' DMA program on declaretile.self\n";

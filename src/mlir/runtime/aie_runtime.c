@@ -7272,6 +7272,46 @@ void __Runtime_plan_setup(int bd_once, int persistent_go_lock) {
 /* 1 on the first launch of a dataflow plan (dfschedule first_launch_only / later_value). */
 int __Runtime_plan_first(void) { return g_rt_plan_launch <= 1; }
 
+/* Persistent kernel (dataflow plan, go lock >= 0): the first launch of a partition generation loads the
+ * ELF and starts the cores; later launches reuse that kernel group and only release every core's go lock.
+ * One place for every load / launch variant (4 / 8 / 16 tiles, MMIO or control packets) -- the 16-tile
+ * control path used to be the only one, so an 8-core mesh reloaded (reset) its cores on launch 2 and hung. */
+static struct_kernel_group s_plan_kg;
+static XAie_DevInst *s_plan_kg_dev;
+static unsigned s_plan_kg_gen;
+static int rt_plan_kg_cached(XAie_DevInst *dev, struct_kernel_group *out) {
+    if (g_rt_plan_go_lock < 0 || !s_plan_kg.num_tiles || s_plan_kg_dev != dev || s_plan_kg_gen != g_partition_gen)
+        return 0;
+    *out = s_plan_kg;
+    return 1;
+}
+static struct_kernel_group rt_plan_kg_store(XAie_DevInst *dev, struct_kernel_group kg) {
+    if (g_rt_plan_go_lock >= 0) {
+        s_plan_kg = kg;
+        s_plan_kg_dev = dev;
+        s_plan_kg_gen = g_partition_gen;
+    }
+    return kg;
+}
+/* 1: a later launch of the persistent kernel, handled (go locks released); 0: start the cores. */
+static int rt_plan_go(XAie_DevInst *dev, struct_kernel_group kg) {
+    static XAie_DevInst *s_run_dev;
+    static unsigned s_run_gen;
+    if (g_rt_plan_go_lock < 0)
+        return 0;
+    if (s_run_dev == dev && s_run_gen == g_partition_gen) {
+        unsigned long long tg = RT_PROF_TIC();
+        for (uint32_t i = 0; i < kg.num_tiles; i++)
+            if (__Runtime_is_aie_core_tile(kg.tiles[i]))
+                XAie_LockSetValue(dev, kg.tiles[i], XAie_LockInit((u8)g_rt_plan_go_lock, 1));
+        RT_PROF_PHASE(PH_COREEN, tg);
+        return 1;
+    }
+    s_run_dev = dev;
+    s_run_gen = g_partition_gen;
+    return 0;
+}
+
 /* 1 if the identical write was already made (skip it); records it otherwise */
 static int rt_bd_once_seen(XAie_DevInst *dev, XAie_LocType t, uint8_t kind, uint8_t id, uint64_t addr, uint32_t hash) {
     if (!g_rt_plan_bd_once)
@@ -8235,7 +8275,14 @@ static void rt_relaunch_dma_reset(XAie_DevInst *dev, const XAie_LocType *tiles, 
 
 /** Array-based variant: copies caller-provided tile array into the static buffer
  *  and loads the kernel ELF into each core tile. Supports up to MAX_KERNEL_TILES. */
+static struct_kernel_group rt_load_kernel_group_nt_(XAie_DevInst *dev, XAie_LocType *tiles, int n);
 struct_kernel_group __Runtime_load_kernel_group_nt(XAie_DevInst *dev, XAie_LocType *tiles, int n) {
+    struct_kernel_group kg;
+    if (rt_plan_kg_cached(dev, &kg))
+        return kg;
+    return rt_plan_kg_store(dev, rt_load_kernel_group_nt_(dev, tiles, n));
+}
+static struct_kernel_group rt_load_kernel_group_nt_(XAie_DevInst *dev, XAie_LocType *tiles, int n) {
     unsigned long long __kl_t0 = RT_PROF_TIC();
     AIEHLC_LOG(printf("[aie_runtime] load_kernel_group_nt n=%d\n", n););
     rt_relaunch_dma_reset(dev, tiles, n);
@@ -9055,9 +9102,18 @@ static int rt_ctrl_kernel_tiles_match(const __Runtime_CtrlRowFabric *fab, const 
     return 1;
 }
 
+static struct_kernel_group rt_ctrl_load_kernel_group_nt_(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                         XAie_LocType *tiles, int n, int32_t bd_id, int32_t mm2s_ch);
 static struct_kernel_group rt_ctrl_load_kernel_group_nt(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
                                                          XAie_LocType *tiles, int n, int32_t bd_id,
                                                          int32_t mm2s_ch) {
+    struct_kernel_group kg;
+    if (rt_plan_kg_cached(dev, &kg))
+        return kg;
+    return rt_plan_kg_store(dev, rt_ctrl_load_kernel_group_nt_(dev, fab, tiles, n, bd_id, mm2s_ch));
+}
+static struct_kernel_group rt_ctrl_load_kernel_group_nt_(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                         XAie_LocType *tiles, int n, int32_t bd_id, int32_t mm2s_ch) {
     unsigned long long __kl_t0 = RT_PROF_TIC();
     struct_kernel_group kg = {.tiles = s_kernel_tiles, .num_tiles = 0U, .elf_buffers = NULL};
     if (!dev || !fab || fab->dev != dev || !s_active_kernel_elf || n <= 0 || n > MAX_KERNEL_TILES ||
@@ -9109,17 +9165,6 @@ struct_kernel_group __Runtime_load_kernel_group_16t_ctrl(
     XAie_LocType t9, XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14,
     XAie_LocType t15, int n, int32_t bd_id, int32_t mm2s_ch) {
     XAie_LocType tiles[] = {t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15};
-    if (g_rt_plan_go_lock >= 0) { /* dataflow plan: persistent kernel, loaded on the first launch only */
-        static struct_kernel_group s_kg;
-        static XAie_DevInst *s_kg_dev;
-        static unsigned s_kg_gen;
-        if (s_kg.num_tiles && s_kg_dev == dev && s_kg_gen == g_partition_gen)
-            return s_kg;
-        s_kg = rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
-        s_kg_dev = dev;
-        s_kg_gen = g_partition_gen;
-        return s_kg;
-    }
     return rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
 }
 
@@ -9187,6 +9232,8 @@ struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_grou
     evt.timeout_us = 100000;
 
     AIEHLC_LOG(printf("[aie_runtime] launch_kernel_group num_tiles=%u\n", (unsigned)kg.num_tiles););
+    if (rt_plan_go(dev, kg))
+        return evt;
     rt_kernel_profile_setup(dev, kg);
 
     unsigned long long __ce_t0 = RT_PROF_TIC();
@@ -9206,20 +9253,8 @@ struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_Ctr
         evt.num_tiles = 0U;
         return evt;
     }
-    if (g_rt_plan_go_lock >= 0) { /* dataflow plan: persistent kernel -- later launches release the go lock */
-        static XAie_DevInst *s_run_dev;
-        static unsigned s_run_gen;
-        if (s_run_dev == dev && s_run_gen == g_partition_gen) {
-            unsigned long long tg = RT_PROF_TIC();
-            for (uint32_t i = 0; i < kg.num_tiles; i++)
-                if (__Runtime_is_aie_core_tile(kg.tiles[i]))
-                    XAie_LockSetValue(dev, kg.tiles[i], XAie_LockInit((u8)g_rt_plan_go_lock, 1));
-            RT_PROF_PHASE(PH_COREEN, tg);
-            return evt;
-        }
-        s_run_dev = dev;
-        s_run_gen = g_partition_gen;
-    }
+    if (rt_plan_go(dev, kg))
+        return evt;
     rt_kernel_profile_setup(dev, kg);
     const XAie_CoreMod *core = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
     uint32_t enable = core->CoreCtrl->CtrlEn.Mask;

@@ -1029,7 +1029,9 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         llvm::outs() << "replicate_on=" << replicate_on << " single_tile_owner=" << single_tile_owner << "\n";
 
         std::vector<Point> tileList;
-        int tileNum = (split_axis == "row") ? row : col;
+        // A split along the rows gives one group per mesh row: the row's cores, one per COLUMN (and a split
+        // along the columns one group per column of `row` cores). The two counts only coincide on a square mesh.
+        int tileNum = (split_axis == "row") ? col : row;
         int core_start_row = (int) router_.getRM()->getrsc()->absTileRow(TileType::Core, 0);
         for(int i = 0; i < tileNum; i++) {
             if (split_axis == "row") {

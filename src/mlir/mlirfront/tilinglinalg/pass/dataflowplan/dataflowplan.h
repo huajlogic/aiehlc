@@ -11,7 +11,8 @@
 //   dmaphop.plan_route  {arg = 0, src = [col, row, ch], src_kind = "shim"|"dma", dsts = [[col, row, ch], ...]}
 //   dmaphop.plan_stream {arg = 0, role = "a", share = "neighbor", stage = "memtile_ring", ring = 10,
 //                        resident = "launch"|"launches", chunk = [64, 128], chunks = 20, rounds = 60,
-//                        tensor = [7680, 2560], host_rows = [0, 3], first_rows = [0, 2]}
+//                        tensor = [7680, 2560], host_rows = [0, 3], first_rows = [0, 2],
+//                        channels = 2, slots = 2, readers = 2, parts = 2, elem_bytes = 1}
 // dfschedule -- the DMA program that realizes them (deriveDmaProgram -> materializeHostPlan /
 //   materializeKernelPlan): config.tile_bd / lock_set / channel_enable / channel_start on the
 //   MemTiles (host module) and the cores (kernel module, declaretile.self), config.dma_bd + create_io
@@ -30,6 +31,7 @@
 #define TILINGLINALG_DATAFLOWPLAN_H
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/OwningOpRef.h"
 #include <cstdint>
 #include <set>
 #include <string>
@@ -56,6 +58,7 @@ struct PlanLock {
     // the host writes it only when that value changes -- launch 0, and launch 1 when `later` differs (each
     // MMIO lock write is ~372 ns on the launch's critical path).
     bool restored = false;
+    std::string tag; // the op's role (dfplan.tag on the dfschedule op): what the readback lifts it into
 };
 
 struct PlanBd {
@@ -66,6 +69,7 @@ struct PlanBd {
     int64_t iterStep = 0, iterWrap = 0;
     int acqLock = -1, acqVal = 0, relLock = -1, relVal = 0;
     int next = -1;
+    std::string tag;
 };
 
 struct PlanChannel {
@@ -73,6 +77,7 @@ struct PlanChannel {
     bool s2mm = true;
     int ch = 0, startBd = 0, repeat = 1;
     bool firstLaunchOnly = false;
+    std::string tag;
 };
 
 struct PlanShimBd {
@@ -83,6 +88,7 @@ struct PlanShimBd {
     int64_t iterStep = 0, iterWrap = 1;
     int repeat = 1;
     bool firstLaunchOnly = false;
+    std::string tag;
 };
 
 struct PlanRoute {
@@ -103,22 +109,25 @@ struct PlanKernelParam {
 // What assignPlanResources picked (planresource.cpp): ids and addresses, never literals in the derivation.
 struct PlanResources {
     bool assigned = false;
+    bool hasCore = false, hasMem = false, hasShim = false; // pinned: which parts were read back
     // core tiles (the same on every core: one kernel ELF reads them as constants)
-    int coreBd[2][2] = {{-1, -1}, {-1, -1}}; // [S2MM channel slot][buffer]: two chained BDs per channel
-    int lockF = -1;                          // F(ch) = lockF + ch; G = F + handDelta; no-op pair G + handDelta
-    int handDelta = 2;
-    int lockE = -1; // E(ch, k) = lockE + ch + 2 k
+    std::vector<int> coreBd; // per S2MM channel: the first of `slots` chained BDs
+    // reader locks: reader i of channel ch takes lockF + i * handDelta + ch and hands on handDelta above;
+    // the last reader's hand-on lands on the no-op row (held at 0) -- (readers + 1) x channels locks
+    int lockF = -1;
+    int handDelta = 0; // = channels
+    int lockE = -1;    // E(buffer) = lockE + buffer, buffer = channel + channels x slot
     int lockGo = -1, lockSync = -1;
     int64_t slotBase = 0, slotBytes = 0; // core memory (core view) the hosted chunks occupy
-    // MemTiles: per stream (index into DataflowPlan::streams)
+    // MemTiles: per stream (index into DataflowPlan::streams), per column
     struct Mem {
-        int lockA = -1, lockB = -1; // ring: empty / full; resident: ready / free
-        int bdIn = -1;              // S2MM BD (ring: first of `ring`)
-        std::vector<int> bdOut;     // ring: first MM2S BD; resident: one BD per MM2S route
+        std::vector<int> locks; // ring: (empty, full) per served parity; resident: ready, free
+        int bdIn = -1;          // first S2MM BD of the chain
+        std::vector<int> bdOut; // per MM2S route: its first BD
         int64_t addr = 0;
     };
-    std::vector<Mem> mem;
-    // shim: per stream, per column
+    std::vector<std::vector<Mem>> mem;
+    // shim: per stream, per column (-1: the column carries no part of the stream)
     std::vector<std::vector<int>> shimBd;
 };
 
@@ -134,6 +143,18 @@ struct PlanStream {
     int64_t tensorRows = 0, tensorCols = 0;
     std::vector<int> hostRows;  // mesh row hosting strip group g
     std::vector<int> firstRows; // mesh row that reads strip group g first
+    // The hosted-stream protocol (aie_block_io_plan.h), carried in the IR rather than fixed: chunk g goes to
+    // core S2MM channel g % channels and buffer g % (channels x slots); `readers` cores read every chunk
+    // (reader i hands it on to reader i + 1); the kernel addresses a chunk as `parts` row parts, which the
+    // plan puts PART_STRIDE apart (different memory banks).
+    int channels = 2, slots = 2, readers = 2, parts = 2;
+    int elemBytes = 1;
+    // the logical grid, per mesh row: the strip group a row reads (row_groups), and per column and group
+    // the tensor strip that column's cores read (strips, column-major) -- what the host lays out in DDR
+    std::vector<int> rowGroups;
+    std::vector<int> strips;
+    int64_t chunkBytes() const { return (int64_t)chunkRows * chunkCols * elemBytes; }
+    int buffers() const { return channels * slots; }
 };
 
 struct DataflowPlan {
@@ -153,6 +174,9 @@ struct DataflowPlan {
     std::vector<PlanShimBd> shimBds;
     std::vector<PlanKernelParam> params;
     PlanResources res;
+    // Read back from a dfschedule program (planreadback.cpp) or a dmaphop.plan_resources op: the resources
+    // assignPlanResources adopts (checked) instead of allocating.
+    PlanResources pinned;
 
     // Arguments whose blocks the kernel takes from hosted slots (aiehlc_share_load): the kernel body's
     // aie::load_buffer / aie::release on them are rewritten (kernel params S<arg>_VIEW / _LOCK /
@@ -164,6 +188,22 @@ struct DataflowPlan {
     // core-tile (row >= 2 and not a MemTile) S2MM channels the plan programs itself
     std::set<int> coreS2mmChannels(int memtileRows) const;
 };
+
+// How a stream uses one column's MemTile (from its routes): the MemTile, its S2MM channel, its MM2S routes
+// (one per served chunk parity for a ring, one per (strip group, parity) for a resident stream).
+struct MemtileUse {
+    bool present = false;
+    Tile mt;
+    int s2mm = -1;
+    const PlanRoute *shimRoute = nullptr;
+    std::vector<const PlanRoute *> out;
+    std::vector<int> parities; // ring: the chunk parities (core S2MM channels) the MemTile serves
+    int s2mmBds = 0, locks = 0;
+    std::vector<int> mm2sBds; // per out route
+    int64_t bytes = 0;        // MemTile memory
+    int64_t chunksPerTile = 0;
+};
+MemtileUse memtileUse(const DataflowPlan &p, const PlanStream &s, int col);
 
 // Reads + validates the dmaphop plan ops, derives the DMA program, tags the replaced flows and
 // erases the ops. false (diagnostics on llvm::errs) on a malformed plan; no plan -> !present.
@@ -197,21 +237,39 @@ bool materializeKernelPlan(mlir::ModuleOp kernelModule, const DataflowPlan &plan
 // The plan is published to the later stages through this process-wide slot.
 DataflowPlan &activePlan();
 
-// ---- C text that is not a DMA program ----
-
-// Ports already taken by the generated (kept) routes, from routingresourcemap.json.
-struct PortBook {
-    std::set<std::tuple<int, int, char, std::string, int>> used; // col,row,'m'|'s',dir,idx
-};
-bool loadPortBook(const std::string &resourceMapJson, PortBook &book);
-
-// `static void aiehlc_plan_routing(XAie_DevInst *v1)`; false on an unroutable net.
-bool emitPlanRouting(const DataflowPlan &plan, PortBook &book, int dataColLo, int dataColHi, int numRows,
-                     int memtileRows, std::string &out);
+// ---- the plan's routes: lowered by DmaphopToRoutinghwPass (passdmaphoptoroutinghw/planroutes.cpp) ----
+// collectDataflowPlan keeps the plan_route ops; the pipeline erases them from the module the host / kernel
+// paths are cloned from.
+void erasePlanRoutes(mlir::ModuleOp module);
 
 // aiehlc_plan.h: the kernel side of the shared ports (aiehlc_share_load / _release, per-core init,
 // AIEHLC_PLAN_<name> constants, AIEHLC_PLAN_PERSISTENT / _GO_LOCK).
 std::string emitPlanHeader(const DataflowPlan &plan);
+
+// ---- readback (planreadback.cpp): dfschedule -> dfscheblueprint / dmaphop ----
+// Lift the plan's resources (BD / lock ids, addresses) and ring sizes from the tagged dfschedule ops
+// (dfplan.tag) of a host and / or kernel module into `out` / the plan's streams. false + why on an
+// inconsistent program (e.g. E locks not in a row).
+bool liftDfschedulePlan(mlir::ModuleOp host, mlir::ModuleOp kernel, DataflowPlan &plan, PlanResources &out,
+                        std::string &why);
+// The plan's DMA program as a standalone dfschedule module (every dfplan-tagged op of the host and kernel
+// modules on its own tile declarations; a shim transfer as a config.tile_bd record) -- the readback format.
+mlir::OwningOpRef<mlir::ModuleOp> buildPlanProgram(mlir::ModuleOp host, mlir::ModuleOp kernel);
+// AIEHLC_DFSCHEDULE_PLAN_IN: an edited plan program (ir/dfschedule/NN_DataflowPlanProgram.mlir) -> plan.pinned
+// + rings. No env: no-op.
+bool readBackDfscheduleFiles(mlir::MLIRContext *ctx, DataflowPlan &plan, std::string &why);
+// After both modules are materialized: write the plan program to dumpPath; when one was read back it must
+// come out identical (else: the first line the levels above cannot express, false).
+bool checkReadBack(mlir::ModuleOp host, mlir::ModuleOp kernel, const std::string &dumpPath, std::string &why);
+// dmaphop.plan_resources <-> PlanResources.
+void readPlanResources(mlir::Operation *op, DataflowPlan &plan);
+std::string planResourcesText(const DataflowPlan &plan);
+// The plan on the dfscheblueprint level: dfscheblueprint.plan = {...} on every shared tensor's
+// declare_data (stream decisions; with resources once assigned).
+void annotateBlueprint(mlir::ModuleOp blueprint, const DataflowPlan &plan, bool withResources);
+// The dmaphop plan as read back: rings and a dmaphop.plan_resources op updated in a snapshot of the dmaphop
+// module (re-enterable with AIEHLC_DMAPHOP_IR_IN).
+void readBackDmaphop(mlir::ModuleOp dmaphopSnapshot, const DataflowPlan &plan);
 
 // The kernel-side lowering of the plan ops in a kernel module (KERNELCONFIGOFFLOAD text) -- used by
 // DfscheduleToKernelApiPass; erases the ops.

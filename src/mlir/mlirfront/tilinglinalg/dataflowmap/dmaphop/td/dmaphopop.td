@@ -403,5 +403,7 @@ def dmaphop_plan_route : dmaphop_PlanOp<"plan_route",
   "Circuit-switched stream route from a shim / MemTile / core DMA MM2S channel to S2MM channels">;
 def dmaphop_plan_stream : dmaphop_PlanOp<"plan_stream",
   "One shared operand's stream: staging, ring, residency, chunk geometry, host mesh rows">;
+def dmaphop_plan_resources : dmaphop_PlanOp<"plan_resources",
+  "Pinned DMA-program resources (BD / lock ids, buffer addresses), as read back from the dfschedule program">;
 
 #endif // DMAPHOP_OPS

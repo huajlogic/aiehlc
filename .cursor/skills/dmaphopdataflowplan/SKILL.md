@@ -31,6 +31,18 @@ GOLDEN PASS).
 - Kernel side: `src/mlir/runtime/aie_block_io_plan.h` (always_inline, operand by descriptor, tile
   sync at commit); `aiehlc_plan.h` is constants only.
 
+## Routes, protocol, layouts, readback (2026-11-24)
+- Routes: `plan_route` lowered in DmaphopToRoutinghwPass (`passdmaphoptoroutinghw/planroutes.cpp`) to routinghw ops;
+  `[DataflowPlan] routed N plan net(s) in DmaphopToRoutinghwPass`. No `aiehlc_plan_routing()` any more.
+- Protocol: `plan_stream channels / slots / readers / parts / elem_bytes / row_groups / strips` (synthesized:
+  channels = core S2MM count, slots = `{.depth}`, parts = `{.parts}`); header `AIEHLC_PLAN_READER(o, pm)`.
+- Layouts: any mesh width >= A strips; 4 x 2 = `gemm_plan_4x2.cc` (86.5 %). Skill **nonsquaremeshplan**.
+- Host DDR layout: `aiehlc_plan_arrange(arg, src, dst)` generated in `aiehlc_plan.h` (`#if __has_include`).
+- Readback: edit `ir/dfschedule/NN_DataflowPlanProgram.mlir`, build with `AIEHLC_DFSCHEDULE_PLAN_IN=<file>`;
+  `readback: the regenerated dfschedule plan program equals the edited one` or an ERROR naming the line;
+  `NN_DataflowPlanReadback(dmaphop).mlir` (with `dmaphop.plan_resources`) re-enters via `AIEHLC_DMAPHOP_IR_IN`.
+  `ir/` keeps dumps of earlier builds: pick the highest-numbered file.
+
 ## Checks that it worked (the build log)
 - `[DataflowPlan] synthesized from the routing IR: ...` (C / routing level only)
 - `[DataflowPlan] N generated flow(s) replaced by the plan` -- 0 means the args in `replace_args`
