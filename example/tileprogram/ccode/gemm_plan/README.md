@@ -1,4 +1,4 @@
-# 2 x 8 shared-operand int8 GEMM, 84.9 % of the VEK385 peak, from the C source alone
+# 2 x 8 shared-operand int8 GEMM, 85.5 % of the VEK385 peak, from the C source alone
 
 The 84.5 % GEMM of `../gemm_memtile/share2x8.py` was reached by rewriting the generated
 `host.cc`, `kernel.cc` and `routing.cc` after every build. Here the dataflow is stated in the
@@ -46,6 +46,7 @@ declaretile.self`, `routed 28 plan net(s): 138 switch connections`,
 | routing IR attributes | 1.160 ms mean, 1.154 best | 84.7 % / 85.2 % |
 | C source, `#if __chess__` kernel (commit 3ca2c9c4) | 1.158 ms mean, 1.154 best | 84.9 % / 85.2 % |
 | C source, one `load_buffer` body (bbff26c5) | 1.160-1.168 ms typical, 1.159 best | 84.4-84.7 % / 84.8 % |
-| **C source, one body, DMA program as dfschedule ops (as committed)** | **1.156-1.162 ms typical, 1.156 best** | **84.6-85.0 % / 85.0 %** |
+| C source, one body, DMA program as dfschedule ops (303d9459) | 1.156-1.162 ms typical, 1.156 best | 84.6-85.0 % / 85.0 % |
+| **+ allocated resources, device table, inlined plan runtime with tile sync (as committed)** | **1.147-1.153 ms every launch, 1.150 mean** | **85.3-85.7 % / 85.5 % mean** |
 
 The first launch (2.18 ms) also loads the kernel and B; it is excluded from the steady mean.

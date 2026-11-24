@@ -7341,6 +7341,14 @@ void __Runtime_tile_lock_set(XAie_DevInst *dev, XAie_LocType t, int id, int valu
     XAie_LockSetValue(dev, t, XAie_LockInit((u8)id, (s8)v));
 }
 
+/* dfschedule.config.lock_set {restored}: every launch moves the same data through the lock's buffers, so it
+ * ends each launch at its start value; write it on the first launch, and on the second only when the
+ * value from the second launch on differs (each MMIO lock write is ~372 ns on the launch's critical path). */
+void __Runtime_tile_lock_set_restored(XAie_DevInst *dev, XAie_LocType t, int id, int value, int later) {
+    if (g_rt_plan_launch <= 1 || (g_rt_plan_launch == 2 && later >= 0 && later != value))
+        __Runtime_tile_lock_set(dev, t, id, value, later);
+}
+
 void __Runtime_dma_channel_enable(XAie_DevInst *dev, XAie_LocType t, int ch, int mm2s) {
     if (g_rt_plan_bd_once && g_rt_plan_launch > 1)
         return;

@@ -648,6 +648,7 @@ LogicalResult emitCoreBufferDma(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTi
                     cfg.bdLenBytes = (int)t.coreBdLen;
                     cfg.ppDepth = (int)t.ppDepth;
                     cfg.flowIndex = c.flowIndex;
+                    cfg.funcArgIdx = c.funcArgIdx;
                     cfg.pingBdId = t.offloadPingBdId;
                     cfg.pongBdId = (t.ppDepth == 1) ? -1 : t.offloadPongBdId;
                     cfg.pingL1Offset = (int)t.pingL1Offset;
@@ -758,7 +759,7 @@ void emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitD
             const int64_t blockAlign =
                 d.passState ? routing::lookupBlockAlign(d.passState->tensorInfo, c.funcArgIdx) : 0;
             const uint32_t align = blockAlign > 32 ? (uint32_t)blockAlign : 32u;
-            auto pingAddr = allocator.allocate(pingName, bufSizeBytes, align);
+            auto pingAddr = allocator.allocate(pingName, bufSizeBytes, align, c.funcArgIdx);
             if (t.ppDepth == 1) {
                 // Single buffer mode: only allocate ping buffer, no pong
                 if (pingAddr) {
@@ -767,7 +768,7 @@ void emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitD
                     c.flowAddrsValid = true;
                 }
             } else {
-                auto pongAddr = allocator.allocate(pongName, bufSizeBytes, align);
+                auto pongAddr = allocator.allocate(pongName, bufSizeBytes, align, c.funcArgIdx);
                 if (pingAddr && pongAddr) {
                     // Convert core processor view (0x78000+) to DMA view (0x08000+)
                     // Core DMA engine sees memory starting at 0x00000, not 0x70000

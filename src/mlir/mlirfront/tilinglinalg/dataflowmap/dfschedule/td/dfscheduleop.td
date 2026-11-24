@@ -251,11 +251,16 @@ def dfschedule_ConfigTileBdOp : dfscheduleop<"config.tile_bd"> {
 }
 def dfschedule_ConfigLockSetOp : dfscheduleop<"config.lock_set"> {
   let summary = "Set a tile lock's value every launch (later_value from the second launch on, -1 = same)";
+  let description = [{
+    `restored`: the dataflow hands the lock back at its launch-start value every launch, so the value is
+    written only when it changes -- the first launch, and the second when later_value differs.
+  }];
   let arguments = (ins
     dfschedule_TileHandleType:$tile,
     I32Attr:$lock_id,
     I32Attr:$value,
-    DefaultValuedAttr<I32Attr, "-1">:$later_value
+    DefaultValuedAttr<I32Attr, "-1">:$later_value,
+    DefaultValuedAttr<BoolAttr, "false">:$restored
   );
   let assemblyFormat = "`(` $tile `)` attr-dict `:` type($tile)";
 }

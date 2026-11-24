@@ -65,8 +65,18 @@ struct aiehlc_kernel_view_t {
 // Blocks handed out on one port (persists across kernel calls): the round (i, j) of the next block,
 // wrapping per launch.
 struct aiehlc_blk_cursor {
-    int n;
+    int n;    // blocks taken (load_buffer / store_buffer)
     int i, j; // round (i outer, j inner) of the next block -- kept running, so a check divides nothing
+    int r;    // blocks handed back (release / commit)
+};
+// A port's cursor for the duration of one kernel call: the pipeline's rewrite declares one per port at the
+// top of the kernel body and passes `.c` to every block call, so the counts live in registers (a local)
+// and are written back when the call returns.
+struct aiehlc_cursor_local {
+    aiehlc_blk_cursor &home;
+    aiehlc_blk_cursor c;
+    explicit aiehlc_cursor_local(aiehlc_blk_cursor &h) : home(h), c(h) {}
+    ~aiehlc_cursor_local() { home = c; }
 };
 // A block offset or shape: {d0, d1, d2[, d3]}.
 struct aiehlc_blk {
@@ -112,7 +122,7 @@ static inline int aiehlc_blk_check(const aiehlc_blk_desc &d, aiehlc_blk_cursor &
 // A block's address, converting to the pointer type the kernel assigns it to
 // (`const int8_t *`, `const bfloat16 *`, ...) -- as in the kernel analysis and kemu.
 // part(i): rows [i R / n, (i + 1) R / n) of a block loaded with {.parts = n} (back to back in a window;
-// a dataflow-plan port puts them in different memory banks -- aiehlc_plan.h's aiehlc_share_block).
+// a dataflow-plan port puts them in different memory banks, PART_STRIDE apart -- aie_block_io_plan.h).
 struct aiehlc_block_ptr {
     int8_t *p;
     int part_bytes;
@@ -125,14 +135,29 @@ static inline int aiehlc_elem_bytes(input_window_uint8 *) { return 1; }
 static inline int aiehlc_elem_bytes(input_window_int16 *) { return 2; }
 static inline int aiehlc_elem_bytes(input_window_int32 *) { return 4; }
 static inline int aiehlc_elem_bytes(input_window_float *) { return 4; }
+// The generated window behind a port (every port without a dataflow plan).
 template <typename W>
-static inline aiehlc_block_ptr aiehlc_load_buffer(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int p0,
+static inline aiehlc_block_ptr aiehlc_window_load(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int p0,
                                                   int p1, aiehlc_blk off, aiehlc_blk shape, int parts = 1) {
     aiehlc_blk_check(d, cur, p0, p1, off, shape);
     int bytes = aiehlc_elem_bytes(win);
     for (int k = 0; k < d.rank; ++k)
         bytes *= shape.v[k];
     return {(int8_t *)acquire_input_window(win), parts > 1 ? bytes / parts : 0};
+}
+
+// The pipeline's rewrite passes every block call the port, its descriptor, its cursor (a local copy) and
+// this core's program_id: aiehlc_load_buffer(P, desc, cur, pid0, pid1, off, shape[, parts]),
+// aiehlc_release(P, desc, cur, pid0, pid1), ... A dataflow plan with neighbour-shared operands (the
+// generated aiehlc_plan.h, included before this header, defines AIEHLC_PLAN_SHARED) brings its own
+// implementation of the four calls.
+#if defined(AIEHLC_PLAN_SHARED)
+#include "aie_block_io_plan.h"
+#else
+template <typename W>
+static inline aiehlc_block_ptr aiehlc_load_buffer(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int p0,
+                                                  int p1, aiehlc_blk off, aiehlc_blk shape, int parts = 1) {
+    return aiehlc_window_load(win, d, cur, p0, p1, off, shape, parts);
 }
 template <typename W>
 static inline aiehlc_block_ptr aiehlc_store_buffer(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int p0,
@@ -142,5 +167,16 @@ static inline aiehlc_block_ptr aiehlc_store_buffer(W *win, const aiehlc_blk_desc
 }
 template <typename W> static inline void aiehlc_release(W *win) { release_input_window(win); }
 template <typename W> static inline void aiehlc_commit(W *win) { release_output_window(win); }
+template <typename W>
+static inline void aiehlc_release(W *win, const aiehlc_blk_desc &, aiehlc_blk_cursor &c, int, int) {
+    c.r++;
+    release_input_window(win);
+}
+template <typename W>
+static inline void aiehlc_commit(W *win, const aiehlc_blk_desc &, aiehlc_blk_cursor &c, int, int) {
+    c.r++;
+    release_output_window(win);
+}
+#endif // dataflow plan
 
 #endif // AIE_BLOCK_IO_H

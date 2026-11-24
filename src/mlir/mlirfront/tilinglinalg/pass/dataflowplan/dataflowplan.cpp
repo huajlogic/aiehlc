@@ -177,7 +177,8 @@ int traceArg(Value v) {
 void readHeader(Reader &r, DataflowPlan &p) {
     for (int64_t a : r.ints("replace_args"))
         p.replacedArgs.push_back((int)a);
-    p.persistentGoLock = (int)r.i64("persistent_go_lock", -1);
+    // `persistent = true`; the older `persistent_go_lock = N` reads as persistent (the go lock is allocated)
+    p.persistent = r.flag("persistent") || r.i64("persistent_go_lock", -1) >= 0;
     p.bdOnce = r.flag("bd_once");
     if (r.has("share_args"))
         for (int64_t a : r.ints("share_args")) {
@@ -185,12 +186,13 @@ void readHeader(Reader &r, DataflowPlan &p) {
                 r.err() << "share_args: arg " << a << " is not in replace_args";
             p.shareArgs.push_back((int)a);
         }
-    if (p.persistentGoLock > 15)
-        r.err() << "persistent_go_lock " << p.persistentGoLock << " is not a core lock (0..15)";
 }
 
 void readRoute(Reader &r, DataflowPlan &p) {
     PlanRoute rt;
+    rt.arg = (int)r.i64("arg", -1);
+    if (rt.arg >= 0 && !p.replaces(rt.arg))
+        r.err() << "arg " << rt.arg << " is not in the plan's replace_args";
     auto s = r.ints("src");
     if (s.size() != 3) {
         r.err() << "'src' must be [col, row, channel]";
@@ -322,29 +324,19 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
     plan.meshCols = colHi - plan.colLo + 1;
     plan.meshRows = rowHi - plan.coreRowBase + 1;
     std::string why;
-    if (!deriveDmaProgram(plan, why)) {
+    if (!checkPlanLayout(plan, why)) {
         ops.front()->emitError() << "[dataflow plan] " << why;
         return false;
     }
-    for (int a : plan.shareArgs)
-        for (const char *suf : {"_VIEW", "_LOCK", "_FIRST"}) {
-            std::string n = "S" + std::to_string(a) + suf;
-            if (std::none_of(plan.params.begin(), plan.params.end(), [&](auto &k) { return k.name == n; })) {
-                ops.front()->emitError() << "[dataflow plan] share_args has " << a << " but no kernel param " << n;
-                return false;
-            }
-        }
     tagReplacedFlows(module, plan);
     Builder b(module.getContext());
     SmallVector<int64_t> args(plan.replacedArgs.begin(), plan.replacedArgs.end());
     module->setAttr("dmaphop.plan_replaced_args", b.getI64ArrayAttr(args));
     for (Operation *op : ops)
         op->erase();
-    llvm::outs() << "[DataflowPlan] plan: " << plan.routes.size() << " routes, " << plan.streams.size()
-                 << " streams -> DMA program " << plan.bds.size() << " BDs, " << plan.locks.size() << " locks, "
-                 << plan.channels.size() << " channels, " << plan.shimBds.size() << " shim BDs, " << plan.params.size()
-                 << " kernel params" << (plan.persistentGoLock >= 0 ? ", persistent kernel" : "")
-                 << (plan.bdOnce ? ", BD write-once" : "") << "\n";
+    llvm::outs() << "[DataflowPlan] plan: " << plan.routes.size() << " routes, " << plan.streams.size() << " streams"
+                 << (plan.persistent ? ", persistent kernel" : "") << (plan.bdOnce ? ", BD write-once" : "")
+                 << " (DMA program derived in dfschedule once the resources are assigned)\n";
     return true;
 }
 
