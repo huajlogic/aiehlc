@@ -25,8 +25,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef GP_HW_ROWS
 #define GP_HW_ROWS 4
+#endif
+#ifndef GP_HW_COLS
 #define GP_HW_COLS 4
+#endif
 
 static inline uint32_t gp_mix32(uint32_t x) {
     x ^= x >> 16;

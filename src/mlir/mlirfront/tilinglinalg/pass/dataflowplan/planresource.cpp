@@ -154,136 +154,121 @@ Pool poolOver(const std::map<Tile, std::set<int>> &used, const std::vector<Tile>
 
 std::string tileStr(const Tile &t) { return "(" + std::to_string(t.col) + ", " + std::to_string(t.row) + ")"; }
 
-// Core tiles: chunk buffers, BDs, locks; every core the same.
+// Core tiles: chunk buffers, BDs, locks; every core the same (the protocol of streams[0]: checkPlanLayout
+// makes every shared stream agree).
 bool assignCores(const DataflowPlan &p, const Used &u, PlanResources &r, std::string &why) {
     const PlanTarget &T = planTarget();
+    const PlanStream &s = p.streams[0];
     std::vector<Tile> cores;
     for (int c = 0; c < p.meshCols; c++)
         for (int pm = 0; pm < p.meshRows; pm++)
             cores.push_back({p.colLo + c, p.coreRowBase + pm});
     for (const Tile &t : cores) {
         auto it = u.channels.find(t);
-        for (int ch = 0; ch < T.coreS2mmChannels && it != u.channels.end(); ch++)
+        for (int ch = 0; ch < s.channels && it != u.channels.end(); ch++)
             if (it->second.count({ch, true})) {
                 why = "core " + tileStr(t) + " S2MM channel " + std::to_string(ch) +
-                      " is used by a generated flow; the plan's hosted streams need every core S2MM channel";
+                      " is used by a generated flow; the plan's hosted streams need it";
                 return false;
             }
     }
     Pool bd = poolOver(u.bds, cores, 0, T.coreBds), lk = poolOver(u.locks, cores, 0, T.coreLocks);
-    for (int ch = 0; ch < 2; ch++) {
-        const int b = bd.run(2);
-        if (b < 0) {
-            why = "no two free core BDs for S2MM channel " + std::to_string(ch);
+    r.coreBd.assign(s.channels, -1);
+    for (int ch = 0; ch < s.channels; ch++)
+        if ((r.coreBd[ch] = bd.run(s.slots)) < 0) {
+            why = "no " + std::to_string(s.slots) + " free core BDs in a row for S2MM channel " + std::to_string(ch);
             return false;
         }
-        r.coreBd[ch][0] = b, r.coreBd[ch][1] = b + 1;
-    }
-    // F / G / no-op: three pairs handDelta apart (aie_block_io_plan.h hands on to acquire id + delta);
-    // E: four in a row (buffer index ch + 2 slot); then the go and sync locks
-    r.lockF = lk.run(3 * r.handDelta);
-    r.lockE = lk.run(4);
+    // reader locks: (readers + 1) rows of `channels` (aie_block_io_plan.h hands on to acquire id + delta);
+    // E: one per buffer, in a row; then the go and sync locks
+    r.handDelta = s.channels;
+    r.lockF = lk.run((s.readers + 1) * s.channels);
+    r.lockE = lk.run(s.buffers());
     r.lockGo = p.persistent ? lk.run(1) : -1;
     r.lockSync = lk.run(1);
     if (r.lockF < 0 || r.lockE < 0 || r.lockSync < 0 || (p.persistent && r.lockGo < 0)) {
-        why = "not enough free core locks (" + std::to_string(lk.hi - (int)lk.used.size()) +
-              " left; the plan needs F / G / no-op pairs, 4 E locks, a sync lock and a go lock)";
+        why = "not enough free core locks (" + std::to_string(lk.hi - (int)lk.used.size()) + " left; the plan needs " +
+              std::to_string((s.readers + 1) * s.channels) + " reader locks, " + std::to_string(s.buffers()) +
+              " E locks, a sync lock" + (p.persistent ? " and a go lock)" : ")");
         return false;
     }
     // the hosted chunks: in the memory the allocator gave the replaced ports' windows
-    const PlanStream *A = streamOfRole(p, "a");
-    const int64_t need = 4 * (int64_t)A->chunkRows * A->chunkCols;
+    const int64_t need = (int64_t)s.buffers() * s.chunkBytes();
     int64_t lo = INT64_MAX, hi = 0, total = 0;
     try {
-        for (const CoreMemSlot &s : ResourceMgr::instance()->coreMemAllocator().getAllocations())
-            if (p.replaces(s.ownerId)) {
-                lo = std::min<int64_t>(lo, s.address), hi = std::max<int64_t>(hi, s.address + s.size);
-                total += s.size;
+        for (const CoreMemSlot &m : ResourceMgr::instance()->coreMemAllocator().getAllocations())
+            if (p.replaces(m.ownerId)) {
+                lo = std::min<int64_t>(lo, m.address), hi = std::max<int64_t>(hi, m.address + m.size);
+                total += m.size;
             }
     } catch (...) {
     }
     if (total == 0 || hi - lo != total || total < need) {
         why = "the replaced ports' core buffers (" + std::to_string(total) + " B, " +
               (total && hi - lo != total ? "not contiguous" : "contiguous") + ") cannot hold the hosted chunks (" +
-              std::to_string(need) + " B: 2 channels x 2 buffers x one chunk)";
+              std::to_string(need) + " B: channels x slots x one chunk)";
         return false;
     }
     r.slotBase = lo, r.slotBytes = need;
     return true;
 }
 
-// MemTiles: per stream, the tiles its shim routes end on; locks, BDs (in the channel's bank) and memory.
+// MemTiles: per stream and column, the MemTile its shim route ends on; locks, BDs (in each channel's bank)
+// and memory (bump-allocated per MemTile, capacity checked).
 bool assignMemTiles(const DataflowPlan &p, const Used &u, PlanResources &r, std::string &why) {
     const PlanTarget &T = planTarget();
-    std::map<Tile, int64_t> next; // bump allocation of each MemTile's memory
-    r.mem.assign(p.streams.size(), {});
+    std::map<Tile, int64_t> next;
+    std::map<Tile, std::set<int>> takenBd = u.bds, takenLock = u.locks;
+    r.mem.assign(p.streams.size(), std::vector<PlanResources::Mem>(p.meshCols));
     for (size_t si = 0; si < p.streams.size(); si++) {
         const PlanStream &s = p.streams[si];
-        PlanResources::Mem &m = r.mem[si];
-        std::vector<Tile> mts;
-        int s2mm = -1;
-        std::vector<int> mm2s; // MM2S channels out of the MemTile (column 0's; every column alike)
-        for (int c = 0; c < p.meshCols; c++)
-            for (const PlanRoute *rt : routesOf(p, s.arg, true, p.colLo + c)) {
-                const Tile mt = rt->dsts.front().first;
-                if (!isMemRow(p, mt.row)) {
-                    why = "stream " + std::to_string(s.arg) + ": its shim route ends on " + tileStr(mt) +
-                          ", not a MemTile";
-                    return false;
-                }
-                mts.push_back(mt);
-                s2mm = rt->dsts.front().second;
-                if (c == 0)
-                    for (const PlanRoute *o : routesOf(p, s.arg, false, mt.col))
-                        if (o->src == mt)
-                            mm2s.push_back(o->srcCh);
-            }
-        for (const Tile &t : mts) {
-            auto it = u.bds.find(t);
-            if (it != u.bds.end() && !it->second.empty()) {
+        for (int c = 0; c < p.meshCols; c++) {
+            const MemtileUse mu = memtileUse(p, s, p.colLo + c);
+            if (!mu.present)
+                continue;
+            const Tile &t = mu.mt;
+            auto uit = u.bds.find(t);
+            if (uit != u.bds.end() && !uit->second.empty()) {
                 why = "MemTile " + tileStr(t) + " is used by a generated flow (BD " +
-                      std::to_string(*it->second.begin()) + "); the plan does not share a MemTile's memory";
+                      std::to_string(*uit->second.begin()) + "); the plan does not share a MemTile's memory";
                 return false;
             }
+            PlanResources::Mem &m = r.mem[si][c];
+            Pool lk = poolOver(takenLock, {t}, 0, T.memLocks);
+            for (int i = 0; i < mu.locks; i++)
+                m.locks.push_back(lk.run(1));
+            auto bankRun = [&](int ch, int n) {
+                Pool b = poolOver(takenBd, {t}, T.memBankLo(ch), T.memBankLo(ch) + T.memBdBank);
+                const int x = b.run(n);
+                if (x >= 0)
+                    for (int k = 0; k < n; k++)
+                        takenBd[t].insert(x + k);
+                return x;
+            };
+            m.bdIn = bankRun(mu.s2mm, mu.s2mmBds);
+            for (size_t k = 0; k < mu.out.size(); k++)
+                m.bdOut.push_back(bankRun(mu.out[k]->srcCh, mu.mm2sBds[k]));
+            bool ok = m.bdIn >= 0;
+            for (int x : m.locks)
+                ok &= x >= 0;
+            for (int x : m.bdOut)
+                ok &= x >= 0;
+            if (!ok) {
+                why = "stream " + std::to_string(s.arg) +
+                      ": not enough free locks / BDs (in the channels' banks) on "
+                      "MemTile " +
+                      tileStr(t);
+                return false;
+            }
+            takenLock[t].insert(m.locks.begin(), m.locks.end());
+            if (next[t] + mu.bytes > T.memBytes) {
+                why = "stream " + std::to_string(s.arg) + ": " + std::to_string(mu.bytes) +
+                      " B of buffers on MemTile " + tileStr(t) + " exceed its " + std::to_string(T.memBytes) + " B";
+                return false;
+            }
+            m.addr = T.memOwnBase + next[t];
+            next[t] += mu.bytes;
         }
-        Pool lk = poolOver(u.locks, mts, 0, T.memLocks), bd = poolOver(u.bds, mts, 0, T.memBds);
-        auto bankRun = [&](int ch, int n) {
-            Pool b = bd;
-            b.lo = T.memBankLo(ch), b.hi = b.lo + T.memBdBank;
-            const int x = b.run(n);
-            if (x >= 0)
-                bd.used = b.used, bd.used.insert(x); // keep the taken ids
-            return x;
-        };
-        m.lockA = lk.run(1), m.lockB = lk.run(1);
-        const bool ring = s.stage == "memtile_ring";
-        const int64_t chunk = (int64_t)s.chunkRows * s.chunkCols;
-        const int64_t bytes = ring ? (int64_t)s.ring * 2 * chunk : (int64_t)s.hostRows.size() * s.chunks * chunk;
-        m.bdIn = bankRun(s2mm, ring ? s.ring : 1);
-        m.bdOut.clear();
-        if (ring)
-            m.bdOut.push_back(mm2s.size() == 1 ? bankRun(mm2s[0], s.ring) : -1);
-        else
-            for (int ch : mm2s)
-                m.bdOut.push_back(bankRun(ch, 1));
-        bool ok = m.lockA >= 0 && m.lockB >= 0 && m.bdIn >= 0 && !m.bdOut.empty();
-        for (int b : m.bdOut)
-            ok &= b >= 0;
-        if (!ok) {
-            why = "stream " + std::to_string(s.arg) + ": not enough free MemTile locks / BDs in the channels' banks";
-            return false;
-        }
-        int64_t at = 0;
-        for (const Tile &t : mts)
-            at = std::max(at, next[t]);
-        if (at + bytes > T.memBytes) {
-            why = "stream " + std::to_string(s.arg) + ": " + std::to_string(bytes) + " B of MemTile buffers at " +
-                  std::to_string(at) + " exceed the MemTile's " + std::to_string(T.memBytes) + " B";
-            return false;
-        }
-        m.addr = T.memOwnBase + at;
-        for (const Tile &t : mts)
-            next[t] = at + bytes;
     }
     return true;
 }
@@ -295,8 +280,9 @@ bool assignShim(const DataflowPlan &p, const Used &u, PlanResources &r, std::str
         const Tile t{p.colLo + c, 0};
         Pool bd = poolOver(u.bds, {t}, 0, T.shimBds);
         for (size_t si = 0; si < p.streams.size(); si++) {
-            r.shimBd[si][c] = bd.run(1, 1, /*top*/ true);
-            if (r.shimBd[si][c] < 0) {
+            if (!memtileUse(p, p.streams[si], p.colLo + c).present)
+                continue;
+            if ((r.shimBd[si][c] = bd.run(1, 1, /*top*/ true)) < 0) {
                 why = "shim " + tileStr(t) + ": no free BD for stream " + std::to_string(p.streams[si].arg);
                 return false;
             }
@@ -307,25 +293,124 @@ bool assignShim(const DataflowPlan &p, const Used &u, PlanResources &r, std::str
 
 } // namespace
 
+// Pinned resources (dmaphop.plan_resources, or read back from a dfschedule program) replace the allocated
+// ones part by part -- after a check that they are free of the generated flows and inside the device.
+bool adoptPinned(const DataflowPlan &p, const Used &u, PlanResources &r, std::string &why) {
+    const PlanTarget &T = planTarget();
+    const PlanResources &pin = p.pinned;
+    auto clash = [&](const std::map<Tile, std::set<int>> &used, const Tile &t, int id, int n, const char *what) {
+        auto it = used.find(t);
+        if (id < 0 || id >= n || (it != used.end() && it->second.count(id))) {
+            why = std::string("pinned ") + what + " " + std::to_string(id) + " on " + tileStr(t) +
+                  " is outside the tile or used by a generated flow";
+            return true;
+        }
+        return false;
+    };
+    if (pin.hasCore) {
+        const PlanStream &s = p.streams[0];
+        std::vector<int> locks, bds;
+        for (int i = 0; i <= s.readers; i++)
+            for (int ch = 0; ch < s.channels; ch++)
+                locks.push_back(pin.lockF + i * pin.handDelta + ch);
+        for (int b = 0; b < s.buffers(); b++)
+            locks.push_back(pin.lockE + b);
+        locks.push_back(pin.lockSync);
+        if (p.persistent)
+            locks.push_back(pin.lockGo);
+        for (int ch = 0; ch < (int)pin.coreBd.size(); ch++)
+            for (int k = 0; k < s.slots; k++)
+                bds.push_back(pin.coreBd[ch] + k);
+        for (int c = 0; c < p.meshCols; c++)
+            for (int pm = 0; pm < p.meshRows; pm++) {
+                const Tile t{p.colLo + c, p.coreRowBase + pm};
+                for (int l : locks)
+                    if (clash(u.locks, t, l, T.coreLocks, "core lock"))
+                        return false;
+                for (int b : bds)
+                    if (clash(u.bds, t, b, T.coreBds, "core BD"))
+                        return false;
+            }
+        if ((int)pin.coreBd.size() != s.channels || pin.slotBase != r.slotBase) {
+            std::ostringstream o;
+            o << "pinned core chunk slots must be the replaced windows' memory (0x" << std::hex << r.slotBase
+              << std::dec << ") with one BD run per channel";
+            why = o.str();
+            return false;
+        }
+        r.coreBd = pin.coreBd, r.lockF = pin.lockF, r.handDelta = pin.handDelta, r.lockE = pin.lockE;
+        r.lockGo = pin.lockGo, r.lockSync = pin.lockSync;
+    }
+    if (pin.hasMem)
+        for (size_t si = 0; si < pin.mem.size() && si < r.mem.size(); si++)
+            for (size_t c = 0; c < pin.mem[si].size() && c < r.mem[si].size(); c++) {
+                const PlanResources::Mem &m = pin.mem[si][c];
+                if (m.bdIn < 0)
+                    continue;
+                const MemtileUse mu = memtileUse(p, p.streams[si], p.colLo + (int)c);
+                if (!mu.present || m.locks.size() != (size_t)mu.locks || m.bdOut.size() != mu.out.size() ||
+                    m.addr < T.memOwnBase || m.addr + mu.bytes > T.memOwnBase + T.memBytes) {
+                    why = "pinned MemTile resources of stream " + std::to_string(p.streams[si].arg) + " column " +
+                          std::to_string(c) + " do not fit its layout (locks, MM2S routes, memory)";
+                    return false;
+                }
+                for (int l : m.locks)
+                    if (clash(u.locks, mu.mt, l, T.memLocks, "MemTile lock"))
+                        return false;
+                auto inBank = [&](int ch, int first, int n) {
+                    return first >= T.memBankLo(ch) && first + n <= T.memBankLo(ch) + T.memBdBank;
+                };
+                bool ok = inBank(mu.s2mm, m.bdIn, mu.s2mmBds);
+                for (size_t k = 0; k < mu.out.size(); k++)
+                    ok &= inBank(mu.out[k]->srcCh, m.bdOut[k], mu.mm2sBds[k]);
+                if (!ok) {
+                    why = "pinned MemTile BDs of stream " + std::to_string(p.streams[si].arg) + " column " +
+                          std::to_string(c) + " leave their channels' BD banks";
+                    return false;
+                }
+                r.mem[si][c] = m;
+            }
+    if (pin.hasShim)
+        for (size_t si = 0; si < pin.shimBd.size() && si < r.shimBd.size(); si++)
+            for (size_t c = 0; c < pin.shimBd[si].size() && c < r.shimBd[si].size(); c++) {
+                const int b = pin.shimBd[si][c];
+                if (b < 0)
+                    continue;
+                if (clash(u.bds, {p.colLo + (int)c, 0}, b, T.shimBds, "shim BD"))
+                    return false;
+                r.shimBd[si][c] = b;
+            }
+    return true;
+}
+
 bool assignPlanResources(ModuleOp hostModule, DataflowPlan &p, std::string &why) {
     const Used u = collectUsed(hostModule, p);
     PlanResources r;
-    if (!assignCores(p, u, r, why) || !assignMemTiles(p, u, r, why) || !assignShim(p, u, r, why))
+    if (!assignCores(p, u, r, why) || !assignMemTiles(p, u, r, why) || !assignShim(p, u, r, why) ||
+        !adoptPinned(p, u, r, why))
         return false;
     r.assigned = true;
     p.res = r;
     std::ostringstream os;
-    os << "[DataflowPlan] resources (" << planTarget().name << "): core BDs " << r.coreBd[0][0] << "," << r.coreBd[0][1]
-       << "/" << r.coreBd[1][0] << "," << r.coreBd[1][1] << ", core locks F " << r.lockF << " E " << r.lockE << " go "
-       << r.lockGo << " sync " << r.lockSync << ", chunk slots 0x" << std::hex << r.slotBase << std::dec << "+"
-       << r.slotBytes << " (the replaced windows)";
-    for (size_t si = 0; si < r.mem.size(); si++) {
-        os << "; stream " << p.streams[si].arg << ": MemTile locks " << r.mem[si].lockA << "/" << r.mem[si].lockB
-           << " BDs in " << r.mem[si].bdIn << " out";
-        for (int b : r.mem[si].bdOut)
-            os << " " << b;
-        os << " @0x" << std::hex << r.mem[si].addr << std::dec << ", shim BD " << r.shimBd[si][0];
-    }
+    os << "[DataflowPlan] resources (" << planTarget().name << "): core BDs";
+    for (int b : r.coreBd)
+        os << " " << b;
+    os << " (x" << p.streams[0].slots << "), core locks F " << r.lockF << " E " << r.lockE << " go " << r.lockGo
+       << " sync " << r.lockSync << ", chunk slots 0x" << std::hex << r.slotBase << std::dec << "+" << r.slotBytes
+       << " (the replaced windows)";
+    for (size_t si = 0; si < r.mem.size(); si++)
+        for (int c = 0; c < p.meshCols; c++) {
+            const auto &m = r.mem[si][c];
+            if (m.bdIn < 0)
+                continue;
+            os << "; stream " << p.streams[si].arg << " col " << c << ": locks";
+            for (int x : m.locks)
+                os << " " << x;
+            os << " BDs in " << m.bdIn << " out";
+            for (int x : m.bdOut)
+                os << " " << x;
+            os << " @0x" << std::hex << m.addr << std::dec << " shim BD " << r.shimBd[si][c];
+        }
     llvm::outs() << os.str() << "\n";
     return true;
 }

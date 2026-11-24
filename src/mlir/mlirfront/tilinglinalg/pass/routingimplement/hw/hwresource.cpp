@@ -222,17 +222,19 @@ template <> struct GenTraits<5> {
 
     static const std::map<TileType, std::vector<PortTemplate>> &defaultPortTemplates() {
         static const std::map<TileType, std::vector<PortTemplate>> templates = {
+            // AIE2PS core stream switch (xaie2psgbl_reginit.c): masters N 6 / S 4 / E 4 / W 4 / DMA 2,
+            // slaves S 6 / N 4 / E 4 / W 4 / DMA 2 -- a core's SOUTH slaves pair with the MemTile's 6 NORTH masters
             {TileType::Core,
-             {{PortDirection::North, PortRole::Master, 4},
+             {{PortDirection::North, PortRole::Master, 6},
               {PortDirection::South, PortRole::Master, 4},
               {PortDirection::East, PortRole::Master, 4},
               {PortDirection::West, PortRole::Master, 4},
-              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 2},
               {PortDirection::North, PortRole::Slave, 4},
-              {PortDirection::South, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 6},
               {PortDirection::East, PortRole::Slave, 4},
               {PortDirection::West, PortRole::Slave, 4},
-              {PortDirection::DMA, PortRole::Slave, 4}}},
+              {PortDirection::DMA, PortRole::Slave, 2}}},
             {TileType::Shim,
              {{PortDirection::North, PortRole::Master, 4},
               {PortDirection::South, PortRole::Master, 2, {3, 7}}, // mux - XAie_EnableShimDmaToAieStrmPort

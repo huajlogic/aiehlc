@@ -559,9 +559,16 @@ dump `4_DataflowPlan.mlir`) -> dmaphop dataflow ops `dmaphop.plan` / `plan_route
 (`collectDataflowPlan` validates, tags replaced flows `dmaphop.plan_replaced`) -> the DMA program
 derived (`plandma.cpp`) as **dfschedule** ops `config.tile_bd` / `lock_set` / `channel_enable` /
 `channel_start` (MemTiles on the host module, cores on the kernel module via `declaretile.self`) +
-shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernelApi; routes as
-`aiehlc_plan_routing()` (routing.cc, routed around the kept ports); `aiehlc_plan.h` (shared-port
-loads, constants). The kernel is ONE body of `load_buffer` / `store_buffer` (no `#if __chess__`):
+shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernelApi; routes: the
+`plan_route` ops lowered in **DmaphopToRoutinghwPass** to ordinary routinghw ops (`passdmaphoptoroutinghw/planroutes.cpp`,
+router port model, around the generated routes + control plane) -- no text branch in routing.cc; `aiehlc_plan.h`
+(constants + the generated host `aiehlc_plan_arrange`, the DDR layout the shim BDs read).
+**Protocol + layout from the IR**: `plan_stream` carries `channels / slots / readers / parts / elem_bytes /
+row_groups / strips`; any column count >= A strips (4 x 4 85.5 %, **4 x 2** `gemm_plan_4x2.cc` 86.5 %, both GOLDEN PASS).
+**Readback**: every plan op is tagged (`dfplan.tag`); `NN_DataflowPlanProgram.mlir` (the dfschedule program alone)
+edited and fed back with `AIEHLC_DFSCHEDULE_PLAN_IN` is lifted (ids, addresses, ring) and regenerated identically
+or the build names the line it cannot express; the result is dumped to dfscheblueprint (`dfscheblueprint.plan`)
+and dmaphop (`dmaphop.plan_resources`, re-enterable) -- `planreadback.cpp`. The kernel is ONE body of `load_buffer` / `store_buffer` (no `#if __chess__`):
 `.parts` / `.align` options, the kernel analysis accepts the shared-operand grid; its block calls on the shared ports
 are served by `src/mlir/runtime/aie_block_io_plan.h` (always_inline, operand by descriptor, tile sync at commit).
 **No literals:** device facts in `pass/dataflowplan/plantarget.h` (incl. per-tile-kind BD wrap limits -- core 8 bits),
@@ -1026,6 +1033,8 @@ Read the matching skill when the task fits:
 | `data used without being loaded` and WHICH constant causes it (`oc_t = 15` vs loops walking 16); `cause (static analysis)` / `out-of-block access (static analysis)` lines; extending `kernel_static.cpp` | blockstaticbounds |
 | Edit the routing / dmaphop IR and feed it back (`AIEHLC_ROUTING_IR_IN`, `AIEHLC_DMAPHOP_IR_IN`, `aiebackend.routing_ir`: view / set_level / lint / check / build), round-trip test, an IR edit that does nothing or is silently accepted although illegal; `flowcheck FAILED` / `FLOWCHECK ERROR ... does not reach / also reaches` after a build | routingirreentry |
 | GOLDEN FAIL with an identical match count every run and unchanged perf after changing BD dims; core BD wrap > 255 (8-bit field, MemTile / shim 10-bit) | bdwrapfieldwidth |
+| Persistent kernel (dataflow plan) passes launch 0 and hangs from launch 1 (`wait_io TIMEOUT` on the input shims), cores read `core_status=0 pc=0`; only on a non-16-core mesh | persistentkernelreload |
+| A non-square mesh (4 x 2) places core groups on columns it does not have; `No free shim DMA slot` before a dataflow plan replaces the flows; a `#ifndef` / `#define` default missing in the trace harness or the kernel TU | nonsquaremeshplan |
 | Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `dataflow = {...}`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
 | Kernel-only kernel without options hangs in `wait_io TIMEOUT ... dir=0` (output) but works with `{.depth = 2}`; output `pp_depth=1`, one output MM2S BD with `next_bd=-1` vs ping/pong `window_init`; `{.depth = 1} on aie::store_buffer` error | outputpingponghang |
 | A dialect attribute's dumped IR does not parse back (`expected integer value`, `failed to parse ...Attr parameter ... ArrayRef<int64_t>`, `AIEHLC_*_IR_IN ... does not parse / verify`, roundtrip FAIL at the re-entry build): `struct(params)` with an `ArrayRefParameter` | mlirattrarrayroundtrip |
