@@ -120,12 +120,22 @@
         bX = (bh_);                                                                                                    \
         bXo = (bl_);                                                                                                   \
     }
-/* the two parts of chunks xa (A) / xb (B), in this core's walk order (pa / pb: 1 = part 1 first) */
+/* the two halves (row parts) of chunks xa (A) / xb (B), in this core's walk order (pa / pb: 1 = half 1
+   first): with {.parts = 2} the plan puts them in different memory banks (x.part(i)); with one part they
+   are back to back, half a chunk apart */
+#if !defined(GP_PARTS) || GP_PARTS == 2
 #define SH_PARTS(xa, xb, al_, ah_, bl_, bh_)                                                                           \
     al_ = (const int8_t *)(xa).part(pa);                                                                               \
     ah_ = (const int8_t *)(xa).part(pa ^ 1);                                                                           \
     bl_ = (const int8_t *)(xb).part(pb);                                                                               \
     bh_ = (const int8_t *)(xb).part(pb ^ 1);
+#else
+#define SH_PARTS(xa, xb, al_, ah_, bl_, bh_)                                                                           \
+    al_ = (const int8_t *)(xa) + pa * (KA_TM / 2 * KA_KC);                                                             \
+    ah_ = (const int8_t *)(xa) + (pa ^ 1) * (KA_TM / 2 * KA_KC);                                                       \
+    bl_ = (const int8_t *)(xb) + pb * (KA_TN / 2 * KA_KC);                                                             \
+    bh_ = (const int8_t *)(xb) + (pb ^ 1) * (KA_TN / 2 * KA_KC);
+#endif
 /* chunk boundary, first half: blocks 14 / 15 of the current chunk with chunk (nAl, nBl) prefetched */
 #define SH_BOUND1(nAl, nBl)                                                                                            \
     K4_ST(cur, X);                                                                                                     \

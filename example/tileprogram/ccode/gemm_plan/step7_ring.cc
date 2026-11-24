@@ -1,0 +1,15 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ******************************************************************************/
+// tutorial/perfoptmize step 7: + {.ring = 10}: a deeper A FIFO ring in the MemTile (= gemm_plan.cc).
+#pragma aie_debug_level(AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
+#pragma control_plan_op_control_packet
+#pragma control_packet_mode(aot)
+#pragma KERNELCONFIGOFFLOAD
+#pragma output_tile_major
+#pragma persistent_kernel
+#define GP_RING 10
+#define GP_KEEP true
+#define GP_PARTS 2
+#include "gemm_plan_body.cc"
