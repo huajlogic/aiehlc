@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Shim BD rewrite for share2x8.py: the base build's generated host_canonicalized() programs one A
 # BD and one B BD per shim column and one output (S2MM, out-of-order) BD per core; this rewrites
 # them for the 2 x 8 target shape, with the DMA streams laid out CONTIGUOUSLY in DDR:

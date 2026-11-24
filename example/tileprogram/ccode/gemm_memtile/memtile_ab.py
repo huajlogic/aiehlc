@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Hand edit: MemTile B (replayed breps times) + double-buffered A (each tile replayed nt times).
 # usage: memtile_ab.py <aout/worklocal> <blen> <breps> <alen> <nt> <arounds> x
 # then: rm build/host.o build/routing.o build/host; WORKLOCAL_DIR=... AIE_VERSION=5 PLATFORM=baremetal script/hostcompile.sh

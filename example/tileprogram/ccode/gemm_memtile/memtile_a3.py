@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Apply AFTER memtile_ab.py: replaces memtile_ab() with a 3-buffer A version (A refill overlaps the replay).
 # usage: memtile_a3.py <aout/worklocal> <blen> <breps> <alen> <nt> <arounds>   (arounds % 3 == 0; 3*nt + 3 <= 24 BDs)
 # memtile_ab with 3 A buffers (S2MM chain A0->A1->A2, MM2S replays each nt times)

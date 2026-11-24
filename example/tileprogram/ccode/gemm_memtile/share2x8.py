@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Hand edit: 2 x 8 SHARED-OPERAND layout for the K-accumulating GEMM (gemm_kacc_v2.cc built with
 # KA_R 21, KA_NT 2, then memtile_ab.py / memtile_split.py / shim_bd_once.py as in the README).
 #

@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Hand edit (after memtile_ab.py + memtile_split.py): B shared between core-row pairs.
 # usage: bshare.py <aout/worklocal> <TN> <KC>
 import re, sys

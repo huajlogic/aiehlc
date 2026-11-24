@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 """Pick the int8 GEMM solution for a board from its memory system (MC count, DDR zones).
 
 The two designs in example/tileprogram/ccode/gemm_memtile/ win on different boards:

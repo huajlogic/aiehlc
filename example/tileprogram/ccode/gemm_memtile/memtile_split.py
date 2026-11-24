@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # usage: memtile_split.py <aout/worklocal> <blen> <breps> <alen> <nt> <arounds>   (after memtile_ab.py)
 # Apply AFTER memtile_ab.py: B stays on MemTile (c,1) ch0; A (3 buffers) moves to MemTile (c,2) ch1.
 import sys, re

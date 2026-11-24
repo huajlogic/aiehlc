@@ -1,3 +1,7 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ******************************************************************************/
 // K-accumulating int8 GEMM (step 1 of the MemTile design): every core keeps an int32 C tile
 // (KA_TM x KA_TN) in core memory across all K chunks; A and B arrive in KA_KC-wide chunks.
 #pragma aie_debug_level(AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)

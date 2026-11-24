@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Stream-route helper for the hand-built 2x8 shared-operand GEMM (share2x8.py).
 # Parses a generated routing.cc, separates the input routes (everything reachable from a shim MM2S
 # port, through MemTile staging) from the rest (outputs, packet switching), books every port the

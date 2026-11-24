@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Upper bound on end-to-end int8 GEMM throughput on the 4x4 AIE2PS mesh, MemTile-stationary B,
 # K accumulated on core (C written once), A strips double-buffered in MemTile. Ignores launch cost.
 PEAK=16*512*0.998e9
