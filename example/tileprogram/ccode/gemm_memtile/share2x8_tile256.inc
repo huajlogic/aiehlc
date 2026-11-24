@@ -1,3 +1,7 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ******************************************************************************/
 #if defined(__chess__)
 /* SHARE2X8 tile kernel (64 x 64 x NKC*128): one software pipeline across all chunks of a tile.
  * Blocks b = 0..15 per chunk (2x2 accumulators): A pair b >> 2, B pair b & 3; accumulators of block b

@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Hand edit (after memtile_ab.py, memtile_split.py, shim_bd_once.py): WEIGHT-RESIDENT B.
 # B is loaded into the MemTiles on the first launch only; later launches mark its parts
 # full again and skip B's shim transfer and MemTile S2MM. A and C still move every launch.

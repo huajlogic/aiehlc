@@ -1,3 +1,7 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ******************************************************************************/
 #if defined(__chess__)
 /* SHARE2X8 chunk kernel (64 x 64 x 128): A pairs {0,1} at a_lo, {2,3} at a_hi; B pairs likewise. */
 typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;

@@ -1,3 +1,7 @@
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+###############################################################################
 # Hand edit (last): shim BDs and OOO channel config are identical on every launch -- write
 # them on the first launch only; later launches only re-push the start queues.
 # usage: shim_bd_once.py <aout/worklocal>
