@@ -45,69 +45,82 @@
 #define SH_TILES 60
 
 // AIEHLC_KERNEL_PROLOGUE_BEGIN
-#if defined(__chess__)
-#include "aiehlc_plan.h"
 #include "gemm_plan_tile.h"
-#endif
 // AIEHLC_KERNEL_PROLOGUE_END
 
+// One body for the core and for the compiler's x86 trace: every operand block comes from
+// aie::load_buffer, every output tile goes out through aie::store_buffer -- the compiler serves the
+// shared ports from the dataflow plan's hosted slots (locks, slot rotation, bank-split parts).
 __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M, KA_K>> a,
                         aie::port<input_window_int8 *, aie::WEIGHTS, aie::shape<KA_N, KA_K>> b,
                         aie::port<output_window_int8 *, aie::OFM, aie::shape<KA_M, KA_N>> c) {
+    typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4; // one mac_8x8_8x8: 512 int8 MAC / cycle
+    // 2 x 8 logical grid on the 4 x 4 mesh: core (pm, pn) computes A strip sa x B strip sb.
     const int pm = aie::program_id(0), pn = aie::program_id(1);
-    const int nk = KA_K / KA_KC;
+    const int sa = pm >> 1, sb = pn + 4 * (pm & 1), brow = sb * KA_TN;
+    // The two cores reading one block walk its two parts in opposite order (different memory banks).
+    const int pa = pm & 1, pb = pm >> 1, swz = (pa << 3) ^ (pb << 1);
     alignas(8192) static int32_t acc[KA_TM * KA_TN];
-#if defined(__chess__)
-    // Operands come from the tiles that host them (the plan's A_VIEW / B_VIEW: own / north / south
-    // memory view), synchronised on the host tile's locks (A_LOCK / B_LOCK base); the first reader of
-    // a buffer hands it to the second right after acquiring (A_FIRST / B_FIRST); the two readers walk
-    // the buffer halves in opposite phase (A_PHASE / B_PHASE).
-    (void)pn;
-    (void)nk;
-    const uintptr_t vA = (uintptr_t)AIEHLC_PLAN_A_VIEW(pm), vB = (uintptr_t)AIEHLC_PLAN_B_VIEW(pm);
-    const int lA = (int)AIEHLC_PLAN_A_LOCK(pm), lB = (int)AIEHLC_PLAN_B_LOCK(pm);
-    const int fl = (AIEHLC_PLAN_A_FIRST(pm) ? 1 : 0) | (AIEHLC_PLAN_B_FIRST(pm) ? 2 : 0) |
-                   (AIEHLC_PLAN_A_PHASE(pm) ? 4 : 0) | (AIEHLC_PLAN_B_PHASE(pm) ? 8 : 0);
-    const int swz = ((AIEHLC_PLAN_A_PHASE(pm) ? 1 : 0) << 3) ^ ((AIEHLC_PLAN_B_PHASE(pm) ? 1 : 0) << 1);
-    unsigned gc = 0; /* chunks consumed so far (the hosted streams' slot / channel rotation) */
-    for (int launch = 0; AIEHLC_PLAN_PERSISTENT || launch < 1; launch++) {
-        if (AIEHLC_PLAN_PERSISTENT)
-            acquire_greater_equal(AIEHLC_PLAN_GO_LOCK, 1); /* go: one launch */
-        for (int i = 0; i < KA_TM * KA_TN; i += 64)
-            aie::store_v(acc + i, aie::zeros<int32_t, 64>());
-        for (int t = 0; t < SH_TILES; t++) {
-            int8_t *y = acquire_output_window(c);
-            ka_tile(vA, vB, lA, lB, fl, gc, SH_NK, 1, acc, acc + 2048, y, swz);
-            gc += SH_NK;
-            release_output_window(c);
-        }
+    int32_t *__restrict ae = acc, *__restrict ao = acc + 2048;
+    int arow = 0;
+    // A: shared with the neighbour core, staged through a MemTile FIFO ring of 10 buffers.
+    // B: shared likewise, kept in a MemTile across launches (weight-resident).
+// How A and B travel (the dataflow the compiler builds; see the file header).
+#define OPTS_A                                                                                                         \
+    {                                                                                                                  \
+        .depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile_ring, .ring = 10, .parts = 2,          \
+        .align = 64                                                                                                    \
     }
-#else
-    // Traced (x86): what the shim sends -- A(m) once (m, k), B(n) once (n, k); C every tile.
-    for (int s = 0; s < KA_R; s++)
-        for (int nt = 0; nt < KA_NT; nt++) {
-            int8_t *y = aie::store_buffer(c, {(pm * KA_R + s) * KA_TM, (pn * KA_NT + nt) * KA_TN}, {KA_TM, KA_TN});
-            for (int j = 0; j < nk; j++) {
-                if (nt == 0) {
-                    const int8_t *x = aie::load_buffer(
-                        a, {(pm * KA_R + s) * KA_TM, j * KA_KC}, {KA_TM, KA_KC},
-                        {.depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile_ring, .ring = 10});
-                    (void)x;
-                    aie::release(a);
-                }
-                if (s == 0) {
-                    const int8_t *w = aie::load_buffer(
-                        b, {(pn * KA_NT + nt) * KA_TN, j * KA_KC}, {KA_TN, KA_KC},
-                        {.depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile, .keep = true});
-                    (void)w;
-                    aie::release(b);
-                }
-            }
-            for (int i = 0; i < KA_TM * KA_TN; i++)
-                y[i] = 0;
-            aie::commit(c);
+#define OPTS_B                                                                                                         \
+    {.depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile, .keep = true, .parts = 2, .align = 64}
+    KaMM4 X0, X1, X2, X3, Y0, Y1, Y2, Y3;
+    int32_t *cur, *nxt;
+    const int8_t *aY, *aX, *bY, *bYo, *bX, *bXo;
+    int dA;
+    for (int t = 0; t < SH_TILES; t++) {
+        arow = sa * (KA_M / 2) + t * KA_TM;
+        int8_t *__restrict y = aie::store_buffer(c, {arow, brow}, {KA_TM, KA_TN}, {.align = 64});
+        const int8_t *Al, *Ah, *Bl, *Bh;
+        {
+            auto xa = aie::load_buffer(a, {arow, 0}, {KA_TM, KA_KC}, OPTS_A);
+            auto xb = aie::load_buffer(b, {brow, 0}, {KA_TN, KA_KC}, OPTS_B);
+            SH_PARTS(xa, xb, Al, Ah, Bl, Bh);
         }
-#endif
+        aie::vector<int8_t, 64> va0 = aie::load_v<64>(Al), va1 = aie::load_v<64>(Al + K4_H);
+        aie::vector<int8_t, 64> vb0 = aie::load_v<64>(Bl), vb1 = aie::load_v<64>(Bl + K4_H);
+        aie::vector<int8_t, 64> wa0 = aie::load_v<64>(Al + 64), wa1 = aie::load_v<64>(Al + K4_H + 64);
+        aie::vector<int8_t, 64> wb0 = aie::load_v<64>(Bl + 64), wb1 = aie::load_v<64>(Bl + K4_H + 64);
+        SH_RESET(Al, Ah, Bl, Bh);
+        K4_LDZ(X, ae);
+        K4_LDZ(Y, ae + 256);
+        K4_BLK(X, Al, Bl, Al, Bl + 2048);
+// boundary into chunk k: chunk k is taken before chunk k - 1 is given back (blocks 14 / 15 of chunk
+// k - 1 run with chunk k's first operands prefetched)
+#define GEMM_NEXT_CHUNK(k)                                                                                             \
+    {                                                                                                                  \
+        const int8_t *nAl, *nAh, *nBl, *nBh;                                                                           \
+        auto xa = aie::load_buffer(a, {arow, (k) * KA_KC}, {KA_TM, KA_KC}, OPTS_A);                                    \
+        auto xb = aie::load_buffer(b, {brow, (k) * KA_KC}, {KA_TN, KA_KC}, OPTS_B);                                    \
+        SH_PARTS(xa, xb, nAl, nAh, nBl, nBh);                                                                          \
+        SH_BOUND1(nAl, nBl);                                                                                           \
+        aie::release(a);                                                                                               \
+        aie::release(b);                                                                                               \
+        SH_BOUND2(nAl, nAh, nBl, nBh);                                                                                 \
+    }
+        SH_INNER_W(K4_STI, K4_LDZ); // chunk 0: accumulators start from zero
+        GEMM_NEXT_CHUNK(1);
+        for (int j = 1; j < SH_NK - 1; j++) {
+            SH_INNER_W(K4_STI, K4_LD);
+            GEMM_NEXT_CHUNK(j + 1);
+        }
+        SH_INNER_W(K4_OUT, K4_LD); // last chunk: blocks go straight to the int8 output tile
+        K4_OUT(cur, X, 14);
+        K4_BLK(Y, aY, bY, aY, bY);
+        aie::release(a);
+        aie::release(b);
+        K4_OUT(cur + 256, Y, 15);
+        aie::commit(c);
+    }
 }
 
 void __Runtime_ctrl_high_throughput_enable(int on);

@@ -56,6 +56,29 @@ The kernel body reads what the compiler decided from the generated `aiehlc_plan.
 `AIEHLC_PLAN_PERSISTENT`, `AIEHLC_PLAN_GO_LOCK`); include it in the kernel prologue
 (`// AIEHLC_KERNEL_PROLOGUE_BEGIN ... #include "aiehlc_plan.h"`), under `__chess__`.
 
+### One kernel body, no `#if defined(__chess__)` (2026-11-23, later)
+
+`gemm_plan.cc`'s kernel is ONE body for the core and for the x86 trace: every operand block comes from
+`aie::load_buffer`, every output tile goes out through `aie::store_buffer`, with the TRUE 2 x 8 offsets
+(`sa = pm >> 1`, `sb = pn + 4 (pm & 1)`). `gemm_plan_tile.h` is compute macros only. What made it work:
+
+| piece | where |
+|---|---|
+| `.parts = n` -> `block.part(i)`: the block's row parts (the plan puts them in different DM banks) | harness / kemu `AnyPtr`, `aie_block_io.h`, plan `aiehlc_share_block` |
+| `.align = N`: the port's core buffers N-aligned (64-byte `load_v` / `store_v` on a window) | harness / kemu allocation, `block_align` attr -> `flowtransfer_kernel.cpp` allocator |
+| kernel analysis accepts blocks affine in the shared-operand grid (p0 / 2, p1 + C (p0 % 2)) when a port has `.share`; the true fit checks the core (`aiehlc_blk_desc.remap_cols`), an equivalent R x C tiling feeds the routing derivation | `kernel_trace.cpp remapSharedGrid`, `trace_routing.cpp` |
+| a shared port's `load_buffer` / `release` -> `aiehlc_share_load` / `_release` (lock role, slot rotation, bank-split parts), its state copied to a LOCAL at kernel entry (registers), one `chess_memory_fence()` per run of loads / releases | `resolveBlockIoBuiltins`, `planemit.cpp shareRuntime` |
+| `#pragma persistent_kernel` -> `main()` calls the kernel in a go-lock loop | `passdfscheduletokernelapi.cpp` |
+| on-core block check off for plan builds (`AIEHLC_BLOCK_CHECK 0`, the analysis proved every block); the check no longer divides | `aie_block_io.h` |
+| the trace harness `-I` the source dir (prologue headers), `-O2` (the full compute traces in 53 s) | `kernel_trace.cpp` |
+
+Measured (vek385-6, GOLDEN PASS every run): typical launch 1.160-1.168 ms = 84.4-84.7 % (best 84.79 %),
+against 1.153-1.158 ms for the `#if __chess__` version; both see the same occasional 1.20-1.26 ms launch
+(board noise). The ~0.5 % left is static: the last-chunk loop 141 vs 139 bundles, the chunk boundary
+148 vs ~145.5 (chess unrolled the hand-written chunk loop by 2; unrolling it here overflows the 16 KB
+program memory). Steps that mattered: state in registers (77 -> 81 %), the reference's chunk-loop
+shape (81 -> 81.8 %), `__restrict` output + division-free check + one fence (-> 84.7 %).
+
 ## 2. Routing level
 
 ```mlir

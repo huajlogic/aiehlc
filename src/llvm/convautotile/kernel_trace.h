@@ -80,6 +80,15 @@ struct PortFit {
     int rank = 0;
     std::vector<int> shape, base_p0, base_p1, step_i, step_j;
     int rounds_i = 1, rounds_j = 1;
+    // Shared-operand logical grid ({.share = aie::share::neighbor}, doc/design/dmaphop_dataflow_plan.md):
+    // the R x C mesh computes an (R/2) x (2C) grid, logical (q0, q1) = (p0 / 2, p1 + C (p0 % 2)). When
+    // the blocks are affine in (q0, q1) but not in (p0, p1), `remap_cols` = C and the TRUE fit is
+    // offset = q_base0 q0 + q_base1 q1 + q_step_i i + q_step_j j over q_rounds_i x q_rounds_j blocks; the
+    // fields above then hold the equivalent physical tiling the routing derivation consumes (the
+    // shared inputs are realized by the dataflow plan; a tile-major output keeps its per-core order).
+    int remap_cols = 0;
+    std::vector<int> q_base0, q_base1, q_step_i, q_step_j;
+    int q_rounds_i = 1, q_rounds_j = 1;
 };
 
 // Dataflow options of one port, from its load_buffer / store_buffer calls
@@ -99,10 +108,15 @@ struct BlockOpts {
     // memtile_ring (2), .ring = MemTile ring buffers, .keep = kept across launches
     int share = 0, stage = 0, ring = 0;
     bool keep = false;
-    bool any() const { return depth || resident || tile[0] || tile[1] || share || stage || ring || keep; }
+    int parts = 0; // .parts = n: the kernel addresses the block as n row parts (block.part(i))
+    int align = 0; // .align = N: the port's core buffers are N-byte aligned (64 for 64-byte vector access)
+    bool any() const {
+        return depth || resident || tile[0] || tile[1] || share || stage || ring || keep || parts || align;
+    }
     bool operator==(const BlockOpts &o) const {
         return depth == o.depth && resident == o.resident && tile[0] == o.tile[0] && tile[1] == o.tile[1] &&
-               share == o.share && stage == o.stage && ring == o.ring && keep == o.keep;
+               share == o.share && stage == o.stage && ring == o.ring && keep == o.keep && parts == o.parts &&
+               align == o.align;
     }
 };
 

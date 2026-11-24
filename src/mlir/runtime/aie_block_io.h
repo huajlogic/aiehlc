@@ -54,35 +54,48 @@ struct aiehlc_blk_desc {
     int step_j[4];
     int rounds_i;
     int rounds_j;
+    // > 0: the kernel computes on the shared-operand logical grid ({.share}, dmaphop_dataflow_plan.md):
+    // base_p0 / base_p1 apply to (p0 / 2, p1 + remap_cols (p0 % 2)) instead of (p0, p1).
+    int remap_cols;
 };
 // `map.oh_t` etc. in the kernel body: the mapping's block sizes.
 struct aiehlc_kernel_view_t {
     int oh, ow, oh_per_core, oc_per_core, oh_t, ow_t, ih_t, iw_t, c_align;
 };
-// Round index of the next block on one port, kept in [0, rounds_i*rounds_j)
-// (persists across kernel calls and wraps per launch).
+// Blocks handed out on one port (persists across kernel calls): the round (i, j) of the next block,
+// wrapping per launch.
 struct aiehlc_blk_cursor {
     int n;
+    int i, j; // round (i outer, j inner) of the next block -- kept running, so a check divides nothing
 };
 // A block offset or shape: {d0, d1, d2[, d3]}.
 struct aiehlc_blk {
     int v[4];
 };
 
+// AIEHLC_BLOCK_CHECK (default 1): check every block on the core. A dataflow-plan build (aiehlc_plan.h)
+// sets it to 0 -- the kernel analysis has already proved every block of every core on x86, and the
+// per-block check sits in the tile loop of kernels tuned to the cycle. -DAIEHLC_BLOCK_CHECK=1 restores it.
+#ifndef AIEHLC_BLOCK_CHECK
+#define AIEHLC_BLOCK_CHECK 1
+#endif
 // 1 when (off, shape) is the block port `d` delivers next on core (p0, p1).
 static inline int aiehlc_blk_check(const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int p0, int p1,
                                    const aiehlc_blk &off, const aiehlc_blk &shape) {
-    const int per = d.rounds_i * d.rounds_j;
-    // Keep n in [0, per): a resident run(-1) graph would otherwise overflow the
-    // int after 2^31 blocks and report false BLKE from then on. Also avoids a
-    // per-call '%' (no hardware divide on the AIE scalar unit).
-    if (per <= 0 || cur.n < 0 || cur.n >= per)
-        cur.n = 0;
-    const int round = cur.n;
-    const int i = d.rounds_j > 0 ? round / d.rounds_j : 0;
-    const int j = d.rounds_j > 0 ? round % d.rounds_j : 0;
-    if (per > 0 && ++cur.n == per)
-        cur.n = 0;
+    if (!AIEHLC_BLOCK_CHECK)
+        return 1;
+    if (d.remap_cols > 0) {
+        p1 += d.remap_cols * (p0 & 1);
+        p0 >>= 1;
+    }
+    // The round (i, j) wraps per launch with no division (no hardware divide on the AIE scalar unit) and
+    // never overflows -- a resident run(-1) graph checks blocks forever.
+    const int i = cur.i, j = cur.j, round = i * d.rounds_j + j;
+    if (++cur.j >= d.rounds_j) { // next round; wraps per launch (no division on the core)
+        cur.j = 0;
+        if (++cur.i >= d.rounds_i)
+            cur.i = 0;
+    }
     int ok = 1;
     for (int k = 0; k < d.rank; ++k) {
         const int want = d.base_p0[k] * p0 + d.base_p1[k] * p1 + d.step_i[k] * i + d.step_j[k] * j;
@@ -98,21 +111,34 @@ static inline int aiehlc_blk_check(const aiehlc_blk_desc &d, aiehlc_blk_cursor &
 
 // A block's address, converting to the pointer type the kernel assigns it to
 // (`const int8_t *`, `const bfloat16 *`, ...) -- as in the kernel analysis and kemu.
+// part(i): rows [i R / n, (i + 1) R / n) of a block loaded with {.parts = n} (back to back in a window;
+// a dataflow-plan port puts them in different memory banks -- aiehlc_plan.h's aiehlc_share_block).
 struct aiehlc_block_ptr {
     int8_t *p;
+    int part_bytes;
     template <typename T> operator T *() const { return (T *)p; }
+    int8_t *part(int i) const { return p + i * part_bytes; }
 };
+// Element bytes of an input window type (window structs hold vector-typed pointers, so not sizeof).
+static inline int aiehlc_elem_bytes(input_window_int8 *) { return 1; }
+static inline int aiehlc_elem_bytes(input_window_uint8 *) { return 1; }
+static inline int aiehlc_elem_bytes(input_window_int16 *) { return 2; }
+static inline int aiehlc_elem_bytes(input_window_int32 *) { return 4; }
+static inline int aiehlc_elem_bytes(input_window_float *) { return 4; }
 template <typename W>
 static inline aiehlc_block_ptr aiehlc_load_buffer(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int p0,
-                                                  int p1, aiehlc_blk off, aiehlc_blk shape) {
+                                                  int p1, aiehlc_blk off, aiehlc_blk shape, int parts = 1) {
     aiehlc_blk_check(d, cur, p0, p1, off, shape);
-    return {(int8_t *)acquire_input_window(win)};
+    int bytes = aiehlc_elem_bytes(win);
+    for (int k = 0; k < d.rank; ++k)
+        bytes *= shape.v[k];
+    return {(int8_t *)acquire_input_window(win), parts > 1 ? bytes / parts : 0};
 }
 template <typename W>
 static inline aiehlc_block_ptr aiehlc_store_buffer(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int p0,
                                                    int p1, aiehlc_blk off, aiehlc_blk shape) {
     aiehlc_blk_check(d, cur, p0, p1, off, shape);
-    return {(int8_t *)acquire_output_window(win)};
+    return {(int8_t *)acquire_output_window(win), 0};
 }
 template <typename W> static inline void aiehlc_release(W *win) { release_input_window(win); }
 template <typename W> static inline void aiehlc_commit(W *win) { release_output_window(win); }

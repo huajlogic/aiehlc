@@ -135,6 +135,11 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     if (NT2 != 1 || R2 * NT2 != g.tiles || NK % 2 || R2 > 64)
         return fail("shape: need N = 2 x cols x block rows, M / (rows/2) / block rows = output tiles per core (<= 64), "
                     "K / chunk even");
+    // The kernel's shared-port state restarts every launch (a register copy, see resolveBlockIoBuiltins):
+    // a launch must take a whole number of slot periods (2 channels x 2 slots = 4 chunks).
+    if ((R2 * NK) % 4)
+        return fail("chunks per launch (" + std::to_string(R2 * NK) +
+                    ") must be a multiple of 4 (2 channels x 2 slots)");
     const int64_t half = chunk / 2, aLen = NK / 2 * chunk, bLen = NK * chunk;
     const int64_t ring = dint(A.df, "ring", 10), aRounds = R2 * aLen / (ring * 2 * chunk);
     if (R2 * aLen % (ring * 2 * chunk))
@@ -152,7 +157,7 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     std::vector<int> host = matchHosts(cons, g.meshRows);
     if (host.empty())
         return fail("no host-tile matching for the shared streams");
-    os << "dmaphop.plan {replace_args = [" << A.arg << ", " << B.arg
+    os << "dmaphop.plan {replace_args = [" << A.arg << ", " << B.arg << "], share_args = [" << A.arg << ", " << B.arg
        << "], persistent_go_lock = " << (persistent ? 14 : -1) << ", bd_once = true}\n";
     // ---- routes
     for (int c = 0; c < g.meshCols; c++) {
@@ -251,16 +256,15 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
         return hostRow == pm + 1 ? (lock ? 32 : 0x60000) : (lock ? 0 : 0x40000);
     };
     std::map<std::string, std::vector<int64_t>> prm;
+    const std::string sa = "S" + std::to_string(A.arg), sb = "S" + std::to_string(B.arg);
     for (int pm = 0; pm < g.meshRows; pm++) {
         int a = pm / 2, b = SA + pm % 2;
-        prm["A_VIEW"].push_back(view(pm, host[a], false));
-        prm["A_LOCK"].push_back(view(pm, host[a], true));
-        prm["A_FIRST"].push_back(cons[a].first == pm);
-        prm["A_PHASE"].push_back(cons[a].first != pm);
-        prm["B_VIEW"].push_back(view(pm, host[b], false));
-        prm["B_LOCK"].push_back(view(pm, host[b], true));
-        prm["B_FIRST"].push_back(cons[b].first == pm);
-        prm["B_PHASE"].push_back(cons[b].first != pm);
+        prm[sa + "_VIEW"].push_back(view(pm, host[a], false));
+        prm[sa + "_LOCK"].push_back(view(pm, host[a], true));
+        prm[sa + "_FIRST"].push_back(cons[a].first == pm);
+        prm[sb + "_VIEW"].push_back(view(pm, host[b], false));
+        prm[sb + "_LOCK"].push_back(view(pm, host[b], true));
+        prm[sb + "_FIRST"].push_back(cons[b].first == pm);
     }
     for (auto &[n, v] : prm) {
         os << "dmaphop.plan_kernel_param {name = \"" << n << "\", per_mesh_row = [";

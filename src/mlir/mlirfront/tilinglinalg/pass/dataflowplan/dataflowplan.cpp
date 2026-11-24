@@ -22,6 +22,10 @@ bool DataflowPlan::replaces(int arg) const {
     return std::find(replacedArgs.begin(), replacedArgs.end(), arg) != replacedArgs.end();
 }
 
+bool DataflowPlan::sharesArg(int arg) const {
+    return std::find(shareArgs.begin(), shareArgs.end(), arg) != shareArgs.end();
+}
+
 std::set<int> DataflowPlan::coreS2mmChannels(int memtileRows) const {
     std::set<int> out;
     for (const auto &c : channels)
@@ -175,6 +179,12 @@ void readHeader(Reader &r, DataflowPlan &p) {
         p.replacedArgs.push_back((int)a);
     p.persistentGoLock = (int)r.i64("persistent_go_lock", -1);
     p.bdOnce = r.flag("bd_once");
+    if (r.has("share_args"))
+        for (int64_t a : r.ints("share_args")) {
+            if (!p.replaces((int)a))
+                r.err() << "share_args: arg " << a << " is not in replace_args";
+            p.shareArgs.push_back((int)a);
+        }
     if (p.persistentGoLock > 15)
         r.err() << "persistent_go_lock " << p.persistentGoLock << " is not a core lock (0..15)";
 }
@@ -379,6 +389,18 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
     }
     if (!ok)
         return false;
+    for (const auto &c : plan.bds)
+        for (const auto &t : c.tiles)
+            if (t.row > memtileRows && (plan.coreRowBase < 0 || t.row < plan.coreRowBase))
+                plan.coreRowBase = t.row;
+    for (int a : plan.shareArgs)
+        for (const char *suf : {"_VIEW", "_LOCK", "_FIRST"}) {
+            std::string n = "S" + std::to_string(a) + suf;
+            if (std::none_of(plan.params.begin(), plan.params.end(), [&](auto &k) { return k.name == n; })) {
+                ops.front()->emitError() << "[dataflow plan] share_args has " << a << " but no kernel param " << n;
+                return false;
+            }
+        }
     tagReplacedFlows(module, plan);
     Builder b(module.getContext());
     SmallVector<int64_t> args(plan.replacedArgs.begin(), plan.replacedArgs.end());

@@ -11,6 +11,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <sstream>
@@ -435,6 +436,50 @@ std::string emitPlanKernelBlock(const DataflowPlan &plan, int memRows, int partS
         os << "    aie_kc_encode_" << (c.s2mm ? "s2mm" : "mm2s") << "_start(_kc, " << c.ch << ", " << c.startBd << ", "
            << c.repeat << ", 0);\n    core_reg_write(_kc[0].off, _kc[0].val);\n  }\n";
     }
+    if (!plan.shareArgs.empty()) // this core's view / lock base / role of every shared port
+        os << "  aiehlc_plan_share_init(_prow - " << plan.coreRowBase << ");\n";
+    os << "}\n";
+    return os.str();
+}
+
+// Kernel side of the shared ports: aie::load_buffer / aie::release on a share_args port become
+// these (the pipeline's body rewrite). One block = one chunk of the hosted stream: the first reader
+// acquires F and hands the chunk on through G, the second acquires G (and "releases" a lock held at
+// 0, branch-free); slot q = 2 (chunk & 1) + ((chunk >> 1) & 1) (channel = chunk parity, 2 slots each);
+// the two parts sit in different memory banks (SLOT_LO / SLOT_HI). Release frees the slot's E lock.
+static std::string shareRuntime(const DataflowPlan &plan) {
+    std::ostringstream os;
+    os << "#ifndef AIEHLC_BLOCK_CHECK // blocks proved by the kernel analysis (aie_block_io.h)\n"
+       << "#define AIEHLC_BLOCK_CHECK 0\n#endif\n"
+       << "#include \"aie_block_io.h\"\n"
+       << "struct aiehlc_share_port {\n  uintptr_t view;\n  int lock, first;\n  unsigned g, r;\n};\n"
+       << "static aiehlc_share_port aiehlc_plan_share["
+       << *std::max_element(plan.shareArgs.begin(), plan.shareArgs.end()) + 1 << "];\n"
+       << "struct aiehlc_share_block {\n  int8_t *p0, *p1;\n"
+       << "  template <typename T> operator T *() const { return (T *)p0; }\n"
+       << "  int8_t *part(int i) const { return i ? p1 : p0; }\n};\n"
+       << "// the block's offset / shape are the kernel's (checked by the kernel analysis); the slot is the plan's\n"
+       << "static inline aiehlc_share_block aiehlc_share_load(aiehlc_share_port &s, const aiehlc_blk_desc &,\n"
+       << "                                                   aiehlc_blk_cursor &, int, int, aiehlc_blk, aiehlc_blk,\n"
+       << "                                                   int = 1) {\n"
+       << "  const unsigned g = s.g++;\n"
+       << "  const int ch_ = AIEHLC_PLAN_LOCK_CH_STRIDE * (int)(g & 1u);\n"
+       << "  acquire_greater_equal(s.lock + (s.first ? AIEHLC_PLAN_LOCK_F : AIEHLC_PLAN_LOCK_G) + ch_, 1);\n"
+       << "  release(s.first ? s.lock + AIEHLC_PLAN_LOCK_G + ch_ : AIEHLC_PLAN_LOCK_NOP, s.first ? 1 : 0);\n"
+       << "  // no fence here: the rewrite puts ONE chess_memory_fence() after a run of shared loads\n"
+       << "  const unsigned q_ = 2u * (g & 1u) + ((g >> 1) & 1u);\n"
+       << "  return {(int8_t *)(s.view + AIEHLC_PLAN_SLOT_LO + q_ * AIEHLC_PLAN_SLOT_STRIDE),\n"
+       << "          (int8_t *)(s.view + AIEHLC_PLAN_SLOT_HI + q_ * AIEHLC_PLAN_SLOT_STRIDE)};\n}\n"
+       << "// no fence here: the rewrite puts ONE chess_memory_fence() before a run of shared releases\n"
+       << "static inline void aiehlc_share_release(aiehlc_share_port &s) {\n"
+       << "  const unsigned g = s.r++;\n"
+       << "  release(s.lock + AIEHLC_PLAN_LOCK_E + AIEHLC_PLAN_LOCK_CH_STRIDE * (int)(g & 1u) + (int)((g >> 1) & 1u), "
+          "1);\n"
+       << "}\n"
+       << "static inline void aiehlc_plan_share_init(int pm) {\n";
+    for (int a : plan.shareArgs)
+        os << "  aiehlc_plan_share[" << a << "] = {(uintptr_t)AIEHLC_PLAN_S" << a << "_VIEW(pm), (int)AIEHLC_PLAN_S"
+           << a << "_LOCK(pm), (int)AIEHLC_PLAN_S" << a << "_FIRST(pm), 0u, 0u};\n";
     os << "}\n";
     return os.str();
 }
@@ -457,6 +502,8 @@ std::string emitPlanHeader(const DataflowPlan &plan) {
             os << (i ? ", " : "") << p.perMeshRow[i];
         os << "};\n#define AIEHLC_PLAN_" << p.name << "(pm) (aiehlc_plan_" << p.name << "[(pm)])\n";
     }
+    if (!plan.shareArgs.empty())
+        os << shareRuntime(plan);
     os << "#endif\n";
     return os.str();
 }

@@ -437,10 +437,14 @@ std::vector<std::string> routedTUDecls(const std::string &kernel, const RoutingP
         if (it == fits.end())
             continue;
         const PortFit &f = it->second;
-        out.push_back("static const aiehlc_blk_desc " + blockDescVar(kernel, rp.var) + " = {" + std::to_string(f.rank) + ", " +
-                      list4(f.shape) + ", " + list4(f.base_p0) + ", " + list4(f.base_p1) + ", " + list4(f.step_i) +
-                      ", " + list4(f.step_j) + ", " + std::to_string(f.rounds_i) + ", " + std::to_string(f.rounds_j) +
-                      "};");
+        // A port on the shared-operand logical grid checks the kernel's TRUE blocks (PortFit q_* fields,
+        // remap_cols); the physical fields are the equivalent tiling the DMA derivation used.
+        const bool q = f.remap_cols > 0;
+        out.push_back("static const aiehlc_blk_desc " + blockDescVar(kernel, rp.var) + " = {" + std::to_string(f.rank) +
+                      ", " + list4(f.shape) + ", " + list4(q ? f.q_base0 : f.base_p0) + ", " +
+                      list4(q ? f.q_base1 : f.base_p1) + ", " + list4(q ? f.q_step_i : f.step_i) + ", " +
+                      list4(q ? f.q_step_j : f.step_j) + ", " + std::to_string(q ? f.q_rounds_i : f.rounds_i) + ", " +
+                      std::to_string(q ? f.q_rounds_j : f.rounds_j) + ", " + std::to_string(f.remap_cols) + "};");
         out.push_back("static aiehlc_blk_cursor " + blockCurVar(kernel, rp.var) + ";");
     }
     return out;
