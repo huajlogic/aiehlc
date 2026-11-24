@@ -280,6 +280,7 @@ static KernelBlock kernelBlockFor(const std::string &kernel, const std::string &
     kb.stage = p->second.opts.stage;
     kb.ring = p->second.opts.ring;
     kb.keep = p->second.opts.keep;
+    kb.align = p->second.opts.align;
     return kb;
 }
 // Trace-routed kernel-only kernels: kernel -> port var -> traced block bytes

@@ -118,6 +118,9 @@ inline constexpr llvm::StringLiteral kDeclPpDepthAttr = "routing.pp_depth";
 // declare_data as `routing.window_bytes`.
 inline constexpr llvm::StringLiteral kScheduleWindowBytesAttr = "window_bytes";
 inline constexpr llvm::StringLiteral kDeclWindowBytesAttr = "routing.window_bytes";
+// {.align = N} on a kernel-only port: its core buffers are N-byte aligned.
+inline constexpr llvm::StringLiteral kScheduleBlockAlignAttr = "block_align";
+inline constexpr llvm::StringLiteral kDeclBlockAlignAttr = "routing.block_align";
 // Kernel round schedule on the routing func.func (see KernelTilingAttr).
 inline constexpr llvm::StringLiteral kKernelTilingAttr = "routing.kernel_tiling";
 
@@ -128,6 +131,7 @@ struct TensorRoutingInfo {
     std::optional<int64_t> ppDepth;  // unset when absent
     KernelBlockAttr kernelBlock;     // null: not a kernel-only (traced) port
     int64_t windowBytes = 0;         // per-port core window cap (bytes); 0 = none
+    int64_t blockAlign = 0;          // {.align = N}: core buffer alignment (bytes); 0 = default
 };
 using TensorRoutingInfoMap = llvm::DenseMap<int, TensorRoutingInfo>;
 
@@ -139,6 +143,8 @@ const TensorRoutingInfo *lookupTensorRoutingInfo(const TensorRoutingInfoMap &map
 // Per-port core window cap of func arg `argIdx` in bytes (the traced block of a
 // trace-routed kernel-only port), or 0 when the port has none.
 int64_t lookupWindowBytes(const TensorRoutingInfoMap &map, int argIdx);
+// Core buffer alignment of func arg `argIdx` ({.align}), or 0.
+int64_t lookupBlockAlign(const TensorRoutingInfoMap &map, int argIdx);
 // The map's func-arg indices in ascending order (DenseMap order is unstable).
 llvm::SmallVector<int> sortedTensorIndices(const TensorRoutingInfoMap &map);
 // The halo of func arg `argIdx`, or null.

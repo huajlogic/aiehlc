@@ -52,6 +52,8 @@
 #define chess_loop_range(...)
 #define chess_unroll_loop(...)
 #define chess_flatten_loop
+#define chess_memory_fence()
+#define chess_separator_scheduler()
 
 // Accumulator tags are global in the AIE API (acc32, not aie::acc32).
 struct acc32 {};

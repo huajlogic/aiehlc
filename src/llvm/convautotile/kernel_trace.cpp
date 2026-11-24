@@ -233,13 +233,22 @@ const char *kHarnessRuntime = R"HARNESS(
 #include <initializer_list>
 #include <sanitizer/asan_interface.h>
 #include <source_location>
+#include <map>
 namespace aiehlc_trace {
 struct Port { const char *name; int rank; int dim[4]; int eb; int out; std::deque<void *> live; int n;
               std::deque<int> live_line; };
 static FILE *g_out;
 static int g_p0, g_p1, g_rows, g_cols, g_seed, g_pp;
 static int g_line; // source line of the block call being checked (#line maps it to the user's file)
-struct AnyPtr { void *p; template <class T> operator T *() const { return (T *)p; } };
+static std::map<void *, int> g_lead; // bytes in front of each block (its alignment lead, ASan-poisoned)
+// A block: converts to the pointer the kernel assigns it to; part(i) = rows [i R / n, (i + 1) R / n) of a
+// block loaded with {.parts = n} (contiguous here; on the core the parts may sit in different banks).
+struct AnyPtr {
+    void *p;
+    long part_bytes = 0;
+    template <class T> operator T *() const { return (T *)p; }
+    unsigned char *part(int i) const { return (unsigned char *)p + i * part_bytes; }
+};
 } // namespace aiehlc_trace
 namespace aie {
 enum class pad_value { none, zero };
@@ -251,7 +260,7 @@ enum class share { none, neighbor };
 enum class stage { none, memtile, memtile_ring };
 struct load_opts { int reuse = 0; pad_value pad = pad_value::none; int depth = 0; bool resident = false;
                    int tile[2] = {0, 0}; aie::share share = aie::share::none; aie::stage stage = aie::stage::none;
-                   int ring = 0; bool keep = false; };
+                   int ring = 0; bool keep = false; int parts = 0; int align = 0; };
 using store_opts = load_opts;
 } // namespace aie
 namespace aiehlc_trace {
@@ -264,10 +273,10 @@ static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_li
     int o[4] = {0, 0, 0, 0}, s[4] = {0, 0, 0, 0}, ro = 0, rs = 0;
     for (int v : off) { if (ro < 4) o[ro] = v; ro++; }
     for (int v : shape) { if (rs < 4) s[rs] = v; rs++; }
-    fprintf(g_out, "%c %d %d %s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", st ? 'S' : 'L',
+    fprintf(g_out, "%c %d %d %s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", st ? 'S' : 'L',
             g_p0, g_p1, p.name, p.n, ro, rs, o[0], o[1], o[2], o[3], s[0], s[1], s[2], s[3], opt.reuse, pad,
             opt.depth, opt.resident ? 1 : 0, opt.tile[0], opt.tile[1], (int)opt.share, (int)opt.stage, opt.ring,
-            opt.keep ? 1 : 0, line);
+            opt.keep ? 1 : 0, opt.parts, opt.align, line);
     if (st && !p.out) AIEHLC_E(p, "aie::store_buffer on an input port");
     if (!st && p.out) AIEHLC_E(p, "aie::load_buffer on an output port");
     if (st && (opt.share != aie::share::none || opt.stage != aie::stage::none || opt.ring || opt.keep))
@@ -297,21 +306,28 @@ static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_li
     const int pp = opt.resident ? 1 : opt.depth > 0 ? opt.depth : g_pp;
     if ((int)p.live.size() >= pp)
         AIEHLC_E(p, "takes a block while %d of this port are still held (pp_depth %d): release first", (int)p.live.size(), pp);
-    // Like a DMA window on the core: 32-byte aligned and NOT 64-byte aligned,
-    // with ASan guarding both ends of exactly `bytes`.
+    // Like a DMA window on the core: 32-byte aligned and NOT 64-byte aligned -- unless the block asks
+    // for {.align = N} (the compiler then places its buffers N-aligned) -- with ASan guarding both ends
+    // of exactly `bytes`.
     void *raw = nullptr;
-    if (posix_memalign(&raw, 64, (bytes > 0 ? bytes : 1) + 32)) abort();
-    ASAN_POISON_MEMORY_REGION(raw, 32);
-    unsigned char *m = (unsigned char *)raw + 32;
+    const int al = opt.align >= 64 ? opt.align : 64, lead = opt.align >= 64 ? opt.align : 32;
+    if (posix_memalign(&raw, al, (bytes > 0 ? bytes : 1) + lead)) abort();
+    ASAN_POISON_MEMORY_REGION(raw, lead);
+    unsigned char *m = (unsigned char *)raw + lead;
+    g_lead[m] = lead;
     for (long i = 0; i < bytes; i++) m[i] = (unsigned char)(i * 31 + g_seed * 97 + p.n * 7);
     p.live.push_back(m);
     p.live_line.push_back(line);
     p.n++;
-    return {m};
+    if (opt.parts > 1 && (rs < 1 || s[0] % opt.parts))
+        AIEHLC_E(p, "{.parts = %d} must divide the block's first dim %d", opt.parts, s[0]);
+    return {m, opt.parts > 1 ? bytes / opt.parts : 0};
 }
 static void unblock(void *m) {
-    void *raw = (unsigned char *)m - 32;
-    ASAN_UNPOISON_MEMORY_REGION(raw, 32);
+    const int lead = g_lead.count(m) ? g_lead[m] : 32;
+    g_lead.erase(m);
+    void *raw = (unsigned char *)m - lead;
+    ASAN_UNPOISON_MEMORY_REGION(raw, lead);
     free(raw);
 }
 static void release(Port &p, int st, int line) {
@@ -486,7 +502,7 @@ std::vector<Event> parseTrace(const std::string &text) {
             ls >> ev.reuse >> ev.pad;
             int resident = 0, keep = 0;
             ls >> ev.opts.depth >> resident >> ev.opts.tile[0] >> ev.opts.tile[1] >> ev.opts.share >> ev.opts.stage >>
-                ev.opts.ring >> keep >> ev.line;
+                ev.opts.ring >> keep >> ev.opts.parts >> ev.opts.align >> ev.line;
             ev.opts.resident = resident != 0;
             ev.opts.keep = keep != 0;
         }
@@ -496,6 +512,10 @@ std::vector<Event> parseTrace(const std::string &text) {
 }
 
 // Compile + run the harness twice; fills events (run 1) and records errors.
+// The kernel source's directory: the harness includes the source's AIEHLC_KERNEL_PROLOGUE, whose
+// #includes ("gemm_plan_tile.h") resolve there, as they do for the core compile (worklocal copy).
+static std::string s_traceIncludeDir;
+
 bool runHarness(const std::string &harness, const std::string &srcName, int rows, int cols, int pp,
                 std::vector<Event> &events, KernelTraceResult &r) {
     const char *tmpEnv = std::getenv("TMPDIR");
@@ -513,9 +533,10 @@ bool runHarness(const std::string &harness, const std::string &srcName, int rows
     }
     const char *cxx = std::getenv("CXX");
     std::string cc = std::string(cxx && *cxx ? cxx : "g++") +
-                     " -std=c++20 -O1 -g -w -fsanitize=address -fno-omit-frame-pointer " + "-DAIEHLC_EMU_HEADER='\"" +
-                     std::string(AIEHLC_SOURCE_DIR) + "/src/mlir/runtime/aie_api_x86emu.h\"' -o " + dir + "/h " + dir +
-                     "/harness.cc > " + dir + "/cc.log 2>&1";
+                     " -std=c++20 -O2 -g -w -fsanitize=address -fno-omit-frame-pointer " + "-DAIEHLC_EMU_HEADER='\"" +
+                     std::string(AIEHLC_SOURCE_DIR) + "/src/mlir/runtime/aie_api_x86emu.h\"' " +
+                     (s_traceIncludeDir.empty() ? std::string() : "-I'" + s_traceIncludeDir + "' ") + "-o " + dir +
+                     "/h " + dir + "/harness.cc > " + dir + "/cc.log 2>&1";
     if (std::system(cc.c_str()) != 0) {
         std::string log = readAll(dir + "/cc.log");
         r.errors.push_back("kernel analysis: the kernel body does not compile for tracing (x86, " + srcName + "):\n" +
@@ -798,8 +819,67 @@ void declaredShapeHints(const std::string &src, const std::string &srcName, cons
 // ---------------------------------------------------------------------------
 // Fit + coverage
 // ---------------------------------------------------------------------------
+// The shared-operand logical grid (PortFit::remap_cols): fit the cores' first blocks affine in
+// (q0, q1) = (p0 / 2, p1 + cols (p0 % 2)) and replace the physical fit by the equivalent R x C
+// tiling: a port depending on q0 only splits its dim 0 over the mesh rows (row broadcast), q1 only
+// over the mesh cols (col broadcast), both = a gather. Blocks per core are kept for an output.
+static bool remapSharedGrid(const TracePort &port, std::map<std::pair<int, int>, std::vector<const Event *>> &seq,
+                            int rows, int cols, PortFit &f, std::string &err) {
+    const int rank = f.rank;
+    if (rows % 2 || rank != 2) {
+        err = port.var + ": blocks not affine in program_id, and the shared-operand grid needs an even mesh "
+                         "row count and 2-D blocks";
+        return false;
+    }
+    const std::vector<int> o(seq[{0, 0}][0]->off, seq[{0, 0}][0]->off + rank);
+    f.q_base0.assign(rank, 0);
+    f.q_base1.assign(rank, 0);
+    for (int d = 0; d < rank; d++) {
+        f.q_base0[d] = seq[{2, 0}][0]->off[d] - o[d]; // logical (1, 0)
+        f.q_base1[d] = seq[{0, 1}][0]->off[d] - o[d]; // logical (0, 1)
+    }
+    for (auto &kv : seq) {
+        const int q0 = kv.first.first / 2, q1 = kv.first.second + cols * (kv.first.first % 2);
+        for (int d = 0; d < rank; d++)
+            if (kv.second[0]->off[d] != o[d] + q0 * f.q_base0[d] + q1 * f.q_base1[d]) {
+                err = port.var + ": the first block of core (" + std::to_string(kv.first.first) + "," +
+                      std::to_string(kv.first.second) + ") is " + vecStr(kv.second[0]->off, rank) +
+                      ", affine neither in program_id nor in the shared-operand grid (p0 / 2, p1 + C (p0 % 2))";
+                return false;
+            }
+    }
+    f.remap_cols = cols;
+    f.q_step_i = f.step_i;
+    f.q_step_j = f.step_j;
+    f.q_rounds_i = f.rounds_i;
+    f.q_rounds_j = f.rounds_j;
+    const bool dep0 = std::any_of(f.q_base0.begin(), f.q_base0.end(), [](int v) { return v; });
+    const bool dep1 = std::any_of(f.q_base1.begin(), f.q_base1.end(), [](int v) { return v; });
+    const int D0 = port.shape[0], D1 = port.shape[1], b0 = f.shape[0], b1 = f.shape[1];
+    const int r0 = dep0 || (dep1 && !dep0) ? (dep0 ? rows : cols) : 1; // parts of dim 0
+    const int r1 = dep0 && dep1 ? cols : 1;                            // parts of dim 1
+    if (D0 % (r0 * b0) || D1 % (r1 * b1)) {
+        err = port.var + ": the shared-operand grid has no equivalent mesh tiling (tensor " + vecStr(port.shape) +
+              ", block " + vecStr(f.shape) + ")";
+        return false;
+    }
+    f.base_p0 = {dep0 ? D0 / rows : 0, 0};
+    f.base_p1 = {dep1 && !dep0 ? D0 / cols : 0, dep0 && dep1 ? D1 / cols : 0};
+    f.rounds_i = D0 / r0 / b0;
+    f.rounds_j = D1 / r1 / b1;
+    f.step_i = {f.rounds_i > 1 ? b0 : 0, 0};
+    f.step_j = {0, f.rounds_j > 1 ? b1 : 0};
+    if (port.output && f.rounds_i * f.rounds_j != f.q_rounds_i * f.q_rounds_j) {
+        err = port.var + ": " + std::to_string(f.q_rounds_i * f.q_rounds_j) +
+              " blocks per core on the shared-operand grid, but the equivalent mesh tiling has " +
+              std::to_string(f.rounds_i * f.rounds_j);
+        return false;
+    }
+    return true;
+}
+
 bool fitPort(const TracePort &port, const std::vector<Event> &events, int rows, int cols, PortFit &f,
-             std::vector<int> &origin, std::string &err) {
+             std::vector<int> &origin, std::string &err, bool allowRemap = false) {
     std::map<std::pair<int, int>, std::vector<const Event *>> seq;
     for (auto &e : events)
         if ((e.kind == 'L' || e.kind == 'S') && e.port == port.var)
@@ -870,6 +950,13 @@ bool fitPort(const TracePort &port, const std::vector<Event> &events, int rows, 
         if (cols > 1)
             f.base_p1[d] = seq[{0, 1}][0]->off[d] - origin[d];
     }
+    bool affine = true;
+    for (auto &kv : seq)
+        for (int d = 0; d < rank; d++)
+            affine &=
+                kv.second[0]->off[d] == origin[d] + kv.first.first * f.base_p0[d] + kv.first.second * f.base_p1[d];
+    if (!affine && allowRemap)
+        return remapSharedGrid(port, seq, rows, cols, f, err);
     for (auto &kv : seq)
         for (int d = 0; d < rank; d++)
             if (kv.second[0]->off[d] != origin[d] + kv.first.first * f.base_p0[d] + kv.first.second * f.base_p1[d]) {
@@ -1198,11 +1285,14 @@ KernelTraceResult traceKernel(const std::string &src, const TraceKernel &k, int 
     }
     declaredShapeHints(src, srcName, k, events, r); // the likely cause first, then the per-core symptoms
     collectHarnessErrors(events, src, srcName, r);
+    // {.share = aie::share::neighbor} on some port: the kernel computes on the shared-operand logical
+    // grid, so every port may be affine in it instead of in program_id (PortFit::remap_cols).
+    const bool shared = std::any_of(events.begin(), events.end(), [](const Event &e) { return e.opts.share != 0; });
     for (auto &p : k.ports) {
         PortFit f;
         std::vector<int> origin;
         std::string err;
-        if (!fitPort(p, events, rows, cols, f, origin, err)) {
+        if (!fitPort(p, events, rows, cols, f, origin, err, shared)) {
             r.errors.push_back(err);
             continue;
         }
@@ -1465,6 +1555,7 @@ void inferRoles(std::vector<TracePort> &ports, const std::map<std::string, PortF
 } // namespace
 
 KernelOnlyResult inferKernelOnly(std::string &src, const std::string &srcDir, const std::string &srcName) {
+    s_traceIncludeDir = srcDir;
     KernelOnlyResult res;
     auto macros = sourceMacros(src, srcDir);
     std::string err;
@@ -1727,6 +1818,7 @@ void verifySpaceKernel(std::string &src, const std::string &srcDir, const std::s
 
 KernelOnlyResult verifySpaceKernels(std::string &src, const std::string &srcDir, const std::string &srcName,
                                     const std::vector<std::string> &skip) {
+    s_traceIncludeDir = srcDir;
     KernelOnlyResult res;
     const std::string blank = sourceBlankComments(src);
     if (blank.find("aie::load_buffer") == std::string::npos && blank.find("aie::store_buffer") == std::string::npos)

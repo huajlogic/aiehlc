@@ -40,7 +40,7 @@ def plan_ops(r2, nk, fb, cols=(1, 2, 3, 4), core_rows=(3, 4, 5, 6)):
     ops = []
     op = ops.append
     a_len, b_len = nk // 2 * 8192, nk * 8192  # A per m-tile per column (parity half), B strip
-    op('dmaphop.plan {replace_args = [0, 1], persistent_go_lock = 14, bd_once = true}')
+    op('dmaphop.plan {replace_args = [0, 1], share_args = [0, 1], persistent_go_lock = 14, bd_once = true}')
     # ---- routes: shim -> MemTiles, MemTile row 2 -> A host rows, MemTile row 1 -> B host rows
     for c in cols:
         op('dmaphop.plan_route {src = [%d, 0, 1], src_kind = "shim", dsts = [[%d, 2, 1]]}' % (c, c))
@@ -110,11 +110,10 @@ def plan_ops(r2, nk, fb, cols=(1, 2, 3, 4), core_rows=(3, 4, 5, 6)):
     # ---- what the kernel body reads (aiehlc_plan.h)
     # mesh row 0 hosts A0 (own), 1 hosts B_c, 2 hosts B_c+4, 3 hosts A1; views: own 0x70000, north
     # 0x60000, south 0x40000; locks: own 48.., north 32.., south 0..
-    params = {
-        'A_VIEW': [0x70000, 0x40000, 0x60000, 0x70000], 'B_VIEW': [0x60000, 0x60000, 0x40000, 0x40000],
-        'A_LOCK': [48, 0, 32, 48], 'B_LOCK': [32, 32, 0, 0],
-        'A_FIRST': [1, 0, 1, 0], 'B_FIRST': [1, 1, 0, 0],
-        'A_PHASE': [0, 1, 0, 1], 'B_PHASE': [0, 0, 1, 1]}
+    params = {  # S<arg>_*: arg 0 = A, arg 1 = B (the shared ports' kernel side, aiehlc_plan.h)
+        'S0_VIEW': [0x70000, 0x40000, 0x60000, 0x70000], 'S1_VIEW': [0x60000, 0x60000, 0x40000, 0x40000],
+        'S0_LOCK': [48, 0, 32, 48], 'S1_LOCK': [32, 32, 0, 0],
+        'S0_FIRST': [1, 0, 1, 0], 'S1_FIRST': [1, 1, 0, 0]}
     for n, v in params.items():
         op('dmaphop.plan_kernel_param {name = "%s", per_mesh_row = %s}' % (n, ilist(v)))
     for n, v in (('SLOT_LO', 0x8000), ('SLOT_HI', 0xc000), ('SLOT_STRIDE', 4096), ('LOCK_F', 6), ('LOCK_G', 7),

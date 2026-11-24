@@ -1,34 +1,18 @@
 // Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// gemm_plan_tile.h -- the 2 x 8 shared-operand tile kernel (share2x8_tile.inc) with every buffer
-// address and lock id taken from the dataflow plan (aiehlc_plan.h, generated from the dmaphop IR's
-// dmaphop.plan_kernel_param ops) instead of literals: AIEHLC_PLAN_SLOT_LO / _HI / _STRIDE (slot q's
-// two halves relative to the operand's view), AIEHLC_PLAN_LOCK_F / _G / _E / _CH_STRIDE (lock ids
-// relative to the host tile's lock base), AIEHLC_PLAN_LOCK_NOP (a lock held at 0).
+// gemm_plan_tile.h -- compute macros of the 2 x 8 shared-operand GEMM tile (64 x 64 x K in 128-wide
+// chunks, aie::mmul<8, 8, 8> int8). Pure compute: no locks, addresses or memory layout -- the blocks
+// come from aie::load_buffer in gemm_plan.cc, which the compiler serves from the dataflow plan's hosted
+// slots on the core and from the trace harness on x86. Same macros on both.
+//
+// A chunk = 16 blocks of 2 x 2 accumulators: A pair b >> 2, B pair b & 3; accumulators of block b in
+// bank (b >> 1) & 1 (ae / ao). Pairs {0,1} sit in part 0 of the chunk, {2,3} in part 1 (the parts may
+// be in different memory banks, so the next part is reached through dA, not a fixed offset). At a chunk
+// boundary the last block of chunk j overlaps the first block of chunk j+1 (no prologue / epilogue).
 #ifndef GEMM_PLAN_TILE_H
 #define GEMM_PLAN_TILE_H
-#ifndef AIEHLC_PLAN
-#error "gemm_plan_tile.h needs aiehlc_plan.h (the dataflow plan) included first"
-#endif
-#if defined(__chess__)
-/* SHARE2X8 tile kernel (64 x 64 x NKC*128): one software pipeline across all chunks of a tile.
- * Blocks b = 0..15 per chunk (2x2 accumulators): A pair b >> 2, B pair b & 3; accumulators of block b
- * in bank (b >> 1) & 1 (ae / ao). A chunk's A pairs {0,1} sit at a_lo (+0 / +2048), {2,3} at a_hi; B
- * likewise. At a chunk boundary the last block of chunk j overlaps the first of chunk j+1: chunk j+1 is
- * acquired first, its first operands are prefetched during block 15, chunk j is released right after
- * its last reads -- no per-chunk prologue / epilogue / call. */
-typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
-#ifdef SH_AALT
-#define SH_AALT_ON 1
-#else
-#define SH_AALT_ON 0
-#endif
-#ifdef SH_QSLOT
-#define SH_QSLOT_ON 1
-#else
-#define SH_QSLOT_ON 0
-#endif
+// (macros only: the kernel body declares KaMM4 = aie::mmul<8, 8, 8, int8_t, int8_t>)
 #define K4_H (KA_KC / 8 * 64)
 #define K4_LD(c, p)                                                                                                    \
     {                                                                                                                  \
@@ -100,59 +84,6 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         K4_STEP(c, (npa), (npb));                                                                                      \
         K4_STEPW(c, (npa) + 64, (npb) + 64);                                                                           \
     }
-#if defined(SH_DMAONLY) /* share2x8.py --dmaonly: no MACs / accumulator traffic; locks and DMA unchanged */
-#undef K4_LD
-#undef K4_ST
-#undef K4_OUT
-#define K4_OUT(p, c, bl)                                                                                               \
-    {}
-#undef K4_LDZ
-#define K4_LDZ(c, p)                                                                                                   \
-    {}
-#undef K4_STEPX
-#define K4_LD(c, p)                                                                                                    \
-    {}
-#define K4_ST(p, c)                                                                                                    \
-    {}
-#define K4_STEPX(c, l, m, A0, A1, B0, B1)                                                                              \
-    { chess_memory_fence(); }
-#endif
-/* acquire the chunk with running index g (channel g & 1): first reader takes F and hands G on.
- * lv = 1 normally; 0 for the no-wait bench (acquire >= 0 and release 0 are no-ops). */
-#define SH_ACQ(g)                                                                                                      \
-    {                                                                                                                  \
-        /* branch-free (each role branch cost ~5 delay-slot bundles per chunk): the first reader takes F and           \
-         * hands G on; the second takes G and "releases" own lock 15 (id 63) by 0 -- a no-op */                        \
-        const int ch4_ = AIEHLC_PLAN_LOCK_CH_STRIDE * ((g) & 1);                                                       \
-        acquire_greater_equal(lA + (fa_ ? AIEHLC_PLAN_LOCK_F : AIEHLC_PLAN_LOCK_G) + ch4_, lv);                        \
-        release(fa_ ? lA + AIEHLC_PLAN_LOCK_G + ch4_ : AIEHLC_PLAN_LOCK_NOP, fa_ ? lv : 0);                            \
-        acquire_greater_equal(lB + (fb_ ? AIEHLC_PLAN_LOCK_F : AIEHLC_PLAN_LOCK_G) + ch4_, lv);                        \
-        release(fb_ ? lB + AIEHLC_PLAN_LOCK_G + ch4_ : AIEHLC_PLAN_LOCK_NOP, fb_ ? lv : 0);                            \
-        chess_memory_fence();                                                                                          \
-    }
-#define SH_REL(g)                                                                                                      \
-    {                                                                                                                  \
-        chess_memory_fence();                                                                                          \
-        release(lA + AIEHLC_PLAN_LOCK_E + AIEHLC_PLAN_LOCK_CH_STRIDE * ((g) & 1) + (((g) >> 1) & 1), lv);              \
-        release(lB + AIEHLC_PLAN_LOCK_E + AIEHLC_PLAN_LOCK_CH_STRIDE * ((g) & 1) + (((g) >> 1) & 1), lv);              \
-    }
-/* the four half pointers of chunk g, in this core's phase */
-#define SH_HALVES(g, Alo, Ahi, Blo, Bhi)                                                                               \
-    {                                                                                                                  \
-        /* buffer index: 2 ch + slot, or with SH_QSLOT 2 slot + ch (a channel's slots in different banks) */           \
-        const unsigned q_ = SH_QSLOT_ON ? 2 * (((g) >> 1) & 1) + ((g) & 1) : 2 * ((g) & 1) + (((g) >> 1) & 1);         \
-        const int8_t *x0_ = (const int8_t *)(vA + AIEHLC_PLAN_SLOT_LO + q_ * AIEHLC_PLAN_SLOT_STRIDE),                 \
-                     *x1_ = (const int8_t *)(vA + AIEHLC_PLAN_SLOT_HI + q_ * AIEHLC_PLAN_SLOT_STRIDE);                 \
-        const int8_t *y0_ = (const int8_t *)(vB + AIEHLC_PLAN_SLOT_LO + q_ * AIEHLC_PLAN_SLOT_STRIDE),                 \
-                     *y1_ = (const int8_t *)(vB + AIEHLC_PLAN_SLOT_HI + q_ * AIEHLC_PLAN_SLOT_STRIDE);                 \
-        /* SH_AALT: the A half order flips every chunk, so a reader stays in one A half for 16 blocks                  \
-         * across the chunk boundary instead of 8 (fewer bank conflicts with the other reader's lag) */                \
-        const int af_ = (fl & 4) ^ (SH_AALT_ON ? (((g) & 1) << 2) : 0);                                                \
-        Alo = af_ ? x1_ : x0_;                                                                                         \
-        Ahi = af_ ? x0_ : x1_;                                                                                         \
-        Blo = (fl & 8) ? y1_ : y0_;                                                                                    \
-        Bhi = (fl & 8) ? y0_ : y1_;                                                                                    \
-    }
 /* 7 iterations: blocks 1 .. 14 of the current chunk (state: X = block 0 done, Y = block 1 loaded) */
 #define K4_STI(p, c, bl) K4_ST(p, c)
 #define SH_INNER_W(ST, LD)                                                                                             \
@@ -164,7 +95,7 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         LD(Y, nxt + 256);                                                                                              \
         const int8_t *aY2 = aX;                                                                                        \
         K4_BLK(X, aX, bX, aY2, bYo);                                                                                   \
-        int32_t *t_ = cur + 512 + ((unsigned)(i - 2) < 2u ? dW : 0); /* SH_AALT odd chunk: offsets wrap */             \
+        int32_t *t_ = cur + 512 + 0;                                                                                   \
         cur = nxt;                                                                                                     \
         nxt = t_;                                                                                                      \
         aX = aY + 2048 + ((unsigned)(i - 2) < 2u ? dA : 0);                                                            \
@@ -176,32 +107,12 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         bX = bXo;                                                                                                      \
         bXo = tb;                                                                                                      \
     }
-/* boundary: blocks 14, 15 of chunk g, blocks 0, 1 of chunk g+1; then g = g + 1 */
-#define SH_BOUND()                                                                                                     \
-    {                                                                                                                  \
-        const int8_t *nAl, *nAh, *nBl, *nBh;                                                                           \
-        SH_ACQ(g + 1);                                                                                                 \
-        SH_HALVES(g + 1, nAl, nAh, nBl, nBh);                                                                          \
-        K4_ST(cur, X);                                                                                                 \
-        K4_LD(X, ae + SH_WO(g + 1));                                                                                   \
-        K4_BLK(Y, aY, bY, nAl, nBl);                                                                                   \
-        SH_REL(g);                                                                                                     \
-        K4_ST(cur + 256, Y);                                                                                           \
-        K4_LD(Y, ae + 256 + SH_WO(g + 1));                                                                             \
-        K4_BLK(X, nAl, nBl, nAl, nBl + 2048);                                                                          \
-        SH_RESET(nAl, nAh, nBl, nBh, g + 1);                                                                           \
-        g++;                                                                                                           \
-    }
-/* SH_AALT: an odd chunk's blocks are the even chunk's with A halves swapped (logical block bl ^ 8), so their
- * accumulators sit 1024 ints further in each 8 KB region (mod 2048) */
-#define SH_WO(g) (SH_AALT_ON && ((g) & 1) ? 1024 : 0)
 /* pointer state for chunk g whose halves are (al_, ah_, bl_, bh_) */
-#define SH_RESET(al_, ah_, bl_, bh_, g)                                                                                \
+#define SH_RESET(al_, ah_, bl_, bh_)                                                                                   \
     {                                                                                                                  \
         dA = (int)((ah_) - (al_)) - 4096;                                                                              \
-        dW = SH_WO(g) ? -2048 : 0;                                                                                     \
-        cur = ae + SH_WO(g);                                                                                           \
-        nxt = ao + SH_WO(g);                                                                                           \
+        cur = ae + 0;                                                                                                  \
+        nxt = ao + 0;                                                                                                  \
         aY = (al_);                                                                                                    \
         aX = (al_);                                                                                                    \
         bY = (bl_) + 2048;                                                                                             \
@@ -209,65 +120,21 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
         bX = (bh_);                                                                                                    \
         bXo = (bl_);                                                                                                   \
     }
-/* One 64 x 64 tile over nkc chunks starting at running chunk index g0; accumulators start at ZERO
- * (acc is scratch: chunk 0 starts from zero registers, the last chunk writes the int8 tile to y). fl: 1 A first reader,
- * 2 B first reader, 4 A halves swapped, 8 B halves swapped. */
-__attribute__((noinline)) static void ka_tile(uintptr_t vA, uintptr_t vB, int lA, int lB, int fl, unsigned g0, int nkc,
-                                              int lv, int32_t *__restrict ae, int32_t *__restrict ao,
-                                              int8_t *__restrict y, int swz) {
-    KaMM4 X0, X1, X2, X3, Y0, Y1, Y2, Y3;
-    const int8_t *Al, *Ah, *Bl, *Bh;
-    int32_t *cur, *nxt;
-    const int8_t *aY, *aX, *bY, *bYo, *bX, *bXo;
-    int dA, dW;
-    if (SH_AALT_ON) /* the output follows the last chunk's A phase */
-        swz ^= ((g0 + nkc - 1) & 1) << 3;
-    unsigned g = g0;
-    const int fa_ = fl & 1, fb_ = fl & 2;
-    SH_ACQ(g);
-    SH_HALVES(g, Al, Ah, Bl, Bh);
-    aie::vector<int8_t, 64> va0 = aie::load_v<64>(Al), va1 = aie::load_v<64>(Al + K4_H);
-    aie::vector<int8_t, 64> vb0 = aie::load_v<64>(Bl), vb1 = aie::load_v<64>(Bl + K4_H);
-    aie::vector<int8_t, 64> wa0 = aie::load_v<64>(Al + 64), wa1 = aie::load_v<64>(Al + K4_H + 64);
-    aie::vector<int8_t, 64> wb0 = aie::load_v<64>(Bl + 64), wb1 = aie::load_v<64>(Bl + K4_H + 64);
-    SH_RESET(Al, Ah, Bl, Bh, g);
-    K4_LDZ(X, ae);
-    K4_LDZ(Y, ae + 256);
-    K4_BLK(X, Al, Bl, Al, Bl + 2048);
-    /* chunk 0 (accumulators from zero), chunks 1 .. nkc-2, then the last chunk (output); nkc >= 2 */
-    SH_INNER_W(K4_STI, K4_LDZ);
-    SH_BOUND();
-    for (int j = 1; j < nkc - 1; j++) {
-        SH_INNER_W(K4_STI, K4_LD);
-        SH_BOUND();
-    }
-    SH_INNER_W(K4_OUT, K4_LD); /* last chunk: blocks go straight to the output tile */
-    K4_OUT(cur, X, 14);
-    K4_BLK(Y, aY, bY, Al, Bl);
-    SH_REL(g);
-    K4_OUT(cur + 256, Y, 15);
-}
-/* int32 accumulators -> int8 output tile; iteration block bl holds logical block bl ^ swz (phase swap).
- * Own function: inlined into the caller it hit chess's "no mappings for bundle" (SRS + store + add). */
-__attribute__((noinline)) static void sh_convert(int8_t *__restrict y, int32_t *__restrict acc, int swz) {
-    for (int bl = 0; bl < 16; bl++) {
-        const int L = bl ^ swz;
-        int8_t *tt = y + ((2 * (L >> 2)) * 8 + 2 * (L & 3)) * 64;
-        int32_t *ap = acc + ((((bl) >> 1) & 1) * 2048 + (((bl) >> 2) * 2 + ((bl) & 1)) * 256);
-        KaMM4 Z0, Z1, Z2, Z3;
-        K4_LD(Z, ap);
-        /* leave the accumulators zeroed for the next tile (saves a separate 16 KB zeroing pass) */
-        aie::store_v((int32_t *)ap, aie::zeros<int32_t, 64>());
-        aie::store_v((int32_t *)ap + 64, aie::zeros<int32_t, 64>());
-        aie::store_v((int32_t *)ap + 128, aie::zeros<int32_t, 64>());
-        aie::store_v((int32_t *)ap + 192, aie::zeros<int32_t, 64>());
-        chess_separator_scheduler();
-        aie::store_v(tt, Z0.to_vector<int8_t>(0));
-        aie::store_v(tt + 64, Z1.to_vector<int8_t>(0));
-        aie::store_v(tt + 8 * 64, Z2.to_vector<int8_t>(0));
-        aie::store_v(tt + 8 * 64 + 64, Z3.to_vector<int8_t>(0));
-        chess_separator_scheduler();
-    }
-}
-#endif
+/* the two parts of chunks xa (A) / xb (B), in this core's walk order (pa / pb: 1 = part 1 first) */
+#define SH_PARTS(xa, xb, al_, ah_, bl_, bh_)                                                                           \
+    al_ = (const int8_t *)(xa).part(pa);                                                                               \
+    ah_ = (const int8_t *)(xa).part(pa ^ 1);                                                                           \
+    bl_ = (const int8_t *)(xb).part(pb);                                                                               \
+    bh_ = (const int8_t *)(xb).part(pb ^ 1);
+/* chunk boundary, first half: blocks 14 / 15 of the current chunk with chunk (nAl, nBl) prefetched */
+#define SH_BOUND1(nAl, nBl)                                                                                            \
+    K4_ST(cur, X);                                                                                                     \
+    K4_LD(X, ae);                                                                                                      \
+    K4_BLK(Y, aY, bY, nAl, nBl);
+/* second half (after the current chunk is released): blocks 0 / 1 of the next chunk */
+#define SH_BOUND2(nAl, nAh, nBl, nBh)                                                                                  \
+    K4_ST(cur + 256, Y);                                                                                               \
+    K4_LD(Y, ae + 256);                                                                                                \
+    K4_BLK(X, nAl, nBl, nAl, nBl + 2048);                                                                              \
+    SH_RESET(nAl, nAh, nBl, nBh);
 #endif

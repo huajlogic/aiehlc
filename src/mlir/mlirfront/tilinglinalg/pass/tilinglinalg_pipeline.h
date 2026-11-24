@@ -71,6 +71,7 @@ struct KernelBlock {
     int stage = 0;     // {.stage = aie::stage::memtile} (1) / memtile_ring (2)
     int ring = 0;      // {.ring = N}: MemTile FIFO ring buffers
     bool keep = false; // {.keep = true}: loaded on the first launch, kept across launches
+    int align = 0;     // {.align = N}: the port's core buffers N-byte aligned (-> block_align attr)
     bool empty() const { return shape.empty(); }
 };
 

@@ -678,6 +678,8 @@ routing::TensorRoutingInfoMap routing::collectTensorRoutingInfo(mlir::ModuleOp m
             info.kernelBlock = decl.getKernelBlockAttr();
             if (auto wb = op->getAttrOfType<IntegerAttr>(kScheduleWindowBytesAttr))
                 info.windowBytes = wb.getInt();
+            if (auto ba = op->getAttrOfType<IntegerAttr>(kScheduleBlockAlignAttr))
+                info.blockAlign = ba.getInt();
         } else if (op->getName().getStringRef() == "dfscheblueprint.declare_data" && op->getNumOperands() == 1) {
             // Matched by name: the routing library does not link the
             // dfscheblueprint dialect.
@@ -691,6 +693,8 @@ routing::TensorRoutingInfoMap routing::collectTensorRoutingInfo(mlir::ModuleOp m
             info.kernelBlock = op->getAttrOfType<KernelBlockAttr>(kDeclKernelBlockAttr);
             if (auto wb = op->getAttrOfType<IntegerAttr>(kDeclWindowBytesAttr))
                 info.windowBytes = wb.getInt();
+            if (auto ba = op->getAttrOfType<IntegerAttr>(kDeclBlockAlignAttr))
+                info.blockAlign = ba.getInt();
         } else {
             return;
         }
@@ -704,6 +708,11 @@ routing::TensorRoutingInfoMap routing::collectTensorRoutingInfo(mlir::ModuleOp m
 const routing::TensorRoutingInfo *routing::lookupTensorRoutingInfo(const TensorRoutingInfoMap &map, int argIdx) {
     auto it = map.find(argIdx);
     return it == map.end() ? nullptr : &it->second;
+}
+
+int64_t routing::lookupBlockAlign(const TensorRoutingInfoMap &map, int argIdx) {
+    const TensorRoutingInfo *ti = lookupTensorRoutingInfo(map, argIdx);
+    return ti ? ti->blockAlign : 0;
 }
 
 int64_t routing::lookupWindowBytes(const TensorRoutingInfoMap &map, int argIdx) {
@@ -761,6 +770,8 @@ void routing::copyTensorRoutingInfo(routing::createscheduletensor from, mlir::Op
         to->setAttr(kDeclKernelBlockAttr, a);
     if (auto a = from->getAttrOfType<IntegerAttr>(kScheduleWindowBytesAttr))
         to->setAttr(kDeclWindowBytesAttr, a);
+    if (auto a = from->getAttrOfType<IntegerAttr>(kScheduleBlockAlignAttr))
+        to->setAttr(kDeclBlockAlignAttr, a);
 }
 
 // The routing func is the module's func.func (@main, or @routing on the

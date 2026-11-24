@@ -42,3 +42,15 @@ Design: `doc/design/dmaphop_dataflow_plan.md`. Example: `example/tileprogram/cco
 - **The farm host refuses scp** (`Permission denied (publickey)`) once the systest hold lapses:
   `python3 script/test/hws.py --board gomphus6 --type vek385 up`, then rerun apppaltest.
 - The printed % of `gemm_plan.cc` uses GEMM_AIE_MHZ = 1250 (VEK385); palmyra is 998.
+
+## One kernel body (no `__chess__` split) -- what cost performance and how it came back
+- Shared-port state read from a global on every load: 77 %. Copy to a local at kernel entry (the
+  rewrite does it); lambdas capturing by reference pin it in memory again -- use body macros.
+- A conditional around the inner chunk loop (`if (j < NK - 1)`) changed chess's schedule: keep the
+  hand-written shape (chunk 0, boundary, loop {inner; boundary}, last chunk).
+- Output tile pointer without `__restrict` made the last-chunk loop 147 bundles (139).
+- Unrolling the chunk loop by 2 overflows the 16 KB program memory (`could not find free space` /
+  PM > 0x4000): do not.
+- `aie::mmul` at file scope in the prologue breaks the aiehlc front-end parse: prologue headers
+  must hold macros only; declare the typedef in the body.
+- Board noise: both builds see occasional 1.20-1.26 ms launches; compare typical launches.

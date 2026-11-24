@@ -804,6 +804,20 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     }
                 }
                 rewriter.create<emitc::VerbatimOp>(loc, "// kernel_invoke " + callee);
+                const int goLock = dfplan::activePlan().present ? dfplan::activePlan().persistentGoLock : -1;
+                if (goLock >= 0) {
+                    // #pragma persistent_kernel (dataflow plan): the kernel stays loaded; every launch
+                    // is one call, released by the host through the go lock (initialised to 1 by the
+                    // plan block, so the first launch runs at once).
+                    rewriter.create<emitc::VerbatimOp>(
+                        loc, "for (;;) { // persistent kernel: one call per launch, released by go lock " +
+                                 std::to_string(goLock));
+                    rewriter.create<emitc::VerbatimOp>(loc, "  acquire_greater_equal(" + std::to_string(48 + goLock) +
+                                                                ", 1);");
+                    rewriter.create<emitc::VerbatimOp>(loc, "  " + callee + "(" + argList + ");");
+                    rewriter.create<emitc::VerbatimOp>(loc, "}");
+                    continue;
+                }
                 rewriter.create<emitc::VerbatimOp>(loc, callee + "(" + argList + ");");
                 continue;
             }

@@ -60,7 +60,12 @@ inline int g_p0, g_p1, g_rows = 1, g_cols = 1, g_err;
 #define KEMU_E(...) do { if (kemu::g_err++ < 20) { fprintf(stdout, "KEMU ERROR core(%d,%d): ", kemu::g_p0, kemu::g_p1); \
     fprintf(stdout, __VA_ARGS__); fputc('\n', stdout); } } while (0)
 struct Blk { unsigned char *m; int o[4], s[4]; };
-struct AnyPtr { void *p; template <class T> operator T *() const { return (T *)p; } };
+struct AnyPtr {
+    void *p;
+    long part_bytes = 0;
+    template <class T> operator T *() const { return (T *)p; }
+    unsigned char *part(int i) const { return (unsigned char *)p + i * part_bytes; }
+};
 } // namespace kemu
 namespace aie {
 enum role_t { IFM, WEIGHTS, OFM };
@@ -70,7 +75,7 @@ enum class share { none, neighbor };
 enum class stage { none, memtile, memtile_ring };
 struct load_opts { int reuse = 0; pad_value pad = pad_value::none; int depth = 0; bool resident = false;
                    int tile[2] = {0, 0}; aie::share share = aie::share::none; aie::stage stage = aie::stage::none;
-                   int ring = 0; bool keep = false; };
+                   int ring = 0; bool keep = false; int parts = 0; int align = 0; };
 using store_opts = load_opts;
 template <int... D> struct shape { static constexpr int rank = sizeof...(D); };
 template <class W, role_t R, class S = shape<>> struct port;
@@ -130,7 +135,12 @@ template <class P> AnyPtr block(P &p, std::initializer_list<int> off, std::initi
     }
     if (outside && (st || opt.pad != aie::pad_value::zero))
         KEMU_E("block [%d,%d,%d,%d]+[%d,%d,%d,%d] leaves the tensor", b.o[0], b.o[1], b.o[2], b.o[3], b.s[0], b.s[1], b.s[2], b.s[3]);
-    b.m = (unsigned char *)malloc(bytes);  // exactly the block: ASan flags any access past it
+    if (opt.align >= 64) {  // {.align = N}: the compiler places this port's buffers N-aligned
+        void *q = nullptr;
+        if (posix_memalign(&q, opt.align, ((size_t)bytes + opt.align - 1) / opt.align * opt.align)) abort();
+        b.m = (unsigned char *)q;
+    } else
+        b.m = (unsigned char *)malloc(bytes);  // exactly the block: ASan flags any access past it
     if (st)
         memset(b.m, 0xA5, bytes);
     else
@@ -145,7 +155,7 @@ template <class P> AnyPtr block(P &p, std::initializer_list<int> off, std::initi
         free(t);
     }
     p.live.push_back(b);
-    return {b.m};
+    return {b.m, opt.parts > 1 ? bytes / opt.parts : 0};
 }
 template <class P> void unblock(P &p, int st) {
     if (st != P::out) KEMU_E("%s on an %s port", st ? "aie::commit" : "aie::release", P::out ? "output" : "input");
@@ -161,8 +171,10 @@ namespace aie {
 template <class P> kemu::AnyPtr load_buffer(P &p, std::initializer_list<int> o, std::initializer_list<int> s, load_opts opt = {}) {
     return kemu::block(p, o, s, 0, opt);
 }
-template <class P> kemu::AnyPtr store_buffer(P &p, std::initializer_list<int> o, std::initializer_list<int> s, store_opts = {}) {
-    return kemu::block(p, o, s, 1, {});
+template <class P> kemu::AnyPtr store_buffer(P &p, std::initializer_list<int> o, std::initializer_list<int> s, store_opts opt = {}) {
+    load_opts so{};
+    so.align = opt.align;
+    return kemu::block(p, o, s, 1, so);
 }
 template <class P> void release(P &p) { kemu::unblock(p, 0); }
 template <class P> void commit(P &p) { kemu::unblock(p, 1); }

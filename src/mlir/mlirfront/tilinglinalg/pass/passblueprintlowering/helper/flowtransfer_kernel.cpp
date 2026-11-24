@@ -754,7 +754,11 @@ void emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitD
         uint32_t bufSizeBytes = ((kernelBufElements * t.elementSizeBytes) + 3) & ~3;
         try {
             auto &allocator = ResourceMgr::instance()->coreMemAllocator();
-            auto pingAddr = allocator.allocate(pingName, bufSizeBytes, /*alignment=*/32);
+            // {.align = N} on the port (64 for 64-byte vector loads / stores on the window); default 32.
+            const int64_t blockAlign =
+                d.passState ? routing::lookupBlockAlign(d.passState->tensorInfo, c.funcArgIdx) : 0;
+            const uint32_t align = blockAlign > 32 ? (uint32_t)blockAlign : 32u;
+            auto pingAddr = allocator.allocate(pingName, bufSizeBytes, align);
             if (t.ppDepth == 1) {
                 // Single buffer mode: only allocate ping buffer, no pong
                 if (pingAddr) {
@@ -763,7 +767,7 @@ void emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitD
                     c.flowAddrsValid = true;
                 }
             } else {
-                auto pongAddr = allocator.allocate(pongName, bufSizeBytes, /*alignment=*/32);
+                auto pongAddr = allocator.allocate(pongName, bufSizeBytes, align);
                 if (pingAddr && pongAddr) {
                     // Convert core processor view (0x78000+) to DMA view (0x08000+)
                     // Core DMA engine sees memory starting at 0x00000, not 0x70000

@@ -113,7 +113,13 @@ struct DataflowPlan {
     std::vector<PlanShimBd> shimBds;
     std::vector<PlanKernelParam> params;
 
+    // Arguments whose blocks the kernel takes from hosted slots (aiehlc_share_load): the kernel body's
+    // aie::load_buffer / aie::release on them are rewritten (plan header `share_args`, kernel params
+    // S<arg>_VIEW / _LOCK / _FIRST per mesh row).
+    std::vector<int> shareArgs;
+    int coreRowBase = -1; // absolute row of mesh row 0 (the plan's lowest core row)
     bool replaces(int arg) const;
+    bool sharesArg(int arg) const;
     // core-tile (row >= 2 and not a MemTile) S2MM channels the plan programs itself
     std::set<int> coreS2mmChannels(int memtileRows) const;
 };
