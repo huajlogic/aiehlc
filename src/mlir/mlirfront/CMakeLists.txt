@@ -133,6 +133,7 @@ list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphoptoroutinghw/passdmap
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/dataflowplan/dataflowplan.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/dataflowplan/planemit.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/dataflowplan/plansynth.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/dataflowplan/plandma.cpp)
 # Blueprint lowering: host path + kernel path share helper/ (core-tile DMA, lock
 # and buffer config both paths must agree on).
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passblueprintlowering/helper/flowtransfer_common.cpp)

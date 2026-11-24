@@ -9,7 +9,7 @@ kernel source and the compiler generates all three files (design:
 |---|---|
 | `gemm_plan.cc` | kernel + host app. ONE kernel body (no `#if defined(__chess__)`): `aie::load_buffer` / `release` / `store_buffer` / `commit` with the true 2 x 8 offsets and `{.share / .stage / .ring / .keep / .parts / .align}`; `#pragma persistent_kernel` |
 | `gemm_plan_tile.h` | compute macros of the tile (mmul<8,8,8>, chunk pipeline); no locks, addresses or layout |
-| `gen_plan.py` | the same dataflow written by hand as `dmaphop.plan*` ops (the dmaphop-level way in) |
+| `gen_plan.py` | the same dataflow written by hand as dmaphop ops (`plan` / `plan_route` / `plan_stream`; the dmaphop-level way in) |
 
 ## Build and run (C level)
 
@@ -20,7 +20,9 @@ python3 script/test/apppaltest.py -board vek385-6 -host gomphus6 -y --netload ao
 
 The log shows each level: `tensor_0 dataflow={ring = 10 : i64, share = "neighbor", ...}`,
 `[DataflowPlan] synthesized from the routing IR: A strips 2 x B strips 8, 60 tiles / core, ...`,
-`8 generated flow(s) replaced by the plan`, `routed 28 plan net(s): 138 switch connections`,
+`plan: 28 routes, 2 streams -> DMA program 29 BDs, 14 locks, 9 channels, 8 shim BDs`, `host dfschedule:
+MemTile + shim DMA program after the kernel launch`, `kernel dfschedule: cores' DMA program on
+declaretile.self`, `routed 28 plan net(s): 138 switch connections`,
 `flowcheck: OK -- 32 flows, 8 replaced by the dataflow plan, 0 error(s)`.
 
 ## The two lower ways in
@@ -32,7 +34,8 @@ The log shows each level: `tensor_0 dataflow={ring = 10 : i64, share = "neighbor
 * **dmaphop IR**: `python3 gen_plan.py ir/dfschedule/3_DmapToDmaphopPass.mlir /tmp/plan.mlir`, rebuild
   with `AIEHLC_DMAPHOP_IR_IN=/tmp/plan.mlir`. Explicit plan ops win over the routing-level
   attributes. The synthesized plan (`ir/dfschedule/4_DataflowPlan.mlir`) equals `gen_plan.py`'s
-  105 ops.
+  31 ops, and the two builds generate byte-identical host.cc / kernel.cc / routing.cc. The DMA program
+  is derived from the streams as dfschedule ops (`ir/dfschedule/NN_DataflowPlanToDfschedule.mlir`).
 
 ## Results (vek385-6, 1.25 GHz array, 2026-11-23; GOLDEN PASS 187,758 / 187,758 every row)
 
@@ -42,6 +45,7 @@ The log shows each level: `tensor_0 dataflow={ring = 10 : i64, share = "neighbor
 | dmaphop plan (`gen_plan.py`) | 1.160 ms mean, 1.154 best | 84.8 % / 85.2 % |
 | routing IR attributes | 1.160 ms mean, 1.154 best | 84.7 % / 85.2 % |
 | C source, `#if __chess__` kernel (commit 3ca2c9c4) | 1.158 ms mean, 1.154 best | 84.9 % / 85.2 % |
-| **C source, one `load_buffer` body (as committed)** | **1.160-1.168 ms typical, 1.159 best** | **84.4-84.7 % / 84.8 %** |
+| C source, one `load_buffer` body (bbff26c5) | 1.160-1.168 ms typical, 1.159 best | 84.4-84.7 % / 84.8 % |
+| **C source, one body, DMA program as dfschedule ops (as committed)** | **1.156-1.162 ms typical, 1.156 best** | **84.6-85.0 % / 85.0 %** |
 
 The first launch (2.18 ms) also loads the kernel and B; it is excluded from the steady mean.

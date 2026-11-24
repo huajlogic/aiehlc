@@ -1898,7 +1898,11 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
 
         // Create __Runtime_startio call:
         // struct ioevent = __Runtime_startio(dev, io, bd_id, repeat);
-        auto startIoCall = rewriter.create<emitc::CallOpaqueOp>(loc, ioEventType, "__Runtime_startio", nullptr, nullptr,
+        // dfschedule.first_launch_only (dataflow plan: a weight-resident operand is loaded once): the
+        // transfer starts on the first launch only; later launches get an event __Runtime_wait skips.
+        const char *startFn =
+            op->hasAttr("dfschedule.first_launch_only") ? "__Runtime_startio_first" : "__Runtime_startio";
+        auto startIoCall = rewriter.create<emitc::CallOpaqueOp>(loc, ioEventType, startFn, nullptr, nullptr,
                                                                 ValueRange{
                                                                     state.devInstRef,       // XAie_DevInst* dev
                                                                     ioHandle,               // struct io
@@ -1910,6 +1914,55 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
         
         // Replace the op with the ioevent
         rewriter.replaceOp(op, startIoCall.getResult(0));
+        return success();
+    }
+};
+
+/// Dataflow plan DMA program (DataflowPlanToDfschedule, doc/design/dmaphop_dataflow_plan.md):
+/// MemTile BDs / locks / channels as runtime calls (BD write-once and first-launch handled there).
+struct PlanTileOpsInnerPattern : public ConversionPattern {
+    ConversionState &state;
+    PlanTileOpsInnerPattern(TypeConverter &tc, MLIRContext *ctx, ConversionState &state)
+        : ConversionPattern(tc, MatchAnyOpTypeTag(), /*benefit=*/5, ctx), state(state) {}
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (!isa<dfschedule::ConfigTileBdOp, dfschedule::ConfigLockSetOp, dfschedule::ConfigChannelEnableOp,
+                 dfschedule::ConfigChannelStartOp>(op))
+            return failure();
+        auto loc = op->getLoc();
+        auto i32 = [&](int64_t v) {
+            return rewriter
+                .create<emitc::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr((int32_t)v))
+                .getResult();
+        };
+        auto u32 = [](uint32_t v) { return (int64_t)(int32_t)v; };
+        SmallVector<Value> args{state.devInstRef, operands[0]};
+        const char *fn = nullptr;
+        if (auto bd = dyn_cast<dfschedule::ConfigTileBdOp>(op)) {
+            fn = "__Runtime_tile_bd_config";
+            ArrayAttr st = bd.getDimStrides(), wr = bd.getDimWraps();
+            args.append({i32(u32(bd.getBdId())), i32((int64_t)bd.getAddr()), i32(u32(bd.getLen())), i32(st.size())});
+            for (unsigned d = 0; d < 3; d++) {
+                args.push_back(i32(d < st.size() ? cast<IntegerAttr>(st[d]).getInt() : 0));
+                args.push_back(i32(d < wr.size() ? cast<IntegerAttr>(wr[d]).getInt() : 0));
+            }
+            args.append({i32(u32(bd.getIterStepSize())), i32(u32(bd.getIterWrap())), i32(u32(bd.getAcquireLockId())),
+                         i32(u32(bd.getAcquireLockVal())), i32(u32(bd.getReleaseLockId())),
+                         i32(u32(bd.getReleaseLockVal())), i32(u32(bd.getNextBd()))});
+        } else if (auto l = dyn_cast<dfschedule::ConfigLockSetOp>(op)) {
+            fn = "__Runtime_tile_lock_set";
+            args.append({i32(u32(l.getLockId())), i32(u32(l.getValue())), i32(u32(l.getLaterValue()))});
+        } else if (auto e = dyn_cast<dfschedule::ConfigChannelEnableOp>(op)) {
+            fn = "__Runtime_dma_channel_enable";
+            args.append({i32(u32(e.getChannel())), i32(e.getDirection() == "MM2S")});
+        } else {
+            auto c = cast<dfschedule::ConfigChannelStartOp>(op);
+            fn = "__Runtime_dma_channel_start";
+            args.append({i32(u32(c.getChannel())), i32(c.getDirection() == "MM2S"), i32(u32(c.getStartBd())),
+                         i32(u32(c.getRepeatCount())), i32(c.getFirstLaunchOnly() ? 1 : 0)});
+        }
+        rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, fn, nullptr, nullptr, args);
+        rewriter.eraseOp(op);
         return success();
     }
 };
@@ -1979,7 +2032,16 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         auto loc = op.getLoc();
         
         llvm::errs() << "[Pattern] LoadKernelGroup called\n";
-        
+        // Dataflow plan switches (persistent kernel, BD write-once; doc/design/dmaphop_dataflow_plan.md):
+        // set before the load -- a persistent kernel's later launches skip the load / launch.
+        if (auto m = op->getParentOfType<ModuleOp>()) {
+            auto once = m->getAttrOfType<IntegerAttr>("dfschedule.plan_bd_once");
+            auto go = m->getAttrOfType<IntegerAttr>("dfschedule.plan_go_lock");
+            if (once && go)
+                rewriter.create<emitc::VerbatimOp>(loc, "__Runtime_plan_setup(" + std::to_string(once.getInt()) + ", " +
+                                                            std::to_string(go.getInt()) + ");");
+        }
+
         // Get tiles operands (variadic)
         auto tiles = adaptor.getTiles();
         llvm::errs() << "  Number of tiles: " << tiles.size() << "\n";
@@ -3453,7 +3515,8 @@ void DfscheduleToApiPass::runOnOperation() {
     
     // ScheduleWaitOp depends on StartIoOp (benefit = 1)
     innerPatterns.add<ScheduleWaitInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
-    
+    innerPatterns.add<PlanTileOpsInnerPattern>(typeConverter, ctx, state);
+
     // LoadKernelGroupOp loads and configures kernel groups (benefit = 2)
     innerPatterns.add<LoadKernelGroupInnerPattern>(typeConverter, ctx, state, /*benefit=*/2);
 
@@ -3507,6 +3570,8 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfschedule::LoadKernelGroupOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigCreateIoOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();  // Converted in Phase 3 with proper benefits
+    innerTarget.addIllegalOp<dfschedule::ConfigTileBdOp, dfschedule::ConfigLockSetOp, dfschedule::ConfigChannelEnableOp,
+                             dfschedule::ConfigChannelStartOp>();
     innerTarget.addIllegalOp<dfschedule::CtrlPlanInitOp>();
     innerTarget.addIllegalOp<dfschedule::GroupRegWriteOp>();
 
