@@ -6,11 +6,31 @@
 
 #include <stdio.h>
 
+#include "aie_runtime_bdlimits.h"
+
+/* sticky: number of BDs refused for a length over the tile's Buffer_Length field */
+int rt_seq_bdlen_ovf_n = 0;
+
+int rt_seq_bd_len_guard(XAie_DevInst *dev, XAie_LocType tile, int bd_id, int64_t len_bytes) {
+    const int kind = (int)dev->DevOps->GetTTypefromLoc(dev, tile);
+    if (__Runtime_bd_len_ok(kind, len_bytes))
+        return 1;
+    rt_seq_bdlen_ovf_n++;
+    printf("[aie_runtime] BDLEN_OVF tile(%u,%u) bd=%d words=%u max=0x%X\n", (unsigned)tile.Col, (unsigned)tile.Row,
+           bd_id, (unsigned)__Runtime_bd_len_words(len_bytes), (unsigned)__Runtime_bd_len_max_words(kind));
+    return 0;
+}
+
 AieRC rt_seq_bd_desc(XAie_DevInst *dev, XAie_LocType tile, uint64_t dma_addr, const rt_seq_bd_args *a,
                      XAie_DmaDesc *desc) {
     AieRC rc = XAie_DmaDescInit(dev, desc, tile);
     if (rc != XAIE_OK)
         return rc;
+    /* Buffer_Length guard: aie-rt masks an over-long length to the field width (a MemTile
+     * BD of 0x20000 words becomes 0). Refuse it: the BD is left disabled, callers must not
+     * write it (rt_seq_bd_len_refused), the AOT tool keeps the window JIT (rc != OK). */
+    if (!rt_seq_bd_len_guard(dev, tile, a->bd_id, a->len))
+        return XAIE_INVALID_ARGS;
     int max_addr_dims = 3;
     int num_dims = a->num_dims > (a->ooo ? 3 : 4) ? (a->ooo ? 3 : 4) : a->num_dims;
     int addr_dims = num_dims <= max_addr_dims ? num_dims : max_addr_dims;
