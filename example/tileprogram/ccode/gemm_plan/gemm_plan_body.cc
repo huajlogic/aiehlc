@@ -8,6 +8,8 @@
 //   GP_LAUNCHES  persistent launches; the steady figure is the median of launches 2 .. N           default 8
 //   GP_RING   A's MemTile FIFO ring depth (buffers of 2 chunks)   default: deepest <= 10 dividing the stream
 //   GP_KEEP   B held in the MemTiles across launches (weight-resident)   default: when B's slice fits a MemTile
+//   GP_B_RING B chunked along K through a MemTile ring of this many buffers per (strip, parity) instead of
+//             staged whole (0)                                        default: 0 when B's slice fits, else 4
 //   GP_PARTS  each chunk in 2 row parts in different core memory banks (or 1 part)    default 2
 // Every count below (tiles per core, K chunks, strips) is derived from the shape; the limits are
 // static_asserts. The AIE clock is measured in the run (shim timer vs the A78 generic timer).
@@ -81,12 +83,24 @@
 #endif
 // MemTile capacity (AIE-ML v2: 512 KB). The dataflow plan stages B whole in one MemTile per mesh column
 // (its strips, KA_N / columns rows x KA_K bytes) and A's ring in the MemTile row above; B is kept across
-// launches when its slice fits (else the build cannot place B: static_assert below).
+// launches when its slice fits. When it does not, B is chunked along K through a MemTile ring instead
+// ({.stage = memtile_ring, .ring = GP_B_RING}: GP_B_RING one-chunk buffers per (strip, parity) it serves,
+// refilled every launch).
 #define GP_MT_BYTES (512 * 1024)
 #define GP_A_RING_BYTES (GP_RING * 2 * KA_TM * KA_KC)
 #define GP_B_SLICE_BYTES (KA_N / GP_HW_COLS * KA_K)
-#ifndef GP_KEEP
+#ifndef GP_B_RING
 #if GP_B_SLICE_BYTES <= GP_MT_BYTES
+#define GP_B_RING 0
+#else
+#define GP_B_RING 4
+#endif
+#endif
+#define GP_B_STRIPS (KA_N / GP_HW_COLS / KA_TN)
+#define GP_B_RING_BYTES (GP_B_RING * GP_B_STRIPS * 2 * KA_TN * KA_KC)
+#define GP_B_MT_BYTES (GP_B_RING ? GP_B_RING_BYTES : GP_B_SLICE_BYTES)
+#ifndef GP_KEEP
+#if GP_B_SLICE_BYTES <= GP_MT_BYTES && GP_B_RING == 0
 #define GP_KEEP true
 #else
 #define GP_KEEP false
@@ -103,7 +117,8 @@ static_assert(GP_K % GP_KCE == 0 && KA_K % KA_KC == 0, "K % KC == 0 (whole chunk
 static_assert(GP_RING_CHUNKS % (2 * GP_RING) == 0, "A ring must divide the chunk stream (tiles x K chunks)");
 static_assert(SH_NK >= 2, "the chunk pipeline needs at least 2 K chunks");
 static_assert(SH_TILES >= 1 && SH_TILES <= 64, "tiles / core <= 64 (6-bit OOO iteration counter)");
-static_assert(GP_B_SLICE_BYTES <= GP_MT_BYTES, "B's per-column slice (KA_N / columns x KA_K bytes) must fit its MemTile");
+static_assert(GP_B_MT_BYTES <= GP_MT_BYTES, "B's MemTile buffers (whole slice, or GP_B_RING ring) must fit its 512 KiB MemTile");
+static_assert(!(GP_B_RING && GP_KEEP), "a MemTile ring (GP_B_RING) is refilled every launch: no GP_KEEP");
 static_assert(GP_A_RING_BYTES <= GP_MT_BYTES, "A's ring must fit its MemTile");
 static_assert(GP_LAUNCHES >= 2, "GP_LAUNCHES >= 2 (launch 1 loads the kernel)");
 
@@ -126,7 +141,8 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
 #define OPTS_B                                                                                                         \
     {.depth = 2,                                                                                                       \
      .share = aie::share::neighbor,                                                                                    \
-     .stage = aie::stage::memtile,                                                                                     \
+     .stage = GP_B_RING ? aie::stage::memtile_ring : aie::stage::memtile,                                              \
+     .ring = GP_B_RING,                                                                                                \
      .keep = GP_KEEP,                                                                                                  \
      .parts = GP_PARTS,                                                                                                \
      .align = 64}

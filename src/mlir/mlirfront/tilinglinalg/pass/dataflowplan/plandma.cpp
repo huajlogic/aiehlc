@@ -391,7 +391,9 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
         why = S + "a chunk does not fit the core / MemTile / shim BD wrap limits";
         return false;
     }
-    int served = 0;
+    // a ring serves (strip, parity) streams: every strip of the layout once per chunk parity
+    std::set<std::pair<int, int>> served;
+    std::set<int> stripSet(s.strips.begin(), s.strips.end());
     for (int c = 0; c < p.meshCols; c++) {
         const MemtileUse u = memtileUse(p, s, p.colLo + c);
         if (!u.present)
@@ -402,7 +404,15 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
         }
         if (s.stage == "memtile_ring") {
             const int k = (int)u.parities.size();
-            served += k;
+            for (const PlanRoute *r : u.out)
+                for (const auto &[t, q] : r->dsts) {
+                    const int g = groupOfHostRow(s, t.row - p.coreRowBase), x = t.col - p.colLo;
+                    if (g < 0 || x < 0 || x >= p.meshCols) {
+                        why = S + "a ring route must end on a core hosting one of its strips";
+                        return false;
+                    }
+                    served.insert({s.strips[x * groups + g], q});
+                }
             const int64_t perTile = u.chunksPerTile;
             if (k == 1 ? (s.rounds * perTile) % (2 * s.ring) : (s.rounds * perTile) % (s.ring * k)) {
                 why = S + "the ring does not divide column " + str(c) + "'s chunk stream";
@@ -413,9 +423,9 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
             return false;
         }
     }
-    if (s.stage == "memtile_ring" && served != (int)groups * s.channels) {
-        why = S + "the MemTile rings serve " + str(served) + " (strip group, parity) streams, the layout needs " +
-              str((int)groups * s.channels);
+    if (s.stage == "memtile_ring" && served.size() != stripSet.size() * s.channels) {
+        why = S + "the MemTile rings serve " + str((int)served.size()) + " (strip, parity) streams, the layout needs " +
+              str((int)(stripSet.size() * s.channels));
         return false;
     }
     return true;
@@ -483,10 +493,13 @@ bool deriveDmaProgram(DataflowPlan &p, std::string &why) {
                 continue;
             const int64_t len = u.chunksPerTile * chunk;
             const int reps = ring ? s.rounds : (int)s.hostRows.size();
+            // a ring over strips one chunk tall reads the same chunks every round: the BD re-reads them
+            const bool again = ring && s.rereadsEveryRound();
             p.shimBds.push_back({p.colLo + c, u.shimRoute->srcCh, p.res.shimBd[si][c], s.arg, true, off, len,
-                                 shimChunkDims(s, u.chunksPerTile), len, reps, reps, !ring && s.residentLaunches});
+                                 shimChunkDims(s, u.chunksPerTile), again ? 0 : len, again ? 1 : reps, reps,
+                                 !ring && s.residentLaunches});
             p.shimBds.back().tag = "shim/" + std::to_string(si) + "/" + std::to_string(c);
-            off += reps * len;
+            off += (again ? 1 : reps) * len;
         }
     }
     deriveCoreSlots(p, p.streams[0], cores);

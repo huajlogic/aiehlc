@@ -250,6 +250,13 @@ CONVOPTS_CASES = [
     ("convopts: .depth = 1 on the halo slab",
      [("{ih_t, iw_t, C}, {.depth = 2}", "{ih_t, iw_t, C}, {.depth = 1}")],
      "is not supported on a spatial-halo (conv) kernel yet"),
+    # A MemTile ring streams the operand chunk by chunk along its reduction dim (a FIFO of .ring buffers,
+    # refilled every launch): nothing stays in the MemTile, so .keep cannot hold it across launches.
+    ("convopts: .keep on a MemTile ring (a ring is refilled every launch)",
+     [("{ih_t, iw_t, C}, {.depth = 2}",
+       "{ih_t, iw_t, C}, {.depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile_ring, "
+       ".ring = 4, .keep = true}")],
+     "a MemTile ring is refilled every launch: it cannot be {.keep = true}"),
 ]
 
 # bfloat16 ports (simpleconv2dkernel_port_bf16.cc): 2-byte blocks through the

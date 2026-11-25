@@ -32,6 +32,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OwningOpRef.h"
+#include <algorithm>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -137,7 +138,7 @@ struct PlanStream {
     int arg = -1;
     std::string role;              // "a": strips over mesh-row pairs; "b": strips over columns x 2
     std::string stage;             // "memtile_ring" | "memtile"
-    int ring = 0;                  // memtile_ring: FIFO buffers of 2 chunks
+    int ring = 0;                  // memtile_ring: FIFO buffers (2 chunks each for one served parity, else 1)
     bool residentLaunches = false; // loaded on the first launch only
     int chunkRows = 0, chunkCols = 0, chunks = 0, rounds = 0;
     int64_t tensorRows = 0, tensorCols = 0;
@@ -155,6 +156,13 @@ struct PlanStream {
     std::vector<int> strips;
     int64_t chunkBytes() const { return (int64_t)chunkRows * chunkCols * elemBytes; }
     int buffers() const { return channels * slots; }
+    // strips one chunk tall: every output-tile round reads the same chunks (the stream does not advance)
+    bool rereadsEveryRound() const {
+        int n = 0;
+        for (int x : strips)
+            n = std::max(n, x + 1);
+        return n > 0 && tensorRows == (int64_t)n * chunkRows;
+    }
 };
 
 struct DataflowPlan {

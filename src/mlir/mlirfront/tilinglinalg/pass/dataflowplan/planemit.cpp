@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <map>
 #include <sstream>
+#include <vector>
 
 namespace dfplan {
 
@@ -46,7 +47,38 @@ static std::string emitPlanArrange(const DataflowPlan &plan) {
             const MemtileUse u = memtileUse(plan, s, plan.colLo + c);
             if (!u.present)
                 continue;
-            if (s.stage == "memtile_ring") {
+            // a ring serving several strips (one chunk-tall strip per group): its chain takes, per round, the
+            // served (strip, parity) streams in route order, chunk q + n x channels of each; a stream that does
+            // not advance over rounds is laid out once (the shim BD re-reads it)
+            std::vector<std::pair<int, int>> sq;
+            for (const PlanRoute *r : u.out) {
+                const auto &d = r->dsts[0];
+                int g = 0;
+                for (size_t x = 0; x < groups; x++)
+                    if ((int)s.hostRows[x] == d.first.row - plan.coreRowBase)
+                        g = (int)x;
+                sq.push_back({s.strips[(d.first.col - plan.colLo) * groups + g], d.second});
+            }
+            bool multi = false;
+            for (auto &x : sq)
+                multi |= x.first != sq[0].first;
+            if (s.stage == "memtile_ring" && multi) {
+                const int k = (int)sq.size();
+                const int64_t per = (int64_t)s.chunks * k / s.channels, rounds = s.rereadsEveryRound() ? 1 : s.rounds;
+                os << "        { /* column " << c << ": " << k << " (strip, parity) ring streams */\n"
+                   << "            static const long sq[" << k << "][2] = {";
+                for (int j = 0; j < k; j++)
+                    os << (j ? ", " : "") << "{" << sq[j].first << ", " << sq[j].second << "}";
+                os << "};\n"
+                   << "            for (long t = 0; t < " << rounds << "; t++)\n"
+                   << "                for (long i = 0; i < " << per << "; i++)\n"
+                   << "                    for (long r = 0; r < " << s.chunkRows << "; r++, dst += " << rowB << ")\n"
+                   << "                        memcpy(dst, src + ((sq[i % " << k << "][0] * " << stripRows
+                   << "L + t * " << s.chunkRows << " + r) * " << s.tensorCols << " + (sq[i % " << k
+                   << "][1] + i / " << k << " * " << s.channels << ") * " << s.chunkCols << ") * " << eb << ", "
+                   << rowB << ");\n"
+                   << "        }\n";
+            } else if (s.stage == "memtile_ring") {
                 unsigned mask = 0;
                 for (int q : u.parities)
                     mask |= 1u << q;

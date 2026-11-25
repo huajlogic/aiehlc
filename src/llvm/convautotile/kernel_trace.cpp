@@ -292,6 +292,9 @@ static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_li
         AIEHLC_E(p, "aie::store_buffer takes no dataflow options (.share / .stage / .ring / .keep)");
     if (!st && opt.stage == aie::stage::memtile_ring && opt.ring <= 0)
         AIEHLC_E(p, "{.stage = aie::stage::memtile_ring} needs {.ring = N} (MemTile ring buffers)");
+    if (!st && opt.stage == aie::stage::memtile_ring && opt.keep)
+        AIEHLC_E(p, "a MemTile ring is refilled every launch: it cannot be {.keep = true} (stage the whole "
+                    "operand with {.stage = aie::stage::memtile} to keep it)");
     if (st && (opt.reuse || pad || opt.resident || opt.tile[0] || opt.tile[1]))
         AIEHLC_E(p, "aie::store_buffer takes only {.depth}; .reuse / .pad / .resident / .tile are load options");
     if (ro != p.rank || rs != p.rank)
