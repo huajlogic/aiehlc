@@ -741,7 +741,6 @@ static void gp_c1_report(void) {
     }
 }
 #endif
-
 int main() {
     const long M = GP_M, N = GP_N, K = GP_K;
     const int launches = GP_LAUNCHES;
