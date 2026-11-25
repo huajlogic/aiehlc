@@ -210,6 +210,14 @@ bool assignCores(const DataflowPlan &p, const Used &u, PlanResources &r, std::st
         return false;
     }
     r.slotBase = lo, r.slotBytes = need;
+    if (r.accAddr >= 0) {
+        if (need + r.accBytes > total) {
+            why = "the replaced ports' core buffers (" + std::to_string(total) + " B) cannot hold the chunk slots (" +
+                  std::to_string(need) + " B) and the K accumulator (" + std::to_string(r.accBytes) + " B)";
+            return false;
+        }
+        r.accAddr = lo + need;
+    }
     return true;
 }
 
@@ -383,11 +391,57 @@ bool adoptPinned(const DataflowPlan &p, const Used &u, PlanResources &r, std::st
     return true;
 }
 
+// Core data memory: the windows the allocator placed, a minimum stack, the kernel's other statics -- and the
+// GEMM's K accumulator (A chunk rows x B chunk rows x 4 B partial sums, kept across the K chunks). When the
+// accumulator does not fit what is left, the plan makes room in the memory it owns (the replaced windows):
+// one slot per channel instead of `slots`, the accumulator after the chunk slots. Else it fails, naming it.
+bool planCoreMemory(DataflowPlan &p, PlanResources &r, std::string &why) {
+    const PlanTarget &T = planTarget();
+    if (p.streams.size() < 2 || p.streams[0].chunks < 2)
+        return true;
+    int64_t used = 0, replaced = 0;
+    try {
+        for (const CoreMemSlot &m : ResourceMgr::instance()->coreMemAllocator().getAllocations()) {
+            used += m.size;
+            if (p.replaces(m.ownerId))
+                replaced += m.size;
+        }
+    } catch (...) {
+    }
+    r.accBytes = (int64_t)p.streams[0].chunkRows * p.streams[1].chunkRows * 4;
+    r.dmFree = T.coreDmBytes - used - T.coreMinStack - T.coreStaticReserve;
+    std::ostringstream os;
+    os << "[DataflowPlan] core memory: windows " << used << " B (" << replaced
+       << " B the plan's), stack >= " << T.coreMinStack << " B, statics " << T.coreStaticReserve << " B, " << r.dmFree
+       << " B left; K accumulator " << r.accBytes << " B";
+    if (r.accBytes <= r.dmFree) {
+        llvm::outs() << os.str() << ": the kernel's own\n";
+        return true;
+    }
+    for (PlanStream &s : p.streams) {
+        if (s.slots > 1 && (int64_t)s.channels * s.chunkBytes() + r.accBytes <= replaced)
+            s.slots = 1;
+    }
+    const PlanStream &s = p.streams[0];
+    if ((int64_t)s.buffers() * s.chunkBytes() + r.accBytes > replaced) {
+        why = "core memory: the K accumulator (" + std::to_string(r.accBytes) +
+              " B) does not fit: " + std::to_string(r.dmFree) +
+              " B left next to the windows, and the replaced windows (" + std::to_string(replaced) + " B) hold " +
+              std::to_string(s.buffers()) + " chunk buffers of " + std::to_string(s.chunkBytes()) + " B -- " +
+              std::to_string((int64_t)s.buffers() * s.chunkBytes() + r.accBytes - replaced) + " B short";
+        return false;
+    }
+    r.accAddr = 0; // placed by assignCores after the slots
+    llvm::outs() << os.str() << ": does not fit, the plan holds it in its windows with " << s.slots
+                 << " slot(s) per channel (AIEHLC_PLAN_ACC)\n";
+    return true;
+}
+
 bool assignPlanResources(ModuleOp hostModule, DataflowPlan &p, std::string &why) {
     const Used u = collectUsed(hostModule, p);
     PlanResources r;
-    if (!assignCores(p, u, r, why) || !assignMemTiles(p, u, r, why) || !assignShim(p, u, r, why) ||
-        !adoptPinned(p, u, r, why))
+    if (!planCoreMemory(p, r, why) || !assignCores(p, u, r, why) || !assignMemTiles(p, u, r, why) ||
+        !assignShim(p, u, r, why) || !adoptPinned(p, u, r, why))
         return false;
     r.assigned = true;
     p.res = r;

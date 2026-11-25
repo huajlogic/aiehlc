@@ -298,6 +298,12 @@ void deriveCoreSlots(DataflowPlan &p, const PlanStream &s, const std::vector<Til
                                                      {"LOCK_SYNC", r.lockSync}};
     for (auto &[n, v] : scal)
         p.params.push_back({n, {v}, true, false});
+    if (r.accBytes > 0) { // the kernel's K accumulator: ACC when the plan holds it (core address), else its own
+        p.params.push_back({"ACC_BYTES", {r.accBytes}, true, false});
+        p.params.push_back({"DM_FREE", {r.dmFree}, true, false});
+        if (r.accAddr >= 0)
+            p.params.push_back({"ACC", {r.accAddr}, true, false});
+    }
 }
 
 // Reader order of strip group g of a stream: its first row, then the group's other rows ascending.

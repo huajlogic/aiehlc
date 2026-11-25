@@ -1036,6 +1036,7 @@ Read the matching skill when the task fits:
 | GOLDEN FAIL with an identical match count every run and unchanged perf after changing BD dims; core BD wrap > 255 (8-bit field, MemTile / shim 10-bit) | bdwrapfieldwidth |
 | Persistent kernel (dataflow plan) passes launch 0 and hangs from launch 1 (`wait_io TIMEOUT` on the input shims), cores read `core_status=0 pc=0`; only on a non-16-core mesh | persistentkernelreload |
 | Dataflow plan with B `.stage = memtile` but no `.keep`: launch 0 passes, launch 1 hangs `wait_io TIMEOUT tile(c,0) ch=0 dir=1` on the B input shims (B MemTile locks `restored` though unbalanced) | planmemtilebperlaunch |
+| Kernel-only GEMM with `output_tile_major` (bf16 C as `N x 2` bytes) GOLDEN FAILs ~everywhere with right values at wrong places; no `routing.tiling`; output BD `len=0` hang; bf16 output one ulp off (floor rounding) | kbtilemajoroutput |
 | Dataflow-plan GEMM at a new shape hangs on the B input shims or GOLDEN FAILs ~96 % of outputs; B exactly 512 KiB per MemTile; shim BD `iter_step_size=0`; a channel started > 256 times | planbdfieldlimits |
 | A hand-written GemmSpace GEMM (simplematmul2) hangs in `wait_io TIMEOUT ... dir=1` / watchdog after a compiler update; `startio(..., 4)` became `(..., 1)`; `3D K BD is already the whole walk ... repeat 4 -> 1` | kwalkrepeatcollapse |
 | A launch slower after merging main with identical kernel / routing / DMA program: `__aie_launch` now invalidates every output (`__Runtime_sync_for_cpu`) -- allocate outputs uncached | postlaunchoutputinval |

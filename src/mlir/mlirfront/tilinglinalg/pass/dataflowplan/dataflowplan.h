@@ -120,6 +120,9 @@ struct PlanResources {
     int lockE = -1;    // E(buffer) = lockE + buffer, buffer = channel + channels x slot
     int lockGo = -1, lockSync = -1;
     int64_t slotBase = 0, slotBytes = 0; // core memory (core view) the hosted chunks occupy
+    // the K-accumulator (a GEMM's partial sums across K chunks): placed by the plan right after the chunk
+    // slots when it does not fit next to the core's windows (accAddr < 0: the kernel keeps its own)
+    int64_t accBytes = 0, accAddr = -1, dmFree = 0;
     // MemTiles: per stream (index into DataflowPlan::streams), per column
     struct Mem {
         std::vector<int> locks; // ring: (empty, full) per served parity; resident: ready, free

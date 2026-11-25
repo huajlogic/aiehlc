@@ -41,7 +41,11 @@ struct PlanTarget {
     // largest BD buffer length in 32-bit words, per tile kind (the field is 14 bits in a core tile's BD,
     // 17 bits in a MemTile's: *_DMA_BD0_0_BUFFER_LENGTH_MASK); a longer one is silently truncated
     int64_t coreBdMaxLenWords, memBdMaxLenWords;
-    int chMaxRepeat; // largest repeat count of a DMA channel's start (task queue): MaxRepeatCount
+    // ---- core data memory, as the kernel's link sees it
+    int64_t coreDmBytes;       // one core tile's data memory
+    int64_t coreMinStack;      // the smallest stack kc.sh relinks a kernel with (AIEHLC_DM_MIN_STACK)
+    int64_t coreStaticReserve; // kernel statics besides the accumulator (klog area, block-call state)
+    int chMaxRepeat;           // largest repeat count of a DMA channel's start (task queue): MaxRepeatCount
     int memBankLo(int ch) const { return memBdBank * (ch & 1); }
 };
 
@@ -74,6 +78,9 @@ inline const PlanTarget &planTarget() {
         /*bdMaxIterWrap*/ 64,
         /*coreBdMaxLenWords*/ 0x3FFF,
         /*memBdMaxLenWords*/ 0x1FFFF,
+        /*coreDmBytes*/ 0x10000,
+        /*coreMinStack*/ 4096,
+        /*coreStaticReserve*/ 4096,
         /*chMaxRepeat*/ 256,
     };
     return t;

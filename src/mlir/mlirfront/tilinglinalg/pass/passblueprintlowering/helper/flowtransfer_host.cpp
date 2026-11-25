@@ -399,7 +399,43 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
         bool convWidthSplit = convHalo.valid && !c.shimIsSender;
         bool gemm3D = tileM > 0 && tileM < tileRowsVal && !c.shimIsSender && isFullConnectAuto(moduleOpGuard);
 
-        if (gemm3D || convWidthSplit) {
+        // #pragma output_tile_major on a kernel-only output with no GEMM tiling (no #routing.tiling: e.g. a
+        // bf16 C declared as N x 2 bytes, which the GEMM model does not match against B): the traced blocks
+        // alone give the layout -- each core's R blocks back to back, one BD walking them with its
+        // iteration. Without this the gather fell back to the routing's row-major dims and scattered the
+        // tiles (gemm_plan bf16: only the first 256 B of each tile landed where the host reads them).
+        const routing::TensorRoutingInfo *outInfo =
+            routing::lookupTensorRoutingInfo(passState->tensorInfo, traceFlowConfigToFuncArgIndex(c.shimFlowConfig));
+        int64_t kbRounds = 0, kbBlockBytes = 0;
+        if (!gemm3D && !convWidthSplit && !c.shimIsSender && passState->outputTileMajor && outInfo &&
+            outInfo->kernelBlock && !outInfo->halo) {
+            kbRounds = outInfo->kernelBlock.getRoundsI() * outInfo->kernelBlock.getRoundsJ();
+            kbBlockBytes = c.ooElementSizeBytes;
+            for (int64_t d : outInfo->kernelBlock.getShape())
+                kbBlockBytes *= d;
+        }
+        constexpr int64_t kIterWrapMax = 64; // 6-bit BD iteration counter
+        if (kbRounds > 1 && kbRounds <= kIterWrapMax && kbRounds == c.ooNumIterations &&
+            kbBlockBytes == c.perRoundBytes && kbBlockBytes % 64 == 0) {
+            // the descriptor the rest of the gather reads (BD length, round loop), as the GEMM tile-major one
+            c.outDesc = OutputTileDescriptor();
+            c.outDesc.bdLenBytes = kbBlockBytes;
+            c.outDesc.bdDims = {{4, 16}, {64, kbBlockBytes / 64}};
+            c.outDesc.iterStep = (int32_t)kbBlockBytes;
+            c.outDesc.iterWrap = (int32_t)kbRounds;
+            c.outDesc.totalRounds = 1;
+            c.outDesc.roundDims.push_back({1, 0});
+            c.outDesc.perTileStrideBytes = kbRounds * kbBlockBytes;
+            c.perTileDimStrides = rewriter.getI32ArrayAttr({4, 64});
+            c.perTileDimWraps = rewriter.getI32ArrayAttr({16, (int32_t)(kbBlockBytes / 64)});
+            c.oooIterStepSize = (int32_t)kbBlockBytes;
+            c.oooIterWrap = (int32_t)kbRounds;
+            c.oooMRounds = 1;
+            c.usedMRounds3D = true;
+            c.perTileStrideFromDims = kbRounds * kbBlockBytes;
+            llvm::errs() << "[OOO ShimBD desc] output_tile_major from the traced blocks: " << kbRounds << " x "
+                         << kbBlockBytes << " B per core, back to back\n";
+        } else if (gemm3D || convWidthSplit) {
             auto moduleOp = op->getParentOfType<ModuleOp>();
             // Thread the partition #routing.tiling descriptor (if present) so the
             // NCHW conv-output BD geometry is derived from the authoritative tiling
@@ -945,6 +981,10 @@ void FlowTransferConversion::computeMultipleInputShimBd(FlowLoweringCtx &c, Mult
     } else if (kWalk3D && c.kb.attr && p.loopIterWrap <= 1 && p.loopRepeat > 1) {
         // len is the whole K walk and nothing steps between starts: a repeat would send the
         // same strip k_rounds times, and the core takes it once (input shims never finish).
+        // Only for a traced kernel-only port (#routing.kernel_block; simplegemm_kacc.cc's B,
+        // which does not `follow` its blocks but whose trace says the core takes the walk
+        // once): a hand-written GemmSpace kernel may read the same strip once per k-round
+        // (simplematmul2.cc: its core takes repeat 4; 1 hangs the launch in wait_io).
         llvm::errs() << "[BlueprintToSchedule] 3D K BD is already the whole walk (" << full
                      << " B) and does not iterate: repeat " << p.loopRepeat << " -> 1\n";
         p.loopRepeat = 1;
@@ -981,10 +1021,6 @@ LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx 
     const bool halo2D = p.halo2D;
     const int64_t haloHStrideBytes = p.haloHStrideBytes;
     const int64_t haloWStrideBytes = p.haloWStrideBytes;
-    // Only for a traced kernel-only port (#routing.kernel_block; simplegemm_kacc.cc's B,
-    // which does not `follow` its blocks but whose trace says the core takes the walk
-    // once): a hand-written GemmSpace kernel may read the same strip once per k-round
-    // (simplematmul2.cc: its core takes repeat 4; 1 hangs the launch in wait_io).
     const int64_t haloWRoundsVal = p.haloWRoundsVal;
 
     // Erase the initial createIoOp and shimBdOp created above.

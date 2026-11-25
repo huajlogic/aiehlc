@@ -136,6 +136,17 @@ and `deriveDmaProgram` turns the streams into the dfschedule DMA program (sectio
   `aiehlc_plan.h` as `aiehlc_plan_arrange(arg, src, dst)` from the same streams and routes, which the
   host calls (`gemm_plan.cc`; byte-identical to the former hand-written `sh_arrange` on 4 x 4).
 
+**Core data memory** (`planresource.cpp` `planCoreMemory`). The plan counts one core's 64 KiB: the
+windows the allocator placed (incl. the replaced ports' windows, which the plan owns), a minimum stack
+(`coreMinStack`, kc.sh's 4 KiB relink) and the kernel's other statics (`coreStaticReserve`), and the
+GEMM's K accumulator (A chunk rows x B chunk rows x 4 B -- int32 / fp32 partial sums kept across the K
+chunks). Fits: the kernel keeps its own (`[DataflowPlan] core memory: ... the kernel's own`, generated
+files unchanged). Does not fit (bf16: the output windows are twice the int8 ones): the plan makes room in
+the memory it owns -- one chunk slot per channel instead of `slots` -- and places the accumulator after
+the slots, `AIEHLC_PLAN_ACC` (core address) / `AIEHLC_PLAN_ACC_BYTES` / `AIEHLC_PLAN_DM_FREE` in
+`aiehlc_plan.h`; the kernel uses it when defined (`gemm_plan_body.cc` bf16: `facc`). Still short: a build
+error naming the accumulator and the bytes missing.
+
 Limits (errors name them): two shared operands (A ring, B resident or ring), every stream the same reader
 count (4 mesh rows), columns >= A strips, N = 2C block rows (one n tile per core), output tiles per
 core <= the shim BD's iteration limit (64), K / chunk a multiple of `channels`, the ring must divide

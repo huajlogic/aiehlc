@@ -207,9 +207,19 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
     // 2 x 2 blocks over the 64 x 64 tile, fp32 partial sums in core memory between chunks, bf16 out at
     // the last chunk. Same ports, chunks and dataflow as int8 (KA_KC bytes = GP_KCE elements of K).
     typedef aie::mmul<8, 8, 8, bfloat16, bfloat16, accfloat> BfMM;
+    // fp32 -> bf16 rounds by the core's rounding mode, which starts as floor: round to nearest even, as the
+    // reference does (gplan_ref.h "bf16cmp"; floor is one bf16 ulp off on half the outputs)
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const int pm = aie::program_id(0), pn = aie::program_id(1);
     const int sa = pm >> 1, sb = pn + GP_HW_COLS * (pm & 1), brow = sb * KA_TN;
+    // The fp32 partial sums across the K chunks. When they do not fit next to the core's windows the
+    // dataflow plan holds them in the memory it owns (AIEHLC_PLAN_ACC, one chunk slot per channel instead
+    // of two; build log "[DataflowPlan] core memory: ..."); otherwise -- and in the x86 trace -- a static.
+#if defined(AIEHLC_PLAN_ACC)
+    float *const facc = (float *)AIEHLC_PLAN_ACC;
+#else
     alignas(8192) static float facc[KA_TM * KA_TN];
+#endif
 #if GP_PARTS == 2
 #define BF_PART(x, i) ((const bfloat16 *)(x).part(i))
 #else
@@ -491,6 +501,48 @@ int main() {
     gp_got_ctx gx = {(const gp_elem_t *)Ct, 0xFFFFFFFFu};
     const gpref_res_t r = gpref_check(GP_REF_DTYPE, A, B, M, N, K, gp_got, &gx);
     const uint32_t out_crc = gx.crc ^ 0xFFFFFFFFu;
+#if GP_DTYPE == 2 && defined(GP_DEBUG_MAP) /* debug: which outputs are right, per row 0 / 7 / 64 / 2048 */
+    {
+        const long rows[] = {0, 7, 64, 2048};
+        for (int ri = 0; ri < 4; ri++) {
+            char map[129];
+            for (long j = 0; j < 128; j++) {
+                const uint16_t w = gpref_ref_bf16((const uint16_t *)A, (const uint16_t *)B, K, rows[ri], j);
+                map[j] = gpref_bf16_ok((uint16_t)gp_got(&gx, rows[ri], j), w) ? '.' : 'x';
+            }
+            map[128] = 0;
+            printf("GPDBG row %ld cols 0..127: %s\n", rows[ri], map);
+        }
+        for (long i = 0; i < 128; i += 8) { /* 8 x 8 blocks of tiles 0 and 1 (rows 0..127), columns 0..63 */
+            char m[9];
+            for (long jb = 0; jb < 8; jb++) {
+                int ok = 1;
+                for (long u = 0; u < 8; u++)
+                    for (long v = 0; v < 8; v++)
+                        ok &= gpref_bf16_ok(
+                            (uint16_t)gp_got(&gx, i + u, jb * 8 + v),
+                            gpref_ref_bf16((const uint16_t *)A, (const uint16_t *)B, K, i + u, jb * 8 + v));
+                m[jb] = ok ? '.' : 'x';
+            }
+            m[8] = 0;
+            printf("GPDBG blocks rows %3ld..%3ld: %s\n", i, i + 7, m);
+        }
+        for (long q = 0; q < 12; q++) { /* where in tile 0 does the value at row 0 / 8, column 16 + 4q belong? */
+            const long gi = q < 6 ? 0 : 8, gj = 16 + 4 * (q % 6) + (q < 6 ? 0 : -16);
+            const uint16_t g = (uint16_t)gp_got(&gx, gi, gj);
+            long fi = -1, fj = -1, n = 0;
+            for (long i = 0; i < 64; i++)
+                for (long j = 0; j < 64; j++)
+                    if (gpref_ref_bf16((const uint16_t *)A, (const uint16_t *)B, K, i, j) == g && n++ == 0)
+                        fi = i, fj = j;
+            printf("GPDBG got C[%ld][%ld] = %f equals ref C[%ld][%ld] (%ld matches in tile 0)\n", gi, gj, gpref_bf2f(g),
+                   fi, fj, n);
+        }
+        for (long j = 0; j < 64; j += 8)
+            printf("GPDBG C[0][%ld] got %f want %f\n", j, gpref_bf2f((uint16_t)gp_got(&gx, 0, j)),
+                   gpref_bf2f(gpref_ref_bf16((const uint16_t *)A, (const uint16_t *)B, K, 0, j)));
+    }
+#endif
     if (r.bad)
         printf("MISMATCH first C[%ld][%ld]: got %d want %d (rule %s)\n", r.first_bad_i, r.first_bad_j, (int)r.first_got,
                (int)r.first_want, gpref_rule(GP_REF_DTYPE));

@@ -101,11 +101,20 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 ## Stage 2: core data-memory budget owns the accumulator (L5)
 
-- [ ] Accumulator size comes from the plan (`aiehlc_plan.h`) and is counted by `planresource` with the
+- [x] Accumulator size comes from the plan (`aiehlc_plan.h`) and is counted by `planresource` with the
       port buffers and chunk slots; over budget -> the plan shrinks the tile or ring, or fails naming
-      the item and the overflow in bytes.
-- [ ] bf16 4096 x 512 x 4096 (fp32 accumulate) builds without hand-edited macros and runs GOLDEN PASS
-      on VEK385. Evidence:
+      the item and the overflow in bytes. Evidence: `planCoreMemory` (A chunk rows x B chunk rows x 4 B);
+      int8 7680: `[DataflowPlan] core memory: windows 40960 B (32768 B the plan's), stack >= 4096 B,
+      statics 4096 B, 16384 B left; K accumulator 16384 B: the kernel's own` (files unchanged); bf16:
+      `... 8192 B left; K accumulator 16384 B: does not fit, the plan holds it in its windows with 1 slot(s)
+      per channel (AIEHLC_PLAN_ACC)`; still short -> error naming the accumulator and the bytes missing.
+- [x] bf16 4096 x 512 x 4096 (fp32 accumulate) builds without hand-edited macros and runs GOLDEN PASS
+      on VEK385. Evidence: VEK385 `GOLDEN PASS shape=4096x512x4096 dtype=bf16 launch=101 checked=300032
+      bad=0 in_crc=63c4a919 ref_crc=a10c5ff4 out_crc=a10c5ff4 | PERF SUMMARY gemm_plan steady 6.209 ms
+      median (27.02 % of peak @ 1250 MHz)`; palmyra same crc, 18.253 ms (11.49 %). Needed two more fixes:
+      the bf16 C (declared N x 2 bytes) had no GEMM tiling, so `output_tile_major` was not applied and the
+      tiles were scattered -- now taken from the traced blocks; and fp32 -> bf16 rounding set to RNE
+      (skill `kbtilemajoroutput`).
 
 ## Stage 3: one source, any configuration via -D (L6)
 
@@ -143,4 +152,6 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 | date | stage | result | commit |
 |---|---|---|---|
-| 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | this commit |
+| 2026-11-24 | 0 | baseline re-measured (VEK385 85.5 % / 86.7 %, palmyra 87-89 % of its DDR bound); a plan-less GemmSpace GEMM (simplematmul2) hung on this branch -- fixed, files identical to 3ff40966 again (skill `kwalkrepeatcollapse`) | 46ae6afc |
+| 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | 5f75d43e |
+| 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | this commit |
