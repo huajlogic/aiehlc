@@ -654,6 +654,25 @@ static void gp_c1_wr(int ti, uint32_t off, uint32_t v) {
                        XAie_TileLoc(GP_C1_COL0 + ti % GP_HW_COLS, GP_C1_ROW0 + ti / GP_HW_COLS), off, v);
 }
 #endif
+// PROFILING=1 (aiehlc.sh --profiling -> -DAIEHLC_PROFILING=1): the runtime arms the 4 core perf counters
+// (ACTIVE, INSTR_VECTOR, STREAM_STALL, LOCK_STALL) on the 16 cores at launch 1 when g_runtime_debug_level has
+// AIE_DEBUG_FLAG_CORE_PERF_COUNTER (0x100); the persistent kernel is not re-armed later, so the host zeroes them
+// before the last launch and prints one [PERF] tag=<last launch index> line per core after it (one launch,
+// for perfsplit.py --xchk: active - lock_stall of the worst core vs its CORE1 window).
+#if defined(AIEHLC_PROFILING) && AIEHLC_PROFILING
+#define GP_C1_PERF 1
+extern int g_runtime_debug_level;
+void __Runtime_core_perf_report(int tag);
+static void gp_c1_perf_zero(void) {
+#ifdef GP_C1_HW
+    for (int ti = 0; ti < GP_C1_CORES; ti++)
+        for (uint8_t c = 0; c < 4; c++)
+            XAie_PerfCounterSet(__Runtime_get_partition_dev(0),
+                                XAie_TileLoc(GP_C1_COL0 + ti % GP_HW_COLS, GP_C1_ROW0 + ti / GP_HW_COLS), XAIE_CORE_MOD,
+                                c, 0);
+#endif
+}
+#endif
 // before launch `it` (> 0): clear every found block's magic word
 static void gp_c1_arm(int it) {
 #ifdef GP_C1_HW
@@ -788,6 +807,12 @@ int main() {
         }
 #if GP_CORE1
         gp_c1_arm(it);
+#ifdef GP_C1_PERF
+        if (it == 0)
+            g_runtime_debug_level |= 0x100; // AIE_DEBUG_FLAG_CORE_PERF_COUNTER: armed by the launch-1 kernel start
+        if (it == launches - 1)
+            gp_c1_perf_zero();
+#endif
 #endif
         XTime t0, t1;
         XTime_GetTime(&t0);
@@ -796,6 +821,10 @@ int main() {
         lms[it] = gp_ms(t0, t1);
 #if GP_CORE1
         gp_c1_collect(it);
+#ifdef GP_C1_PERF
+        if (it == launches - 1)
+            __Runtime_core_perf_report(it);
+#endif
 #endif
         if (it == 0) { // the array is up and clocked: measure its clock
             aie_clk = gp_aie_clock();
