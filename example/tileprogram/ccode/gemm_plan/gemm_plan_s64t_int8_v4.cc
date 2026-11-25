@@ -1,0 +1,26 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// gemm_plan_s64t_int8.cc variant for M3.3.6.2.1.2.4.1 fix96_inner (phase PV, build-only): V4 (LB row) tm96_tn64 kc64 cdepth1, GT_CHUNK_P
+// C[12288 x 512] = A[12288 x 2048] . B[512 x 2048]^T int8, core tile 96 x 64, K chunks of 64, output {.depth = 1},
+// chunk kernel GP_GT 1 (gemm_plan_tbody.cc / gemm_plan_tile.h). The default configs are untouched.
+//   run_board.sh --build-only example/tileprogram/ccode/gemm_plan/gemm_plan_s64t_int8_v4.cc <log> -DGP_M=12288 -DGP_N=512 -DGP_K=2048 -DGP_LAUNCHES=8 -DGP_TM=96 -DGP_TN=64 -DGP_KC=64 -DGP_C_DEPTH=1 -DGP_GT=1 -DGP_DM_FIXED=4096
+#define GP_M 12288
+#define GP_N 512
+#define GP_K 2048
+#define GP_DTYPE 1
+#define GP_LAUNCHES 8
+#define GP_TM 96
+#define GP_TN 64
+#define GP_KC 64
+#define GP_C_DEPTH 1
+#define GP_GT 1
+#define GP_DM_FIXED 4096
+// the pragmas of gemm_plan.cc
+#pragma aie_debug_level(AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
+#pragma control_plan_op_control_packet
+#pragma control_packet_mode(aot)
+#pragma KERNELCONFIGOFFLOAD
+#pragma output_tile_major
+#pragma persistent_kernel
+#include "gemm_plan_tbody.cc"
