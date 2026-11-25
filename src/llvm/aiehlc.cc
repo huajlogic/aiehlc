@@ -48,6 +48,7 @@
 #include "convautotile/kernel_trace.h"
 #include "convautotile/kernel_template.h"
 #include "convautotile/kernel_front.h"
+#include "convautotile/gemm_autotile.h"
 
 class AieFrontEnd;
 
@@ -4218,6 +4219,18 @@ public:
         // aout/conv_autotile.json. AIEHLC_CONV_TUNE (JSON text or @file) overrides
         // the tunable knobs (time_oh, time_ow, pp_depth, c_align) -- the hook the
         // AutoTVM tuner (script/convtune) uses. A rejected configuration aborts.
+        // #pragma gemm_autotile (convautotile/gemm_autotile.h): the mesh and A ring of a 2 x 8 shared-operand
+        // GEMM chosen by the cost model from GP_M / GP_N / GP_K / GP_DTYPE, written as #defines before the
+        // kernel is traced. Board: #pragma gemm_autotile(palmyra) or AIEHLC_GEMM_BOARD (default vek385).
+        void applyGemmAutoTiling(std::string &src) {
+            std::string log, err;
+            if (!gemmtile::applyGemmAutoTile(src, log, err)) {
+                llvm::errs() << "[GemmAutoTile] ERROR: " << err << "\n";
+                std::exit(1);
+            }
+            llvm::outs() << log;
+        }
+
         void applyConvAutoTiling(std::string &src) {
             convautotile::Overrides ov;
             if (const char *env = std::getenv("AIEHLC_CONV_TUNE")) {
@@ -4466,6 +4479,7 @@ public:
                 injectUserDefines(SourceCodeString);
                 inlineSourceIncludes(SourceCodeString);
                 applyKernelTemplates(SourceCodeString);
+                applyGemmAutoTiling(SourceCodeString);
                 applyConvAutoTiling(SourceCodeString);
 
                 // Collect user #define macros before any rewriting.

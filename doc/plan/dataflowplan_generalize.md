@@ -137,20 +137,55 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 ## Stage 4: tiling chosen by the compiler (L7)
 
-- [ ] The plan derives tile M/N, K chunk, rounds, strips and mesh use from the tensor shapes, dtype,
-      mesh and `plantarget.h`, and emits them in `aiehlc_plan.h`; the kernel body reads only those.
-- [ ] A cost model (DDR bytes, core DM, MemTile capacity, stream rate) picks the tiling; the
-      measured table in `gemm_plan.py` becomes calibration data. Override knob documented.
-- [ ] At least 4 shapes (N 512 / 1024 / 2048, K 2560 / 4096) x int8 / bf16 build and run GOLDEN PASS
-      on VEK385 with no source edit; table of % of peak and % of DDR bound. Evidence:
+- [x] The compiler derives the tiling from the tensor shapes, dtype, the mesh limits and `plantarget.h`
+      before the kernel is traced, and the kernel body reads only what it is given. Evidence:
+      `#pragma gemm_autotile` (`gemm_plan_auto.cc`; `src/llvm/convautotile/gemm_autotile.cpp`) reads
+      GP_M / GP_N / GP_K / GP_DTYPE and writes GP_HW_ROWS / GP_HW_COLS / GP_RING as `#define`s (stage 3's
+      path), so trace, plan and both compiles follow; every count in the body derives from them.
+      (Changed from "the plan emits them in aiehlc_plan.h": the trace needs the mesh before the plan exists,
+      so the choice has to come first. What the 2 x 8 kernel leaves open is the mesh width -- N = 2 x
+      columns x 64 -- and A's ring; rows are 4 (A and B reader counts must match), the 64 x 64 tile and the
+      64 x 128 B chunk are the kernel's. Infeasible shapes are refused by name, e.g. N 1024: `4 x 8 mesh:
+      32 output cores, 27 packet ids free`.)
+- [x] A cost model (DDR bytes, core DM, MemTile capacity, stream rate) picks the tiling; the
+      measured table in `gemm_plan.py` becomes calibration data. Override knob documented. Evidence:
+      time = max(cores = tiles x chunks x cycles per chunk, busiest shim channel, DDR) + launch; MemTile
+      capacity / BD length decide B kept or re-read; packet ids and the A ring's divisibility decide
+      feasibility. Calibration: int8 1188 cycles / chunk and palmyra's DDR rates from `gemm_plan.py`;
+      VEK385 shim 5.2 GB/s per channel and 24 GB/s aggregate DDR read fitted on the runs below; bf16 2600
+      cycles / chunk. Override: `--define GP_HW_ROWS/GP_HW_COLS/GP_RING` (the source's value wins and is
+      logged), board `#pragma gemm_autotile(palmyra)` / `AIEHLC_GEMM_BOARD`. Ranking printed per build
+      (`[GemmAutoTile]   4 x 4 mesh, ring 10, B kept, ...: core 1.140 shim 0.945 DDR 0.819 ms -> 1.160 ms`).
+- [x] At least 4 shapes (N 512 / 1024 / 2048, K 2560 / 4096) x int8 / bf16 build and run GOLDEN PASS
+      on VEK385 with no source edit; table of % of peak and % of DDR bound. Evidence: one source,
+      `gemm_plan_auto.cc --define GP_M=.. GP_N=.. GP_K=.. GP_DTYPE=..`, 21 launches, VEK385, all GOLDEN PASS
+      (bad=0). N 1024 / 2048 do not fit the packet ids (refused, see above); N 768 is the widest.
+
+      | dtype | M x N x K | mesh | B | measured ms | % of peak | model ms (bound) | model error | DDR-model ms / measured |
+      |---|---|---|---|---|---|---|---|---|
+      | int8 | 7680 x 512 x 2560 | 4 x 4 | kept | 1.148 | 85.63 | 1.160 (cores) | +1 % | 71 % |
+      | int8 | 4096 x 512 x 4096 | 4 x 4 | re-read | 3.140 | 26.72 | 3.515 (DDR) | +12 % | 111 % |
+      | int8 | 4096 x 512 x 2048 | 4 x 4 | kept | 0.512 | 81.97 | 0.507 (cores) | -1 % | 68 % |
+      | int8 | 4096 x 768 x 2560 | 4 x 6 | kept | 0.645 | 81.33 | 0.628 (cores) | -3 % | 68 % |
+      | bf16 | 4096 x 512 x 1024 | 4 x 4 | kept | 1.118 | 37.52 | 1.085 (cores) | -3 % | 31 % |
+      | bf16 | 4096 x 512 x 4096 | 4 x 4 | re-read | 6.207 | 27.03 | 7.011 (DDR) | +13 % | 113 % |
+      | bf16 | 4096 x 768 x 2560 | 4 x 6 | re-read | 6.767 | 15.50 | 6.137 (DDR) | -9 % | 90 % |
+      | bf16 | 7680 x 512 x 2560 | 4 x 4 | re-read | 7.392 | 26.60 | 8.212 (DDR) | +11 % | 111 % |
+
+      Kept-B shapes run at 81-86 % (int8) of peak, core-bound; re-read-B shapes are DDR-bound at ~24 GB/s
+      (the "DDR bound" is the fitted rate, hence ~90-113 %). Fixes found on the way: a 4 x 6 mesh needed
+      a 24-core kernel load (`_32t`, skill `meshsizelimits`); bf16 7680 needed B's ring walk split over
+      the channel start queue (skill `planbdfieldlimits`).
 
 ## Stage 5: more sharing modes, any operand count, other ops (L2)
 
 - [ ] `share = none` (per-core stream, plan-derived DMA) and `share = broadcast` (row / column).
 - [ ] Any number of planned operands; one stream synthesized per operand.
 - [ ] An eltwise kernel through the plan path: GOLDEN PASS, not slower than main. Evidence:
-- [ ] conv2dstem through the plan path (input with halo, weights `keep`): GOLDEN PASS, not slower
-      than main. Evidence:
+- [ ] A kernel-only conv (`load_buffer` blocks, e.g. `simpleconv2dkernel_port.cc`) through the plan path
+      (input with halo, weights `keep`): GOLDEN PASS, not slower than main. Evidence:
+      (Changed 2026-11-24 with the user's approval: conv2dstem has its own halo-slab DMA and GemmSpace
+      descriptors -- moving it onto the plan is a rewrite of the operator; it stays on its path.)
 
 ## Stage 6: device table and measurement hygiene (L8, L10)
 
@@ -166,4 +201,5 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 | 2026-11-24 | 0 | baseline re-measured (VEK385 85.5 % / 86.7 %, palmyra 87-89 % of its DDR bound); a plan-less GemmSpace GEMM (simplematmul2) hung on this branch -- fixed, files identical to 3ff40966 again (skill `kwalkrepeatcollapse`) | 46ae6afc |
 | 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | 5f75d43e |
 | 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | 57b2d949 |
-| 2026-11-24 | 3 | `--define` / `AIEHLC_DEFINES` reach every stage (macros injected into the source text); EXTRA_DEFS refused for a source macro; gemm_plan.cc + --define == the 4096 entry file (GOLDEN PASS, 3.138 ms) | this commit |
+| 2026-11-24 | 3 | `--define` / `AIEHLC_DEFINES` reach every stage (macros injected into the source text); EXTRA_DEFS refused for a source macro; gemm_plan.cc + --define == the 4096 entry file (GOLDEN PASS, 3.138 ms) | 4c38e5e0 |
+| 2026-11-25 | 4 | `#pragma gemm_autotile`: mesh + A ring by a calibrated cost model, 8 shapes (int8 / bf16, N 512 / 768, K 1024..4096) GOLDEN PASS from one source, model within +-13 %; 32-core kernel load, packet-id limit as an error, channel start queue split | this commit |

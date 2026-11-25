@@ -31,12 +31,16 @@ Fix: the same data again = no iteration (`iter_wrap` 1; the runtime only program
 and the channel start's repeat count re-reads the BD. `deriveDmaProgram` rejects any shim BD with
 wrap > 1 and a step under one word.
 
-## 3. Channel start repeat: at most 256
+## 3. Channel start repeat: at most 256 per start, 4 starts queued
 
-`MaxRepeatCount = 256U` (`xaie2psgbl_reginit.c`) for core, MemTile and shim channels. A ring's MemTile
-channels start `rounds x chunks per tile / (ring x k)` times; with B streamed (k = groups x channels
-= 4) that reaches 512 at bf16 4096^2-ish shapes. Limit: `chMaxRepeat`; plansynth deepens B's ring until
-every start is <= 256; `deriveDmaProgram` rejects a channel above it.
+`MaxRepeatCount = 256U`, `StartQSizeMax = 4U` (`xaie2psgbl_reginit.c`) for core, MemTile and shim
+channels. A ring's MemTile channels walk `rounds x chunks per tile / (ring x k)` times per launch; with B
+streamed (k = groups x channels = 4) that is 600 at bf16 7680 x 512 x 2560 for ring 2. plandma splits a
+walk over up to `chStartQueue` equal starts (`__Runtime_dma_channel_start` twice or more = queued, tags
+`.../q1`); plansynth picks the shallowest B ring whose walk splits that way. A deeper ring instead runs
+out of MemTile BDs: a bank (24 BDs) serves 3 channels, so 4 MM2S replays of ring 5 + its 20-BD S2MM
+chain cannot be placed (`MemTile (1, 1): out of DMA channels for B's replays`). Limits: `chMaxRepeat`,
+`chStartQueue`; a walk beyond 256 x 4 or not divisible is a build error.
 
 ## Check
 

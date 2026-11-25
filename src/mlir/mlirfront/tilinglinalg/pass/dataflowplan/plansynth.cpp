@@ -244,7 +244,14 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
             // times and that divides the column's chunk stream (rounds x groups x K chunks)
             const int64_t stream = R2 * (int64_t)sb.groups * NK, k = (int64_t)sb.groups * channels;
             sb.ring = (int)dint(B.df, "ring", 2);
-            while (sb.ring < 64 && (stream % (sb.ring * k) || stream / (sb.ring * k) > T.chMaxRepeat))
+            // (a channel's walk may span chStartQueue queued starts of <= chMaxRepeat each: plandma splits it)
+            auto startsOk = [&](int64_t rep) {
+                for (int n = 1; n <= T.chStartQueue; n++)
+                    if (rep % n == 0 && rep / n <= T.chMaxRepeat)
+                        return true;
+                return false;
+            };
+            while (sb.ring < 64 && (stream % (sb.ring * k) || !startsOk(stream / (sb.ring * k))))
                 sb.ring++;
             const int64_t bRing = (int64_t)sb.ring * sb.groups * channels * bChunk;
             if (bRing > room)

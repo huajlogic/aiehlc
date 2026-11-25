@@ -19,6 +19,9 @@ namespace dfplan {
 
 struct PlanTarget {
     const char *name;
+    // ---- the array (aie_device_map.h): columns, core rows
+    int arrayCols, coreRows;
+    int pktIds; // packet ids (5-bit field, 0 reserved); the router hands one to every packet-switched output core
     // ---- resources per tile
     int coreLocks, coreBds, coreS2mmChannels;
     int memLocks, memBds, memChannels; // MemTile: per direction
@@ -46,6 +49,7 @@ struct PlanTarget {
     int64_t coreMinStack;      // the smallest stack kc.sh relinks a kernel with (AIEHLC_DM_MIN_STACK)
     int64_t coreStaticReserve; // kernel statics besides the accumulator (klog area, block-call state)
     int chMaxRepeat;           // largest repeat count of a DMA channel's start (task queue): MaxRepeatCount
+    int chStartQueue;          // starts a channel's task queue holds (StartQSizeMax): a longer walk is split
     int memBankLo(int ch) const { return memBdBank * (ch & 1); }
 };
 
@@ -53,6 +57,9 @@ struct PlanTarget {
 inline const PlanTarget &planTarget() {
     static const PlanTarget t{
         "aie2ps",
+        /*arrayCols*/ 36,
+        /*coreRows*/ 4,
+        /*pktIds*/ 31,
         /*coreLocks*/ 16,
         /*coreBds*/ 16,
         /*coreS2mmChannels*/ 2,
@@ -82,6 +89,7 @@ inline const PlanTarget &planTarget() {
         /*coreMinStack*/ 4096,
         /*coreStaticReserve*/ 4096,
         /*chMaxRepeat*/ 256,
+        /*chStartQueue*/ 4,
     };
     return t;
 }

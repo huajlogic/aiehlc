@@ -565,7 +565,9 @@ router port model, around the generated routes + control plane) -- no text branc
 (constants + the generated host `aiehlc_plan_arrange`, the DDR layout the shim BDs read).
 **B staged by MemTile capacity**: held whole (`.keep`) when its column's strips fit, else a `memtile_ring` too (re-read from DDR per output tile; ring depth keeps every channel start <= 256, `plantarget.h` `chMaxRepeat`), so bf16 / large-K shapes build (`gemm_plan_4096x512x4096_{int8,bf16}.cc`; shape / dtype knobs `GP_M/N/K/DTYPE` in `gemm_plan_body.cc`). Shape / dtype at build time: `aiehlc.sh --define GP_M=4096 ...` (also `AIEHLC_DEFINES`) reaches the front end, the
 x86 trace, the plan and both compiles (aiehlc writes `#define` lines at the top of the source text; `EXTRA_DEFS` is
-host-only and refused for a macro the source uses). Work plan for generalizing: `doc/plan/dataflowplan_generalize.md`. **Protocol + layout from the IR**: `plan_stream` carries `channels / slots / readers / parts / elem_bytes /
+host-only and refused for a macro the source uses); `#pragma gemm_autotile` (`gemm_plan_auto.cc`,
+`src/llvm/convautotile/gemm_autotile.cpp`) picks mesh rows x columns and A's ring with a calibrated cost model
+(`[GemmAutoTile]` ranking in the build log). Work plan for generalizing: `doc/plan/dataflowplan_generalize.md`. **Protocol + layout from the IR**: `plan_stream` carries `channels / slots / readers / parts / elem_bytes /
 row_groups / strips`; any column count >= A strips (4 x 4 85.5 %, **4 x 2** `gemm_plan_4x2.cc` 86.5 %, both GOLDEN PASS).
 **Readback**: every plan op is tagged (`dfplan.tag`); `NN_DataflowPlanProgram.mlir` (the dfschedule program alone)
 edited and fed back with `AIEHLC_DFSCHEDULE_PLAN_IN` is lifted (ids, addresses, ring) and regenerated identically
@@ -1038,6 +1040,7 @@ Read the matching skill when the task fits:
 | GOLDEN FAIL with an identical match count every run and unchanged perf after changing BD dims; core BD wrap > 255 (8-bit field, MemTile / shim 10-bit) | bdwrapfieldwidth |
 | Persistent kernel (dataflow plan) passes launch 0 and hangs from launch 1 (`wait_io TIMEOUT` on the input shims), cores read `core_status=0 pc=0`; only on a non-16-core mesh | persistentkernelreload |
 | Dataflow plan with B `.stage = memtile` but no `.keep`: launch 0 passes, launch 1 hangs `wait_io TIMEOUT tile(c,0) ch=0 dir=1` on the B input shims (B MemTile locks `restored` though unbalanced) | planmemtilebperlaunch |
+| Mesh wider than 4 x 4: `bad_optional_access` abort after `Allocated DataIO` lines, `out of packet ids`, `too many tiles (24) for load_kernel_group`, gemm_autotile `packet ids free` | meshsizelimits |
 | Kernel-only GEMM with `output_tile_major` (bf16 C as `N x 2` bytes) GOLDEN FAILs ~everywhere with right values at wrong places; no `routing.tiling`; output BD `len=0` hang; bf16 output one ulp off (floor rounding) | kbtilemajoroutput |
 | Dataflow-plan GEMM at a new shape hangs on the B input shims or GOLDEN FAILs ~96 % of outputs; B exactly 512 KiB per MemTile; shim BD `iter_step_size=0`; a channel started > 256 times | planbdfieldlimits |
 | A hand-written GemmSpace GEMM (simplematmul2) hangs in `wait_io TIMEOUT ... dir=1` / watchdog after a compiler update; `startio(..., 4)` became `(..., 1)`; `3D K BD is already the whole walk ... repeat 4 -> 1` | kwalkrepeatcollapse |

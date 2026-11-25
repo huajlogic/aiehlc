@@ -523,12 +523,34 @@ bool deriveDmaProgram(DataflowPlan &p, std::string &why) {
             return false;
         }
     }
+    // a start repeats at most chMaxRepeat times: a longer walk goes into the task queue as several equal
+    // starts (at most chStartQueue)
+    {
+        std::vector<PlanChannel> split;
+        for (const PlanChannel &ch : p.channels) {
+            int n = 1;
+            while (n <= planTarget().chStartQueue && (ch.repeat % n || ch.repeat / n > planTarget().chMaxRepeat))
+                n++;
+            if (n == 1 || n > planTarget().chStartQueue) {
+                split.push_back(ch);
+                continue;
+            }
+            for (int q = 0; q < n; q++) {
+                split.push_back(ch);
+                split.back().repeat = ch.repeat / n;
+                if (q)
+                    split.back().tag += "/q" + std::to_string(q);
+            }
+        }
+        p.channels = split;
+    }
     for (const PlanChannel &ch : p.channels)
         if (ch.repeat < 1 || ch.repeat > planTarget().chMaxRepeat) {
             why = "DMA channel " + std::to_string(ch.ch) + (ch.s2mm ? " S2MM" : " MM2S") + " of tile (" +
                   std::to_string(ch.tiles[0].col) + ", " + std::to_string(ch.tiles[0].row) + ") would start " +
                   std::to_string(ch.repeat) + " times, a channel start repeats at most " +
-                  std::to_string(planTarget().chMaxRepeat) + " (" + ch.tag + "): use a deeper ring";
+                  std::to_string(planTarget().chMaxRepeat) + " x " + std::to_string(planTarget().chStartQueue) +
+                  " queued starts (" + ch.tag + "): use a deeper ring";
             return false;
         }
     if (!deriveKernelParams(p, why))

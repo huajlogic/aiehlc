@@ -59,7 +59,7 @@ carried as `BlockOpts` -> `KernelBlock` (`tilinglinalg_pipeline.h`) and attached
 The kernel body is a plain block-load kernel; it never names a lock, a view or an address. The
 compiler binds its block calls on the shared ports to the plan (section 4, "Kernel side").
 
-### Shape and dtype at build time: `--define`
+### Shape, dtype and tiling at build time: `--define`, `#pragma gemm_autotile`
 
 `gemm_plan_body.cc` takes its problem as macros (`GP_M` / `GP_N` / `GP_K` / `GP_DTYPE`, defaults
 7680 / 512 / 2560 / int8) and derives every count from them. A macro must reach every stage that
@@ -69,6 +69,22 @@ NAME=VALUE` (or `AIEHLC_DEFINES="-DNAME=VALUE ..."`) does that: aiehlc writes th
 lines at the top of the source text (`injectUserDefines`, then `#line 1`), before the includes are
 spliced, so a body's `#ifndef NAME` default yields and `kernel.cc`, `host.cc` and the KOBJ cache key
 all follow. `EXTRA_DEFS` stays host-only and is refused for a macro the source uses.
+
+`#pragma gemm_autotile[(board)]` (`gemm_plan_auto.cc`) lets the compiler pick the tiling the 2 x 8
+kernel leaves open: the mesh (rows x columns: N = 2 x columns x 64 fixes the columns; rows must be 4 so
+A's and B's reader counts match) and A's MemTile ring (deepest <= 10 dividing the chunk stream). A mesh
+must also fit the packet ids (every packet-switched output core takes one of 27 on aie2ps: columns <= 6)
+and the 32-core kernel load. `src/llvm/convautotile/gemm_autotile.cpp`
+ranks every feasible choice by max(cores, shim channels, DDR) + launch: cores = tiles x K chunks x
+cycles per chunk (int8 1188 measured, bf16 calibrated on the board), shim = the busiest channel's bytes
+at the board's per-channel rate (B re-read per output tile when it cannot be held), DDR = reads /
+writes at the board's rates (palmyra: one controller, no overlap; VEK385: 24 GB/s aggregate read, fitted
+on the B-re-read runs). Measured on 8 shapes (doc/plan/dataflowplan_generalize.md stage 4): within
++-13 %. Board facts: `vek385`, `palmyra`
+(`#pragma gemm_autotile(palmyra)` or `AIEHLC_GEMM_BOARD`); device facts: `plantarget.h`. It writes
+`GP_HW_ROWS` / `GP_HW_COLS` / `GP_RING` the same way as `--define`, except those the source sets itself,
+and prints the ranking (`[GemmAutoTile] ...`, predicted ms and % of peak per candidate). The K chunk
+(64 x 128 B) and the 64 x 64 output tile are the kernel's and not searched.
 
 ### One kernel body, no `#if defined(__chess__)` (2026-11-23, later)
 
