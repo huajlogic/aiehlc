@@ -7547,6 +7547,52 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
  * @param iter_step_size Iteration step size in bytes (÷4 for 32-bit words).
  * @param iter_wrap      Number of times the BD re-executes (OOO packets).
  */
+/* Per-slice shim BD address rebase (m3362124221 PRT).  See aie_runtime.h.
+ * Host-readable call counter; P3 reports it as rebase writes per launch. */
+static volatile uint64_t g_shim_bd_rebase_n = 0;
+
+uint64_t __Runtime_shim_bd_rebase_count(void) { return g_shim_bd_rebase_n; }
+
+void __Runtime_shim_bd_rebase_count_reset(void) { g_shim_bd_rebase_n = 0; }
+
+int __Runtime_shim_bd_set_addr(int col, int row, int bd, uint64_t addr) {
+    if (row != 0) {
+        printf("[aie_runtime] shim_bd_set_addr ERROR: tile(%d,%d) is not a shim tile (row must be 0)\n", col, row);
+        return -1;
+    }
+    /* bd_id handling as in __Runtime_dma_bd_config_multidim: carried as an
+     * int, narrowed to the aie-rt BD number; reject values that would be
+     * truncated (createio/BdTrackEntry still store bd_id as u8). aie-rt
+     * checks bd against the shim's BD count itself. */
+    if (bd < 0 || bd > 0xFF || col < 0) {
+        printf("[aie_runtime] shim_bd_set_addr ERROR: shim(%d,0) bad bd=%d\n", col, bd);
+        return -1;
+    }
+    XAie_DevInst *dev = g_DevInst;
+    if (!dev) {
+        printf("[aie_runtime] shim_bd_set_addr ERROR: no device instance\n");
+        return -1;
+    }
+    XAie_LocType tile = XAie_TileLoc((u8)col, 0);
+    uint64_t dma_addr = addr;
+    {
+        uint64_t offset = 0;
+        XAie_MemInst *mem = __vaddr_to_mem_offset((void *)(uintptr_t)addr, &offset);
+        if (mem)
+            dma_addr = XAie_MemGetDevAddr(mem) + offset;
+    }
+    AieRC rc = XAie_DmaUpdateBdAddr(dev, tile, (u64)dma_addr, (u16)bd);
+    AIEHLC_LOG(printf("[aie_runtime] shim_bd_set_addr shim(%d,0) bd=%d addr=0x%llx dev=0x%llx rc=%d\n", col, bd,
+                      (unsigned long long)addr, (unsigned long long)dma_addr, (int)rc));
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] shim_bd_set_addr ERROR: shim(%d,0) bd=%d addr=0x%llx rc=%d\n", col, bd,
+               (unsigned long long)dma_addr, (int)rc);
+        return -1;
+    }
+    g_shim_bd_rebase_n++;
+    return 0;
+}
+
 XAie_DmaDesc __Runtime_dma_bd_config_multidim_ooo(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
                                                   int32_t len, int32_t next_bd, int32_t enable_packet,
                                                   int32_t packet_id, int32_t acquire_lock_id, int32_t acquire_lock_val,

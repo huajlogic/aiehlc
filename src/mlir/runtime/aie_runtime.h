@@ -315,6 +315,21 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
                                               int32_t dim_stride2, int32_t dim_wrap2, int32_t dim_stride3,
                                               int32_t dim_wrap3);
 
+// Per-slice shim BD address rebase (m3362124221 PRT).
+// Rewrites ONLY the address word(s) of an already-configured shim BD via
+// XAie_DmaUpdateBdAddr over MMIO (control packets cannot write the shim BD
+// address word).  len / locks / next_bd / packet / dims are left untouched.
+// addr: a host vaddr inside a registered XAie_MemInst is translated to its
+// device address (same as __Runtime_dma_bd_config_multidim); any other value
+// is written as a device address unchanged.
+// Uses g_DevInst.  Returns 0 on success, -1 if row != 0 (not shim), bd is
+// outside 0..255 (BD ids are carried as u8, see createio), no device, or
+// aie-rt rejects the write (e.g. bd >= number of shim BDs).
+// Each successful call increments a counter: __Runtime_shim_bd_rebase_count().
+int __Runtime_shim_bd_set_addr(int col, int row, int bd, uint64_t addr);
+uint64_t __Runtime_shim_bd_rebase_count(void);
+void __Runtime_shim_bd_rebase_count_reset(void);
+
 // Multi-dimensional BD with OOO iteration support.
 // Configures D0-D2 address dimensions plus a separate iteration dimension
 // for out-of-order packet reception where the BD re-executes iter_wrap times
