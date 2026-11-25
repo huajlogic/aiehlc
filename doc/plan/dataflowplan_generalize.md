@@ -118,11 +118,22 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 ## Stage 3: one source, any configuration via -D (L6)
 
-- [ ] `aiehlc.sh` passes user `-D` (and `AIEHLC_DEFINES`) to the front end, the x86 trace, the plan,
-      `kc.sh` and the KOBJ cache key.
-- [ ] Shape macros that differ between host and kernel builds are a build error.
-- [ ] `gemm_plan.cc` with `-DGP_M=4096 ...` produces the same files as a dedicated entry file.
-      Evidence:
+- [x] `aiehlc.sh` passes user `-D` (and `AIEHLC_DEFINES`) to the front end, the x86 trace, the plan,
+      `kc.sh` and the KOBJ cache key. Evidence: `aiehlc.sh --define NAME=VALUE` / `AIEHLC_DEFINES`; aiehlc
+      writes them as `#define` lines at the top of the source text before anything reads it
+      (`injectUserDefines`, `#line 1`), so all of these derive from one text; build log `[aiehlc] define
+      GP_M = 4096 (AIEHLC_DEFINES)` x 5.
+- [x] Shape macros that differ between host and kernel builds are a build error. Evidence:
+      `EXTRA_DEFS=-DGP_M=4096` on gemm_plan.cc -> rc 1, `Error: EXTRA_DEFS -DGP_M=4096 reaches only the host
+      compile, but GP_M is used by the source (gemm_plan.cc gemm_plan_body.cc): the kernel, the trace and the
+      plan would see another value. Pass it with --define GP_M=4096 (or AIEHLC_DEFINES) instead.`
+- [x] `gemm_plan.cc` with `-DGP_M=4096 ...` produces the same files as a dedicated entry file.
+      Evidence: `--define GP_M=4096 GP_N=512 GP_K=4096 GP_DTYPE=1 GP_LAUNCHES=101` vs
+      `gemm_plan_4096x512x4096_int8.cc`: `kernel.cc`, `routing.cc`, `aiehlc_plan.h` identical, `host.cc`
+      differs only in the entry file's comment and the splice markers; VEK385 `GOLDEN PASS
+      shape=4096x512x4096 dtype=int8 launch=101 checked=300032 bad=0 | PERF SUMMARY gemm_plan steady 3.138 ms
+      median (26.73 % of peak @ 1250 MHz)`. Without defines gemm_plan.cc's kernel.cc / routing.cc /
+      aiehlc_plan.h are unchanged.
 
 ## Stage 4: tiling chosen by the compiler (L7)
 
@@ -154,4 +165,5 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 |---|---|---|---|
 | 2026-11-24 | 0 | baseline re-measured (VEK385 85.5 % / 86.7 %, palmyra 87-89 % of its DDR bound); a plan-less GemmSpace GEMM (simplematmul2) hung on this branch -- fixed, files identical to 3ff40966 again (skill `kwalkrepeatcollapse`) | 46ae6afc |
 | 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | 5f75d43e |
-| 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | this commit |
+| 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | 57b2d949 |
+| 2026-11-24 | 3 | `--define` / `AIEHLC_DEFINES` reach every stage (macros injected into the source text); EXTRA_DEFS refused for a source macro; gemm_plan.cc + --define == the 4096 entry file (GOLDEN PASS, 3.138 ms) | this commit |

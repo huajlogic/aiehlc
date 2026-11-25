@@ -563,7 +563,9 @@ shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernel
 `plan_route` ops lowered in **DmaphopToRoutinghwPass** to ordinary routinghw ops (`passdmaphoptoroutinghw/planroutes.cpp`,
 router port model, around the generated routes + control plane) -- no text branch in routing.cc; `aiehlc_plan.h`
 (constants + the generated host `aiehlc_plan_arrange`, the DDR layout the shim BDs read).
-**B staged by MemTile capacity**: held whole (`.keep`) when its column's strips fit, else a `memtile_ring` too (re-read from DDR per output tile; ring depth keeps every channel start <= 256, `plantarget.h` `chMaxRepeat`), so bf16 / large-K shapes build (`gemm_plan_4096x512x4096_{int8,bf16}.cc`; shape / dtype knobs `GP_M/N/K/DTYPE` in `gemm_plan_body.cc`). Work plan for generalizing: `doc/plan/dataflowplan_generalize.md`. **Protocol + layout from the IR**: `plan_stream` carries `channels / slots / readers / parts / elem_bytes /
+**B staged by MemTile capacity**: held whole (`.keep`) when its column's strips fit, else a `memtile_ring` too (re-read from DDR per output tile; ring depth keeps every channel start <= 256, `plantarget.h` `chMaxRepeat`), so bf16 / large-K shapes build (`gemm_plan_4096x512x4096_{int8,bf16}.cc`; shape / dtype knobs `GP_M/N/K/DTYPE` in `gemm_plan_body.cc`). Shape / dtype at build time: `aiehlc.sh --define GP_M=4096 ...` (also `AIEHLC_DEFINES`) reaches the front end, the
+x86 trace, the plan and both compiles (aiehlc writes `#define` lines at the top of the source text; `EXTRA_DEFS` is
+host-only and refused for a macro the source uses). Work plan for generalizing: `doc/plan/dataflowplan_generalize.md`. **Protocol + layout from the IR**: `plan_stream` carries `channels / slots / readers / parts / elem_bytes /
 row_groups / strips`; any column count >= A strips (4 x 4 85.5 %, **4 x 2** `gemm_plan_4x2.cc` 86.5 %, both GOLDEN PASS).
 **Readback**: every plan op is tagged (`dfplan.tag`); `NN_DataflowPlanProgram.mlir` (the dfschedule program alone)
 edited and fed back with `AIEHLC_DFSCHEDULE_PLAN_IN` is lifted (ids, addresses, ring) and regenerated identically

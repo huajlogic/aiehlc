@@ -4036,6 +4036,33 @@ public:
         // A directive whose file cannot be read is left ALONE rather than
         // dropped -- Clang then reports the missing include against the real
         // line, which is a better error than a silent empty splice.
+        // AIEHLC_DEFINES="-DNAME=VALUE -DFLAG ..." (aiehlc.sh --define NAME=VALUE): the user's build-time
+        // macros, written as #define lines at the top of the source TEXT -- before the includes are spliced,
+        // the user #defines are collected and the kernel is traced -- so the front end, the x86 trace, the
+        // dataflow plan, the kernel TU (kc.sh) and host.cc all see the same values, and a `#ifndef NAME`
+        // default in an included body yields to them. (A -D on the host compile alone gave a kernel built
+        // for one shape and a host for another.) `#line 1` keeps the user's line numbers.
+        void injectUserDefines(std::string &src) {
+            const char *env = std::getenv("AIEHLC_DEFINES");
+            if (!env || !*env)
+                return;
+            std::istringstream is(env);
+            std::string tok, text;
+            while (is >> tok) {
+                if (tok.rfind("-D", 0) != 0 || tok.size() < 3) {
+                    llvm::errs() << "[aiehlc] ERROR: AIEHLC_DEFINES: '" << tok << "' is not -DNAME[=VALUE]\n";
+                    std::exit(1);
+                }
+                tok = tok.substr(2);
+                const size_t eq = tok.find('=');
+                const std::string name = tok.substr(0, eq), value = eq == std::string::npos ? "1" : tok.substr(eq + 1);
+                text += "#define " + name + " " + value + "\n";
+                llvm::outs() << "[aiehlc] define " << name << " = " << value << " (AIEHLC_DEFINES)\n";
+            }
+            if (!text.empty())
+                src = text + "#line 1\n" + src;
+        }
+
         void inlineSourceIncludes(std::string &src, int depth = 0) {
             if (depth > 8) // cycle backstop; `seen` already prevents the common case
                 return;
@@ -4436,6 +4463,7 @@ public:
                 //
                 // Headers (`.h`) are left to Clang, as before.
                 checkSourceIncludes(SourceCodeString);
+                injectUserDefines(SourceCodeString);
                 inlineSourceIncludes(SourceCodeString);
                 applyKernelTemplates(SourceCodeString);
                 applyConvAutoTiling(SourceCodeString);

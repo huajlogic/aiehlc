@@ -59,6 +59,17 @@ carried as `BlockOpts` -> `KernelBlock` (`tilinglinalg_pipeline.h`) and attached
 The kernel body is a plain block-load kernel; it never names a lock, a view or an address. The
 compiler binds its block calls on the shared ports to the plan (section 4, "Kernel side").
 
+### Shape and dtype at build time: `--define`
+
+`gemm_plan_body.cc` takes its problem as macros (`GP_M` / `GP_N` / `GP_K` / `GP_DTYPE`, defaults
+7680 / 512 / 2560 / int8) and derives every count from them. A macro must reach every stage that
+reads the source -- the front end's macro scan, the x86 kernel trace, the dataflow plan, the kernel and
+host compiles -- or the kernel is built for one shape and the host for another. `aiehlc.sh --define
+NAME=VALUE` (or `AIEHLC_DEFINES="-DNAME=VALUE ..."`) does that: aiehlc writes the macros as `#define`
+lines at the top of the source text (`injectUserDefines`, then `#line 1`), before the includes are
+spliced, so a body's `#ifndef NAME` default yields and `kernel.cc`, `host.cc` and the KOBJ cache key
+all follow. `EXTRA_DEFS` stays host-only and is refused for a macro the source uses.
+
 ### One kernel body, no `#if defined(__chess__)` (2026-11-23, later)
 
 `gemm_plan.cc`'s kernel is ONE body for the core and for the x86 trace: every operand block comes from
