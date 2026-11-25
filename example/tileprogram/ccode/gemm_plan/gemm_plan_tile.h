@@ -354,15 +354,19 @@
             int8_t *const yr_ = (last) ? (y) + (mi - (ym0)) * (KA_TN / 8) * 64 : nullptr;                              \
             for (int ni = 0; ni < KA_TN / 8; ni += 4)                                                                  \
                 chess_loop_range(KA_TN / 32, KA_TN / 32) {                                                             \
-                    GT_LDC(Y, first, r0_ + (ni + 2) * 64, r1_ + (ni + 2) * 64)                                         \
-                    GT_MACC(X, pa0_, pa1_, qa0_, qa1_, b0, b1, b0q, b1q, ns, ni)                                       \
-                    GT_STC(X, last, r0_ + ni * 64, r1_ + ni * 64, yr_ + ni * 64)                                       \
+                    /* the three partial-sum blocks of this step (Y, X, next X) are disjoint: restrict lets the next \
+                       X load move above X's store (otherwise store -> load order serialises the two sets) */      \
                     const bool nx_ = ni + 4 < KA_TN / 8;                                                               \
-                    int32_t *const x0_ = nx_ ? r0_ + (ni + 4) * 64 : n0_;                                              \
-                    int32_t *const x1_ = nx_ ? r1_ + (ni + 4) * 64 : n1_;                                              \
-                    GT_LDC(X, first, x0_, x1_)                                                                         \
+                    int32_t *__restrict py0_ = r0_ + (ni + 2) * 64, *__restrict py1_ = r1_ + (ni + 2) * 64;            \
+                    int32_t *__restrict px0_ = r0_ + ni * 64, *__restrict px1_ = r1_ + ni * 64;                        \
+                    const int32_t *__restrict pn0_ = nx_ ? r0_ + (ni + 4) * 64 : n0_;                                  \
+                    const int32_t *__restrict pn1_ = nx_ ? r1_ + (ni + 4) * 64 : n1_;                                  \
+                    GT_LDC(Y, first, py0_, py1_)                                                                       \
+                    GT_MACC(X, pa0_, pa1_, qa0_, qa1_, b0, b1, b0q, b1q, ns, ni)                                       \
+                    GT_STC(X, last, px0_, px1_, yr_ + ni * 64)                                                         \
+                    GT_LDC(X, first, pn0_, pn1_)                                                                       \
                     GT_MACC(Y, pa0_, pa1_, qa0_, qa1_, b0, b1, b0q, b1q, ns, ni + 2)                                   \
-                    GT_STC(Y, last, r0_ + (ni + 2) * 64, r1_ + (ni + 2) * 64, yr_ + (ni + 2) * 64)                     \
+                    GT_STC(Y, last, py0_, py1_, yr_ + (ni + 2) * 64)                                                   \
                 }                                                                                                      \
         }                                                                                                              \
     }
