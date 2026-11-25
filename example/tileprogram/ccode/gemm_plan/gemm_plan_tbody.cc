@@ -197,7 +197,7 @@ static_assert(GP_TM % 16 == 0 && GP_TN % 16 == 0, "GP_TM / GP_TN: whole 16-row a
 static_assert(GP_KC % 8 == 0 && GP_KCE % 8 == 0, "GP_KC: whole 8-deep k blocks");
 static_assert(GP_GT >= 0 && GP_GT <= 4 && ((GP_GT != 2 && GP_GT != 4) || (GP_K / GP_KCE) % 2 == 0),
               "GP_GT: 0 .. 4 (2 / 4: an even number of K chunks)");
-static_assert(GP_GT < 3 || (GP_TM / 16 * (GP_TN / 16)) % 2 == 0, "GP_GT 3 / 4: an even number of accumulator pairs per tile");
+static_assert(GP_GT < 3 || GP_TN % 32 == 0, "GP_GT 3 / 4: KA_TN % 32 == 0 (pair columns walked in X / Y steps)");
 static_assert(GP_C_DEPTH == 1 || GP_C_DEPTH == 2, "GP_C_DEPTH: 1 (one output buffer) or 2 (ping-pong)");
 static_assert(GP_C_DEPTH == 2 || (GP_DTYPE == 1 && !(KA_TM == 64 && KA_TN == 64 && KA_KC == 128)),
               "GP_C_DEPTH 1: the generic int8 tile kernel only (GT_CHUNK)");
@@ -381,6 +381,7 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
                                       , acc14, acc15
 #endif
     };
+#if GP_GT == 0
     for (int t = 0; t < SH_TILES; t++) {
         const int arow = sa * (KA_M / 2) + t * KA_TM;
         for (int k = 0; k < SH_NK; k++) {
@@ -390,17 +391,6 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
             const int8_t *a0p = GT_PART(xa, 0, KA_TM), *a1p = GT_PART(xa, 1, KA_TM);
             const int8_t *b0p = GT_PART(xb, 0, KA_TN), *b1p = GT_PART(xb, 1, KA_TN);
             GP_C1_ACQ(b1p);
-#if GP_GT == 2 || GP_GT == 4
-            // two chunks (both input slots) per accumulator reload: chunk k + 1 is acquired before chunk k is released
-            k++;
-            auto xa2 = aie::load_buffer(a, {arow, k * KA_KC}, {KA_TM, KA_KC}, OPTS_A);
-            auto xb2 = aie::load_buffer(b, {brow, k * KA_KC}, {KA_TN, KA_KC}, OPTS_B);
-            const int8_t *a0q = GT_PART(xa2, 0, KA_TM), *a1q = GT_PART(xa2, 1, KA_TM);
-            const int8_t *b0q = GT_PART(xb2, 0, KA_TN), *b1q = GT_PART(xb2, 1, KA_TN);
-#define GT_FIRST_K 1
-#else
-#define GT_FIRST_K 0
-#endif
             for (int h = 0; h < GP_C_SPLIT; h++) {
                 const int m0 = h * (GP_C_ROWS / 8), m1 = (h + 1) * (GP_C_ROWS / 8);
                 int8_t *__restrict y = nullptr;
@@ -409,40 +399,85 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
                     y = aie::store_buffer(c, {arow + h * GP_C_ROWS, brow}, {GP_C_ROWS, KA_TN}, GT_C_OPTS);
                     GP_C1_ACQ(y);
                 }
-#if GP_GT == 0
                 GT_CHUNK(accp, y, m0, a0p, a1p, b0p, b1p, k == 0, k == SH_NK - 1, m0, m1);
+                if (k == SH_NK - 1)
+                    aie::commit(c);
+            }
+            aie::release(a);
+            aie::release(b);
+        }
+    }
 #else
-#if GP_GT == 4
-#define GT_CALL(fi, la) GT_CHUNK_K(accp, y, m0, a0p, a1p, b0p, b1p, a0q, a1q, b0q, b1q, fi, la, m0, m1, 2)
-#elif GP_GT == 3
-#define GT_CALL(fi, la) GT_CHUNK_K(accp, y, m0, a0p, a1p, b0p, b1p, a0p, a1p, b0p, b1p, fi, la, m0, m1, 1)
+    // GP_GT 1 .. 4: the K walk peeled into first chunk step / middle loop / last chunk step, each with its own
+    // compile-time chunk kind (no chunk-kind branch left in the kernel). A step takes GT_NS chunks: with 2 (GP_GT 2 / 4)
+    // chunk k + 1 is acquired before chunk k is released (both input slots), one partial-sum round trip per 2 chunks.
+#if GP_GT == 2 || GP_GT == 4
+#define GT_NS 2
+#else
+#define GT_NS 1
+#endif
+#if GP_GT == 4 || GP_GT == 3
+#define GT_CALL(fi, la) GT_CHUNK_K(accp, y, m0, a0p, a1p, b0p, b1p, a0q, a1q, b0q, b1q, fi, la, m0, m1, GT_NS)
 #elif GP_GT == 2
 #define GT_CALL(fi, la) GT_CHUNK_P2(accp, y, m0, a0p, a1p, b0p, b1p, a0q, a1q, b0q, b1q, fi, la, m0, m1, 2)
 #else
 #define GT_CALL(fi, la) GT_CHUNK_P(accp, y, m0, a0p, a1p, b0p, b1p, fi, la, m0, m1)
 #endif
-                // one specialisation per chunk kind (first / middle / last): no branch inside the pipelined loop
-                if (k == GT_FIRST_K) {
-                    GT_CALL(1, 0)
-                } else if (k == SH_NK - 1) {
-                    GT_CALL(0, 1)
-                } else {
-                    GT_CALL(0, 0)
-                }
-#undef GT_CALL
+#if GT_NS == 2
+#define GT_ACQ2(k_)                                                                                                    \
+    auto xa2 = aie::load_buffer(a, {arow, ((k_) + 1) * KA_KC}, {KA_TM, KA_KC}, OPTS_A);                                \
+    auto xb2 = aie::load_buffer(b, {brow, ((k_) + 1) * KA_KC}, {KA_TN, KA_KC}, OPTS_B);                                \
+    const int8_t *a0q = GT_PART(xa2, 0, KA_TM), *a1q = GT_PART(xa2, 1, KA_TM);                                         \
+    const int8_t *b0q = GT_PART(xb2, 0, KA_TN), *b1q = GT_PART(xb2, 1, KA_TN);
+#define GT_REL2()                                                                                                      \
+    aie::release(a);                                                                                                   \
+    aie::release(b);
+#else
+#define GT_ACQ2(k_)                                                                                                    \
+    const int8_t *a0q = a0p, *a1q = a1p, *b0q = b0p, *b1q = b1p;
+#define GT_REL2()
 #endif
-                if (k == SH_NK - 1)
-                    aie::commit(c);
-            }
-#undef GT_FIRST_K
-            aie::release(a);
-            aie::release(b);
-#if GP_GT == 2 || GP_GT == 4
-            aie::release(a);
-            aie::release(b);
-#endif
-        }
+#define GT_STEP(kk, fi, la)                                                                                            \
+    {                                                                                                                  \
+        const int k_ = (kk);                                                                                           \
+        GP_C1_T0();                                                                                                    \
+        auto xa = aie::load_buffer(a, {arow, k_ * KA_KC}, {KA_TM, KA_KC}, OPTS_A);                                     \
+        auto xb = aie::load_buffer(b, {brow, k_ * KA_KC}, {KA_TN, KA_KC}, OPTS_B);                                     \
+        const int8_t *a0p = GT_PART(xa, 0, KA_TM), *a1p = GT_PART(xa, 1, KA_TM);                                       \
+        const int8_t *b0p = GT_PART(xb, 0, KA_TN), *b1p = GT_PART(xb, 1, KA_TN);                                       \
+        GP_C1_ACQ(b1p);                                                                                                \
+        GT_ACQ2(k_)                                                                                                    \
+        (void)a0q, (void)a1q, (void)b0q, (void)b1q;                                                                    \
+        for (int h = 0; h < GP_C_SPLIT; h++) {                                                                         \
+            const int m0 = h * (GP_C_ROWS / 8), m1 = (h + 1) * (GP_C_ROWS / 8);                                        \
+            int8_t *__restrict y = nullptr;                                                                            \
+            if (la) {                                                                                                  \
+                GP_C1_T0();                                                                                            \
+                y = aie::store_buffer(c, {arow + h * GP_C_ROWS, brow}, {GP_C_ROWS, KA_TN}, GT_C_OPTS);                 \
+                GP_C1_ACQ(y);                                                                                          \
+            }                                                                                                          \
+            GT_CALL(fi, la)                                                                                            \
+            if (la)                                                                                                    \
+                aie::commit(c);                                                                                        \
+        }                                                                                                              \
+        aie::release(a);                                                                                               \
+        aie::release(b);                                                                                               \
+        GT_REL2()                                                                                                      \
     }
+    static_assert(SH_NK >= 2 * GT_NS && SH_NK % GT_NS == 0, "GP_GT 1 .. 4: at least two K steps of GT_NS chunks");
+    for (int t = 0; t < SH_TILES; t++) {
+        const int arow = sa * (KA_M / 2) + t * KA_TM;
+        GT_STEP(0, 1, 0)
+        for (int k = GT_NS; k < SH_NK - GT_NS; k += GT_NS)
+            chess_loop_range(1, ) GT_STEP(k, 0, 0)
+        GT_STEP(SH_NK - GT_NS, 0, 1)
+    }
+#undef GT_STEP
+#undef GT_ACQ2
+#undef GT_REL2
+#undef GT_CALL
+#undef GT_NS
+#endif
 #if GP_CORE1 && defined(__chess__)
     {
         const unsigned long long tot = get_cycles() - gp_c1_t0;

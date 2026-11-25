@@ -290,13 +290,17 @@
     }
 #define GT_CHUNK_P(fp, y, ym0, a0, a1, b0, b1, first, last, m0, m1)                                                    \
     GT_CHUNK_P2(fp, y, ym0, a0, a1, b0, b1, a0, a1, b0, b1, first, last, m0, m1, 1)
-/* ---- GT_CHUNK_K (GP_GT 3 / 4): the K4 idea on the generic tile -- two 2 x 2 accumulator sets X / Y over the chunk's
- * (pair row, pair column) blocks in row-major order, hand-pipelined: Y's int32 partial sums are loaded before X's
- * VMACs, X's are stored (and the next X loaded) before Y's VMACs, so the accumulator round trip of one block overlaps
- * the VMACs of the other (with GT_CHUNK_P the store of block j and the load of block j + 1 may alias, which serialises
- * the pipelined loop: 39 bundles / 16 MAC). Blocks per call ((m1 - m0) / 2 x KA_TN / 16) must be even. After the
- * last pair the loop reloads pair (m0, 0) into X and discards it (a valid address, no branch). ns as GT_CHUNK_P2. */
-#define GT_LDC(c, first, fp, mi_, ni_)                                                                                 \
+/* ---- GT_CHUNK_K (GP_GT 3 / 4): the K4 idea on the generic tile -- two 2 x 2 accumulator sets X / Y, hand-pipelined:
+ * Y's int32 partial sums are loaded before X's VMACs, X's are stored (and the next X loaded) before Y's VMACs, so the
+ * accumulator round trip of one block overlaps the VMACs of the other (with GT_CHUNK_P the store of block j and the
+ * load of block j + 1 may alias, which serialises the pipelined loop: 39 bundles / 16 MAC). Walk: pair rows mi
+ * (outer), pair columns ni in steps of 2 pairs (X = ni, Y = ni + 2); the X after the last Y of a row is the next
+ * row's first pair (after the last row: pair (m0, 0) again, loaded and discarded -- a valid address, no branch).
+ * Operand / partial-sum addresses are selects and constant multiplies (no division in the loop). KA_TN % 32 == 0.
+ * ns as GT_CHUNK_P2 (2: two chunks a0 .. b1 then a0q .. b1q per partial-sum round trip). */
+/* 8 x 8 operand block r of a T-row chunk (parts p0 / p1), k block 0 -- GT_OP without the division */
+#define GT_OPS(p0, p1, r, T) ((r) < (T) / 16 ? (p0) + (r) * (KA_KC / 8) * 64 : (p1) + ((r) - (T) / 16) * (KA_KC / 8) * 64)
+#define GT_LDC(c, first, g0, g1)                                                                                       \
     if (first) {                                                                                                       \
         const aie::accum<acc32, 64> z_ = aie::zeros<acc32, 64>();                                                      \
         c##0 = KaMM4(z_);                                                                                              \
@@ -304,62 +308,62 @@
         c##2 = KaMM4(z_);                                                                                              \
         c##3 = KaMM4(z_);                                                                                              \
     } else {                                                                                                           \
-        const int32_t *__restrict g0_ = (fp)[mi_] + (ni_) * 64, *__restrict g1_ = (fp)[(mi_) + 1] + (ni_) * 64;        \
         aie::accum<acc32, 64> q0_, q1_, q2_, q3_;                                                                      \
-        q0_.from_vector(aie::load_v<64>(g0_));                                                                         \
-        q1_.from_vector(aie::load_v<64>(g0_ + 64));                                                                    \
-        q2_.from_vector(aie::load_v<64>(g1_));                                                                         \
-        q3_.from_vector(aie::load_v<64>(g1_ + 64));                                                                    \
+        q0_.from_vector(aie::load_v<64>(g0));                                                                          \
+        q1_.from_vector(aie::load_v<64>((g0) + 64));                                                                   \
+        q2_.from_vector(aie::load_v<64>(g1));                                                                          \
+        q3_.from_vector(aie::load_v<64>((g1) + 64));                                                                   \
         c##0 = KaMM4(q0_);                                                                                             \
         c##1 = KaMM4(q1_);                                                                                             \
         c##2 = KaMM4(q2_);                                                                                             \
         c##3 = KaMM4(q3_);                                                                                             \
     }
-#define GT_MACC(c, a0, a1, b0, b1, a0q, a1q, b0q, b1q, ns, mi_, ni_)                                                  \
+#define GT_MACC(c, pa0, pa1, qa0, qa1, b0, b1, b0q, b1q, ns, ni_)                                                     \
     {                                                                                                                  \
-        const int8_t *__restrict pa0_ = GT_OP(a0, a1, mi_, 0, KA_TM), *__restrict pa1_ = GT_OP(a0, a1, (mi_) + 1, 0, KA_TM); \
-        const int8_t *__restrict pb0_ = GT_OP(b0, b1, ni_, 0, KA_TN), *__restrict pb1_ = GT_OP(b0, b1, (ni_) + 1, 0, KA_TN); \
-        GT_KB(c##0, c##1, c##2, c##3, pa0_, pa1_, pb0_, pb1_)                                                          \
+        const int8_t *__restrict pb0_ = GT_OPS(b0, b1, ni_, KA_TN), *__restrict pb1_ = GT_OPS(b0, b1, (ni_) + 1, KA_TN); \
+        GT_KB(c##0, c##1, c##2, c##3, pa0, pa1, pb0_, pb1_)                                                            \
         if ((ns) == 2) {                                                                                               \
-            const int8_t *__restrict qa0_ = GT_OP(a0q, a1q, mi_, 0, KA_TM);                                            \
-            const int8_t *__restrict qa1_ = GT_OP(a0q, a1q, (mi_) + 1, 0, KA_TM);                                      \
-            const int8_t *__restrict qb0_ = GT_OP(b0q, b1q, ni_, 0, KA_TN);                                            \
-            const int8_t *__restrict qb1_ = GT_OP(b0q, b1q, (ni_) + 1, 0, KA_TN);                                      \
-            GT_KB(c##0, c##1, c##2, c##3, qa0_, qa1_, qb0_, qb1_)                                                      \
+            const int8_t *__restrict qb0_ = GT_OPS(b0q, b1q, ni_, KA_TN);                                              \
+            const int8_t *__restrict qb1_ = GT_OPS(b0q, b1q, (ni_) + 1, KA_TN);                                        \
+            GT_KB(c##0, c##1, c##2, c##3, qa0, qa1, qb0_, qb1_)                                                        \
         }                                                                                                              \
     }
-#define GT_STC(c, last, fp, y, ym0, mi_, ni_)                                                                          \
+#define GT_STC(c, last, g0, g1, o)                                                                                     \
     if (last) {                                                                                                        \
-        int8_t *o_ = (y) + (((mi_) - (ym0)) * (KA_TN / 8) + (ni_)) * 64;                                               \
-        aie::store_v(o_, (c##0).to_vector<int8_t>(0));                                                                   \
-        aie::store_v(o_ + 64, (c##1).to_vector<int8_t>(0));                                                              \
-        aie::store_v(o_ + (KA_TN / 8) * 64, (c##2).to_vector<int8_t>(0));                                                \
-        aie::store_v(o_ + (KA_TN / 8) * 64 + 64, (c##3).to_vector<int8_t>(0));                                           \
+        aie::store_v((o), (c##0).to_vector<int8_t>(0));                                                                \
+        aie::store_v((o) + 64, (c##1).to_vector<int8_t>(0));                                                           \
+        aie::store_v((o) + (KA_TN / 8) * 64, (c##2).to_vector<int8_t>(0));                                            \
+        aie::store_v((o) + (KA_TN / 8) * 64 + 64, (c##3).to_vector<int8_t>(0));                                       \
     } else {                                                                                                           \
-        int32_t *__restrict g0_ = (fp)[mi_] + (ni_) * 64, *__restrict g1_ = (fp)[(mi_) + 1] + (ni_) * 64;              \
-        aie::store_v(g0_, (c##0).to_vector<int32_t>());                                                                  \
-        aie::store_v(g0_ + 64, (c##1).to_vector<int32_t>());                                                             \
-        aie::store_v(g1_, (c##2).to_vector<int32_t>());                                                                  \
-        aie::store_v(g1_ + 64, (c##3).to_vector<int32_t>());                                                             \
+        aie::store_v((g0), (c##0).to_vector<int32_t>());                                                               \
+        aie::store_v((g0) + 64, (c##1).to_vector<int32_t>());                                                          \
+        aie::store_v((g1), (c##2).to_vector<int32_t>());                                                               \
+        aie::store_v((g1) + 64, (c##3).to_vector<int32_t>());                                                          \
     }
 #define GT_CHUNK_K(fp, y, ym0, a0, a1, b0, b1, a0q, a1q, b0q, b1q, first, last, m0, m1, ns)                            \
     {                                                                                                                  \
         KaMM4 X0, X1, X2, X3, Y0, Y1, Y2, Y3;                                                                          \
-        int xm_ = (m0), xn_ = 0;                                                                                       \
-        GT_LDC(X, first, fp, xm_, xn_)                                                                                 \
-        for (int it_ = 0; it_ < ((m1) - (m0)) / 2 * (KA_TN / 16) / 2; it_++)                                           \
-            chess_loop_range(1, ) {                                                                                    \
-                const int ym_ = xn_ + 2 < KA_TN / 8 ? xm_ : xm_ + 2, yn_ = xn_ + 2 < KA_TN / 8 ? xn_ + 2 : 0;         \
-                GT_LDC(Y, first, fp, ym_, yn_)                                                                         \
-                GT_MACC(X, a0, a1, b0, b1, a0q, a1q, b0q, b1q, ns, xm_, xn_)                                           \
-                GT_STC(X, last, fp, y, ym0, xm_, xn_)                                                                  \
-                const int nm_ = yn_ + 2 < KA_TN / 8 ? ym_ : ym_ + 2, nn_ = yn_ + 2 < KA_TN / 8 ? yn_ + 2 : 0;         \
-                const int lm_ = nm_ < (m1) ? nm_ : (m0);                                                               \
-                GT_LDC(X, first, fp, lm_, nn_)                                                                         \
-                GT_MACC(Y, a0, a1, b0, b1, a0q, a1q, b0q, b1q, ns, ym_, yn_)                                           \
-                GT_STC(Y, last, fp, y, ym0, ym_, yn_)                                                                  \
-                xm_ = nm_;                                                                                             \
-                xn_ = nn_;                                                                                             \
-            }                                                                                                          \
+        GT_LDC(X, first, (fp)[m0], (fp)[(m0) + 1])                                                                     \
+        for (int mi = (m0); mi < (m1); mi += 2) {                                                                      \
+            const int8_t *__restrict pa0_ = GT_OPS(a0, a1, mi, KA_TM), *__restrict pa1_ = GT_OPS(a0, a1, mi + 1, KA_TM); \
+            const int8_t *__restrict qa0_ = GT_OPS(a0q, a1q, mi, KA_TM);                                               \
+            const int8_t *__restrict qa1_ = GT_OPS(a0q, a1q, mi + 1, KA_TM);                                           \
+            int32_t *const r0_ = (fp)[mi], *const r1_ = (fp)[mi + 1];                                                  \
+            const int mn_ = mi + 2 < (m1) ? mi + 2 : (m0);                                                             \
+            int32_t *const n0_ = (fp)[mn_], *const n1_ = (fp)[mn_ + 1];                                                \
+            int8_t *const yr_ = (last) ? (y) + (mi - (ym0)) * (KA_TN / 8) * 64 : nullptr;                              \
+            for (int ni = 0; ni < KA_TN / 8; ni += 4)                                                                  \
+                chess_loop_range(KA_TN / 32, KA_TN / 32) {                                                             \
+                    GT_LDC(Y, first, r0_ + (ni + 2) * 64, r1_ + (ni + 2) * 64)                                         \
+                    GT_MACC(X, pa0_, pa1_, qa0_, qa1_, b0, b1, b0q, b1q, ns, ni)                                       \
+                    GT_STC(X, last, r0_ + ni * 64, r1_ + ni * 64, yr_ + ni * 64)                                       \
+                    const bool nx_ = ni + 4 < KA_TN / 8;                                                               \
+                    int32_t *const x0_ = nx_ ? r0_ + (ni + 4) * 64 : n0_;                                              \
+                    int32_t *const x1_ = nx_ ? r1_ + (ni + 4) * 64 : n1_;                                              \
+                    GT_LDC(X, first, x0_, x1_)                                                                         \
+                    GT_MACC(Y, pa0_, pa1_, qa0_, qa1_, b0, b1, b0q, b1q, ns, ni + 2)                                   \
+                    GT_STC(Y, last, r0_ + (ni + 2) * 64, r1_ + (ni + 2) * 64, yr_ + (ni + 2) * 64)                     \
+                }                                                                                                      \
+        }                                                                                                              \
     }
 #endif
