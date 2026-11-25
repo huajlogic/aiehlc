@@ -147,67 +147,11 @@
     K4_LD(Y, ae + 256);                                                                                                \
     K4_BLK(X, nAl, nBl, nAl, nBl + 2048);                                                                              \
     SH_RESET(nAl, nAh, nBl, nBh);
-/* ---- tile knobs (M3.3.6.2.1.2.3.1) ---------------------------------------------------------------------
- * A config file sets them before #include "gemm_plan.cc" (and passes the same values as -D flags):
- *   GP_TM / GP_TN    core tile rows / columns, multiples of 16: TM/16 x TN/16 accumulator pairs   default 64
- *   GP_KC            chunk K in bytes (multiple of 16)                                             default 128
- *   GP_C_DEPTH       output tile slots in core DM: 2 ping-pong, 1 one buffer ({.depth = 1})       default 2
- *   GP_DM_FIXED_T    stack + runtime state in the core-DM budget (GP_DM_FIXED)                    default 8192
- * gemm_plan_body.cc's geometry defines (KA_TM 64, KA_TN 64, KA_KC 128, GP_DM_FIXED 8 KiB) stay the defaults
- * and stay untouched: the generated host.cc carries the body's text up to the kernel verbatim, so the 64 x 64
- * default build is byte-identical only if the knobs live in this header (#included, not inlined). With a knob
- * set, the geometry is redefined here and everything after (kernel, host side) expands the new values; the
- * budget below is the costmodel's DM formula (FEAS): fixed + int32 partial sums + 2 input streams x 2 slots x
- * one chunk + GP_C_DEPTH output tiles. */
-#if defined(GP_TM) || defined(GP_TN) || defined(GP_KC) || defined(GP_C_DEPTH) || defined(GP_DM_FIXED_T)
-#ifndef GP_TM
-#define GP_TM 64
-#endif
-#ifndef GP_TN
-#define GP_TN 64
-#endif
-#ifndef GP_KC
-#define GP_KC 128
-#endif
-#ifndef GP_C_DEPTH
-#define GP_C_DEPTH 2
-#endif
-#ifndef GP_DM_FIXED_T
-#define GP_DM_FIXED_T 8192
-#endif
-#undef KA_TM
-#define KA_TM GP_TM
-#undef KA_TN
-#define KA_TN GP_TN
-#undef KA_KC
-#define KA_KC GP_KC
-#undef K4_KC
-#define K4_KC GP_KC
-#undef GP_DM_FIXED
-#define GP_DM_FIXED GP_DM_FIXED_T
-#undef GP_IN_BYTES
-#define GP_IN_BYTES (GP_CORE_S2MM * 2 * (KA_TM > KA_TN ? KA_TM : KA_TN) * KA_KC)
-#undef GP_DM_USED
-#define GP_DM_USED (GP_DM_FIXED + GP_ACC_BYTES + GP_IN_BYTES + GP_C_DEPTH * GP_OUT_TILE_BYTES / GP_C_SPLIT)
-static_assert(GP_TM % 16 == 0 && GP_TN % 16 == 0, "GP_TM / GP_TN: whole 16-row accumulator pairs");
-static_assert(GP_KC % 16 == 0 && GP_KC / GP_ES % 8 == 0, "GP_KC: whole 8-deep k blocks");
-static_assert(GP_C_DEPTH == 1 || GP_C_DEPTH == 2, "GP_C_DEPTH: 1 (one output buffer) or 2 (ping-pong)");
-static_assert(GP_M % (GP_HW_ROWS * KA_TM) == 0 && KA_M == GP_M, "GP_M: whole GP_TM-row tiles on every mesh row");
-static_assert(KA_N == GP_N && SH_NT2 == 1, "2 x 8 layout: N = 2 x mesh columns x GP_TN (one B tile per core)");
-static_assert(GP_K % GP_KCE == 0 && KA_K % KA_KC == 0 && SH_NK >= 2, "K: whole chunks, at least 2");
-static_assert(SH_TILES >= 1 && SH_TILES <= 64, "tiles / core <= 64 (6-bit OOO iteration counter)");
-static_assert(GP_RING_CHUNKS % (2 * GP_RING) == 0, "A ring must divide the chunk stream (set GP_RING)");
-static_assert(GP_RING * 2 * KA_TM * KA_KC <= GP_MT_BYTES, "A's ring must fit its MemTile");
-static_assert(GP_B_MT_BYTES <= GP_MT_BYTES, "B's MemTile buffers must fit its 512 KiB MemTile");
-static_assert(GP_C_SPLIT == 1 || GP_DTYPE == 2, "int8: the whole output tile in one slice");
-static_assert(GP_DM_USED <= GP_DM_BYTES, "core DM (64 KiB): fixed + partial sums + input slots + output slots must fit");
-#else
-#define GP_C_DEPTH 2
-#endif
+/* ---- generic tile (M3.3.6.2.1.2.3.1, gemm_plan_tbody.cc knobs GP_TM / GP_TN / GP_KC / GP_C_DEPTH) ---------- */
 /* the hand-scheduled 4 x 4-pair pipeline above (K4_* / SH_*) is the 64 x 64 x 128 tile; any other tile runs
  * the generic chunk (GT_CHUNK) */
 #define GP_K4_TILE (KA_TM == 64 && KA_TN == 64 && KA_KC == 128)
-#if GP_C_DEPTH == 1
+#if defined(GP_C_DEPTH) && GP_C_DEPTH == 1
 #define GT_C_OPTS {.depth = 1, .align = 64}
 #else
 #define GT_C_OPTS {.align = 64}

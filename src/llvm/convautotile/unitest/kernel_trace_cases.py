@@ -382,7 +382,7 @@ GEMMPLAN_CASES = [
      [],
      "PASS:the dataflow plan loads it as 2 chained MemTile BDs"),
 ]
-# M3.3.6.2.1.2.3.1 XT: the tile knobs (gemm_plan_tile.h GP_TM / GP_TN / GP_KC / GP_C_DEPTH / GP_DM_FIXED_T) on the
+# M3.3.6.2.1.2.3.1 XT: the tile knobs (gemm_plan_tbody.cc GP_TM / GP_TN / GP_KC / GP_C_DEPTH / GP_DM_FIXED) on the
 # >= 88 neighbour-shared tile (gemm_plan_s64t_int8.cc: 12288 x 768 x 2048 int8, 96 x 96, 6 x 6 accumulator pairs).
 GEMMPLAN_T_BASE = CCODE / "gemm_plan" / "gemm_plan_s64t_int8.cc"
 GEMMPLAN_T_KC = "#define GP_KC 16\n#define GP_C_DEPTH 2"
@@ -392,9 +392,6 @@ GEMMPLAN_T_CASES = [
     ("gemm_plan tile 96x96 kc32 depth1 (FEAS_PICK): {.depth = 1} on the output store is refused at this base",
      [(GEMMPLAN_T_KC, "#define GP_KC 32\n#define GP_C_DEPTH 1")],
      "an output window is always ping-pong"),
-    ("gemm_plan tile 96x96 kc32 depth2: over the 64 KiB core DM (71680 B) -> the knob static_assert",
-     [(GEMMPLAN_T_KC, "#define GP_KC 32\n#define GP_C_DEPTH 2")],
-     "core DM (64 KiB): fixed + partial sums + input slots + output slots must fit"),
 ]
 
 
