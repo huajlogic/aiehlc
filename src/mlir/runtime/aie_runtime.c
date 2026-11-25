@@ -7420,8 +7420,23 @@ void __Runtime_dma_channel_start(XAie_DevInst *dev, XAie_LocType t, int ch, int 
                                  int first_only) {
     if (first_only && !__Runtime_plan_first())
         return;
-    if (XAie_DmaChannelSetStartQueue(dev, t, (u8)ch, mm2s ? DMA_MM2S : DMA_S2MM, (u8)bd, (u32)repeat, 0) != XAIE_OK)
-        printf("[aie_runtime] plan channel start (%u,%u) ch %d FAILED\n", (unsigned)t.Col, (unsigned)t.Row, ch);
+    /* AIE-ML start-queue RepeatCount is 1..256 (aie-rt ChProp->MaxRepeatCount); a larger repeat is queued
+     * as several tasks of <= 256 on the same BD chain (task queue depth 4, so up to 1024). Same data order:
+     * the channel runs the queued tasks back to back. repeat <= 256 is one call, as before. */
+    enum { RT_SQ_MAX_REPEAT = 256, RT_SQ_DEPTH = 4 };
+    if (repeat > RT_SQ_MAX_REPEAT * RT_SQ_DEPTH) {
+        printf("[aie_runtime] plan channel start (%u,%u) ch %d repeat %d > %d FAILED\n", (unsigned)t.Col,
+               (unsigned)t.Row, ch, repeat, RT_SQ_MAX_REPEAT * RT_SQ_DEPTH);
+        return;
+    }
+    do {
+        const int r = repeat > RT_SQ_MAX_REPEAT ? RT_SQ_MAX_REPEAT : repeat;
+        if (XAie_DmaChannelSetStartQueue(dev, t, (u8)ch, mm2s ? DMA_MM2S : DMA_S2MM, (u8)bd, (u32)r, 0) != XAIE_OK) {
+            printf("[aie_runtime] plan channel start (%u,%u) ch %d FAILED\n", (unsigned)t.Col, (unsigned)t.Row, ch);
+            return;
+        }
+        repeat -= r;
+    } while (repeat > 0);
 }
 
 XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
