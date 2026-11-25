@@ -382,6 +382,20 @@ GEMMPLAN_CASES = [
      [],
      "PASS:the dataflow plan loads it as 2 chained MemTile BDs"),
 ]
+# M3.3.6.2.1.2.3.1 XT: the tile knobs (gemm_plan_tile.h GP_TM / GP_TN / GP_KC / GP_C_DEPTH / GP_DM_FIXED_T) on the
+# >= 88 neighbour-shared tile (gemm_plan_s64t_int8.cc: 12288 x 768 x 2048 int8, 96 x 96, 6 x 6 accumulator pairs).
+GEMMPLAN_T_BASE = CCODE / "gemm_plan" / "gemm_plan_s64t_int8.cc"
+GEMMPLAN_T_KC = "#define GP_KC 16\n#define GP_C_DEPTH 2"
+GEMMPLAN_T_CASES = [
+    ("gemm_plan tile 96x96 kc16 depth2: 32x2 output tiles/core, every block matches the DMA", [],
+     "PASS:c (OFM, gather, 32x2 blocks/core): d1[12288]=rows/4@3072+i32x96@96 d2[768]=cols/4@192+j2x96@96"),
+    ("gemm_plan tile 96x96 kc32 depth1 (FEAS_PICK): {.depth = 1} on the output store is refused at this base",
+     [(GEMMPLAN_T_KC, "#define GP_KC 32\n#define GP_C_DEPTH 1")],
+     "an output window is always ping-pong"),
+    ("gemm_plan tile 96x96 kc32 depth2: over the 64 KiB core DM (71680 B) -> the knob static_assert",
+     [(GEMMPLAN_T_KC, "#define GP_KC 32\n#define GP_C_DEPTH 2")],
+     "core DM (64 KiB): fixed + partial sums + input slots + output slots must fit"),
+]
 
 
 def inline_cc(path):
@@ -397,7 +411,7 @@ def inline_cc(path):
 
 
 def run_case(cli, name, edits, expect, base=BASE):
-    src = inline_cc(base) if base == GEMMPLAN_BASE else base.read_text()
+    src = inline_cc(base) if base in (GEMMPLAN_BASE, GEMMPLAN_T_BASE) else base.read_text()
     if base == TEMPLATE_BASE:  # the library kernel alone: add the includes and a host launch
         src = TEMPLATE_HEAD + src + TEMPLATE_HOST
     for old, new in edits:
@@ -432,6 +446,7 @@ def main():
     cases += [(n, e, x, SPACE_BASE) for n, e, x in SPACE_CASES]
     cases += [(n, e, x, TEMPLATE_BASE) for n, e, x in TEMPLATE_CASES]
     cases += [(n, e, x, GEMMPLAN_BASE) for n, e, x in GEMMPLAN_CASES]
+    cases += [(n, e, x, GEMMPLAN_T_BASE) for n, e, x in GEMMPLAN_T_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]
     for name, edits, expect, base in cases:

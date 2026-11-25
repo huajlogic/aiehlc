@@ -195,7 +195,7 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
         aie::release(b);                                                                                               \
         SH_BOUND2(nAl, nAh, nBl, nBh);                                                                                 \
     }
-#if GP_DTYPE == 1
+#if GP_DTYPE == 1 && GP_K4_TILE /* the hand-scheduled 64 x 64 x 128 tile (gemm_plan_tile.h K4_* / SH_*) */
     typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4; // one mac_8x8_8x8: 512 int8 MAC / cycle
     // 2 x 8 logical grid on the 4 x 4 mesh: core (pm, pn) computes A strip sa x B strip sb.
     const int pm = aie::program_id(0), pn = aie::program_id(1);
@@ -241,6 +241,32 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
         aie::release(b);
         K4_OUT(cur + 256, Y, 15);
         aie::commit(c);
+    }
+#else
+#if GP_DTYPE == 1
+    // int8, any other tile (GP_TM x GP_TN x GP_KC, gemm_plan_tile.h knobs): per chunk, GT_CHUNK walks the
+    // (KA_TM / 16) x (KA_TN / 16) pairs of 2 x 2 accumulators; int32 partial sums in core memory between
+    // chunks, int8 out at the last chunk. Same ports, options (A / B neighbour-shared) and 2 x 8 grid as above.
+    typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
+    const int pm = aie::program_id(0), pn = aie::program_id(1);
+    const int sa = pm >> 1, sb = pn + GP_HW_COLS * (pm & 1), brow = sb * KA_TN;
+    alignas(64) static int32_t acc[KA_TM * KA_TN];
+    for (int t = 0; t < SH_TILES; t++) {
+        const int arow = sa * (KA_M / 2) + t * KA_TM;
+        for (int k = 0; k < SH_NK; k++) {
+            auto xa = aie::load_buffer(a, {arow, k * KA_KC}, {KA_TM, KA_KC}, OPTS_A);
+            auto xb = aie::load_buffer(b, {brow, k * KA_KC}, {KA_TN, KA_KC}, OPTS_B);
+            const int8_t *a0p = GT_PART(xa, 0, KA_TM), *a1p = GT_PART(xa, 1, KA_TM);
+            const int8_t *b0p = GT_PART(xb, 0, KA_TN), *b1p = GT_PART(xb, 1, KA_TN);
+            int8_t *__restrict y = nullptr;
+            if (k == SH_NK - 1)
+                y = aie::store_buffer(c, {arow, brow}, {KA_TM, KA_TN}, GT_C_OPTS);
+            GT_CHUNK(acc, y, a0p, a1p, b0p, b1p, k == 0, k == SH_NK - 1);
+            if (k == SH_NK - 1)
+                aie::commit(c);
+            aie::release(a);
+            aie::release(b);
+        }
     }
 #else
     // bf16 (correctness first, as peak_bf16.cc): plain aie::mmul<8, 8, 8, bfloat16, bfloat16, accfloat>
@@ -322,6 +348,7 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
             aie::release(b);
         }
     }
+#endif
 #endif
 }
 
