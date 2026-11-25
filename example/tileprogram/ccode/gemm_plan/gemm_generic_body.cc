@@ -20,6 +20,11 @@
 #endif
 #include "simplegemm_peak.h"
 
+#if GEN_VECTOR
+#define GEN_ALIGN 64
+#else
+#define GEN_ALIGN 32
+#endif
 #define KA_TM 64
 #define KA_TN 64
 #define KA_KC 64
@@ -33,12 +38,15 @@ __global__ void gemm_gen(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_
                          aie::port<output_window_int8 *, aie::OFM, aie::shape<KA_M, KA_N>> c) {
     const int pm = aie::program_id(0), pn = aie::program_id(1);
     const int kb = KA_KC / 8, nk = KA_K / KA_KC, nti = KA_TN / 8;
-    static int32_t acc[KA_TM * KA_TN];
+    alignas(64) static int32_t acc[KA_TM * KA_TN];
     for (int s = 0; s < KA_R; s++) {
-        int8_t *y = aie::store_buffer(c, {(pm * KA_R + s) * KA_TM, pn * KA_TN}, {KA_TM, KA_TN});
+        // GEN_ALIGN: a vector kernel's 64-byte aie::load_v / store_v need 64-byte aligned buffers ({.align})
+        int8_t *y = aie::store_buffer(c, {(pm * KA_R + s) * KA_TM, pn * KA_TN}, {KA_TM, KA_TN}, {.align = GEN_ALIGN});
         for (int j = 0; j < nk; j++) {
-            const int8_t *x = aie::load_buffer(a, {(pm * KA_R + s) * KA_TM, j * KA_KC}, {KA_TM, KA_KC}, {.depth = 2});
-            const int8_t *w = aie::load_buffer(b, {pn * KA_TN, j * KA_KC}, {KA_TN, KA_KC}, {.depth = 2});
+            const int8_t *x = aie::load_buffer(a, {(pm * KA_R + s) * KA_TM, j * KA_KC}, {KA_TM, KA_KC},
+                                               {.depth = 2, .align = GEN_ALIGN});
+            const int8_t *w =
+                aie::load_buffer(b, {pn * KA_TN, j * KA_KC}, {KA_TN, KA_KC}, {.depth = 2, .align = GEN_ALIGN});
 #if GEN_VECTOR
             // 2 x 2 register block of mmul<8,8,8> (one mac_8x8_8x8 = 512 MAC per cycle), the int32
             // accumulators reloaded from / stored to core memory once per K chunk

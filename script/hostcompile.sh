@@ -198,7 +198,11 @@ kobj_cache_put() {
     f=$(sed -nE 's/.*id="bridge.cfg" value="([^"]+)".*/\1/p' ./aieml.prx 2>/dev/null | head -1)
     if [ -n "$f" ] && [ -f "./$f" ]; then echo "$f" > "$t/bcf.name"; cp -L "./$f" "$t/bcf.after"; fi
     mkdir -p "$t/cwd"
-    for f in "./host_ctrlpkt_${fn}.h" "./kernel_${fn}_ctrlpkt.h" "./ctrlpkt_${fn}"; do
+    # The single-kernel path's kc.sh writes host_ctrlpkt.h / ctrlpkt/ without the _<f> suffix: store
+    # them too, or a hit restores kernel.o but no host_ctrlpkt.h and the host compile fails on its
+    # #include (the key covers host.cc + the sites file whenever they exist, so the copy is valid).
+    for f in "./host_ctrlpkt_${fn}.h" "./kernel_${fn}_ctrlpkt.h" "./ctrlpkt_${fn}" \
+             ${KOBJ_SINGLE_KERNEL:+"./host_ctrlpkt.h" "./ctrlpkt"}; do
         # -L: in the parallel path these may be links into the worklocal that kc.sh wrote through
         [ -e "$f" ] && cp -rpL "$f" "$t/cwd/"
     done
@@ -343,7 +347,7 @@ compile_one_kernel() {
 }
 
 if [ "${KERNEL_ONLY:-0}" = "1" ]; then
-    compile_one_kernel "${1:-compute_kernel}"
+    KOBJ_SINGLE_KERNEL=1 compile_one_kernel "${1:-compute_kernel}"
     _kret=$?
     cd "${_HOSTCOMPILE_ORIG_PWD}" 2>/dev/null || true
     return $_kret 2>/dev/null || exit $_kret
@@ -505,7 +509,7 @@ else
         fi
     fi
     pushd ${WORKLOCAL_DIR}
-    compile_one_kernel "${KERNEL_FUNC_NAME}"
+    KOBJ_SINGLE_KERNEL=1 compile_one_kernel "${KERNEL_FUNC_NAME}"
     if [ $? -ne 0 ]; then
         echo "Error: kernel build failed"
         exit 1

@@ -205,6 +205,9 @@ wrap limit); `materializeHostPlan` / `materializeKernelPlan` write them as dfsch
 `restored` (the MemTile locks): every launch moves the same data through the lock's buffers, so the
 lock ends each launch at its start value; it is written on the first launch (and on the second if
 `later_value` differs) instead of every launch (~372 ns per MMIO write).
+Only the locks of a `.keep` B are `restored`: a non-keep B is sent again every launch and its
+lock 1 is never handed back, so it ends at (4, 0) and must be rewritten every launch (`plandma.cpp`
+`deriveResident`, `restored = keep`; skill `planmemtilebperlaunch`).
 
 ### Kernel side
 

@@ -226,9 +226,12 @@ bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
         const PlanResources::Mem &m = p.res.mem[si][c];
         const std::vector<Tile> t{u.mt};
         const int replays = (int)u.out.size();
-        p.locks.push_back({t, m.locks[0], 0, keep ? replays : -1, false, true});
+        // Only a kept B hands its locks back balanced (full: `replays` ready, 0 free). Per launch, the
+        // replays acquire and release lock 0 and nothing returns lock 1 -- launch 0 ends at (replays, 0),
+        // so the next S2MM would wait on lock 1 forever: write both every launch (`restored` = false).
+        p.locks.push_back({t, m.locks[0], 0, keep ? replays : -1, false, keep});
         p.locks.back().tag = mtag(si, c, "lock", 0);
-        p.locks.push_back({t, m.locks[1], 1, keep ? 0 : -1, false, true});
+        p.locks.push_back({t, m.locks[1], 1, keep ? 0 : -1, false, keep});
         p.locks.back().tag = mtag(si, c, "lock", 1);
         p.bds.push_back({t, m.bdIn, m.addr, groups * bLen, {}, 0, 0, m.locks[1], -1, m.locks[0], replays, -1});
         p.bds.back().tag = mtag(si, c, "in", 0);
