@@ -340,6 +340,16 @@
         aie::store_v((g1), (c##2).to_vector<int32_t>());                                                               \
         aie::store_v((g1) + 64, (c##3).to_vector<int32_t>());                                                          \
     }
+/* the pair-column loop of a chunk kind (first, last): GP_GT_UNROLL 1 flattens it in the middle kind (a whole pair row
+ * of X / Y steps scheduled as one block); the first / last kinds (2 of SH_NK / GT_NS steps) keep the loop */
+#if defined(GP_GT_UNROLL) && GP_GT_UNROLL
+#define GT_NI_LOOP_00 chess_flatten_loop
+#else
+#define GT_NI_LOOP_00 chess_loop_range(KA_TN / 32, KA_TN / 32)
+#endif
+#define GT_NI_LOOP_10 chess_loop_range(KA_TN / 32, KA_TN / 32)
+#define GT_NI_LOOP_01 chess_loop_range(KA_TN / 32, KA_TN / 32)
+#define GT_NI_LOOP_11 chess_loop_range(KA_TN / 32, KA_TN / 32)
 #define GT_CHUNK_K(fp, y, ym0, a0, a1, b0, b1, a0q, a1q, b0q, b1q, first, last, m0, m1, ns)                            \
     {                                                                                                                  \
         KaMM4 X0, X1, X2, X3, Y0, Y1, Y2, Y3;                                                                          \
@@ -353,7 +363,7 @@
             int32_t *const n0_ = (fp)[mn_], *const n1_ = (fp)[mn_ + 1];                                                \
             int8_t *const yr_ = (last) ? (y) + (mi - (ym0)) * (KA_TN / 8) * 64 : nullptr;                              \
             for (int ni = 0; ni < KA_TN / 8; ni += 4)                                                                  \
-                chess_loop_range(KA_TN / 32, KA_TN / 32) {                                                             \
+                GT_NI_LOOP_##first##last {                                                                             \
                     /* the three partial-sum blocks of this step (Y, X, next X) are disjoint: restrict lets the next \
                        X load move above X's store (otherwise store -> load order serialises the two sets) */      \
                     const bool nx_ = ni + 4 < KA_TN / 8;                                                               \
