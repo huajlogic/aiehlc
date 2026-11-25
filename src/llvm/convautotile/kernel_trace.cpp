@@ -263,9 +263,10 @@ namespace aie {
 enum class pad_value { none, zero };
 // Block options; designated initializers in this order (all optional).
 // Dataflow intent (doc/design/dmaphop_dataflow_plan.md): .share = share::neighbor hosts the
-// stream in ONE core's memory that its neighbours read; .stage stages it through a MemTile
+// stream in ONE core's memory that its neighbours read; share::broadcast multicasts one stream per
+// mesh row to every core of the row (each takes its own copy); .stage stages it through a MemTile
 // (memtile_ring: a FIFO ring of .ring buffers); .keep = true loads it on the first launch only.
-enum class share { none, neighbor };
+enum class share { none, neighbor, broadcast };
 enum class stage { none, memtile, memtile_ring };
 struct load_opts { int reuse = 0; pad_value pad = pad_value::none; int depth = 0; bool resident = false;
                    int tile[2] = {0, 0}; aie::share share = aie::share::none; aie::stage stage = aie::stage::none;
@@ -1211,6 +1212,17 @@ void checkBlockOpts(const TracePort &p, const PortFit &f, const std::vector<Even
         r.errors.push_back(who + m);
         ok = false;
     };
+    // {.share = aie::share::broadcast}: one stream multicast to the cores that read the same blocks -- the
+    // offsets may follow program_id(0) only (one stream per mesh row) or program_id(1) only (per column)
+    BlockOpts ox = o;
+    if (o.share == 2) {
+        auto zero = [](const std::vector<int> &v) { return std::all_of(v.begin(), v.end(), [](int x) { return !x; }); };
+        ox.axis = zero(f.base_p1) ? 1 : zero(f.base_p0) ? 2 : 0;
+        if (!ox.axis)
+            err("{.share = aie::share::broadcast} multicasts one stream per mesh row (or column), but the blocks "
+                "move with both program_id(0) (" +
+                vecStr(f.base_p0) + ") and program_id(1) (" + vecStr(f.base_p1) + "): every core reads different data");
+    }
     // The lowering applies .tile and .resident to an input whose blocks it follows
     // (resolveKernelBlock): blocks that are whole rows of the tensor. On any other
     // block they would be accepted here and ignored by the DMA -- the kernel would
@@ -1249,7 +1261,7 @@ void checkBlockOpts(const TracePort &p, const PortFit &f, const std::vector<Even
                 std::to_string(rowBytes) + " B) must be multiples of 4 bytes");
     }
     if (ok)
-        r.opts[p.var] = o;
+        r.opts[p.var] = ox;
 }
 
 // ", options {.depth = 1, .resident = true, .tile = {4, 16}}" or "".
@@ -1296,7 +1308,7 @@ KernelTraceResult traceKernel(const std::string &src, const TraceKernel &k, int 
     collectHarnessErrors(events, src, srcName, r);
     // {.share = aie::share::neighbor} on some port: the kernel computes on the shared-operand logical
     // grid, so every port may be affine in it instead of in program_id (PortFit::remap_cols).
-    const bool shared = std::any_of(events.begin(), events.end(), [](const Event &e) { return e.opts.share != 0; });
+    const bool shared = std::any_of(events.begin(), events.end(), [](const Event &e) { return e.opts.share == 1; });
     for (auto &p : k.ports) {
         PortFit f;
         std::vector<int> origin;

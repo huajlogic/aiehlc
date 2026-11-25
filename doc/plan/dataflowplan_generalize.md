@@ -179,13 +179,32 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 ## Stage 5: more sharing modes, any operand count, other ops (L2)
 
-- [ ] `share = none` (per-core stream, plan-derived DMA) and `share = broadcast` (row / column).
-- [ ] Any number of planned operands; one stream synthesized per operand.
-- [ ] An eltwise kernel through the plan path: GOLDEN PASS, not slower than main. Evidence:
-- [ ] A kernel-only conv (`load_buffer` blocks, e.g. `simpleconv2dkernel_port.cc`) through the plan path
+- [x] `share = none` (per-core stream, plan-derived DMA) and `share = broadcast` (row / column).
+      Evidence: `{.share = aie::share::broadcast}` (the kernel analysis sets the axis from the fit: row or
+      column; both program ids -> error) and a `.stage` without `.share` (`share = "none"`, with the traced
+      core origin) synthesize per-core copies (`synthCopyText` / `synthPerCore`): one multicast stream per
+      mesh row / column, or one per core through a per-column MemTile ring; core side under
+      `AIEHLC_PLAN_COPY` (`deriveCopySlots`, `aie_block_io_plan.h`). All three on the board below.
+- [x] Any number of planned operands; one stream synthesized per operand. Evidence: one stream per operand,
+      each with its own core S2MM channel, MemTile row and shim channel; the bound is the hardware's: 2
+      per-core operands (a core has 2 S2MM channels; `N per-core copy streams: a core has 2 S2MM channels`
+      otherwise), and neighbour and per-core operands do not mix in one plan (named error).
+- [x] An elementwise kernel through the plan path: GOLDEN PASS, not slower than main. Evidence (VEK385):
+      `simpleeltwise_add_plan.cc` (x, y row broadcast) `GOLDEN PASS: eltwise_plan z = sat(x + y), 262144
+      outputs | PERF SUMMARY eltwise_plan first 0.969 ms, steady 0.365 ms mean`; the same kernel on main's
+      generated path (`simpleeltwise_add.cc`): `[BENCH] aie_wall_ms=57.024`, `FAIL: 237456 mismatches out of
+      262144`. `simpleeltwise_add_none.cc` (x per core, y column broadcast): `GOLDEN PASS ... 262144 outputs
+      | PERF SUMMARY eltwise_none first 1.040 ms, steady 0.213 ms mean`.
+- [x] A kernel-only conv (`load_buffer` blocks, e.g. `simpleconv2dkernel_port.cc`) through the plan path
       (input with halo, weights `keep`): GOLDEN PASS, not slower than main. Evidence:
+      `simpleconv2dkernel_port_plan.cc` (input 19 x 61 x 4 halo blocks, row broadcast through a MemTile ring;
+      weights column broadcast, held in the MemTiles across launches) `GOLDEN PASS: conv_plan 0 mismatches
+      of 802816 | PERF SUMMARY conv_plan first 0.723 ms, steady 0.098 ms mean, best 0.097 ms`; main's
+      generated path, same kernel: `[BENCH] aie_wall_ms=54.229` (that example checks nothing).
       (Changed 2026-11-24 with the user's approval: conv2dstem has its own halo-slab DMA and GemmSpace
       descriptors -- moving it onto the plan is a rewrite of the operator; it stays on its path.)
+      GEMM unchanged by all of this: gemm_plan.cc kernel.cc / routing.cc / aiehlc_plan.h identical,
+      `GOLDEN PASS ... | PERF SUMMARY gemm_plan steady 1.147 ms median (85.72 % of peak @ 1250 MHz)`.
 
 ## Stage 6: device table and measurement hygiene (L8, L10)
 
@@ -202,4 +221,5 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 | 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | 5f75d43e |
 | 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | 57b2d949 |
 | 2026-11-24 | 3 | `--define` / `AIEHLC_DEFINES` reach every stage (macros injected into the source text); EXTRA_DEFS refused for a source macro; gemm_plan.cc + --define == the 4096 entry file (GOLDEN PASS, 3.138 ms) | 4c38e5e0 |
-| 2026-11-25 | 4 | `#pragma gemm_autotile`: mesh + A ring by a calibrated cost model, 8 shapes (int8 / bf16, N 512 / 768, K 1024..4096) GOLDEN PASS from one source, model within +-13 %; 32-core kernel load, packet-id limit as an error, channel start queue split | this commit |
+| 2026-11-25 | 4 | `#pragma gemm_autotile`: mesh + A ring by a calibrated cost model, 8 shapes (int8 / bf16, N 512 / 768, K 1024..4096) GOLDEN PASS from one source, model within +-13 %; 32-core kernel load, packet-id limit as an error, channel start queue split | c0d9168b |
+| 2026-11-25 | 5 | per-core copies: `.share = broadcast` (row / column) and per-core streams; eltwise 0.365 ms (main: 57 ms, wrong) and kernel-only conv 0.098 ms (main 54.2 ms) GOLDEN PASS; GEMM unchanged | this commit |

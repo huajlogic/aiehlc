@@ -71,7 +71,7 @@ namespace aie {
 enum role_t { IFM, WEIGHTS, OFM };
 enum class pad_value { none, zero };
 // Block options, as the kernel analysis takes them (kernel_trace.cpp); .tile re-lays out the block.
-enum class share { none, neighbor };
+enum class share { none, neighbor, broadcast };
 enum class stage { none, memtile, memtile_ring };
 struct load_opts { int reuse = 0; pad_value pad = pad_value::none; int depth = 0; bool resident = false;
                    int tile[2] = {0, 0}; aie::share share = aie::share::none; aie::stage stage = aie::stage::none;

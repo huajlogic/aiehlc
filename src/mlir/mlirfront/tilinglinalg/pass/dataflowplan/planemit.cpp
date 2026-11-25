@@ -39,8 +39,13 @@ static std::string emitPlanArrange(const DataflowPlan &plan) {
         for (int x : s.strips)
             strips = std::max(strips, x + 1);
         const int64_t eb = s.elemBytes, rowB = (int64_t)s.chunkCols * eb,
-                      stripRows = s.tensorRows / std::max(strips, 1);
+                      stripRows = s.tensorRows / std::max(strips, 1), stripStep = s.stripStep ? s.stripStep : stripRows,
+                      rowStep = s.rowStepOr(), colStep = s.colStepOr();
         const size_t groups = s.hostRows.size();
+        auto rowBase = [&](int strip) {
+            return strip < (int)s.stripRowBase.size() ? s.stripRowBase[strip] : strip * stripStep;
+        };
+        auto colBase = [&](int strip) { return strip < (int)s.stripColBase.size() ? s.stripColBase[strip] : 0L; };
         os << "    if (arg == " << s.arg << ") { /* " << s.role << ": " << s.tensorRows << " x " << s.tensorCols
            << " x " << eb << " B, chunk " << s.chunkRows << " x " << s.chunkCols << " */\n";
         for (int c = 0; c < plan.meshCols; c++) {
@@ -58,13 +63,19 @@ static std::string emitPlanArrange(const DataflowPlan &plan) {
                    << (again ? ": one round, re-read by the shim every output tile" : "") << " */\n"
                    << "            for (long jj = 0; jj < " << s.chunks / s.channels << "; jj++) {\n";
                 for (const PlanRoute *r : u.out) {
-                    const int g = s.groupOfHostRow(r->dsts[0].first.row - plan.coreRowBase), q = r->dsts[0].second;
+                    const int g = s.groupOfHostRow(r->dsts[0].first.row - plan.coreRowBase),
+                              q = r->dsts[0].second - s.channel;
                     const int strip = s.strips[c * groups + g];
                     os << "                for (long r = 0; r < " << s.chunkRows << "; r++, dst += " << rowB
                        << ") /* strip " << strip << ", parity " << q << " */\n"
-                       << "                    memcpy(dst, src + ((" << strip * stripRows << "L + t * " << s.chunkRows
-                       << " + r) * " << s.tensorCols << " + (jj * " << s.channels << " + " << q << ") * " << s.chunkCols
-                       << ") * " << eb << ", " << rowB << ");\n";
+                       << "                    memcpy(dst, src + ((" << rowBase(strip) << "L + t * " << rowStep
+                       << (s.rowStepJ ? " + (jj * " + std::to_string(s.channels) + " + " + std::to_string(q) + ") * " +
+                                            std::to_string(s.rowStepJ)
+                                      : std::string())
+                       << " + r) * " << s.tensorCols
+                       << (colBase(strip) ? " + " + std::to_string(colBase(strip)) : std::string())
+                       << (s.colStepI ? " + t * " + std::to_string(s.colStepI) : std::string()) << " + (jj * "
+                       << s.channels << " + " << q << ") * " << colStep << ") * " << eb << ", " << rowB << ");\n";
                 }
                 os << "            }\n";
             } else if (s.stage == "memtile_ring") {
@@ -84,8 +95,11 @@ static std::string emitPlanArrange(const DataflowPlan &plan) {
                    << "                if ((0x" << std::hex << mask << std::dec << "u >> (j % " << s.channels
                    << ")) & 1u)\n"
                    << "                    for (long r = 0; r < " << s.chunkRows << "; r++, dst += " << rowB << ")\n"
-                   << "                        memcpy(dst, src + ((" << strip * stripRows << "L + t * " << s.chunkRows
-                   << " + r) * " << s.tensorCols << " + j * " << s.chunkCols << ") * " << eb << ", " << rowB << ");\n";
+                   << "                        memcpy(dst, src + ((" << rowBase(strip) << "L + t * " << rowStep
+                   << (s.rowStepJ ? " + j * " + std::to_string(s.rowStepJ) : std::string()) << " + r) * "
+                   << s.tensorCols << (colBase(strip) ? " + " + std::to_string(colBase(strip)) : std::string())
+                   << (s.colStepI ? " + t * " + std::to_string(s.colStepI) : std::string()) << " + j * " << colStep
+                   << ") * " << eb << ", " << rowB << ");\n";
             } else {
                 for (size_t g = 0; g < groups; g++) {
                     const int strip = s.strips[c * groups + g];
@@ -93,9 +107,11 @@ static std::string emitPlanArrange(const DataflowPlan &plan) {
                        << ", group " << g << ": strip " << strip << " */\n"
                        << "            for (long j = 0; j < " << s.chunks << "; j++)\n"
                        << "                for (long r = 0; r < " << s.chunkRows << "; r++, dst += " << rowB << ")\n"
-                       << "                    memcpy(dst, src + ((" << strip * stripRows << "L + t * " << s.chunkRows
-                       << " + r) * " << s.tensorCols << " + j * " << s.chunkCols << ") * " << eb << ", " << rowB
-                       << ");\n";
+                       << "                    memcpy(dst, src + ((" << rowBase(strip) << "L + t * " << rowStep
+                       << (s.rowStepJ ? " + j * " + std::to_string(s.rowStepJ) : std::string()) << " + r) * "
+                       << s.tensorCols << (colBase(strip) ? " + " + std::to_string(colBase(strip)) : std::string())
+                       << (s.colStepI ? " + t * " + std::to_string(s.colStepI) : std::string()) << " + j * " << colStep
+                       << ") * " << eb << ", " << rowB << ");\n";
                 }
             }
         }

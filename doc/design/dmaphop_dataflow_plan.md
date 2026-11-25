@@ -300,6 +300,32 @@ is regenerated from the lifted plan and must equal the edited one; anything the 
 read-back dmaphop rebuilds byte-identically, board GOLDEN PASS 85.45 %; a changed BD length is
 rejected with the line.
 
+### Per-core copies: `.share = broadcast` and per-core streams (`share = "none"`)
+
+Beyond the neighbour-hosted 2 x 8 GEMM, a plan can give every core its own copy of an operand:
+
+| C option | dataflow | stream | example |
+|---|---|---|---|
+| `{.share = aie::share::broadcast, .stage = ...}`, blocks follow `program_id(0)` only | `share = "broadcast", axis = "row"` | one per mesh row, multicast to the row's cores | `simpleeltwise_add_plan.cc` x / y, `simpleconv2dkernel_port_plan.cc` input (halo blocks) |
+| same, blocks follow `program_id(1)` only | `axis = "column"` | one per mesh column, multicast up the column | conv weights (`.stage = memtile, .keep = true`), `simpleeltwise_add_none.cc` y |
+| `{.stage = ...}` without `.share` | `share = "none"` + the traced core origin `base_p0` / `base_p1` | one per core: per column one MemTile ring serving its cores (chunk n -> route n % rows) | `simpleeltwise_add_none.cc` x |
+
+The kernel analysis decides the axis from the fit (`BlockOpts.axis`) and refuses a broadcast whose blocks
+move with both program ids. Plan synthesis (`plansynth.cpp` `synthCopyText` / `synthPerCore`): operand o on
+core S2MM channel o, MemTile row `memRows - o`, shim MM2S channel `last - o` -- so at most 2 such operands
+(a core's S2MM channels); a row-broadcast stream is staged in column r (rows <= columns). A stream's blocks
+are a 2-D walk (rank 3 / 4 blocks flattened to rows x columns, the trailing dims spanned): `row_step` /
+`col_step_i` per round, `row_step_j` / `col_step` per chunk, origin `strip_row_base` / `strip_col_base` per
+strip -- overlapping blocks (a conv's halo) are repeated in DDR by `aiehlc_plan_arrange`. Core side
+(`deriveCopySlots`, `aie_block_io_plan.h` under `AIEHLC_PLAN_COPY`): per operand its own chain of `slots`
+BDs, a counting F lock (DMA -> kernel), an E lock per slot (kernel -> DMA), its slots in that operand's own
+replaced windows at the 32-byte-aligned chunk stride (`AIEHLC_PLAN_OP_*(o, pm)` constants); one reader, no
+hand-on, no tile sync. Limits: a column carries a bounded number of vertical streams -- two per-core
+operands on a 4-row mesh need 8 and the router refuses (`no free path`); a spatial-halo conv's weights need
+`{.depth = 2}` (the kernel analysis). Board (VEK385, GOLDEN PASS): eltwise broadcast 0.365 ms per launch
+(the same kernel on the generated path: 57 ms and wrong), x per core + y per column 0.213 ms, conv 7x7 s2
+224 x 224 0.098 ms (54.2 ms on the generated path).
+
 ### What else the compiler does with a plan
 
 | where | what |

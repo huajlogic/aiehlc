@@ -272,6 +272,8 @@ static KernelBlock kernelBlockFor(const std::string &kernel, const std::string &
     kb.shape.assign(f.shape.begin(), f.shape.end());
     kb.stepI.assign(f.step_i.begin(), f.step_i.end());
     kb.stepJ.assign(f.step_j.begin(), f.step_j.end());
+    kb.baseP0.assign(f.base_p0.begin(), f.base_p0.end());
+    kb.baseP1.assign(f.base_p1.begin(), f.base_p1.end());
     kb.roundsI = f.rounds_i;
     kb.roundsJ = f.rounds_j;
     kb.resident = p->second.opts.resident;
@@ -283,6 +285,7 @@ static KernelBlock kernelBlockFor(const std::string &kernel, const std::string &
     kb.keep = p->second.opts.keep;
     kb.align = p->second.opts.align;
     kb.parts = p->second.opts.parts;
+    kb.axis = p->second.opts.axis;
     return kb;
 }
 // Trace-routed kernel-only kernels: kernel -> port var -> traced block bytes

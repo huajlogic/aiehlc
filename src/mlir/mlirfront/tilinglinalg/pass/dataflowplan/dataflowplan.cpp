@@ -234,8 +234,19 @@ void readStream(Reader &r, DataflowPlan &p) {
     PlanStream st;
     st.arg = (int)r.i64("arg", -1, true);
     st.role = r.str("role", ""); // a label; the layout is row_groups / strips (a / b: their legacy defaults)
-    if (r.str("share", "neighbor") != "neighbor")
-        r.err() << "only share = \"neighbor\" is implemented";
+    st.share = r.str("share", "neighbor");
+    if (st.share != "neighbor" && st.share != "broadcast" && st.share != "none")
+        r.err() << "share must be \"neighbor\", \"broadcast\" or \"none\"";
+    st.channel = (int)r.i64("channel", 0);
+    st.rowStep = r.i64("row_step", 0);
+    st.colStep = r.i64("col_step", 0);
+    st.stripStep = r.i64("strip_step", 0);
+    st.rowStepJ = r.i64("row_step_j", 0);
+    st.colStepI = r.i64("col_step_i", 0);
+    for (int64_t v : r.ints("strip_row_base", false))
+        st.stripRowBase.push_back(v);
+    for (int64_t v : r.ints("strip_col_base", false))
+        st.stripColBase.push_back(v);
     st.stage = r.str("stage", "");
     st.ring = (int)r.i64("ring", 0);
     st.residentLaunches = r.str("resident", "launch") == "launches";
