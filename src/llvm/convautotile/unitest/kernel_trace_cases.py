@@ -370,9 +370,34 @@ TEMPLATE_CASES = [
      "no argument and no default for template parameter PX"),
 ]
 
+# The dataflow-plan GEMM (example/tileprogram/ccode/gemm_plan/): a config file that #includes gemm_plan.cc
+# (which #includes gemm_plan_body.cc) -- run_case inlines the local .cc includes, `trace` reads one file.
+# (HG) cases: a BD over its tile's length limit (MemTile: 0x1FFFF words, plantarget.h) -- the s1i8 shape
+# (4096 x 512 x 4096 int8) stages a mesh column's B (128 x 4096 int8 = 512 KiB = 0x20000 words) in its
+# MemTile with {.stage = aie::stage::memtile}: one BD would be truncated (0x20000 & 0x1FFFF = 0), the plan
+# loads it as a next_bd chain (dfplan::splitBdLen).
+GEMMPLAN_BASE = CCODE / "gemm_plan" / "gemm_plan_4096x512x4096_int8.cc"
+GEMMPLAN_CASES = [
+    ("gemm_plan s1i8: resident MemTile B stage 0x20000 words, over a MemTile BD's 0x1FFFF -> 2 chained BDs (HG)",
+     [],
+     "PASS:the dataflow plan loads it as 2 chained MemTile BDs"),
+]
+
+
+def inline_cc(path):
+    """The file with its `#include "x.cc"` lines (same directory) replaced by the file, recursively."""
+    out = []
+    for ln in path.read_text().splitlines(keepends=True):
+        s = ln.strip()
+        if s.startswith('#include "') and s.endswith('.cc"'):
+            out.append(inline_cc(path.parent / s[len('#include "'):-1]))
+        else:
+            out.append(ln)
+    return "".join(out)
+
 
 def run_case(cli, name, edits, expect, base=BASE):
-    src = base.read_text()
+    src = inline_cc(base) if base == GEMMPLAN_BASE else base.read_text()
     if base == TEMPLATE_BASE:  # the library kernel alone: add the includes and a host launch
         src = TEMPLATE_HEAD + src + TEMPLATE_HOST
     for old, new in edits:
@@ -406,6 +431,7 @@ def main():
     cases += [(n, e, x, BF16_BASE) for n, e, x in BF16_CASES]
     cases += [(n, e, x, SPACE_BASE) for n, e, x in SPACE_CASES]
     cases += [(n, e, x, TEMPLATE_BASE) for n, e, x in TEMPLATE_CASES]
+    cases += [(n, e, x, GEMMPLAN_BASE) for n, e, x in GEMMPLAN_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]
     for name, edits, expect, base in cases:

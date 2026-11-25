@@ -14,6 +14,7 @@
 #define TILINGLINALG_DATAFLOWPLAN_TARGET_H
 
 #include <cstdint>
+#include <vector>
 
 namespace dfplan {
 
@@ -38,6 +39,13 @@ struct PlanTarget {
     // MemTile's / shim's: xaie2psgbl_params.h *_D0_WRAP_MASK); a wider wrap is silently truncated
     int coreBdMaxWrap, memBdMaxWrap, shimBdMaxWrap;
     int bdMaxIterWrap; // largest BD iteration count
+    // largest buffer length of ONE BD, in 32-bit words, per tile kind (the BUFFER_LENGTH field; aie-rt masks the
+    // length into it, so a longer BD is silently truncated -- 0x20000 words & 0x1FFFF = 0). aie-rt
+    // xaie2psgbl_params.h (aienginev2/src/global):
+    //   core  MEMORY_MODULE_DMA_BD0_0_BUFFER_LENGTH_MASK   0x00003FFF  (xaie2psgbl_params.h:8678)
+    //   mem   MEM_TILE_MODULE_DMA_BD0_0_BUFFER_LENGTH_MASK 0x0001FFFF  (xaie2psgbl_params.h:26106)
+    //   shim  NOC_MODULE_DMA_BD0_0_BUFFER_LENGTH_MASK      0xFFFFFFFF  (xaie2psgbl_params.h:21663)
+    int64_t coreBdMaxLenWords, memBdMaxLenWords, shimBdMaxLenWords;
     int memBankLo(int ch) const { return memBdBank * (ch & 1); }
 };
 
@@ -68,8 +76,34 @@ inline const PlanTarget &planTarget() {
         /*memBdMaxWrap*/ 1023,
         /*shimBdMaxWrap*/ 1023,
         /*bdMaxIterWrap*/ 64,
+        /*coreBdMaxLenWords*/ 0x3FFF,
+        /*memBdMaxLenWords*/ 0x1FFFF,
+        /*shimBdMaxLenWords*/ 0xFFFFFFFFLL,
     };
     return t;
+}
+
+// splitBdLen: a transfer of `bytes` as a chain of BDs, each at most `maxWords` 32-bit words long and each a
+// whole number of `unitBytes` (the transfer's natural cut: a chunk, a strip). Returns the BD lengths in bytes --
+// as few BDs as the limit allows, the units spread evenly over them -- one entry when the transfer fits one BD;
+// empty when it cannot be cut (unitBytes not a multiple of a word, does not divide `bytes`, or one unit alone
+// is over the limit). The ONE place the BD length limit is applied: the plan's DMA program (plandma.cpp), its
+// resource count (planresource.cpp via memtileUse) and the front end's note (convautotile/kernel_trace.cpp).
+inline std::vector<int64_t> splitBdLen(int64_t bytes, int64_t maxWords, int64_t unitBytes, int wordBytes = 4) {
+    if (bytes <= 0 || maxWords <= 0)
+        return {};
+    if (bytes / wordBytes <= maxWords && bytes % wordBytes == 0)
+        return {bytes};
+    if (unitBytes <= 0 || unitBytes % wordBytes || bytes % unitBytes)
+        return {};
+    const int64_t perBd = maxWords * wordBytes / unitBytes; // units per BD at most
+    if (perBd < 1)
+        return {};
+    const int64_t units = bytes / unitBytes, n = (units + perBd - 1) / perBd;
+    std::vector<int64_t> out;
+    for (int64_t i = 0; i < n; i++)
+        out.push_back((units / n + (i < units % n ? 1 : 0)) * unitBytes);
+    return out;
 }
 
 } // namespace dfplan

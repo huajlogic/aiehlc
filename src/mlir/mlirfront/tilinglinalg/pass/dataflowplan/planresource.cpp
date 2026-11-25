@@ -245,6 +245,23 @@ bool assignMemTiles(const DataflowPlan &p, const Used &u, PlanResources &r, std:
                         takenBd[t].insert(x + k);
                 return x;
             };
+            // the S2MM load's BD count is splitBdLen's (memtileUse): one BD per at most memBdMaxLenWords words
+            if (mu.s2mmBds < 1) {
+                why = "stream " + std::to_string(s.arg) + ": the " + std::to_string(mu.bytes) + " B MemTile load on " +
+                      tileStr(t) + " cannot be cut into BDs of at most " + std::to_string(T.memBdMaxLenWords) +
+                      " words (BD length limit)";
+                return false;
+            }
+            if (mu.s2mmBds > 1) {
+                Pool b = poolOver(takenBd, {t}, T.memBankLo(mu.s2mm), T.memBankLo(mu.s2mm) + T.memBdBank);
+                if (b.run(mu.s2mmBds) < 0) {
+                    why = "stream " + std::to_string(s.arg) + ": the " + std::to_string(mu.bytes) +
+                          " B MemTile load on " + tileStr(t) + " is over a BD's " +
+                          std::to_string(T.memBdMaxLenWords) + " words and needs a chain of " +
+                          std::to_string(mu.s2mmBds) + " BDs, more than its channel's free BDs (BD length limit)";
+                    return false;
+                }
+            }
             m.bdIn = bankRun(mu.s2mm, mu.s2mmBds);
             for (size_t k = 0; k < mu.out.size(); k++)
                 m.bdOut.push_back(bankRun(mu.out[k]->srcCh, mu.mm2sBds[k]));

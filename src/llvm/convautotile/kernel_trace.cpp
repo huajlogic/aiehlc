@@ -8,6 +8,8 @@
 #include "conv_desugar.h"
 #include "kernel_static.h"
 #include "trace_routing.h"
+// the device BD length limits + splitBdLen (header-only, no MLIR): the dataflow plan applies the same split
+#include "../../mlir/mlirfront/tilinglinalg/pass/dataflowplan/plantarget.h"
 
 #include <algorithm>
 #include <deque>
@@ -1250,6 +1252,35 @@ void checkBlockOpts(const TracePort &p, const PortFit &f, const std::vector<Even
             err("{.tile = {" + std::to_string(tr) + ", " + std::to_string(tc) + "}}: the DMA moves 32-bit words, " +
                 "so a tile row (" + std::to_string(tc * p.elem_bytes) + " B) and the tensor row (" +
                 std::to_string(rowBytes) + " B) must be multiples of 4 bytes");
+    }
+    // {.stage = aie::stage::memtile}: a mesh column's MemTile holds every distinct block its cores load, and
+    // the dataflow plan loads it with ONE S2MM transfer. A MemTile BD moves at most memBdMaxLenWords words, so
+    // a longer stage becomes a next_bd chain cut at block bounds (dfplan::splitBdLen -- the plan's own split),
+    // or the build fails when it cannot be cut or the chain does not fit the channel's BD bank.
+    if (!p.output && o.stage == 1) {
+        const dfplan::PlanTarget &T = dfplan::planTarget();
+        int64_t blockBytes = p.elem_bytes;
+        for (int d : f.shape)
+            blockBytes *= d;
+        std::map<int, std::set<std::vector<int>>> perCol; // mesh column -> distinct block offsets
+        for (auto &e : events)
+            if (e.kind == 'L' && e.port == p.var)
+                perCol[e.p1].insert(std::vector<int>(e.off, e.off + 4));
+        int64_t stage = 0;
+        for (auto &[col, offs] : perCol)
+            stage = std::max<int64_t>(stage, (int64_t)offs.size() * blockBytes);
+        const std::vector<int64_t> bds = dfplan::splitBdLen(stage, T.memBdMaxLenWords, blockBytes, T.bdWordBytes);
+        std::ostringstream hx;
+        hx << std::hex << "0x" << stage / T.bdWordBytes << " words, a MemTile BD moves at most 0x"
+           << T.memBdMaxLenWords << " words";
+        if (bds.empty() || (int)bds.size() > T.memBdBank)
+            err("{.stage = aie::stage::memtile}: a mesh column's MemTile stage is " + std::to_string(stage) + " B (" +
+                hx.str() + "); it cannot be loaded as a chain of at most " + std::to_string(T.memBdBank) +
+                " BDs cut at block bounds (BD length limit)");
+        else if (bds.size() > 1)
+            r.notes.push_back(who + "{.stage = aie::stage::memtile}: a mesh column's MemTile stage is " +
+                              std::to_string(stage) + " B (" + hx.str() + "): the dataflow plan loads it as " +
+                              std::to_string(bds.size()) + " chained MemTile BDs (next_bd, cut at block bounds)");
     }
     if (ok)
         r.opts[p.var] = o;

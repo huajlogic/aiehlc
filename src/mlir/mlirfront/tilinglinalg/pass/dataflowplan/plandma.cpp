@@ -68,8 +68,12 @@ MemtileUse memtileUse(const DataflowPlan &p, const PlanStream &s, int col) {
         }
     } else {
         u.chunksPerTile = s.chunks;
-        u.s2mmBds = 1, u.mm2sBds.assign(u.out.size(), 1), u.locks = 2;
         u.bytes = (int64_t)s.hostRows.size() * s.chunks * chunk;
+        // the column's strips arrive as ONE S2MM transfer: a chain of BDs when it is over a MemTile BD's
+        // length (splitBdLen, cut at chunks); 0 BDs = it cannot be cut (assignMemTiles fails the build)
+        const PlanTarget &T = planTarget();
+        u.s2mmBds = (int)splitBdLen(u.bytes, T.memBdMaxLenWords, chunk, T.bdWordBytes).size();
+        u.mm2sBds.assign(u.out.size(), 1), u.locks = 2;
     }
     u.present = !u.out.empty();
     return u;
@@ -230,8 +234,28 @@ bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
         p.locks.back().tag = mtag(si, c, "lock", 0);
         p.locks.push_back({t, m.locks[1], 1, keep ? 0 : -1, false, true});
         p.locks.back().tag = mtag(si, c, "lock", 1);
-        p.bds.push_back({t, m.bdIn, m.addr, groups * bLen, {}, 0, 0, m.locks[1], -1, m.locks[0], replays, -1});
-        p.bds.back().tag = mtag(si, c, "in", 0);
+        // the load: one BD, or a next_bd chain when the strips are over a MemTile BD's length (splitBdLen) --
+        // the first BD acquires `free`, the last releases `ready` to the replays, the middle ones take no lock.
+        // The runtime programs a BD's locks only when it names both (__Runtime_tile_bd_config: acq >= 0 &&
+        // rel >= 0), so the first BD's release is `free` +0 (no change) and the last BD's acquire is `free`
+        // == 0 (acquire-equal, no change: the chain's first BD took it to 0).
+        const std::vector<int64_t> parts = splitBdLen(groups * bLen, T.memBdMaxLenWords, chunk, T.bdWordBytes);
+        if (parts.empty() || (int)parts.size() != u.s2mmBds) {
+            why = "stream " + std::to_string(B.arg) + ": the MemTile stage of column " + std::to_string(c) + " (" +
+                  std::to_string(groups * bLen / T.bdWordBytes) + " words) cannot be cut into BDs of at most " +
+                  std::to_string(T.memBdMaxLenWords) + " words at chunk (" + std::to_string(chunk) + " B) bounds";
+            return false;
+        }
+        int64_t off = 0;
+        for (size_t i = 0; i < parts.size(); i++) {
+            const bool first = i == 0, last = i + 1 == parts.size();
+            const bool lk = first || last;
+            p.bds.push_back({t, m.bdIn + (int)i, m.addr + off, parts[i], {}, 0, 0, lk ? m.locks[1] : -1,
+                             first ? -1 : 0, lk ? (last ? m.locks[0] : m.locks[1]) : -1, last ? replays : 0,
+                             last ? -1 : m.bdIn + (int)i + 1});
+            p.bds.back().tag = mtag(si, c, "in", (int)i);
+            off += parts[i];
+        }
         p.channels.push_back({t, true, u.s2mm, m.bdIn, 1, keep});
         p.channels.back().tag = mtag(si, c, "ch_in", 0);
         for (size_t k = 0; k < u.out.size(); k++) {
@@ -505,6 +529,27 @@ bool deriveDmaProgram(DataflowPlan &p, std::string &why) {
     deriveCoreSlots(p, p.streams[0], cores);
     if (!deriveKernelParams(p, why))
         return false;
+    // every BD the plan emits within its tile kind's BD length (splitBdLen): a longer one would be silently
+    // truncated by the device; the resident load is already a chain, anything else over the limit fails the build
+    const PlanTarget &T = planTarget();
+    for (const PlanBd &bd : p.bds)
+        for (const Tile &t : bd.tiles) {
+            const bool mem = t.row >= 1 && t.row <= p.memtileRows;
+            const int64_t lim = mem ? T.memBdMaxLenWords : T.coreBdMaxLenWords;
+            if (splitBdLen(bd.len, lim, bd.len, T.bdWordBytes).size() != 1) {
+                why = std::string(mem ? "MemTile" : "core") + " BD " + std::to_string(bd.bd) + " (" + bd.tag +
+                      ") is " + std::to_string(bd.len / T.bdWordBytes) + " words, over the BD length limit of " +
+                      std::to_string(lim) + " words";
+                return false;
+            }
+        }
+    for (const PlanShimBd &sb : p.shimBds)
+        if (splitBdLen(sb.len, T.shimBdMaxLenWords, sb.len, T.bdWordBytes).size() != 1) {
+            why = "shim BD " + std::to_string(sb.bd) + " (" + sb.tag + ") is " +
+                  std::to_string(sb.len / T.bdWordBytes) + " words, over the BD length limit of " +
+                  std::to_string(T.shimBdMaxLenWords) + " words";
+            return false;
+        }
     p.persistentGoLock = p.persistent ? p.res.lockGo : -1;
     return true;
 }
