@@ -8,13 +8,11 @@
 > streams and bytes before cores, and fuse them into the producing kernel when
 > you can.
 
-> **Status (2026-11-15).** The kernel below passes the compiler's kernel
-> analysis (section 3), but the pipeline after it still derives core windows
-> from its GEMM tiling model and stops the build for this shape
-> (`error: input: the core window is 64 elements x 1 round(s) per launch, but
-> the kernel's blocks (#routing.kernel_block) are 4096 elements x 16`). Making
-> the lowering follow every port's traced blocks is the pending compiler work;
-> a runnable, board-measured example replaces this note when it lands.
+> **Status (2026-11-25).** This kernel builds on the generated path, but its board
+> result is wrong (237456 of 262144 outputs, 57 ms). Through the dataflow plan it is
+> right and fast: `simpleeltwise_add_plan.cc` -- the same kernel with x / y as
+> `{.share = aie::share::broadcast}` -- GOLDEN PASS at 0.365 ms per launch on VEK385
+> (`doc/design/dmaphop_dataflow_plan.md`, "Per-core copies").
 
 ## The whole program
 
@@ -23,9 +21,8 @@ The whole program -- kernel and host, 4x4 mesh. Helpers (`ops_fill`, `ops_compar
 <!-- code: example/tileprogram/ccode/simpleeltwise_add.cc -->
 ```cpp
 #include "simpleops_load.h"
-// STATUS (2026-11-15): passes the kernel analysis (`build/aiehlc-convtile trace` this file);
-// the lowering does not support this op shape yet, so aiehlc.sh stops with
-// "the core window is ... but the kernel's blocks (#routing.kernel_block) are ...".
+// STATUS (2026-11-25): builds on the generated path, but the board result is wrong (57 ms); the same
+// kernel through the dataflow plan, simpleeltwise_add_plan.cc, is GOLDEN PASS at 0.365 ms on VEK385.
 #define OPS_R 256  // rows
 #define OPS_C 1024 // columns (bytes)
 // Elementwise: z = saturate_int8(x + y), x / y / z int8[256, 1024], on the 4x4 mesh

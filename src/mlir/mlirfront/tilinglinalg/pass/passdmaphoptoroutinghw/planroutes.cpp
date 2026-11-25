@@ -11,6 +11,7 @@
 // enableexttoaieshimport ops, so RoutingHWVerify, the provenance / resource maps and RoutingHWLower see
 // the plan's routes like any other.
 
+#include <cstdlib>
 #include "planroutes.h"
 
 #include "hw/ResourceManager.h"
@@ -114,6 +115,12 @@ void collectUsed(ModuleOp module, Fabric &f) {
         int r, c;
         if (op->getNumOperands() == 0 || !tileRC(op->getOperand(0), r, c))
             return;
+        if (std::getenv("AIEHLC_PLAN_ROUTE_DEBUG") && r >= 2 && r <= 4) {
+            std::string s;
+            llvm::raw_string_ostream os(s);
+            op->print(os);
+            llvm::errs() << "[planroute] used at (" << c << ", " << r << "): " << os.str().substr(0, 260) << "\n";
+        }
         if (isa<routinghw::ConnectStreamSingleSwitchPort>(op)) {
             mark(r, c, false, op->getAttr("slaveportdirection"), op->getAttr("slaveportidx"));
             mark(r, c, true, op->getAttr("masterportdirection"), op->getAttr("masterportidx"));
@@ -221,6 +228,18 @@ bool routeNet(Fabric &f, Emitter &e, int sr, int sc, In src, ArrayRef<std::tuple
                 }
             }
             if (!found) {
+                if (std::getenv("AIEHLC_PLAN_ROUTE_DEBUG")) // the column's vertical ports: free (+) / taken (x)
+                    for (int r = 0; r <= std::max(dr, sr); r++) {
+                        llvm::errs() << "[planroute] (" << dc << ", " << r << ")";
+                        for (PortDirection d : {PortDirection::North, PortDirection::South})
+                            for (int m = 1; m >= 0; m--) {
+                                llvm::errs() << (d == PortDirection::North ? " N" : " S") << (m ? "m" : "s") << ":";
+                                if (f.inside(r, dc))
+                                    for (int k : f.ports(r, dc, m == 1, d))
+                                        llvm::errs() << k << (f.free(r, dc, m == 1, d, k) ? "+" : "x");
+                            }
+                        llvm::errs() << "\n";
+                    }
                 why = "no free path to (" + std::to_string(dc) + ", " + std::to_string(dr) + ")";
                 return false;
             }

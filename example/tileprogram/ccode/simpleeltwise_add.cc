@@ -3,9 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 #include "simpleops_load.h"
-// STATUS (2026-11-15): passes the kernel analysis (`build/aiehlc-convtile trace` this file);
-// the lowering does not support this op shape yet, so aiehlc.sh stops with
-// "the core window is ... but the kernel's blocks (#routing.kernel_block) are ...".
+// STATUS (2026-11-25): builds on the generated path, but the board result is wrong (57 ms); the same
+// kernel through the dataflow plan, simpleeltwise_add_plan.cc, is GOLDEN PASS at 0.365 ms on VEK385.
 #define OPS_R 256  // rows
 #define OPS_C 1024 // columns (bytes)
 // Elementwise: z = saturate_int8(x + y), x / y / z int8[256, 1024], on the 4x4 mesh

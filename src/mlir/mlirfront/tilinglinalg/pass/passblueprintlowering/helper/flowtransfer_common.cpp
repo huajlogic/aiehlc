@@ -15,6 +15,7 @@
 
 #include "dataflowplan/dataflowplan.h"
 #include <cstdlib>
+#include "dataflowplan/plantarget.h"
 #include "flowtransfer_internal.h"
 #include "routingmanager.h"
 #include <cassert>
@@ -680,7 +681,7 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     // shim S2MM BD per core walks them with its iteration dimension and the host
     // arms it once (totalRounds = 1) -- no per-round re-programming, which races a
     // fast core. The iteration counter is 6 bits: at most kIterMax rounds.
-    constexpr int64_t kIterMax = 64;
+    const int64_t kIterMax = dfplan::planTarget().bdMaxIterWrap;
     const int64_t outRounds = mRounds * nRounds;
     if (passState.outputTileMajor && outRounds > 1 && outRounds <= kIterMax) {
         const int64_t roundBytes = desc.bdLenBytes;

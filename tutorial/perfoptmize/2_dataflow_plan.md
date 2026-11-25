@@ -13,9 +13,11 @@ the step file sets the pragmas and three knobs:
 #include "gemm_plan_body.cc"
 ```
 
-The problem grows to C[7680 x 512] (10.07 G MAC) and the chunk to 64 x 128 (K 2560 = 20 chunks).
+The problem grows to C[7680 x 512] (10.07 G MAC) and the chunk to 64 x 128 (K 2560 = 20 chunks). These
+are the body's defaults (`GP_M` / `GP_N` / `GP_K` / `GP_DTYPE`); other shapes, bf16 and the tiling chosen
+by the compiler are chapter 4.
 
-## Step 3: shared operands through the MemTiles (`step3_memtile.cc`) -- 1.498 ms per launch, 65.6 % of peak
+## Step 3: shared operands through the MemTiles (`step3_memtile.cc`) -- 1.497 ms per launch, 65.7 % of peak
 
 The kernel states **where its blocks come from**, not how they get there:
 
@@ -71,7 +73,7 @@ Reproducing this step found a compiler bug: without `.keep`, B's MemTile locks w
 (written on launch 0 only) although nothing hands lock 1 back, so launch 1 hung on the B input. Fixed in
 `plandma.cpp` (`restored = keep`); skill `planmemtilebperlaunch`.
 
-## Step 4: weights stay (`step4_keep.cc`) -- 1.317 ms per launch, 74.7 % of peak
+## Step 4: weights stay (`step4_keep.cc`) -- 1.314 ms per launch, 74.8 % of peak
 
 ```c++
 #define GP_KEEP true
@@ -113,7 +115,7 @@ start.
 The gain is small here because step 2's AOT warm reload already removed most of the reload cost. In the
 history this step was larger (74.2 % on VEK385, `share2x8.py --persist`): AOT did not exist yet.
 
-## Step 6: two memory banks (`step6_banks.cc`) -- 1.151 ms per launch, 85.4 % of peak
+## Step 6: two memory banks (`step6_banks.cc`) -- 1.148 ms per launch, 85.6 % of peak
 
 ```c++
 #define GP_PARTS 2
@@ -133,7 +135,7 @@ The core BD writes the second half one `PART_STRIDE` further on (a third BD dime
 movement needs no extra transfer. The plan's runtime also syncs a stream's two readers once per output
 tile (`LOCK_SYNC`): readers that drift half a chunk apart hit the same bank half on every access.
 
-## Step 7: a deeper ring (`step7_ring.cc` = `gemm_plan.cc`) -- 1.152 ms per launch, 85.4 % of peak
+## Step 7: a deeper ring (`step7_ring.cc` = `gemm_plan.cc`) -- 1.147 ms per launch, 85.7 % of peak
 
 ```c++
 #define GP_RING 10
@@ -141,10 +143,10 @@ tile (`LOCK_SYNC`): readers that drift half a chunk apart hit the same bank half
 
 A's MemTile FIFO goes from 2 to 10 buffers of 16 KB: the shim stream from DDR no longer stalls each time
 a core is slow for a chunk, and the jitter between DDR and the cores is absorbed in the MemTile. Measured
-today it is within noise of step 6 (1.152 vs 1.151 ms): with the bank split and the per-tile reader
+today it is within noise of step 6 (1.147 vs 1.148 ms): with the bank split and the per-tile reader
 sync the cores no longer drift, so a 2-deep ring already keeps them fed. In the hand-edited history,
 which had no tile sync, the deeper ring was worth about 2 points. It stays in `gemm_plan.cc` as head
-room against DDR jitter. This is the final build: **85.4 %** of the VEK385 peak (1.152 ms per launch), GOLDEN PASS, from the C source alone.
+room against DDR jitter. This is the final build: **85.7 %** of the VEK385 peak (1.147 ms per launch), GOLDEN PASS, from the C source alone.
 
 History: 84.5 % was the last hand-edited build (`share2x8.py --afine`: a 10-buffer A ring); the
 compiler build reproduces and slightly passes it.

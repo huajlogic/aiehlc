@@ -110,7 +110,7 @@ void collect(ModuleOp m, Acc &a) {
 bool liftCore(const Acc &a, const DataflowPlan &p, PlanResources &out, std::string &why) {
     if (a.E.empty() && a.R.empty() && a.bd.empty())
         return true;
-    const PlanStream &s = p.streams[0];
+    const PlanStream s = p.coreProtocol();
     out.lockE = a.E.count(0) ? a.E.at(0) : -1;
     for (auto &[b, id] : a.E)
         if (id != out.lockE + b) {

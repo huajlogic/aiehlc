@@ -373,6 +373,21 @@ struct_kernel_group __Runtime_load_kernel_group_16t_ctrl(
     XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8,
     XAie_LocType t9, XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14,
     XAie_LocType t15, int n, int32_t bd_id, int32_t mm2s_ch);
+/* 17..32 cores (a 4 x 6 or 4 x 8 mesh): the positional variant the pipeline emits for them */
+struct_kernel_group __Runtime_load_kernel_group_32t(
+    XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3, XAie_LocType t4,
+    XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9, XAie_LocType t10,
+    XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14, XAie_LocType t15, XAie_LocType t16,
+    XAie_LocType t17, XAie_LocType t18, XAie_LocType t19, XAie_LocType t20, XAie_LocType t21, XAie_LocType t22,
+    XAie_LocType t23, XAie_LocType t24, XAie_LocType t25, XAie_LocType t26, XAie_LocType t27, XAie_LocType t28,
+    XAie_LocType t29, XAie_LocType t30, XAie_LocType t31, int n);
+struct_kernel_group __Runtime_load_kernel_group_32t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
+    XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9,
+    XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14, XAie_LocType t15,
+    XAie_LocType t16, XAie_LocType t17, XAie_LocType t18, XAie_LocType t19, XAie_LocType t20, XAie_LocType t21,
+    XAie_LocType t22, XAie_LocType t23, XAie_LocType t24, XAie_LocType t25, XAie_LocType t26, XAie_LocType t27,
+    XAie_LocType t28, XAie_LocType t29, XAie_LocType t30, XAie_LocType t31, int n, int32_t bd_id, int32_t mm2s_ch);
 
 struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_group kg);
 struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,

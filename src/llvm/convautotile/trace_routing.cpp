@@ -167,7 +167,9 @@ RoutingPlan planRouting(const std::vector<TracePort> &ports, const std::map<std:
             rp.opts = o->second;
         for (auto &d : rp.dims)
             plan.halo = plan.halo || d.halo() || d.meshHalo();
-        if (!rp.output && rp.dependsOn(0) && rp.dependsOn(1))
+        // (a port the dataflow plan routes -- a .stage / .share option -- may be unique per core: the plan
+        // gives each core its own stream, the generated flow is only its stand-in)
+        if (!rp.output && rp.dependsOn(0) && rp.dependsOn(1) && !rp.opts.stage && !rp.opts.share)
             plan.errors.push_back(p.var + " (" + p.role + "): an input block that depends on both program ids is " +
                                   "unique per core; routing supports inputs broadcast along a mesh row " +
                                   "(depends on program_id(0) only) or a mesh col (program_id(1) only)");

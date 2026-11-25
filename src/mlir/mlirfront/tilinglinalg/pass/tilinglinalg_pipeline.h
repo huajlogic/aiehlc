@@ -63,6 +63,7 @@ struct KernelBlock {
                                        // path relabels B as [K, N]; the bytes are [N, K])
     std::vector<int64_t> shape;        // block extent per dim, elements; empty = none
     std::vector<int64_t> stepI, stepJ; // offset per outer / inner round, per dim
+    std::vector<int64_t> baseP0, baseP1; // core (p0, p1)'s first block: base_p0 * p0 + base_p1 * p1
     int64_t roundsI = 1, roundsJ = 1;  // blocks per core = roundsI * roundsJ
     bool resident = false;             // {.resident = true}
     int64_t tileR = 0, tileC = 0;      // {.tile = {tileR, tileC}}, 0 = none
@@ -73,6 +74,7 @@ struct KernelBlock {
     bool keep = false; // {.keep = true}: loaded on the first launch, kept across launches
     int align = 0;     // {.align = N}: the port's core buffers N-byte aligned (-> block_align attr)
     int parts = 0;     // {.parts = n}: the kernel addresses a block as n row parts (-> dataflow parts)
+    int axis = 0;      // share = broadcast: 1 per mesh row, 2 per mesh column (-> dataflow axis)
     bool empty() const { return shape.empty(); }
 };
 

@@ -19,7 +19,13 @@
 
 #include "unistd.h"
 #include "xil_cache.h"
+// XTime: XilTimer on Gen5; the Gen2 BSP ships xiltimer.h unconfigured (its frequency macro is undefined), so
+// it reads xtime_l.h (skill bspheadergen2)
+#if AIE_GEN > 2
 #include "xiltimer.h"
+#else
+#include "xtime_l.h"
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

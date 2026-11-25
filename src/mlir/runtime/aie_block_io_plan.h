@@ -39,6 +39,50 @@ AIEHLC_PLAN_INLINE uintptr_t aiehlc_plan_view(int o, int pm) { return (uintptr_t
 AIEHLC_PLAN_INLINE int aiehlc_plan_lockbase(int o, int pm) { return (int)AIEHLC_PLAN_LOCK(o, pm); }
 AIEHLC_PLAN_INLINE int aiehlc_plan_reader(int o, int pm) { return (int)AIEHLC_PLAN_READER(o, pm); }
 
+// Per-core copies (AIEHLC_PLAN_COPY; load_buffer {.share = aie::share::broadcast}): every core holds its own
+// copy of each such operand's stream, on the operand's own S2MM channel, `OP_SLOTS(o)` buffers of one chunk
+// OP_SLOT_STRIDE apart from OP_SLOT_LO (part i of a {.parts = n} chunk at + i OP_PART_STRIDE). The DMA
+// releases the operand's counting lock OP_F once per chunk; the kernel gives each buffer back on its E lock
+// (OP_E + slot). One reader, so no hand-on and no tile sync.
+#if defined(AIEHLC_PLAN_COPY)
+template <typename W>
+AIEHLC_PLAN_INLINE aiehlc_block_ptr aiehlc_load_buffer(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int pm,
+                                                       int p1, aiehlc_blk off, aiehlc_blk shape, int parts = 1) {
+    const int o = aiehlc_plan_operand(d);
+    if (o < 0) /* not a planned operand: its generated window */
+        return aiehlc_window_load(win, d, cur, pm, p1, off, shape, parts);
+    const unsigned g = (unsigned)cur.n++;
+    acquire_greater_equal(aiehlc_plan_lockbase(o, pm) + (int)AIEHLC_PLAN_OP_F(o, pm), 1);
+    chess_memory_fence();
+    return {(int8_t *)(aiehlc_plan_view(o, pm) + AIEHLC_PLAN_OP_SLOT_LO(o, pm) +
+                       (g % (unsigned)AIEHLC_PLAN_OP_SLOTS(o, pm)) * AIEHLC_PLAN_OP_SLOT_STRIDE(o, pm)),
+            (long)AIEHLC_PLAN_OP_PART_STRIDE(o, pm)};
+}
+template <typename W>
+AIEHLC_PLAN_INLINE void aiehlc_release(W *win, const aiehlc_blk_desc &d, aiehlc_blk_cursor &cur, int pm, int) {
+    const int o = aiehlc_plan_operand(d);
+    if (o < 0) {
+        cur.r++;
+        release_input_window(win);
+        return;
+    }
+    const unsigned r = (unsigned)cur.r++;
+    chess_memory_fence();
+    release(aiehlc_plan_lockbase(o, pm) + (int)AIEHLC_PLAN_OP_E(o, pm) +
+                (int)(r % (unsigned)AIEHLC_PLAN_OP_SLOTS(o, pm)),
+            1);
+}
+template <typename W>
+AIEHLC_PLAN_INLINE aiehlc_block_ptr aiehlc_store_buffer(W *win, const aiehlc_blk_desc &, aiehlc_blk_cursor &, int, int,
+                                                        aiehlc_blk, aiehlc_blk) {
+    return {(int8_t *)acquire_output_window(win), 0};
+}
+template <typename W>
+AIEHLC_PLAN_INLINE void aiehlc_commit(W *win, const aiehlc_blk_desc &, aiehlc_blk_cursor &cur, int, int) {
+    cur.r++;
+    release_output_window(win);
+}
+#else // neighbour-hosted streams
 // Chunk g's channel and buffer: one AND when the counts are powers of two (the constants fold).
 AIEHLC_PLAN_INLINE int aiehlc_plan_ch(unsigned g) {
     return (AIEHLC_PLAN_CHANNELS & (AIEHLC_PLAN_CHANNELS - 1)) == 0 ? (int)(g & (AIEHLC_PLAN_CHANNELS - 1))
@@ -105,5 +149,6 @@ AIEHLC_PLAN_INLINE void aiehlc_commit(W *win, const aiehlc_blk_desc &, aiehlc_bl
     (void)pm;
 #endif
 }
+#endif // AIEHLC_PLAN_COPY
 
 #endif // AIE_BLOCK_IO_PLAN_H

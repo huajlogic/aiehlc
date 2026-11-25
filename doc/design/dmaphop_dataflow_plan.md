@@ -59,6 +59,33 @@ carried as `BlockOpts` -> `KernelBlock` (`tilinglinalg_pipeline.h`) and attached
 The kernel body is a plain block-load kernel; it never names a lock, a view or an address. The
 compiler binds its block calls on the shared ports to the plan (section 4, "Kernel side").
 
+### Shape, dtype and tiling at build time: `--define`, `#pragma gemm_autotile`
+
+`gemm_plan_body.cc` takes its problem as macros (`GP_M` / `GP_N` / `GP_K` / `GP_DTYPE`, defaults
+7680 / 512 / 2560 / int8) and derives every count from them. A macro must reach every stage that
+reads the source -- the front end's macro scan, the x86 kernel trace, the dataflow plan, the kernel and
+host compiles -- or the kernel is built for one shape and the host for another. `aiehlc.sh --define
+NAME=VALUE` (or `AIEHLC_DEFINES="-DNAME=VALUE ..."`) does that: aiehlc writes the macros as `#define`
+lines at the top of the source text (`injectUserDefines`, then `#line 1`), before the includes are
+spliced, so a body's `#ifndef NAME` default yields and `kernel.cc`, `host.cc` and the KOBJ cache key
+all follow. `EXTRA_DEFS` stays host-only and is refused for a macro the source uses.
+
+`#pragma gemm_autotile[(board)]` (`gemm_plan_auto.cc`) lets the compiler pick the tiling the 2 x 8
+kernel leaves open: the mesh (rows x columns: N = 2 x columns x 64 fixes the columns; rows must be 4 so
+A's and B's reader counts match) and A's MemTile ring (deepest <= 10 dividing the chunk stream). A mesh
+must also fit the packet ids (every packet-switched output core takes one of 27 on aie2ps: columns <= 6)
+and the 32-core kernel load. `src/llvm/convautotile/gemm_autotile.cpp`
+ranks every feasible choice by max(cores, shim channels, DDR) + launch: cores = tiles x K chunks x
+cycles per chunk (int8 1188 measured, bf16 calibrated on the board), shim = the busiest channel's bytes
+at the board's per-channel rate (B re-read per output tile when it cannot be held), DDR = reads /
+writes at the board's rates (palmyra: one controller, no overlap; VEK385: 24 GB/s aggregate read, fitted
+on the B-re-read runs). Measured on 8 shapes (doc/plan/dataflowplan_generalize.md stage 4): within
++-13 %. Board facts: `vek385`, `palmyra`
+(`#pragma gemm_autotile(palmyra)` or `AIEHLC_GEMM_BOARD`); device facts: `plantarget.h`. It writes
+`GP_HW_ROWS` / `GP_HW_COLS` / `GP_RING` the same way as `--define`, except those the source sets itself,
+and prints the ranking (`[GemmAutoTile] ...`, predicted ms and % of peak per candidate). The K chunk
+(64 x 128 B) and the 64 x 64 output tile are the kernel's and not searched.
+
 ### One kernel body, no `#if defined(__chess__)` (2026-11-23, later)
 
 `gemm_plan.cc`'s kernel is ONE body for the core and for the x86 trace: every operand block comes from
@@ -119,15 +146,35 @@ and `deriveDmaProgram` turns the streams into the dfschedule DMA program (sectio
   column c = strip c / 2, parity c % 2); with fewer columns a column serves a strip's every parity
   (4 x 2) -- one MM2S channel per parity and an (empty, full) lock pair each; broadcast to the strip's
   host row in every column. B: the next MemTile row, a column's strips held whole, one MM2S replay per
-  (strip group, parity); `resident = "launches"` loads B on the first launch only. MemTile channels
+  (strip group, parity); `resident = "launches"` loads B on the first launch only. **B's staging follows
+  the MemTile capacity** (`plantarget.h` `memBytes`): when a column's strips do not fit next to what
+  else that MemTile holds (bf16 4096 x 512 x 4096: 1 MiB), B becomes a `memtile_ring` too -- one S2MM
+  chain over every (strip group, parity) buffer, chunk n to MM2S route n % k, re-read from DDR for every
+  output tile (the shim BD's iteration step is 0, `aiehlc_plan_arrange` lays one round out); the build
+  prints `[DataflowPlan] stream N: ... streamed as memtile_ring R`. Its ring is the shallowest (from
+  `.ring`, default 2) that divides the column's chunk stream and keeps every channel start at or below
+  `chMaxRepeat` (256, the task queue's repeat count; any channel above it is a build error). `.stage =
+  aie::stage::memtile_ring` on B forces the ring. MemTile channels
   are chosen so each channel's BD bank holds its chain; shim MM2S channels and MemTile rows go to the
-  streams top-down.
+  streams top-down. `role` is a label; the layout is `row_groups` / `strips` (`"a"` / `"b"` only give
+  their defaults to plans written without them).
 * **Shim** (dfschedule). One BD per stream and column on the channel its `plan_route` names; the DDR
   layout is one contiguous chunk stream per column, the columns one after the other -- generated into
   `aiehlc_plan.h` as `aiehlc_plan_arrange(arg, src, dst)` from the same streams and routes, which the
   host calls (`gemm_plan.cc`; byte-identical to the former hand-written `sh_arrange` on 4 x 4).
 
-Limits (errors name them): two shared operands (A ring, B resident), every stream the same reader
+**Core data memory** (`planresource.cpp` `planCoreMemory`). The plan counts one core's 64 KiB: the
+windows the allocator placed (incl. the replaced ports' windows, which the plan owns), a minimum stack
+(`coreMinStack`, kc.sh's 4 KiB relink) and the kernel's other statics (`coreStaticReserve`), and the
+GEMM's K accumulator (A chunk rows x B chunk rows x 4 B -- int32 / fp32 partial sums kept across the K
+chunks). Fits: the kernel keeps its own (`[DataflowPlan] core memory: ... the kernel's own`, generated
+files unchanged). Does not fit (bf16: the output windows are twice the int8 ones): the plan makes room in
+the memory it owns -- one chunk slot per channel instead of `slots` -- and places the accumulator after
+the slots, `AIEHLC_PLAN_ACC` (core address) / `AIEHLC_PLAN_ACC_BYTES` / `AIEHLC_PLAN_DM_FREE` in
+`aiehlc_plan.h`; the kernel uses it when defined (`gemm_plan_body.cc` bf16: `facc`). Still short: a build
+error naming the accumulator and the bytes missing.
+
+Limits (errors name them): two shared operands (A ring, B resident or ring), every stream the same reader
 count (4 mesh rows), columns >= A strips, N = 2C block rows (one n tile per core), output tiles per
 core <= the shim BD's iteration limit (64), K / chunk a multiple of `channels`, the ring must divide
 each column's chunk stream, every MemTile chain must fit its channel's BD bank.
@@ -252,6 +299,45 @@ is regenerated from the lifted plan and must equal the edited one; anything the 
 (0x80000 -> 0x90000) -> regenerated identically, `aiehlc_plan.h` follows (GO_LOCK 62, LOCK_SYNC 15), the
 read-back dmaphop rebuilds byte-identically, board GOLDEN PASS 85.45 %; a changed BD length is
 rejected with the line.
+
+### Per-core copies: `.share = broadcast` and per-core streams (`share = "none"`)
+
+Beyond the neighbour-hosted 2 x 8 GEMM, a plan can give every core its own copy of an operand:
+
+| C option | dataflow | stream | example |
+|---|---|---|---|
+| `{.share = aie::share::broadcast, .stage = ...}`, blocks follow `program_id(0)` only | `share = "broadcast", axis = "row"` | one per mesh row, multicast to the row's cores | `simpleeltwise_add_plan.cc` x / y, `simpleconv2dkernel_port_plan.cc` input (halo blocks) |
+| same, blocks follow `program_id(1)` only | `axis = "column"` | one per mesh column, multicast up the column | conv weights (`.stage = memtile, .keep = true`), `simpleeltwise_add_none.cc` y |
+| `{.stage = ...}` without `.share` | `share = "none"` + the traced core origin `base_p0` / `base_p1` | one per core: per column one MemTile ring serving its cores (chunk n -> route n % rows) | `simpleeltwise_add_none.cc` x |
+
+The kernel analysis decides the axis from the fit (`BlockOpts.axis`) and refuses a broadcast whose blocks
+move with both program ids. Plan synthesis (`plansynth.cpp` `synthCopyText` / `synthPerCore`): operand o on
+core S2MM channel o, MemTile row `memRows - o`, shim MM2S channel `last - o` -- so at most 2 such operands
+(a core's S2MM channels); a row-broadcast stream is staged in column r (rows <= columns). A stream's blocks
+are a 2-D walk (rank 3 / 4 blocks flattened to rows x columns, the trailing dims spanned): `row_step` /
+`col_step_i` per round, `row_step_j` / `col_step` per chunk, origin `strip_row_base` / `strip_col_base` per
+strip -- overlapping blocks (a conv's halo) are repeated in DDR by `aiehlc_plan_arrange`. Core side
+(`deriveCopySlots`, `aie_block_io_plan.h` under `AIEHLC_PLAN_COPY`): per operand its own chain of `slots`
+BDs, a counting F lock (DMA -> kernel), an E lock per slot (kernel -> DMA), its slots in that operand's own
+replaced windows at the 32-byte-aligned chunk stride (`AIEHLC_PLAN_OP_*(o, pm)` constants); one reader, no
+hand-on, no tile sync. Limits: a column carries a bounded number of vertical streams -- two per-core
+operands on a 4-row mesh need 8 and the router refuses (`no free path`); a spatial-halo conv's weights need
+`{.depth = 2}` (the kernel analysis). Board (VEK385, GOLDEN PASS): eltwise broadcast 0.365 ms per launch
+(the same kernel on the generated path: 57 ms and wrong), x per core + y per column 0.213 ms, conv 7x7 s2
+224 x 224 0.098 ms (54.2 ms on the generated path).
+
+### Device facts: one table per target
+
+`plantarget.h` holds every device fact the plan and the flow-transfer helpers use, per target: `aie2ps`
+(`--aie-version 5`: VEK385, palmyra) and `aie2` (AIE-ML, `--aie-version 2`), selected by the pipeline from the build's
+generation (`selectPlanTarget`). Their DMA, lock and memory facts agree; the array differs (36 x 4 vs 38 x 8
+core rows) and so do the shim tiles with a DMA: every column on aie2ps, only the NoC shim columns on AIE-ML
+(2, 3, 6, 7, 14, 15, ...). A plan whose shim streams leave from a column without one is refused by name
+(`the plan streams from the shims of columns 4, 5, which have no DMA on aie2 ...`). On AIE-ML the NoC columns
+come in pairs, so the control-packet plane (a column of its own with a shim DMA) does not fit next to them:
+`gemm_plan_aie2.cc` puts the 4 x 2 mesh on columns 2, 3 without the control plane, and builds (skill
+**aie2planbuild**; the router's AIE-ML core template needed the hardware's 6 NORTH masters / SOUTH slaves). The flow-transfer
+helpers' shim wrap (was 1024: one past the 10-bit field) and iteration limits read the same table.
 
 ### What else the compiler does with a plan
 

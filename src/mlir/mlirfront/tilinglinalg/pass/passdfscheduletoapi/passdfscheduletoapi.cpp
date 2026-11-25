@@ -2078,6 +2078,7 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         //   <=4  -> _4t (pad to 4)
         //   <=8  -> _8t (pad to 8)
         //   <=16 -> _16t (pad to 16)
+        //   <=32 -> _32t (pad to 32; the runtime holds MAX_KERNEL_TILES = 32)
         size_t numTiles = tiles.size();
         size_t padTo;
         std::string funcName;
@@ -2090,6 +2091,9 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         } else if (numTiles <= 16) {
             padTo = 16;
             funcName = "__Runtime_load_kernel_group_16t";
+        } else if (numTiles <= 32) {
+            padTo = 32;
+            funcName = "__Runtime_load_kernel_group_32t";
         } else {
             llvm::errs() << "  ERROR: too many tiles (" << numTiles << ") for load_kernel_group\n";
             return failure();

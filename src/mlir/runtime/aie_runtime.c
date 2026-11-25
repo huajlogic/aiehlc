@@ -8356,6 +8356,18 @@ struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocT
     return __Runtime_load_kernel_group_nt(dev, arr, n);
 }
 
+struct_kernel_group __Runtime_load_kernel_group_32t(
+    XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3, XAie_LocType t4,
+    XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9, XAie_LocType t10,
+    XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14, XAie_LocType t15, XAie_LocType t16,
+    XAie_LocType t17, XAie_LocType t18, XAie_LocType t19, XAie_LocType t20, XAie_LocType t21, XAie_LocType t22,
+    XAie_LocType t23, XAie_LocType t24, XAie_LocType t25, XAie_LocType t26, XAie_LocType t27, XAie_LocType t28,
+    XAie_LocType t29, XAie_LocType t30, XAie_LocType t31, int n) {
+    XAie_LocType arr[] = {t0,  t1,  t2,  t3,  t4,  t5,  t6,  t7,  t8,  t9,  t10, t11, t12, t13, t14, t15,
+                          t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31};
+    return __Runtime_load_kernel_group_nt(dev, arr, n);
+}
+
 #define RT_CTRL_ELF_CHUNK_WORDS 4U
 #define RT_CTRL_ELF_SKIP_ADDR 0xFFFFFFFFU
 #define RT_CTRL_ELF_ACK_WAVE 3U
@@ -9168,6 +9180,18 @@ struct_kernel_group __Runtime_load_kernel_group_16t_ctrl(
     XAie_LocType t9, XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14,
     XAie_LocType t15, int n, int32_t bd_id, int32_t mm2s_ch) {
     XAie_LocType tiles[] = {t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15};
+    return rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
+}
+
+struct_kernel_group __Runtime_load_kernel_group_32t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
+    XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9,
+    XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14, XAie_LocType t15,
+    XAie_LocType t16, XAie_LocType t17, XAie_LocType t18, XAie_LocType t19, XAie_LocType t20, XAie_LocType t21,
+    XAie_LocType t22, XAie_LocType t23, XAie_LocType t24, XAie_LocType t25, XAie_LocType t26, XAie_LocType t27,
+    XAie_LocType t28, XAie_LocType t29, XAie_LocType t30, XAie_LocType t31, int n, int32_t bd_id, int32_t mm2s_ch) {
+    XAie_LocType tiles[] = {t0,  t1,  t2,  t3,  t4,  t5,  t6,  t7,  t8,  t9,  t10, t11, t12, t13, t14, t15,
+                            t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31};
     return rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
 }
 

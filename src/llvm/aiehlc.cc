@@ -48,6 +48,7 @@
 #include "convautotile/kernel_trace.h"
 #include "convautotile/kernel_template.h"
 #include "convautotile/kernel_front.h"
+#include "convautotile/gemm_autotile.h"
 
 class AieFrontEnd;
 
@@ -271,6 +272,8 @@ static KernelBlock kernelBlockFor(const std::string &kernel, const std::string &
     kb.shape.assign(f.shape.begin(), f.shape.end());
     kb.stepI.assign(f.step_i.begin(), f.step_i.end());
     kb.stepJ.assign(f.step_j.begin(), f.step_j.end());
+    kb.baseP0.assign(f.base_p0.begin(), f.base_p0.end());
+    kb.baseP1.assign(f.base_p1.begin(), f.base_p1.end());
     kb.roundsI = f.rounds_i;
     kb.roundsJ = f.rounds_j;
     kb.resident = p->second.opts.resident;
@@ -282,6 +285,7 @@ static KernelBlock kernelBlockFor(const std::string &kernel, const std::string &
     kb.keep = p->second.opts.keep;
     kb.align = p->second.opts.align;
     kb.parts = p->second.opts.parts;
+    kb.axis = p->second.opts.axis;
     return kb;
 }
 // Trace-routed kernel-only kernels: kernel -> port var -> traced block bytes
@@ -4036,6 +4040,33 @@ public:
         // A directive whose file cannot be read is left ALONE rather than
         // dropped -- Clang then reports the missing include against the real
         // line, which is a better error than a silent empty splice.
+        // AIEHLC_DEFINES="-DNAME=VALUE -DFLAG ..." (aiehlc.sh --define NAME=VALUE): the user's build-time
+        // macros, written as #define lines at the top of the source TEXT -- before the includes are spliced,
+        // the user #defines are collected and the kernel is traced -- so the front end, the x86 trace, the
+        // dataflow plan, the kernel TU (kc.sh) and host.cc all see the same values, and a `#ifndef NAME`
+        // default in an included body yields to them. (A -D on the host compile alone gave a kernel built
+        // for one shape and a host for another.) `#line 1` keeps the user's line numbers.
+        void injectUserDefines(std::string &src) {
+            const char *env = std::getenv("AIEHLC_DEFINES");
+            if (!env || !*env)
+                return;
+            std::istringstream is(env);
+            std::string tok, text;
+            while (is >> tok) {
+                if (tok.rfind("-D", 0) != 0 || tok.size() < 3) {
+                    llvm::errs() << "[aiehlc] ERROR: AIEHLC_DEFINES: '" << tok << "' is not -DNAME[=VALUE]\n";
+                    std::exit(1);
+                }
+                tok = tok.substr(2);
+                const size_t eq = tok.find('=');
+                const std::string name = tok.substr(0, eq), value = eq == std::string::npos ? "1" : tok.substr(eq + 1);
+                text += "#define " + name + " " + value + "\n";
+                llvm::outs() << "[aiehlc] define " << name << " = " << value << " (AIEHLC_DEFINES)\n";
+            }
+            if (!text.empty())
+                src = text + "#line 1\n" + src;
+        }
+
         void inlineSourceIncludes(std::string &src, int depth = 0) {
             if (depth > 8) // cycle backstop; `seen` already prevents the common case
                 return;
@@ -4191,6 +4222,18 @@ public:
         // aout/conv_autotile.json. AIEHLC_CONV_TUNE (JSON text or @file) overrides
         // the tunable knobs (time_oh, time_ow, pp_depth, c_align) -- the hook the
         // AutoTVM tuner (script/convtune) uses. A rejected configuration aborts.
+        // #pragma gemm_autotile (convautotile/gemm_autotile.h): the mesh and A ring of a 2 x 8 shared-operand
+        // GEMM chosen by the cost model from GP_M / GP_N / GP_K / GP_DTYPE, written as #defines before the
+        // kernel is traced. Board: #pragma gemm_autotile(palmyra) or AIEHLC_GEMM_BOARD (default vek385).
+        void applyGemmAutoTiling(std::string &src) {
+            std::string log, err;
+            if (!gemmtile::applyGemmAutoTile(src, log, err)) {
+                llvm::errs() << "[GemmAutoTile] ERROR: " << err << "\n";
+                std::exit(1);
+            }
+            llvm::outs() << log;
+        }
+
         void applyConvAutoTiling(std::string &src) {
             convautotile::Overrides ov;
             if (const char *env = std::getenv("AIEHLC_CONV_TUNE")) {
@@ -4436,8 +4479,10 @@ public:
                 //
                 // Headers (`.h`) are left to Clang, as before.
                 checkSourceIncludes(SourceCodeString);
+                injectUserDefines(SourceCodeString);
                 inlineSourceIncludes(SourceCodeString);
                 applyKernelTemplates(SourceCodeString);
+                applyGemmAutoTiling(SourceCodeString);
                 applyConvAutoTiling(SourceCodeString);
 
                 // Collect user #define macros before any rewriting.

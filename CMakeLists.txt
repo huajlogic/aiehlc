@@ -247,7 +247,8 @@ set(SOURCE_FILES ./src/llvm/aiehlc.cc
     ./src/llvm/convautotile/kernel_static.cpp
     ./src/llvm/convautotile/kernel_front.cpp
     ./src/llvm/convautotile/trace_routing.cpp
-    ./src/llvm/convautotile/kernel_template.cpp)
+    ./src/llvm/convautotile/kernel_template.cpp
+    ./src/llvm/convautotile/gemm_autotile.cpp)
 set(mlirfrontend src/mlir/mlirfront/)
 
 add_executable(aiehlc ${SOURCE_FILES})

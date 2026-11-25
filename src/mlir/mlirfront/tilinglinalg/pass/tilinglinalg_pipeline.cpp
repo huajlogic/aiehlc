@@ -4,6 +4,7 @@
  ******************************************************************************/
 #include "tilinglinalg_pipeline.h"
 #include "dataflowplan/dataflowplan.h"
+#include "dataflowplan/plantarget.h"
 #include "../../../../llvm/convautotile/block_io_names.h"
 
 #include "dmaptodmaphop.h"
@@ -716,9 +717,17 @@ static void attachTensorRoutingInfo(OpBuilder &builder, ArrayRef<routing::create
             llvm::outs() << "[TilingLinalg] tensor_" << i << " kernel_block=" << decl.getKernelBlockAttr() << "\n";
             if (kb.align > 32) // {.align = N}: the port's core buffers N-aligned (flowtransfer_kernel)
                 decl->setAttr(routing::kScheduleBlockAlignAttr, builder.getI64IntegerAttr(kb.align));
-            if (kb.share) { // load_buffer {.share / .stage / .ring / .keep} -> routing-level dataflow intent
+            // load_buffer {.share / .stage / .ring / .keep} -> routing-level dataflow intent; a .stage without
+            // .share plans a per-core stream (share = "none", with the core's block origin)
+            if (kb.share || kb.stage) {
                 llvm::SmallVector<mlir::NamedAttribute> df;
-                df.push_back(builder.getNamedAttr("share", builder.getStringAttr("neighbor")));
+                df.push_back(builder.getNamedAttr("share", builder.getStringAttr(kb.share == 2 ? "broadcast"
+                                                                                 : kb.share    ? "neighbor"
+                                                                                               : "none")));
+                if (kb.share != 1) { // per-core copies: where each core's blocks start
+                    df.push_back(builder.getNamedAttr("base_p0", builder.getI64ArrayAttr(kb.baseP0)));
+                    df.push_back(builder.getNamedAttr("base_p1", builder.getI64ArrayAttr(kb.baseP1)));
+                }
                 if (kb.stage)
                     df.push_back(builder.getNamedAttr(
                         "stage", builder.getStringAttr(kb.stage == 2 ? "memtile_ring" : "memtile")));
@@ -728,6 +737,8 @@ static void attachTensorRoutingInfo(OpBuilder &builder, ArrayRef<routing::create
                     df.push_back(builder.getNamedAttr("resident", builder.getStringAttr("launches")));
                 if (kb.parts > 1)
                     df.push_back(builder.getNamedAttr("parts", builder.getI64IntegerAttr(kb.parts)));
+                if (kb.share == 2)
+                    df.push_back(builder.getNamedAttr("axis", builder.getStringAttr(kb.axis == 2 ? "column" : "row")));
                 decl->setAttr("dataflow", builder.getDictionaryAttr(df));
                 llvm::outs() << "[TilingLinalg] tensor_" << i << " dataflow=" << decl->getAttr("dataflow") << "\n";
             }
@@ -991,6 +1002,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
     bool reserveControlPlane = controlPlanAttr && controlPlanAttr.getInt() != 0;
     rt_res_gen resourceGen = __Runtime_res_gen_from_name(aieGen.c_str());
+    // the dataflow plan's device facts (and the flow-transfer helpers' DMA limits) for this generation
+    dfplan::selectPlanTarget(resourceGen == RT_RES_GEN5 ? "aie2ps" : "aie2");
+    dfplan::planPartitionStartCol() = partStartCol >= 0 ? partStartCol : 0;
 
     ControlShimPlacement ctrlPlacement;
     int dataStartCol = relStartCol;

@@ -32,6 +32,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OwningOpRef.h"
+#include <algorithm>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -119,6 +120,13 @@ struct PlanResources {
     int lockE = -1;    // E(buffer) = lockE + buffer, buffer = channel + channels x slot
     int lockGo = -1, lockSync = -1;
     int64_t slotBase = 0, slotBytes = 0; // core memory (core view) the hosted chunks occupy
+    // the K-accumulator (a GEMM's partial sums across K chunks): placed by the plan right after the chunk
+    // slots when it does not fit next to the core's windows (accAddr < 0: the kernel keeps its own)
+    int64_t accBytes = 0, accAddr = -1, dmFree = 0;
+    // per-core copies (copyPlan): per stream (index into streams) its core S2MM BD chain, its F lock (DMA ->
+    // kernel, counting), its E locks (kernel -> DMA, one per slot) and its slots' memory (core view)
+    std::vector<int> copyBd, copyF, copyE;
+    std::vector<int64_t> copySlotBase, copySlotStride; // first slot, slot to slot (the windows' alignment)
     // MemTiles: per stream (index into DataflowPlan::streams), per column
     struct Mem {
         std::vector<int> locks; // ring: (empty, full) per served parity; resident: ready, free
@@ -135,8 +143,13 @@ struct PlanResources {
 // output tile (rounds tiles per core), hosted in one core's memory per (column, strip group).
 struct PlanStream {
     int arg = -1;
-    std::string role;              // "a": strips over mesh-row pairs; "b": strips over columns x 2
+    std::string role;              // a label ("a" / "b": the legacy row_groups / strips defaults)
     std::string stage;             // "memtile_ring" | "memtile"
+    // "neighbor": hosted in one core, read by it and its neighbours (the 2 x 8 GEMM); "broadcast": one stream
+    // per mesh row multicast to every core of the row, each core holding its own copy on S2MM channel
+    // `channel` (readers 1, channels 1 -- several such streams share a core, one channel each)
+    std::string share = "neighbor";
+    int channel = 0;
     int ring = 0;                  // memtile_ring: FIFO buffers of 2 chunks
     bool residentLaunches = false; // loaded on the first launch only
     int chunkRows = 0, chunkCols = 0, chunks = 0, rounds = 0;
@@ -149,13 +162,45 @@ struct PlanStream {
     // plan puts PART_STRIDE apart (different memory banks).
     int channels = 2, slots = 2, readers = 2, parts = 2;
     int elemBytes = 1;
+    // where the blocks sit in the tensor: round t / chunk j of strip s starts at row s * stripStep +
+    // t * rowStep, column j * colStep (elements); 0 = back to back (chunkRows / chunkCols / rounds x
+    // chunkRows). Overlapping blocks (a conv's halo) step less than they span; the DDR layout repeats them.
+    int64_t rowStep = 0, colStep = 0, stripStep = 0;
+    // per strip id its first row / column (a per-core stream, share = "none": the core's block origin);
+    // empty = strip * stripStep, column 0
+    std::vector<int64_t> stripRowBase, stripColBase;
+    int64_t rowStepJ = 0, colStepI = 0; // rows per chunk, columns per round (blocks that move both ways)
+    // (0 = back to back only for a neighbour-hosted stream, whose plans predate the steps; a per-core copy
+    // always states its steps, and 0 there means the blocks do not move that way)
+    int64_t rowStepOr() const { return rowStep || share != "neighbor" ? rowStep : chunkRows; }
+    int64_t colStepOr() const { return colStep || share != "neighbor" ? colStep : chunkCols; }
     // the logical grid, per mesh row: the strip group a row reads (row_groups), and per column and group
     // the tensor strip that column's cores read (strips, column-major) -- what the host lays out in DDR
     std::vector<int> rowGroups;
     std::vector<int> strips;
     int64_t chunkBytes() const { return (int64_t)chunkRows * chunkCols * elemBytes; }
     int buffers() const { return channels * slots; }
+    // rows of one tensor strip (the tensor split evenly over the strips the layout names)
+    int64_t stripRows() const {
+        int n = 0;
+        for (int x : strips)
+            n = std::max(n, x + 1);
+        return tensorRows / std::max(n, 1);
+    }
+    // strip group of the mesh row that hosts it: the g with hostRows[g] == meshRow, else -1
+    int groupOfHostRow(int meshRow) const {
+        for (size_t g = 0; g < hostRows.size(); g++)
+            if (hostRows[g] == meshRow)
+                return (int)g;
+        return -1;
+    }
 };
+
+// A ring stream whose strip is one chunk row tall (a GEMM B strip, one output column block): every
+// round (output tile) reads the same strip again -- held once in DDR, the shim BD re-reads it.
+inline bool repeatsPerRound(const PlanStream &s) {
+    return s.share == "neighbor" && s.rounds > 1 && s.stripRows() == s.chunkRows;
+}
 
 struct DataflowPlan {
     bool present = false;
@@ -167,6 +212,21 @@ struct DataflowPlan {
     bool bdOnce = false;       // identical BD / channel writes are skipped after the first launch
     std::vector<PlanRoute> routes;
     std::vector<PlanStream> streams;
+    // every stream a per-core copy (share = "broadcast" / "none"): a core hosts all of them, one S2MM channel each
+    bool copyPlan() const {
+        for (const PlanStream &s : streams)
+            if (s.share == "neighbor")
+                return false;
+        return !streams.empty();
+    }
+    // The protocol every core runs: streams[0]'s; in a copy plan a core hosts every stream, one S2MM
+    // channel each, so its channels are the streams' count (chunk g of operand o on channel o)
+    PlanStream coreProtocol() const {
+        PlanStream s = streams.front();
+        if (copyPlan())
+            s.channels = (int)streams.size();
+        return s;
+    }
     // ---- the derived DMA program (deriveDmaProgram) ----
     std::vector<PlanLock> locks;
     std::vector<PlanBd> bds;

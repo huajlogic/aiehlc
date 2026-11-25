@@ -260,7 +260,13 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         mlir::IntegerAttr pktIdAttr = nullptr;
         if (direction == DataflowDirection::Pull) {
             auto pktId = router.getRM()->allocatePktId(-1);
-            assert(pktId.has_value() && "pkt_id pool exhausted (max 31)");
+            if (!pktId) { // a release build has no assert: this used to throw bad_optional_access
+                llvm::errs() << "[DmapToDmaphop] ERROR: out of packet ids (5-bit field, ids 1..31 less the control "
+                                "plane's): every core of a packet-switched output takes one -- this output's core "
+                             << i + 1 << " of " << coreGroup.getCoreCount()
+                             << " found none. Use fewer output cores (a smaller mesh).\n";
+                std::exit(1);
+            }
             pktIdAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(pktId.value()));
         }
         corePortsOutOps.push_back(rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("Out"),

@@ -44,6 +44,8 @@
 
 #include <functional>
 #include <map>
+#include <regex>
+#include <set>
 #include <sstream>
 
 namespace dfplan {
@@ -221,13 +223,58 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
             sb.strips.push_back(c + C * k);
     }
     const int64_t ring = sa.ring, chunk = g.TM * g.KC * A.elemBytes;
-    const bool bLaunches = sb.keep;
     auto col = [&](int c) { return g.colLo + c; };
     auto row = [&](int pm) { return g.rowLo + pm; };
     if (g.memRows < 1)
         return fail("the partition has no MemTile row");
     // MemTile rows and shim MM2S channels: one per stream, in stream order from the top
     const int mtA = g.memRows, mtB = std::max(1, g.memRows - 1);
+    // B's staging, by MemTile capacity: held whole (memtile, `keep` across launches) when its column's
+    // strips fit next to what else that MemTile holds, else streamed chunk by chunk through a FIFO ring
+    // (memtile_ring), re-read from DDR for every output tile. An explicit stage = memtile_ring is kept.
+    {
+        const int perStripA = std::min(channels, C / SA), kA = channels / perStripA;
+        const int64_t aBytes = kA == 1 ? ring * 2 * chunk : ring * kA * chunk;
+        const int64_t bChunk = g.TN * g.KC * B.elemBytes, bWhole = (int64_t)sb.groups * NK * bChunk;
+        const int64_t room = T.memBytes - (mtA == mtB ? aBytes : 0);
+        const std::string want = dstr(B.df, "stage");
+        // held whole, the column's strips are ONE S2MM BD: its length field bounds it too
+        const bool bdFits = bWhole / T.bdWordBytes <= T.memBdMaxLenWords;
+        if (want == "memtile_ring" || bWhole > room || !bdFits) {
+            sb.stage = "memtile_ring";
+            // the shallowest ring (from .ring, default 2) whose MemTile channels start at most chMaxRepeat
+            // times and that divides the column's chunk stream (rounds x groups x K chunks)
+            const int64_t stream = R2 * (int64_t)sb.groups * NK, k = (int64_t)sb.groups * channels;
+            sb.ring = (int)dint(B.df, "ring", 2);
+            // (a channel's walk may span chStartQueue queued starts of <= chMaxRepeat each: plandma splits it)
+            auto startsOk = [&](int64_t rep) {
+                for (int n = 1; n <= T.chStartQueue; n++)
+                    if (rep % n == 0 && rep / n <= T.chMaxRepeat)
+                        return true;
+                return false;
+            };
+            while (sb.ring < 64 && (stream % (sb.ring * k) || !startsOk(stream / (sb.ring * k))))
+                sb.ring++;
+            const int64_t bRing = (int64_t)sb.ring * sb.groups * channels * bChunk;
+            if (bRing > room)
+                return fail("B's MemTile ring (" + std::to_string(sb.ring) + " x " + std::to_string(sb.groups) + " x " +
+                            std::to_string(channels) + " chunks = " + std::to_string(bRing) +
+                            " B) does not fit next to A's ring: " + std::to_string(room) + " B left");
+            if (want != "memtile_ring")
+                llvm::outs() << "[DataflowPlan] stream " << B.arg << ": held whole it needs " << bWhole
+                             << " B per MemTile (" << room << " B left next to A's ring, one BD holds "
+                             << T.memBdMaxLenWords * T.bdWordBytes << " B): streamed as memtile_ring " << sb.ring
+                             << " (re-read from DDR per output tile" << (sb.keep ? "; keep ignored" : "") << ")\n";
+            sb.keep = false;
+        }
+        llvm::outs() << "[DataflowPlan] stream " << A.arg << ": memtile_ring " << ring << ", " << aBytes
+                     << " B per MemTile; stream " << B.arg << ": " << sb.stage
+                     << (sb.stage == "memtile_ring" ? " " + std::to_string(sb.ring)
+                                                    : std::string(sb.keep ? " keep" : ""))
+                     << ", " << (sb.stage == "memtile_ring" ? (int64_t)sb.ring * sb.groups * channels * bChunk : bWhole)
+                     << " B per MemTile (of " << T.memBytes << ")\n";
+    }
+    const bool bLaunches = sb.keep, bRing = sb.stage == "memtile_ring";
     const int shimA = T.shimMm2sChannels - 1, shimB = std::max(0, T.shimMm2sChannels - 2);
     os << "dmaphop.plan {replace_args = [" << A.arg << ", " << B.arg << "], share_args = [" << A.arg << ", " << B.arg
        << "], persistent = " << (persistent ? "true" : "false") << ", bd_once = true}\n";
@@ -259,12 +306,14 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     // ---- B: per column its strips, one replay per (group, parity)
     for (int c = 0; c < C; c++) {
         MemtileChannels &mc = mtCh[mtB * 1000 + c];
-        const int s2mm = mc.pick(true, 1);
+        // a ring: one S2MM chain over every (group, parity) buffer, `ring` BDs per replay
+        const int replays = sb.groups * channels, perOut = bRing ? sb.ring : 1;
+        const int s2mm = mc.pick(true, bRing ? sb.ring * replays : 1);
         os << "dmaphop.plan_route {arg = " << B.arg << ", src = [" << col(c) << ", 0, " << shimB
            << "], src_kind = \"shim\", dsts = [[" << col(c) << ", " << mtB << ", " << s2mm << "]]}\n";
         for (int k = 0; k < sb.groups; k++)
             for (int q = 0; q < channels; q++) {
-                const int mm2s = mc.pick(false, 1);
+                const int mm2s = mc.pick(false, perOut);
                 if (s2mm < 0 || mm2s < 0)
                     return fail("MemTile (" + std::to_string(col(c)) + ", " + std::to_string(mtB) +
                                 "): out of DMA channels for B's replays");
@@ -279,8 +328,8 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
         const bool isA = st == &sa;
         os << "dmaphop.plan_stream {arg = " << st->op->arg << ", role = \"" << st->role
            << "\", share = \"neighbor\", stage = \"" << st->stage << "\", ";
-        if (isA)
-            os << "ring = " << ring << ", ";
+        if (st->stage == "memtile_ring")
+            os << "ring = " << st->ring << ", ";
         os << "resident = \"" << (!isA && bLaunches ? "launches" : "launch") << "\", chunk = " << list({g.TM, g.KC})
            << ", chunks = " << NK << ", rounds = " << R2 << ", tensor = " << list({isA ? g.M : g.N, g.K})
            << ", host_rows = " << list(st->hostRows) << ", first_rows = " << list(st->firstRows)
@@ -292,12 +341,229 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     llvm::outs() << "[DataflowPlan] synthesized from the routing IR: " << R << " x " << C << " mesh, A strips " << SA
                  << " x B strips " << SB << ", " << R2 << " tiles / core, K chunks " << NK << ", A ring " << ring
                  << " over " << SA * perStrip << " column(s), " << sa.readers << " readers per stream, B "
-                 << (bLaunches ? "resident across launches" : "per launch") << ", host rows A" << list(sa.hostRows)
-                 << " B" << list(sb.hostRows) << (persistent ? ", persistent kernel" : "") << "\n";
+                 << (bRing       ? "ring " + std::to_string(sb.ring) + " (re-read per output tile)"
+                     : bLaunches ? std::string("resident across launches")
+                                 : std::string("per launch"))
+                 << ", host rows A" << list(sa.hostRows) << " B" << list(sb.hostRows)
+                 << (persistent ? ", persistent kernel" : "") << "\n";
     return true;
 }
 
-bool readGeometry(ModuleOp module, const std::map<int, Operand> &ops, int outArg, Geometry &g) {
+// The traced block walk as 2-D steps (rows x columns, the trailing dims flattened into columns), and the
+// traced core origin (base_p0 / base_p1, from the dataflow dict).
+struct Walk {
+    int64_t rowStep = 0, colStepI = 0, rowStepJ = 0, colStep = 0, rounds = 1, chunks = 1;
+    std::vector<int64_t> b0, b1; // per dim, elements
+    bool fits(int64_t rowBase, int64_t colBase, int64_t cr, int64_t cc, int64_t M, int64_t N) const {
+        const int64_t r = rowBase + (rounds - 1) * std::max<int64_t>(rowStep, 0) +
+                          (chunks - 1) * std::max<int64_t>(rowStepJ, 0),
+                      c = colBase + (rounds - 1) * std::max<int64_t>(colStepI, 0) +
+                          (chunks - 1) * std::max<int64_t>(colStep, 0);
+        return rowBase >= 0 && colBase >= 0 && r + cr <= M && c + cc <= N && rowStep >= 0 && colStepI >= 0 &&
+               rowStepJ >= 0 && colStep >= 0;
+    }
+};
+Walk walkOf(const Operand &op, ArrayRef<int64_t> si, ArrayRef<int64_t> sj, int64_t inner) {
+    Walk w;
+    w.rowStep = si.size() ? si[0] : 0, w.colStepI = (si.size() > 1 ? si[1] : 0) * inner;
+    w.rowStepJ = sj.size() ? sj[0] : 0, w.colStep = (sj.size() > 1 ? sj[1] : 0) * inner;
+    w.rounds = op.kb.getRoundsI(), w.chunks = op.kb.getRoundsJ();
+    for (const char *k : {"base_p0", "base_p1"})
+        if (auto a = op.df.getAs<ArrayAttr>(k))
+            for (Attribute x : a)
+                (k[6] == '0' ? w.b0 : w.b1).push_back(cast<IntegerAttr>(x).getInt());
+    return w;
+}
+std::string walkAttrs(const Walk &w, const std::vector<int64_t> &rowBase, const std::vector<int64_t> &colBase) {
+    std::ostringstream os;
+    os << ", row_step = " << w.rowStep << ", col_step = " << w.colStep << ", row_step_j = " << w.rowStepJ
+       << ", col_step_i = " << w.colStepI << ", strip_row_base = " << list(rowBase)
+       << ", strip_col_base = " << list(colBase);
+    return os.str();
+}
+
+// A per-core stream (share = "none", a .stage without .share): every core reads its own blocks. Per column c:
+// shim c -> one MemTile FIFO ring serving its R cores (the S2MM chain hands chunk n to route n % R) -> core
+// (c, r) on the operand's channel. Strip id = p0 x C + p1, its origin from the traced block origin
+// (base_p0 / base_p1).
+bool synthPerCore(const Geometry &g, const Operand &op, int o, ArrayRef<int64_t> ts, ArrayRef<int64_t> bs,
+                  ArrayRef<int64_t> si, ArrayRef<int64_t> sj, int64_t inner, std::map<int, MemtileChannels> &mtCh,
+                  std::ostringstream &os) {
+    const PlanTarget &T = planTarget();
+    const int R = g.meshRows, C = g.meshCols;
+    const std::string A = "per-core arg " + std::to_string(op.arg) + ": ";
+    auto col = [&](int c) { return g.colLo + c; };
+    auto row = [&](int pm) { return g.rowLo + pm; };
+    const Walk w = walkOf(op, si, sj, inner);
+    const std::vector<int64_t> &b0 = w.b0, &b1 = w.b1;
+    if (b0.size() != ts.size() || b1.size() != ts.size())
+        return fail(A + "needs the traced block origin per core (base_p0 / base_p1)");
+    for (size_t d = 2; d < ts.size(); d++)
+        if (b0[d] || b1[d])
+            return fail(A + "a core's blocks must start at the tensor's dims 2.. origin");
+    if (dstr(op.df, "stage") != "memtile_ring")
+        return fail(A + "implemented with stage = memtile_ring");
+    const int64_t M = ts[0], N = ts[1] * inner, cr = bs[0], cc = bs[1] * inner;
+    const int64_t rounds = w.rounds, chunks = w.chunks;
+    const int ring = (int)dint(op.df, "ring", 2), mt = g.memRows - o, shim = T.shimMm2sChannels - 1 - o;
+    if ((rounds * chunks) % ring)
+        return fail(A + "a ring of " + std::to_string(ring) + " does not divide a core's " +
+                    std::to_string(rounds * chunks) + " chunks");
+    std::vector<int64_t> rowBase, colBase;
+    for (int id = 0; id < R * C; id++) {
+        const int pm = id / C, pn = id % C;
+        rowBase.push_back(b0[0] * pm + b1[0] * pn), colBase.push_back((b0[1] * pm + b1[1] * pn) * inner);
+        if (!w.fits(rowBase.back(), colBase.back(), cr, cc, M, N))
+            return fail(A + "core (" + std::to_string(pm) + ", " + std::to_string(pn) +
+                        ")'s blocks run past the tensor");
+    }
+    for (int c = 0; c < C; c++) {
+        MemtileChannels &mc = mtCh[mt * 1000 + c];
+        const int s2mm = mc.pick(true, ring * R);
+        if (s2mm < 0)
+            return fail("MemTile (" + std::to_string(col(c)) + ", " + std::to_string(mt) + "): no S2MM channel with " +
+                        std::to_string(ring * R) + " BDs free in its bank");
+        os << "dmaphop.plan_route {arg = " << op.arg << ", src = [" << col(c) << ", 0, " << shim
+           << "], src_kind = \"shim\", dsts = [[" << col(c) << ", " << mt << ", " << s2mm << "]]}\n";
+        for (int r = 0; r < R; r++) {
+            const int mm2s = mc.pick(false, ring);
+            if (mm2s < 0)
+                return fail("MemTile (" + std::to_string(col(c)) + ", " + std::to_string(mt) +
+                            "): out of MM2S channels");
+            os << "dmaphop.plan_route {arg = " << op.arg << ", src = [" << col(c) << ", " << mt << ", " << mm2s
+               << "], src_kind = \"dma\", dsts = [[" << col(c) << ", " << row(r) << ", " << o << "]]}\n";
+        }
+    }
+    std::vector<int64_t> rows, strips;
+    for (int r = 0; r < R; r++)
+        rows.push_back(r);
+    for (int c = 0; c < C; c++)
+        for (int r = 0; r < R; r++)
+            strips.push_back((int64_t)r * C + c);
+    os << "dmaphop.plan_stream {arg = " << op.arg << ", role = \"op" << o
+       << "\", share = \"none\", stage = \"memtile_ring\", ring = " << ring
+       << ", resident = \"launch\", chunk = " << list({cr, cc}) << ", chunks = " << chunks << ", rounds = " << rounds
+       << ", tensor = " << list({M, N}) << ", host_rows = " << list(rows) << ", first_rows = " << list(rows)
+       << ", row_groups = " << list(rows) << ", strips = " << list(strips)
+       << ", channels = 1, slots = " << std::max(op.depth, 1) << ", readers = 1, parts = " << dint(op.df, "parts", 1)
+       << ", elem_bytes = " << op.elemBytes << ", channel = " << o << walkAttrs(w, rowBase, colBase) << "}\n";
+    return true;
+}
+
+// Per-core copies ({.share = aie::share::broadcast}): the cores that read the same blocks get one multicast
+// stream and each holds its own copy (readers 1) on the operand's own S2MM channel (operand o -> channel o).
+//   axis "row":    the blocks follow the mesh row -- stream of row r: shim column r -> MemTile -> (every
+//                  column, row r); a stream is the row's strip walked rounds (rows) x chunks (columns), the
+//                  blocks may overlap (a conv's halo: the step is less than the block)
+//   axis "column": the blocks follow the mesh column -- stream of column c: shim c -> MemTile -> (c, every
+//                  row); one block per core (weights)
+// Operand o: MemTile row memRows - o, shim MM2S channel last - o. A block of rank 3 / 4 is viewed as 2-D
+// (first dim x the rest), which needs the block to span the tensor's trailing dims except the second.
+bool synthCopyText(const Geometry &g, const std::vector<const Operand *> &ops, bool persistent,
+                   std::ostringstream &os) {
+    const PlanTarget &T = planTarget();
+    const int R = g.meshRows, C = g.meshCols;
+    if ((int)ops.size() > T.coreS2mmChannels || (int)ops.size() > g.memRows || (int)ops.size() > T.shimMm2sChannels)
+        return fail(std::to_string(ops.size()) + " broadcast operands: a core takes one per S2MM channel (" +
+                    std::to_string(T.coreS2mmChannels) + "), each needs a MemTile row and a shim MM2S channel");
+    auto col = [&](int c) { return g.colLo + c; };
+    auto row = [&](int pm) { return g.rowLo + pm; };
+    os << "dmaphop.plan {replace_args = [";
+    for (size_t o = 0; o < ops.size(); o++)
+        os << (o ? ", " : "") << ops[o]->arg;
+    os << "], share_args = [";
+    for (size_t o = 0; o < ops.size(); o++)
+        os << (o ? ", " : "") << ops[o]->arg;
+    os << "], persistent = " << (persistent ? "true" : "false") << ", bd_once = true}\n";
+    std::map<int, MemtileChannels> mtCh;
+    for (size_t o = 0; o < ops.size(); o++) {
+        const Operand &op = *ops[o];
+        const std::string A = "broadcast arg " + std::to_string(op.arg) + ": ";
+        auto kb = op.kb;
+        if (!kb || kb.getShape().size() < 2 || kb.getShape().size() != kb.getTensorShape().size())
+            return fail(A + "needs traced blocks (#routing.kernel_block)");
+        ArrayRef<int64_t> ts = kb.getTensorShape(), bs = kb.getShape(), si = kb.getStepI(), sj = kb.getStepJ();
+        // 2-D view: rows = dim 0, columns = the rest flattened (the block must span dims 2..)
+        int64_t inner = 1;
+        for (size_t d = 2; d < ts.size(); d++) {
+            if (bs[d] != ts[d] || (d < si.size() && si[d]) || (d < sj.size() && sj[d]))
+                return fail(A + "a block must span the tensor's dims 2.. (it is viewed as rows x columns)");
+            inner *= ts[d];
+        }
+        const int64_t M = ts[0], N = ts[1] * inner, cr = bs[0], cc = bs[1] * inner;
+        const Walk w = walkOf(op, si, sj, inner);
+        const int64_t ri = w.rounds, rj = w.chunks;
+        const bool perCore = dstr(op.df, "share") == "none"; // its own stream per core
+        const bool byRow = perCore || dstr(op.df, "axis", "row") == "row";
+        const std::string stage = dstr(op.df, "stage");
+        const bool keep = dstr(op.df, "resident") == "launches";
+        if (perCore) {
+            if (!synthPerCore(g, op, (int)o, ts, bs, si, sj, inner, mtCh, os))
+                return false;
+            continue;
+        }
+        // the strips: one per mesh row (byRow) or column, at the traced origin of that row / column
+        const int nStrips = byRow ? R : C;
+        if (w.b0.size() != ts.size() || w.b1.size() != ts.size())
+            return fail(A + "needs the traced block origin per core (base_p0 / base_p1)");
+        std::vector<int64_t> rowBase, colBase;
+        for (int s = 0; s < nStrips; s++) {
+            const std::vector<int64_t> &b = byRow ? w.b0 : w.b1;
+            rowBase.push_back(b[0] * s), colBase.push_back(b[1] * s * inner);
+            if (!w.fits(rowBase.back(), colBase.back(), cr, cc, M, N))
+                return fail(A + "the blocks of " + (byRow ? "mesh row " : "mesh column ") + std::to_string(s) +
+                            " run past the tensor");
+        }
+        if (byRow && R > C)
+            return fail(A + "one stream per mesh row, staged in column r -- needs rows <= columns");
+        const bool ring = stage == "memtile_ring";
+        if (!ring && stage != "memtile")
+            return fail(A + "implemented with stage = memtile_ring or memtile");
+        const int nring = ring ? (int)dint(op.df, "ring", 2) : 0, mt = g.memRows - (int)o,
+                  shim = T.shimMm2sChannels - 1 - (int)o;
+        for (int s = 0; s < nStrips; s++) {
+            MemtileChannels &mc = mtCh[mt * 1000 + s];
+            const int s2mm = mc.pick(true, ring ? nring : 1), mm2s = mc.pick(false, ring ? nring : 1);
+            if (s2mm < 0 || mm2s < 0)
+                return fail("MemTile (" + std::to_string(col(s)) + ", " + std::to_string(mt) + "): no channel left");
+            os << "dmaphop.plan_route {arg = " << op.arg << ", src = [" << col(s) << ", 0, " << shim
+               << "], src_kind = \"shim\", dsts = [[" << col(s) << ", " << mt << ", " << s2mm << "]]}\n";
+            os << "dmaphop.plan_route {arg = " << op.arg << ", src = [" << col(s) << ", " << mt << ", " << mm2s
+               << "], src_kind = \"dma\", dsts = [";
+            for (int x = 0; x < (byRow ? C : R); x++)
+                os << (x ? ", " : "") << "[" << col(byRow ? x : s) << ", " << row(byRow ? s : x) << ", " << o << "]";
+            os << "]}\n";
+        }
+        std::vector<int64_t> rowGroups, hostRows, strips;
+        for (int pm = 0; pm < R; pm++)
+            rowGroups.push_back(byRow ? pm : 0);
+        if (byRow)
+            for (int r = 0; r < R; r++)
+                hostRows.push_back(r);
+        else
+            hostRows.push_back(0);
+        for (int c = 0; c < C; c++)
+            for (size_t gi = 0; gi < hostRows.size(); gi++)
+                strips.push_back(byRow ? (int64_t)gi : c);
+        os << "dmaphop.plan_stream {arg = " << op.arg << ", role = \"op" << o << "\", share = \"broadcast\", stage = \""
+           << stage << "\", ";
+        if (ring)
+            os << "ring = " << nring << ", ";
+        os << "resident = \"" << (keep ? "launches" : "launch") << "\", chunk = " << list({cr, cc})
+           << ", chunks = " << rj << ", rounds = " << ri << ", tensor = " << list({M, N})
+           << ", host_rows = " << list(hostRows) << ", first_rows = " << list(hostRows)
+           << ", row_groups = " << list(rowGroups) << ", strips = " << list(strips)
+           << ", channels = 1, slots = " << std::max(op.depth, 1)
+           << ", readers = 1, parts = " << dint(op.df, "parts", 1) << ", elem_bytes = " << op.elemBytes
+           << ", channel = " << o << walkAttrs(w, rowBase, colBase) << "}\n";
+    }
+    llvm::outs() << "[DataflowPlan] synthesized per-core copies: " << R << " x " << C << " mesh, " << ops.size()
+                 << " broadcast operand(s), one multicast stream per mesh row / column\n";
+    return true;
+}
+
+// The mesh as the dmaphop core tiles place it: rows, columns, their origin and the MemTile rows below.
+bool readMesh(ModuleOp module, Geometry &g) {
     int maxRow = -1, maxCol = -1;
     g.rowLo = g.colLo = 1 << 20;
     module.walk([&](Operation *op) {
@@ -317,6 +583,12 @@ bool readGeometry(ModuleOp module, const std::map<int, Operand> &ops, int outArg
     g.meshRows = maxRow - g.rowLo + 1;
     g.meshCols = maxCol - g.colLo + 1;
     g.memRows = g.rowLo - 1;
+    return true;
+}
+
+bool readGeometry(ModuleOp module, const std::map<int, Operand> &ops, int outArg, Geometry &g) {
+    if (!readMesh(module, g))
+        return false;
     auto a = ops.begin()->second, b = std::next(ops.begin())->second;
     if (!a.kb || !b.kb || a.kb.getShape().size() != 2 || b.kb.getShape().size() != 2)
         return fail("the shared operands need traced 2-D blocks (#routing.kernel_block)");
@@ -368,12 +640,20 @@ bool synthesizeDataflowPlan(ModuleOp module, std::string &why) {
                         "re-synthesized\n";
         return true;
     }
-    for (auto &[arg, o] : shared)
-        if (dstr(o.df, "share") != "neighbor") {
-            why = "dataflow on arg " + std::to_string(arg) + ": only share = \"neighbor\" is implemented";
+    size_t nBroadcast = 0;
+    for (auto &[arg, o] : shared) {
+        const std::string sh = dstr(o.df, "share");
+        if (sh != "neighbor" && sh != "broadcast" && sh != "none") {
+            why = "dataflow on arg " + std::to_string(arg) + ": share = \"" + sh + "\" is not implemented";
             return false;
         }
-    if (shared.size() != 2) {
+        nBroadcast += sh == "broadcast" || sh == "none"; // per-core copies
+    }
+    if (nBroadcast && nBroadcast != shared.size()) {
+        why = "a plan's operands are all share = \"neighbor\" or all per-core (\"broadcast\" / \"none\"), not a mix";
+        return false;
+    }
+    if (!nBroadcast && shared.size() != 2) {
         why = "share = \"neighbor\" needs exactly two operands (A, B); found " + std::to_string(shared.size());
         return false;
     }
@@ -390,20 +670,52 @@ bool synthesizeDataflowPlan(ModuleOp module, std::string &why) {
     for (BlockArgument ba : main.getArguments())
         if (!shared.count((int)ba.getArgNumber()))
             outArg = (int)ba.getArgNumber();
-    Geometry g;
-    if (!readGeometry(module, shared, outArg, g)) {
-        why = "geometry";
-        return false;
-    }
     bool persistent = false;
     if (auto p = module->getAttrOfType<IntegerAttr>("routing.persistent_kernel"))
         persistent = p.getInt() != 0;
+    Geometry g;
     std::ostringstream os;
-    if (!synthText(g, shared.begin()->second, std::next(shared.begin())->second, persistent, os)) {
+    if (nBroadcast) {
+        if (!readMesh(module, g)) {
+            why = "geometry";
+            return false;
+        }
+        std::vector<const Operand *> ops;
+        for (auto &[arg, o] : shared)
+            ops.push_back(&o);
+        if (!synthCopyText(g, ops, persistent, os)) {
+            why = "synthesis";
+            return false;
+        }
+    } else if (!readGeometry(module, shared, outArg, g)) {
+        why = "geometry";
+        return false;
+    } else if (!synthText(g, shared.begin()->second, std::next(shared.begin())->second, persistent, os)) {
         why = "synthesis";
         return false;
     }
     std::string text = "module {\n" + os.str() + "}\n";
+    // every shim route must leave from a shim tile with a DMA (AIE-ML: only its NoC shim columns)
+    {
+        std::regex shimRoute("src = \\[([0-9]+), 0, [0-9]+\\], src_kind = \"shim\"");
+        std::set<int> bad;
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), shimRoute); it != std::sregex_iterator(); ++it) {
+            const int abs = std::stoi((*it)[1].str()) + planPartitionStartCol();
+            if (!planTarget().shimHasDma(abs))
+                bad.insert(abs);
+        }
+        if (!bad.empty()) {
+            std::string cols;
+            for (int c : bad)
+                cols += (cols.empty() ? "" : ", ") + std::to_string(c);
+            why = std::string("the plan streams from the shims of columns ") + cols + ", which have no DMA on " +
+                  planTarget().name + " (it has one on columns ";
+            for (size_t k = 0; k < planTarget().shimDmaCols.size(); k++)
+                why += (k ? ", " : "") + std::to_string(planTarget().shimDmaCols[k]);
+            why += "): this layout needs a shim DMA in every mesh column";
+            return false;
+        }
+    }
     OwningOpRef<ModuleOp> parsed = parseSourceString<ModuleOp>(text, module.getContext());
     if (!parsed) {
         why = "synthesized plan does not parse";

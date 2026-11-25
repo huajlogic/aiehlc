@@ -22,6 +22,7 @@
 #include "hw/ResourceManager.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <climits>
@@ -154,11 +155,72 @@ Pool poolOver(const std::map<Tile, std::set<int>> &used, const std::vector<Tile>
 
 std::string tileStr(const Tile &t) { return "(" + std::to_string(t.col) + ", " + std::to_string(t.row) + ")"; }
 
+// Per-core copies (copyPlan): every core holds every stream, stream si on its own S2MM channel -- per stream a
+// chain of `slots` BDs, a counting F lock, `slots` E locks and its slots in that operand's own replaced windows.
+bool assignCopyCores(const DataflowPlan &p, const Used &u, PlanResources &r, std::string &why) {
+    const PlanTarget &T = planTarget();
+    std::vector<Tile> cores;
+    for (int c = 0; c < p.meshCols; c++)
+        for (int pm = 0; pm < p.meshRows; pm++)
+            cores.push_back({p.colLo + c, p.coreRowBase + pm});
+    for (const Tile &t : cores) {
+        auto it = u.channels.find(t);
+        for (const PlanStream &s : p.streams)
+            if (it != u.channels.end() && it->second.count({s.channel, true})) {
+                why = "core " + tileStr(t) + " S2MM channel " + std::to_string(s.channel) +
+                      " is used by a generated flow; the plan's copy of arg " + std::to_string(s.arg) + " needs it";
+                return false;
+            }
+    }
+    Pool bd = poolOver(u.bds, cores, 0, T.coreBds), lk = poolOver(u.locks, cores, 0, T.coreLocks);
+    const size_t n = p.streams.size();
+    r.copyBd.assign(n, -1), r.copyF.assign(n, -1), r.copyE.assign(n, -1), r.copySlotBase.assign(n, 0);
+    r.copySlotStride.assign(n, 0);
+    for (size_t si = 0; si < n; si++) {
+        const PlanStream &s = p.streams[si];
+        r.copyBd[si] = bd.run(s.slots), r.copyF[si] = lk.run(1), r.copyE[si] = lk.run(s.slots);
+        if (r.copyBd[si] < 0 || r.copyF[si] < 0 || r.copyE[si] < 0) {
+            why = "arg " + std::to_string(s.arg) + ": not enough free core BDs / locks for its copy (" +
+                  std::to_string(s.slots) + " BDs, " + std::to_string(s.slots + 1) + " locks)";
+            return false;
+        }
+        int64_t lo = INT64_MAX, hi = 0, total = 0;
+        try {
+            for (const CoreMemSlot &m : ResourceMgr::instance()->coreMemAllocator().getAllocations())
+                if (m.ownerId == s.arg) {
+                    lo = std::min<int64_t>(lo, m.address), hi = std::max<int64_t>(hi, m.address + m.size);
+                    total += m.size;
+                }
+        } catch (...) {
+        }
+        // the allocator aligns each window (32 B): slots step by the aligned chunk, the span must hold them
+        const int64_t stride = (s.chunkBytes() + 31) / 32 * 32, need = (int64_t)(s.slots - 1) * stride + s.chunkBytes();
+        if (total == 0 || hi - lo < need || (s.parts > 1 && stride != s.chunkBytes())) {
+            why = "arg " + std::to_string(s.arg) + ": its core buffers (" + std::to_string(hi - lo) + " B from 0x" +
+                  llvm::utohexstr(lo) + ") cannot hold its copy (" + std::to_string(s.slots) + " slots of " +
+                  std::to_string(s.chunkBytes()) + " B, " + std::to_string(stride) + " B apart" +
+                  (s.parts > 1 ? "; parts need a 32-byte multiple chunk)" : ")");
+            return false;
+        }
+        r.copySlotBase[si] = lo, r.copySlotStride[si] = stride;
+    }
+    r.lockGo = p.persistent ? lk.run(1) : -1;
+    if (p.persistent && r.lockGo < 0) {
+        why = "no free core lock for the persistent kernel's go lock";
+        return false;
+    }
+    r.coreBd = r.copyBd, r.lockF = r.copyF[0], r.lockE = r.copyE[0], r.handDelta = 1;
+    r.slotBase = *std::min_element(r.copySlotBase.begin(), r.copySlotBase.end());
+    return true;
+}
+
 // Core tiles: chunk buffers, BDs, locks; every core the same (the protocol of streams[0]: checkPlanLayout
 // makes every shared stream agree).
 bool assignCores(const DataflowPlan &p, const Used &u, PlanResources &r, std::string &why) {
+    if (p.copyPlan())
+        return assignCopyCores(p, u, r, why);
     const PlanTarget &T = planTarget();
-    const PlanStream &s = p.streams[0];
+    const PlanStream s = p.coreProtocol();
     std::vector<Tile> cores;
     for (int c = 0; c < p.meshCols; c++)
         for (int pm = 0; pm < p.meshRows; pm++)
@@ -210,6 +272,14 @@ bool assignCores(const DataflowPlan &p, const Used &u, PlanResources &r, std::st
         return false;
     }
     r.slotBase = lo, r.slotBytes = need;
+    if (r.accAddr >= 0) {
+        if (need + r.accBytes > total) {
+            why = "the replaced ports' core buffers (" + std::to_string(total) + " B) cannot hold the chunk slots (" +
+                  std::to_string(need) + " B) and the K accumulator (" + std::to_string(r.accBytes) + " B)";
+            return false;
+        }
+        r.accAddr = lo + need;
+    }
     return true;
 }
 
@@ -308,7 +378,7 @@ bool adoptPinned(const DataflowPlan &p, const Used &u, PlanResources &r, std::st
         return false;
     };
     if (pin.hasCore) {
-        const PlanStream &s = p.streams[0];
+        const PlanStream s = p.coreProtocol();
         std::vector<int> locks, bds;
         for (int i = 0; i <= s.readers; i++)
             for (int ch = 0; ch < s.channels; ch++)
@@ -383,11 +453,57 @@ bool adoptPinned(const DataflowPlan &p, const Used &u, PlanResources &r, std::st
     return true;
 }
 
+// Core data memory: the windows the allocator placed, a minimum stack, the kernel's other statics -- and the
+// GEMM's K accumulator (A chunk rows x B chunk rows x 4 B partial sums, kept across the K chunks). When the
+// accumulator does not fit what is left, the plan makes room in the memory it owns (the replaced windows):
+// one slot per channel instead of `slots`, the accumulator after the chunk slots. Else it fails, naming it.
+bool planCoreMemory(DataflowPlan &p, PlanResources &r, std::string &why) {
+    const PlanTarget &T = planTarget();
+    if (p.copyPlan() || p.streams.size() < 2 || p.streams[0].chunks < 2) // the GEMM's K accumulator only
+        return true;
+    int64_t used = 0, replaced = 0;
+    try {
+        for (const CoreMemSlot &m : ResourceMgr::instance()->coreMemAllocator().getAllocations()) {
+            used += m.size;
+            if (p.replaces(m.ownerId))
+                replaced += m.size;
+        }
+    } catch (...) {
+    }
+    r.accBytes = (int64_t)p.streams[0].chunkRows * p.streams[1].chunkRows * 4;
+    r.dmFree = T.coreDmBytes - used - T.coreMinStack - T.coreStaticReserve;
+    std::ostringstream os;
+    os << "[DataflowPlan] core memory: windows " << used << " B (" << replaced
+       << " B the plan's), stack >= " << T.coreMinStack << " B, statics " << T.coreStaticReserve << " B, " << r.dmFree
+       << " B left; K accumulator " << r.accBytes << " B";
+    if (r.accBytes <= r.dmFree) {
+        llvm::outs() << os.str() << ": the kernel's own\n";
+        return true;
+    }
+    for (PlanStream &s : p.streams) {
+        if (s.slots > 1 && (int64_t)s.channels * s.chunkBytes() + r.accBytes <= replaced)
+            s.slots = 1;
+    }
+    const PlanStream &s = p.streams[0];
+    if ((int64_t)s.buffers() * s.chunkBytes() + r.accBytes > replaced) {
+        why = "core memory: the K accumulator (" + std::to_string(r.accBytes) +
+              " B) does not fit: " + std::to_string(r.dmFree) +
+              " B left next to the windows, and the replaced windows (" + std::to_string(replaced) + " B) hold " +
+              std::to_string(s.buffers()) + " chunk buffers of " + std::to_string(s.chunkBytes()) + " B -- " +
+              std::to_string((int64_t)s.buffers() * s.chunkBytes() + r.accBytes - replaced) + " B short";
+        return false;
+    }
+    r.accAddr = 0; // placed by assignCores after the slots
+    llvm::outs() << os.str() << ": does not fit, the plan holds it in its windows with " << s.slots
+                 << " slot(s) per channel (AIEHLC_PLAN_ACC)\n";
+    return true;
+}
+
 bool assignPlanResources(ModuleOp hostModule, DataflowPlan &p, std::string &why) {
     const Used u = collectUsed(hostModule, p);
     PlanResources r;
-    if (!assignCores(p, u, r, why) || !assignMemTiles(p, u, r, why) || !assignShim(p, u, r, why) ||
-        !adoptPinned(p, u, r, why))
+    if (!planCoreMemory(p, r, why) || !assignCores(p, u, r, why) || !assignMemTiles(p, u, r, why) ||
+        !assignShim(p, u, r, why) || !adoptPinned(p, u, r, why))
         return false;
     r.assigned = true;
     p.res = r;
@@ -395,7 +511,7 @@ bool assignPlanResources(ModuleOp hostModule, DataflowPlan &p, std::string &why)
     os << "[DataflowPlan] resources (" << planTarget().name << "): core BDs";
     for (int b : r.coreBd)
         os << " " << b;
-    os << " (x" << p.streams[0].slots << "), core locks F " << r.lockF << " E " << r.lockE << " go " << r.lockGo
+    os << " (x" << p.coreProtocol().slots << "), core locks F " << r.lockF << " E " << r.lockE << " go " << r.lockGo
        << " sync " << r.lockSync << ", chunk slots 0x" << std::hex << r.slotBase << std::dec << "+" << r.slotBytes
        << " (the replaced windows)";
     for (size_t si = 0; si < r.mem.size(); si++)

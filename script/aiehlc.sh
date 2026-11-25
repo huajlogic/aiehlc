@@ -20,10 +20,13 @@ run_cmd() {
 }
 
 usage() {
-    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb] [--profiling] [--skip-bss|--skip-port-bss] [-serialize] [-fast] [--rebuild-alib]"
+    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb] [--profiling] [--skip-bss|--skip-port-bss] [-serialize] [-fast] [--rebuild-alib] [--define NAME[=VALUE]]..."
     echo "  --platform    baremetal (default) | sim | linux | baremetal_debug"
     echo "                'baremetal_debug' builds a baremetal ELF and writes sim_config.sh so the debug"
     echo "                UI can run either a hardware test or a simulator run from one build."
+    echo "  --define NAME[=VALUE]  a build-time macro for every stage: front end, x86 kernel trace, dataflow plan,"
+    echo "                kernel and host compile (repeatable; also AIEHLC_DEFINES=\"-DNAME=VALUE ...\"). EXTRA_DEFS"
+    echo "                reaches the host compile only and is refused for a macro the source uses."
     echo "  --profiling   build the host with the PMU profiling layer (-DAIEHLC_PROFILING=1)"
     echo "  --skip-bss    skip .bss zero-init on kernel load except segments <=64 B (-DAIEHLC_SKIP_BSS_DEFAULT=1; unsafe if the kernel reads a bigger zeroed array)"
     echo "  --skip-port-bss  skip zero-init only for DMA port-buffer .bss (buf_in_*/buf_out_*), keep it for the rest (-DAIEHLC_SKIP_BSS_DEFAULT=2)"
@@ -388,6 +391,11 @@ GDB_MODE=0
 PROFILING=0
 SKIP_BSS=0
 FAST=""
+# Build-time macros for EVERY stage (front end, x86 kernel trace, dataflow plan, kernel compile, host
+# compile): AIEHLC_DEFINES="-DNAME=VALUE ..." from the caller plus each --define NAME[=VALUE]. aiehlc
+# writes them as #define lines at the top of the source text (injectUserDefines), so everything built
+# from it -- kernel.cc, host.cc, the KOBJ cache key -- follows. Not exported: this script is sourced.
+USER_DEFINES="${AIEHLC_DEFINES:-}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -help)
@@ -462,6 +470,10 @@ while [[ $# -gt 0 ]]; do
             FAST=1
             shift
             ;;
+        --define)
+            USER_DEFINES="${USER_DEFINES} -D$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             usage
@@ -485,6 +497,27 @@ fi
 # Convert runtime_source_file to absolute path (resolve relative to AIEHLC_DIR)
 if [ -n "$runtime_source_file" ] && [[ "$runtime_source_file" != /* ]]; then
     runtime_source_file="$(cd "${AIEHLC_DIR}" && cd "$(dirname "$runtime_source_file")" && pwd)/$(basename "$runtime_source_file")"
+fi
+
+# EXTRA_DEFS reaches the host compile only. A macro there that the source (or a quoted file it
+# includes) uses would build the kernel and the plan for one value and the host for another -- refuse.
+if [ -n "${EXTRA_DEFS:-}" ] && [ -n "$runtime_source_file" ]; then
+    _src_dir="$(dirname "$runtime_source_file")"
+    _src_files=("$runtime_source_file")
+    while IFS= read -r _inc; do
+        [ -f "${_src_dir}/${_inc}" ] && _src_files+=("${_src_dir}/${_inc}")
+    done < <(sed -n 's/^[[:space:]]*#[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' "$runtime_source_file" 2>/dev/null)
+    for _d in ${EXTRA_DEFS}; do
+        case "$_d" in -D*) ;; *) continue ;; esac
+        _name="${_d#-D}"
+        _name="${_name%%=*}"
+        if grep -qw -- "$_name" "${_src_files[@]}" 2>/dev/null; then
+            echo "Error: EXTRA_DEFS ${_d} reaches only the host compile, but ${_name} is used by the source" \
+                 "(${_src_files[*]##*/}): the kernel, the trace and the plan would see another value." \
+                 "Pass it with --define ${_d#-D} (or AIEHLC_DEFINES) instead."
+            return 1
+        fi
+    done
 fi
 
 if [[ -z "${LLVM_AIE_PATH:-}" ]]; then
@@ -719,13 +752,13 @@ if [ "$GDB_MODE" -eq 1 ]; then
     echo "Launching aiehlc under gdb (-gdb)..."
     echo "  Tip: 'run' to start, 'bt' on crash, 'break <fn>' before run. aiehlc args are pre-set."
     dbg_echo "+ gdb --args ${AIEHLC} ${AIEHLC_ARGS[*]} ${runtime_source_file} --"
-    gdb --args "${AIEHLC}" \
+    AIEHLC_DEFINES="${USER_DEFINES}" gdb --args "${AIEHLC}" \
         "${AIEHLC_ARGS[@]}" \
         ${runtime_source_file} --
     AIEHLC_RC=$?
 else
     dbg_echo "+ $LD_SO --library-path ${LIB_PATH}:${LIB_BASE_PATH} ${AIEHLC} ${AIEHLC_ARGS[*]} ${runtime_source_file} --"
-    "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" \
+    AIEHLC_DEFINES="${USER_DEFINES}" "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" \
         "${AIEHLC_ARGS[@]}" \
         ${runtime_source_file} -- 2> >(tee "$AIEHLC_ERRLOG" >&2)
     AIEHLC_RC=$?

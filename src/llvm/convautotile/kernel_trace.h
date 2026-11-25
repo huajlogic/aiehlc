@@ -104,12 +104,15 @@ struct BlockOpts {
     int depth = 0;
     bool resident = false;
     int tile[2] = {0, 0};
-    // dataflow intent (dataflow plan): .share = aie::share::neighbor (1), .stage = aie::stage::memtile (1) /
+    // dataflow intent (dataflow plan): .share = aie::share::neighbor (1) / broadcast (2), .stage =
+    // aie::stage::memtile (1) /
     // memtile_ring (2), .ring = MemTile ring buffers, .keep = kept across launches
     int share = 0, stage = 0, ring = 0;
     bool keep = false;
     int parts = 0; // .parts = n: the kernel addresses the block as n row parts (block.part(i))
     int align = 0; // .align = N: the port's core buffers are N-byte aligned (64 for 64-byte vector access)
+    int axis = 0;  // .share = broadcast: 1 the blocks follow the mesh row only (cores of a row read the same),
+                   // 2 the mesh column only -- set by the kernel analysis from the fit, not an option
     bool any() const {
         return depth || resident || tile[0] || tile[1] || share || stage || ring || keep || parts || align;
     }

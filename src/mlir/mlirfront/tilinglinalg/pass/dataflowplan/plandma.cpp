@@ -57,7 +57,7 @@ MemtileUse memtileUse(const DataflowPlan &p, const PlanStream &s, int col) {
     const int64_t chunk = s.chunkBytes();
     if (s.stage == "memtile_ring") {
         for (const PlanRoute *r : u.out)
-            u.parities.push_back(r->dsts[0].second);
+            u.parities.push_back(r->dsts[0].second - s.channel);
         const int k = (int)u.parities.size();
         u.chunksPerTile = (int64_t)s.chunks * k / s.channels;
         if (k == 1) { // one parity: buffers of 2 chunks, one chain each way
@@ -200,14 +200,6 @@ void deriveRing(DataflowPlan &p, size_t si) {
     }
 }
 
-// Strip group of a core row for a stream: the g with hostRows[g] == mesh row.
-int groupOfHostRow(const PlanStream &s, int meshRow) {
-    for (size_t g = 0; g < s.hostRows.size(); g++)
-        if (s.hostRows[g] == meshRow)
-            return (int)g;
-    return -1;
-}
-
 // MemTile side of a memtile (resident) stream, per column: the column's strips held whole (one S2MM load,
 // on the first launch only when resident across launches; locks ready, free), replayed by one MM2S BD per
 // route -- the route's destination says which strip group (its host row) and which chunk parity (its
@@ -239,8 +231,8 @@ bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
         p.channels.back().tag = mtag(si, c, "ch_in", 0);
         for (size_t k = 0; k < u.out.size(); k++) {
             const PlanRoute *r = u.out[k];
-            const int g = groupOfHostRow(B, r->dsts[0].first.row - p.coreRowBase), q = r->dsts[0].second;
-            if (r->dsts.size() != 1 || g < 0 || q >= B.channels) {
+            const int g = B.groupOfHostRow(r->dsts[0].first.row - p.coreRowBase), q = r->dsts[0].second - B.channel;
+            if ((r->dsts.size() != 1 && B.share == "neighbor") || g < 0 || q >= B.channels) {
                 why = "stream " + std::to_string(B.arg) +
                       ": a replay route must end on one core hosting a strip, "
                       "on a channel below `channels`";
@@ -255,6 +247,52 @@ bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
         }
     }
     return true;
+}
+
+// Per-core copies: stream si on S2MM channel s.channel, its `slots` buffers of one chunk in a chain (BD k:
+// E + k acquired, F released by one), parts PART_STRIDE apart -- and the kernel's per-operand constants.
+void deriveCopySlots(DataflowPlan &p, const std::vector<Tile> &cores) {
+    const PlanResources &r = p.res;
+    const PlanTarget &T = planTarget();
+    PlanKernelParam pf{"OP_F", {}, false, true}, pe{"OP_E", {}, false, true}, plo{"OP_SLOT_LO", {}, false, true},
+        pst{"OP_SLOT_STRIDE", {}, false, true}, ppt{"OP_PART_STRIDE", {}, false, true},
+        psl{"OP_SLOTS", {}, false, true};
+    for (size_t o = 0; o < p.shareArgs.size(); o++) {
+        size_t si = 0;
+        while (si < p.streams.size() && p.streams[si].arg != p.shareArgs[o])
+            si++;
+        const PlanStream &s = p.streams[si];
+        // slot k at base + k * slotStride (the aligned chunk); part i of a slot PART_STRIDE further (parts > 1:
+        // slotStride == part x parts... = the chunk, so parts interleave the slots as in the hosted streams)
+        const int64_t chunk = s.chunkBytes(), part = chunk / s.parts,
+                      slotStride = s.parts > 1 ? part : r.copySlotStride[si], stride = (int64_t)s.slots * slotStride;
+        const auto [in, out] = splitWords(part / T.bdWordBytes, T.coreBdMaxWrap);
+        for (int k = 0; k < s.slots; k++) {
+            Dims d = {{1, in}, {in, out}, {stride / T.bdWordBytes, 0}};
+            p.bds.push_back({cores, r.copyBd[si] + k, r.copySlotBase[si] + k * slotStride, chunk, d, 0, 0,
+                             r.copyE[si] + k, -1, r.copyF[si], 1, r.copyBd[si] + (k + 1) % s.slots});
+            p.bds.back().tag = "copy/" + std::to_string(si) + "/bd/" + std::to_string(k);
+            p.locks.push_back({cores, r.copyE[si] + k, 1, -1, false});
+            p.locks.back().tag = "copy/" + std::to_string(si) + "/E/" + std::to_string(k);
+        }
+        p.locks.push_back({cores, r.copyF[si], 0, -1, false});
+        p.locks.back().tag = "copy/" + std::to_string(si) + "/F";
+        p.channels.push_back({cores, true, s.channel, r.copyBd[si], 1, false});
+        p.channels.back().tag = "copy/" + std::to_string(si) + "/ch";
+        for (int pm = 0; pm < p.meshRows; pm++) {
+            pf.perMeshRow.push_back(r.copyF[si]), pe.perMeshRow.push_back(r.copyE[si]);
+            plo.perMeshRow.push_back(r.copySlotBase[si] - T.coreOwnView), pst.perMeshRow.push_back(slotStride);
+            ppt.perMeshRow.push_back(stride), psl.perMeshRow.push_back(s.slots);
+        }
+    }
+    if (p.persistent) {
+        p.locks.push_back({cores, r.lockGo, 1, -1, false});
+        p.locks.back().tag = "core/go";
+    }
+    for (PlanKernelParam *k : {&pf, &pe, &plo, &pst, &ppt, &psl})
+        p.params.push_back(*k);
+    p.params.push_back({"COPY", {1}, true, false});
+    p.params.push_back({"READERS", {1}, true, false});
 }
 
 // Every core hosts at most one stream: per S2MM channel `slots` buffers, each chunk in `parts` row parts
@@ -306,6 +344,12 @@ void deriveCoreSlots(DataflowPlan &p, const PlanStream &s, const std::vector<Til
                                                      {"LOCK_SYNC", r.lockSync}};
     for (auto &[n, v] : scal)
         p.params.push_back({n, {v}, true, false});
+    if (r.accBytes > 0) { // the kernel's K accumulator: ACC when the plan holds it (core address), else its own
+        p.params.push_back({"ACC_BYTES", {r.accBytes}, true, false});
+        p.params.push_back({"DM_FREE", {r.dmFree}, true, false});
+        if (r.accAddr >= 0)
+            p.params.push_back({"ACC", {r.accAddr}, true, false});
+    }
 }
 
 // Reader order of strip group g of a stream: its first row, then the group's other rows ascending.
@@ -335,7 +379,7 @@ bool deriveKernelParams(DataflowPlan &p, std::string &why) {
         if (s->stage == "memtile_ring" && syncOperand < 0)
             syncOperand = (int)o;
         for (int pm = 0; pm < p.meshRows; pm++) {
-            const int g = s->rowGroups[pm], host = s->hostRows[g];
+            const int g = s->rowGroups[pm], host = s->share == "neighbor" ? s->hostRows[g] : pm; // a copy: its own
             if (host < pm - 1 || host > pm + 1) {
                 why = "mesh row " + std::to_string(pm) + " reads stream " + std::to_string(s->arg) + " hosted on row " +
                       std::to_string(host) + ", which is not a neighbour";
@@ -346,7 +390,8 @@ bool deriveKernelParams(DataflowPlan &p, std::string &why) {
                                    : host == pm + 1 ? T.coreNorthLockBias
                                                     : T.coreSouthLockBias);
             const std::vector<int> order = readersOf(*s, g);
-            rd.perMeshRow.push_back(std::find(order.begin(), order.end(), pm) - order.begin());
+            rd.perMeshRow.push_back(s->share == "neighbor" ? std::find(order.begin(), order.end(), pm) - order.begin()
+                                                           : 0);
         }
     }
     p.params.push_back(v);
@@ -378,7 +423,7 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
                   "per column and group";
         return false;
     }
-    for (size_t g = 0; g < groups; g++)
+    for (size_t g = 0; g < groups && s.share == "neighbor"; g++)
         if ((int)readersOf(s, (int)g).size() != s.readers) {
             why = S + "strip group " + str((int)g) + " has " + str((int)readersOf(s, (int)g).size()) +
                   " reader rows, the stream says readers = " + str(s.readers);
@@ -394,7 +439,8 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
         why = S + "a chunk does not fit the core / MemTile / shim BD wrap limits";
         return false;
     }
-    int served = 0;
+    // a ring serves each (tensor strip, parity) stream once: count the distinct ones over the columns
+    std::set<std::pair<int, int>> served;
     for (int c = 0; c < p.meshCols; c++) {
         const MemtileUse u = memtileUse(p, s, p.colLo + c);
         if (!u.present)
@@ -405,7 +451,14 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
         }
         if (s.stage == "memtile_ring") {
             const int k = (int)u.parities.size();
-            served += k;
+            for (const PlanRoute *r : u.out) {
+                const int g = s.groupOfHostRow(r->dsts[0].first.row - p.coreRowBase);
+                if (g < 0) {
+                    why = S + "a ring route of column " + str(c) + " does not end on a strip's host row";
+                    return false;
+                }
+                served.insert({s.strips[c * groups + g], r->dsts[0].second - s.channel});
+            }
             const int64_t perTile = u.chunksPerTile;
             if (k == 1 ? (s.rounds * perTile) % (2 * s.ring) : (s.rounds * perTile) % (s.ring * k)) {
                 why = S + "the ring does not divide column " + str(c) + "'s chunk stream";
@@ -416,10 +469,13 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
             return false;
         }
     }
-    if (s.stage == "memtile_ring" && served != (int)groups * s.channels) {
-        why = S + "the MemTile rings serve " + str(served) + " (strip group, parity) streams, the layout needs " +
-              str((int)groups * s.channels);
-        return false;
+    if (s.stage == "memtile_ring") {
+        const std::set<int> strips(s.strips.begin(), s.strips.end());
+        if (served.size() != strips.size() * s.channels) {
+            why = S + "the MemTile rings serve " + str((int)served.size()) +
+                  " (strip, parity) streams, the layout needs " + str((int)(strips.size() * s.channels));
+            return false;
+        }
     }
     return true;
 }
@@ -437,16 +493,37 @@ bool checkPlanLayout(const DataflowPlan &p, std::string &why) {
             return false;
         }
     const PlanStream &s0 = p.streams[0];
-    std::set<int> hosts;
+    std::set<int> hosts, copyChannels;
+    const bool copy = p.copyPlan();
+    if (!copy &&
+        std::any_of(p.streams.begin(), p.streams.end(), [](const PlanStream &s) { return s.share != "neighbor"; })) {
+        why = "a plan's streams are all neighbour-hosted or all per-core copies (broadcast), not a mix";
+        return false;
+    }
+    if (copy && (int)p.streams.size() > planTarget().coreS2mmChannels) {
+        why = str((int)p.streams.size()) + " per-core copy streams: a core has " + str(planTarget().coreS2mmChannels) +
+              " S2MM channels, one per stream";
+        return false;
+    }
     for (const auto &s : p.streams) {
         if (!checkStream(p, s, why))
             return false;
-        // one kernel ELF: every core runs the same hosted-stream program
-        if (s.chunkBytes() != s0.chunkBytes() || s.channels != s0.channels || s.slots != s0.slots ||
-            s.readers != s0.readers || s.parts != s0.parts || s.chunks != s0.chunks || s.rounds != s0.rounds) {
+        // one kernel ELF: every core runs the same hosted-stream program (copies: one program per operand)
+        if (!copy &&
+            (s.chunkBytes() != s0.chunkBytes() || s.channels != s0.channels || s.slots != s0.slots ||
+             s.readers != s0.readers || s.parts != s0.parts || s.chunks != s0.chunks || s.rounds != s0.rounds)) {
             why = "the shared streams must agree on chunk bytes, chunks, rounds, channels, slots, readers and parts "
                   "(every core runs the same program)";
             return false;
+        }
+        if (copy) { // every core holds every stream: one channel each, operand o on channel o
+            if (s.channels != 1 || s.readers != 1 || !copyChannels.insert(s.channel).second ||
+                s.channel >= (int)p.streams.size()) {
+                why = "stream " + str(s.arg) + ": a per-core copy stream takes 1 channel and 1 reader, its own " +
+                      "core channel (0 .. streams - 1)";
+                return false;
+            }
+            continue;
         }
         for (int h : s.hostRows)
             if (!hosts.insert(h).second) {
@@ -486,13 +563,67 @@ bool deriveDmaProgram(DataflowPlan &p, std::string &why) {
                 continue;
             const int64_t len = u.chunksPerTile * chunk;
             const int reps = ring ? s.rounds : (int)s.hostRows.size();
+            const bool again = ring && repeatsPerRound(s);
             p.shimBds.push_back({p.colLo + c, u.shimRoute->srcCh, p.res.shimBd[si][c], s.arg, true, off, len,
-                                 shimChunkDims(s, u.chunksPerTile), len, reps, reps, !ring && s.residentLaunches});
+                                 shimChunkDims(s, u.chunksPerTile), again ? 0 : len, again ? 1 : reps, reps,
+                                 !ring && s.residentLaunches});
             p.shimBds.back().tag = "shim/" + std::to_string(si) + "/" + std::to_string(c);
-            off += reps * len;
+            // the same part again every round: no BD iteration (its step field holds step - 1, so a step of 0
+            // cannot be written -- it wraps to the largest step), only the channel start's repeat re-reads it
+            off += (again ? 1 : reps) * len;
         }
     }
-    deriveCoreSlots(p, p.streams[0], cores);
+    if (p.copyPlan())
+        deriveCopySlots(p, cores);
+    else
+        deriveCoreSlots(p, p.coreProtocol(), cores);
+    for (const PlanShimBd &sb : p.shimBds)
+        if (sb.iterWrap > 1 && sb.iterStep < planTarget().bdWordBytes) {
+            why = "shim BD " + std::to_string(sb.bd) + " of column " + std::to_string(sb.col) + " iterates " +
+                  std::to_string(sb.iterWrap) + " times with a step of " + std::to_string(sb.iterStep) +
+                  " B: the step field holds step - 1 words, a step below one word cannot be written (" + sb.tag + ")";
+            return false;
+        }
+    for (const PlanBd &bd : p.bds) {
+        const bool mem = bd.tiles[0].row >= 1 && bd.tiles[0].row <= p.memtileRows;
+        const int64_t maxW = mem ? planTarget().memBdMaxLenWords : planTarget().coreBdMaxLenWords;
+        if (bd.len / planTarget().bdWordBytes > maxW) {
+            why = std::string(mem ? "MemTile" : "core") + " BD " + std::to_string(bd.bd) + " of tile (" +
+                  std::to_string(bd.tiles[0].col) + ", " + std::to_string(bd.tiles[0].row) + ") is " +
+                  std::to_string(bd.len) + " B, a BD holds at most " + std::to_string(maxW) + " words (" + bd.tag + ")";
+            return false;
+        }
+    }
+    // a start repeats at most chMaxRepeat times: a longer walk goes into the task queue as several equal
+    // starts (at most chStartQueue)
+    {
+        std::vector<PlanChannel> split;
+        for (const PlanChannel &ch : p.channels) {
+            int n = 1;
+            while (n <= planTarget().chStartQueue && (ch.repeat % n || ch.repeat / n > planTarget().chMaxRepeat))
+                n++;
+            if (n == 1 || n > planTarget().chStartQueue) {
+                split.push_back(ch);
+                continue;
+            }
+            for (int q = 0; q < n; q++) {
+                split.push_back(ch);
+                split.back().repeat = ch.repeat / n;
+                if (q)
+                    split.back().tag += "/q" + std::to_string(q);
+            }
+        }
+        p.channels = split;
+    }
+    for (const PlanChannel &ch : p.channels)
+        if (ch.repeat < 1 || ch.repeat > planTarget().chMaxRepeat) {
+            why = "DMA channel " + std::to_string(ch.ch) + (ch.s2mm ? " S2MM" : " MM2S") + " of tile (" +
+                  std::to_string(ch.tiles[0].col) + ", " + std::to_string(ch.tiles[0].row) + ") would start " +
+                  std::to_string(ch.repeat) + " times, a channel start repeats at most " +
+                  std::to_string(planTarget().chMaxRepeat) + " x " + std::to_string(planTarget().chStartQueue) +
+                  " queued starts (" + ch.tag + "): use a deeper ring";
+            return false;
+        }
     if (!deriveKernelParams(p, why))
         return false;
     p.persistentGoLock = p.persistent ? p.res.lockGo : -1;

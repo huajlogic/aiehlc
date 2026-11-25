@@ -10,6 +10,7 @@
 // byte-identical to the original; all cross-boundary locals are carried in
 // FlowLoweringCtx (`c`).
 
+#include "dataflowplan/plantarget.h"
 #include "flowtransfer_internal.h"
 
 namespace blueprint_sched {
@@ -317,7 +318,7 @@ void FlowTransferConversion::applyKernelBlockShim(FlowLoweringCtx &c) const {
     // The round loop re-programmed the shim BD over MMIO and waited every round.
     {
         const int64_t blk = c.perTileShimLen, R = c.kb.rounds, RJ = c.kb.roundsJ;
-        constexpr int64_t kWrapMax = 1024; // shim BD dim wrap (aie2ps)
+        const int64_t kWrapMax = dfplan::planTarget().shimBdMaxWrap; // shim BD dim wrap (10-bit field: 1023)
         const bool backToBack = (RJ == R && c.kb.strideJBytes == blk) || (RJ == 1 && c.kb.strideIBytes == blk) ||
                                 (RJ > 1 && RJ < R && c.kb.strideJBytes == blk && c.kb.strideIBytes == RJ * blk);
         // A block over kWrapMax words splits into f-word chunks (f | blockWords): 3 dims.
@@ -399,7 +400,43 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
         bool convWidthSplit = convHalo.valid && !c.shimIsSender;
         bool gemm3D = tileM > 0 && tileM < tileRowsVal && !c.shimIsSender && isFullConnectAuto(moduleOpGuard);
 
-        if (gemm3D || convWidthSplit) {
+        // #pragma output_tile_major on a kernel-only output with no GEMM tiling (no #routing.tiling: e.g. a
+        // bf16 C declared as N x 2 bytes, which the GEMM model does not match against B): the traced blocks
+        // alone give the layout -- each core's R blocks back to back, one BD walking them with its
+        // iteration. Without this the gather fell back to the routing's row-major dims and scattered the
+        // tiles (gemm_plan bf16: only the first 256 B of each tile landed where the host reads them).
+        const routing::TensorRoutingInfo *outInfo =
+            routing::lookupTensorRoutingInfo(passState->tensorInfo, traceFlowConfigToFuncArgIndex(c.shimFlowConfig));
+        int64_t kbRounds = 0, kbBlockBytes = 0;
+        if (!gemm3D && !convWidthSplit && !c.shimIsSender && passState->outputTileMajor && outInfo &&
+            outInfo->kernelBlock && !outInfo->halo) {
+            kbRounds = outInfo->kernelBlock.getRoundsI() * outInfo->kernelBlock.getRoundsJ();
+            kbBlockBytes = c.ooElementSizeBytes;
+            for (int64_t d : outInfo->kernelBlock.getShape())
+                kbBlockBytes *= d;
+        }
+        const int64_t kIterWrapMax = dfplan::planTarget().bdMaxIterWrap; // the BD iteration counter
+        if (kbRounds > 1 && kbRounds <= kIterWrapMax && kbRounds == c.ooNumIterations &&
+            kbBlockBytes == c.perRoundBytes && kbBlockBytes % 64 == 0) {
+            // the descriptor the rest of the gather reads (BD length, round loop), as the GEMM tile-major one
+            c.outDesc = OutputTileDescriptor();
+            c.outDesc.bdLenBytes = kbBlockBytes;
+            c.outDesc.bdDims = {{4, 16}, {64, kbBlockBytes / 64}};
+            c.outDesc.iterStep = (int32_t)kbBlockBytes;
+            c.outDesc.iterWrap = (int32_t)kbRounds;
+            c.outDesc.totalRounds = 1;
+            c.outDesc.roundDims.push_back({1, 0});
+            c.outDesc.perTileStrideBytes = kbRounds * kbBlockBytes;
+            c.perTileDimStrides = rewriter.getI32ArrayAttr({4, 64});
+            c.perTileDimWraps = rewriter.getI32ArrayAttr({16, (int32_t)(kbBlockBytes / 64)});
+            c.oooIterStepSize = (int32_t)kbBlockBytes;
+            c.oooIterWrap = (int32_t)kbRounds;
+            c.oooMRounds = 1;
+            c.usedMRounds3D = true;
+            c.perTileStrideFromDims = kbRounds * kbBlockBytes;
+            llvm::errs() << "[OOO ShimBD desc] output_tile_major from the traced blocks: " << kbRounds << " x "
+                         << kbBlockBytes << " B per core, back to back\n";
+        } else if (gemm3D || convWidthSplit) {
             auto moduleOp = op->getParentOfType<ModuleOp>();
             // Thread the partition #routing.tiling descriptor (if present) so the
             // NCHW conv-output BD geometry is derived from the authoritative tiling
@@ -443,8 +480,8 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
             // d0_wrap = the whole slice (2,560 words > the 1,024 shim wrap max:
             // aie-rt rejects the BD and the gather hangs in wait_io). Step the
             // rounds along d0 and fold an over-long run into d0 x d1 (both
-            // wraps <= 1,024 words).
-            constexpr int64_t kShimWrapMax = 1024;
+            // wraps <= 1,023 words: the 10-bit wrap field, plantarget.h).
+            const int64_t kShimWrapMax = dfplan::planTarget().shimBdMaxWrap;
             if (rowsPerRound == 0 && perTileD1Rows == 1 && c.ooNumIterations > 1 && stride0 == 4 &&
                 wrap0 % c.ooNumIterations == 0) {
                 const int64_t roundWords = wrap0 / c.ooNumIterations;
@@ -942,9 +979,13 @@ void FlowTransferConversion::computeMultipleInputShimBd(FlowLoweringCtx &c, Mult
         llvm::errs() << "[BlueprintToSchedule] 3D K BD covers all " << kR << " k-rounds: len=" << full
                      << " B, repeat 1, no BD iteration (was len=" << c.perTileShimLen << " iter_wrap=" << c.shimIterWrap
                      << " repeat=" << p.perIterRepeat << ")\n";
-    } else if (kWalk3D && p.loopIterWrap <= 1 && p.loopRepeat > 1) {
+    } else if (kWalk3D && c.kb.attr && p.loopIterWrap <= 1 && p.loopRepeat > 1) {
         // len is the whole K walk and nothing steps between starts: a repeat would send the
         // same strip k_rounds times, and the core takes it once (input shims never finish).
+        // Only for a traced kernel-only port (#routing.kernel_block; simplegemm_kacc.cc's B,
+        // which does not `follow` its blocks but whose trace says the core takes the walk
+        // once): a hand-written GemmSpace kernel may read the same strip once per k-round
+        // (simplematmul2.cc: its core takes repeat 4; 1 hangs the launch in wait_io).
         llvm::errs() << "[BlueprintToSchedule] 3D K BD is already the whole walk (" << full
                      << " B) and does not iterate: repeat " << p.loopRepeat << " -> 1\n";
         p.loopRepeat = 1;
@@ -952,7 +993,7 @@ void FlowTransferConversion::computeMultipleInputShimBd(FlowLoweringCtx &c, Mult
     // Every output armed once (#pragma output_tile_major): the M rounds need no host loop
     // either. One BD walks them with its iteration (step = the round stride, <= 64 rounds:
     // the aie2ps iteration wrap is 6 bits), started once per round; the core's locks pace it.
-    constexpr int64_t kIterWrapMax = 64;
+    const int64_t kIterWrapMax = dfplan::planTarget().bdMaxIterWrap;
     if (passState->outputTileMajor && kWalk3D && p.outerRounds > 1 && p.outerRounds <= kIterWrapMax && !p.halo2D &&
         p.loopIterWrap <= 1 && p.loopRepeat == 1 && p.loopLen == full) {
         p.oneBd = true;
