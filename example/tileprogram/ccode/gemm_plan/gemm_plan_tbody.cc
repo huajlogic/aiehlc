@@ -19,7 +19,7 @@
 //             fits, else 2
 //   GP_PARTS  each chunk in 2 row parts in different core memory banks (or 1 part)    default 2
 //   GP_TM / GP_TN  core tile rows / columns (multiples of 16: TM/16 x TN/16 accumulator pairs)   default 64
-//   GP_KC     chunk K in bytes (whole 8-deep k blocks, multiple of 16)                           default 128
+//   GP_KC     chunk K in bytes (whole 8-deep k blocks)                                           default 128
 //   GP_C_DEPTH output tile slots in core DM: 2 ping-pong, 1 one buffer ({.depth = 1}; needs a compiler
 //             that accepts {.depth = 1} on aie::store_buffer, 015dbd32)                       default 2
 //   GP_DM_FIXED stack + runtime state in the core-DM budget                                     default 8192
@@ -160,7 +160,7 @@
 #error "GP_DTYPE: 1 = int8, 2 = bf16"
 #endif
 static_assert(GP_TM % 16 == 0 && GP_TN % 16 == 0, "GP_TM / GP_TN: whole 16-row accumulator pairs");
-static_assert(GP_KC % 16 == 0 && GP_KCE % 8 == 0, "GP_KC: whole 8-deep k blocks");
+static_assert(GP_KC % 8 == 0 && GP_KCE % 8 == 0, "GP_KC: whole 8-deep k blocks");
 static_assert(GP_C_DEPTH == 1 || GP_C_DEPTH == 2, "GP_C_DEPTH: 1 (one output buffer) or 2 (ping-pong)");
 static_assert(GP_C_DEPTH == 2 || (GP_DTYPE == 1 && !(KA_TM == 64 && KA_TN == 64 && KA_KC == 128)),
               "GP_C_DEPTH 1: the generic int8 tile kernel only (GT_CHUNK)");
@@ -177,7 +177,7 @@ static_assert(GP_A_RING_BYTES <= GP_MT_BYTES, "A's ring must fit its MemTile");
 static_assert(GP_LAUNCHES >= 2, "GP_LAUNCHES >= 2 (launch 1 loads the kernel)");
 static_assert(GP_C_SPLIT == 1 || (GP_C_SPLIT == 2 && (GP_DTYPE == 2 || !(KA_TM == 64 && KA_TN == 64 && KA_KC == 128))),
               "GP_C_SPLIT: 1, or 2 (bf16 kernel, or the generic int8 tile kernel)");
-static_assert(KA_TM >= 32 && KA_TM <= 128, "the generic int8 tile kernel declares at most 8 partial-sum pair rows (GT_ACC_DECL)");
+static_assert(KA_TM >= 32 && KA_TM <= 128, "the generic int8 tile kernel declares at most 16 partial-sum 8-row blocks (GT_ACC_DECL)");
 static_assert(GP_C_ROWS % 16 == 0, "an output row slice is whole 2 x 8-row block pairs");
 static_assert(GP_DM_USED <= GP_DM_BYTES, "core DM (64 KiB): fixed + partial sums + input slots + output slots must fit");
 
@@ -278,49 +278,57 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
 #if GP_DTYPE == 1
     // int8, any other tile (GP_TM x GP_TN x GP_KC): per chunk, GT_CHUNK (gemm_plan_tile.h) walks the
     // (KA_TM / 16) x (KA_TN / 16) pairs of 2 x 2 accumulators; int32 partial sums in core memory between chunks
-    // (one array per pair row), int8 out at the last chunk in GP_C_SPLIT row slices of GP_C_ROWS rows. Same
+    // (one array per 8-row block), int8 out at the last chunk in GP_C_SPLIT row slices of GP_C_ROWS rows. Same
     // ports, options (A / B neighbour-shared) and 2 x 8 grid as the 64 x 64 kernel.
     typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
     const int pm = aie::program_id(0), pn = aie::program_id(1);
     const int sa = pm >> 1, sb = pn + GP_HW_COLS * (pm & 1), brow = sb * KA_TN;
     GT_ACC_DECL(0)
     GT_ACC_DECL(1)
-#if KA_TM > 32
     GT_ACC_DECL(2)
-#endif
-#if KA_TM > 48
     GT_ACC_DECL(3)
-#endif
-#if KA_TM > 64
+#if KA_TM > 32
     GT_ACC_DECL(4)
-#endif
-#if KA_TM > 80
     GT_ACC_DECL(5)
 #endif
-#if KA_TM > 96
+#if KA_TM > 48
     GT_ACC_DECL(6)
-#endif
-#if KA_TM > 112
     GT_ACC_DECL(7)
 #endif
-    int32_t *const accp[KA_TM / 16] = {acc0, acc1
-#if KA_TM > 32
-                                       , acc2
-#endif
-#if KA_TM > 48
-                                       , acc3
-#endif
 #if KA_TM > 64
-                                       , acc4
+    GT_ACC_DECL(8)
+    GT_ACC_DECL(9)
 #endif
 #if KA_TM > 80
-                                       , acc5
+    GT_ACC_DECL(10)
+    GT_ACC_DECL(11)
 #endif
 #if KA_TM > 96
-                                       , acc6
+    GT_ACC_DECL(12)
+    GT_ACC_DECL(13)
 #endif
 #if KA_TM > 112
-                                       , acc7
+    GT_ACC_DECL(14)
+    GT_ACC_DECL(15)
+#endif
+    int32_t *const accp[KA_TM / 8] = {acc0, acc1, acc2, acc3
+#if KA_TM > 32
+                                      , acc4, acc5
+#endif
+#if KA_TM > 48
+                                      , acc6, acc7
+#endif
+#if KA_TM > 64
+                                      , acc8, acc9
+#endif
+#if KA_TM > 80
+                                      , acc10, acc11
+#endif
+#if KA_TM > 96
+                                      , acc12, acc13
+#endif
+#if KA_TM > 112
+                                      , acc14, acc15
 #endif
     };
     for (int t = 0; t < SH_TILES; t++) {
