@@ -138,14 +138,23 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
         .depth = 2, .share = aie::share::neighbor, .stage = aie::stage::memtile_ring, .ring = GP_RING,                 \
         .parts = GP_PARTS, .align = 64                                                                                 \
     }
+#if GP_B_RING /* B chunked along K through a MemTile ring (its slice does not fit a MemTile) */
 #define OPTS_B                                                                                                         \
     {.depth = 2,                                                                                                       \
      .share = aie::share::neighbor,                                                                                    \
-     .stage = GP_B_RING ? aie::stage::memtile_ring : aie::stage::memtile,                                              \
+     .stage = aie::stage::memtile_ring,                                                                                \
      .ring = GP_B_RING,                                                                                                \
+     .parts = GP_PARTS,                                                                                                \
+     .align = 64}
+#else
+#define OPTS_B                                                                                                         \
+    {.depth = 2,                                                                                                       \
+     .share = aie::share::neighbor,                                                                                    \
+     .stage = aie::stage::memtile,                                                                                     \
      .keep = GP_KEEP,                                                                                                  \
      .parts = GP_PARTS,                                                                                                \
      .align = 64}
+#endif
 // boundary into chunk k: chunk k is taken before chunk k - 1 is given back (blocks 14 / 15 of chunk
 // k - 1 run with chunk k's first operands prefetched)
 #define GEMM_NEXT_CHUNK(k)                                                                                             \
