@@ -942,7 +942,7 @@ void FlowTransferConversion::computeMultipleInputShimBd(FlowLoweringCtx &c, Mult
         llvm::errs() << "[BlueprintToSchedule] 3D K BD covers all " << kR << " k-rounds: len=" << full
                      << " B, repeat 1, no BD iteration (was len=" << c.perTileShimLen << " iter_wrap=" << c.shimIterWrap
                      << " repeat=" << p.perIterRepeat << ")\n";
-    } else if (kWalk3D && p.loopIterWrap <= 1 && p.loopRepeat > 1) {
+    } else if (kWalk3D && c.kb.attr && p.loopIterWrap <= 1 && p.loopRepeat > 1) {
         // len is the whole K walk and nothing steps between starts: a repeat would send the
         // same strip k_rounds times, and the core takes it once (input shims never finish).
         llvm::errs() << "[BlueprintToSchedule] 3D K BD is already the whole walk (" << full
@@ -981,6 +981,10 @@ LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx 
     const bool halo2D = p.halo2D;
     const int64_t haloHStrideBytes = p.haloHStrideBytes;
     const int64_t haloWStrideBytes = p.haloWStrideBytes;
+    // Only for a traced kernel-only port (#routing.kernel_block; simplegemm_kacc.cc's B,
+    // which does not `follow` its blocks but whose trace says the core takes the walk
+    // once): a hand-written GemmSpace kernel may read the same strip once per k-round
+    // (simplematmul2.cc: its core takes repeat 4; 1 hangs the launch in wait_io).
     const int64_t haloWRoundsVal = p.haloWRoundsVal;
 
     // Erase the initial createIoOp and shimBdOp created above.
