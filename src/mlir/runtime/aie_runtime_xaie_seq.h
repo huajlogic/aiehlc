@@ -37,6 +37,13 @@ typedef struct {
 #define RT_SEQ_SHIM_AXI_QOS 0U
 #endif
 
+/* BD-length guard (aie_runtime_bdlimits.h). rt_seq_bd_len_guard prints
+ * `BDLEN_OVF tile(c,r) bd=N words=W max=0x..`, bumps the sticky rt_seq_bdlen_ovf_n and
+ * returns 0 when len_bytes is over the tile's Buffer_Length field; rt_seq_bd_desc runs
+ * it first and returns XAIE_INVALID_ARGS for such a BD. */
+extern int rt_seq_bdlen_ovf_n;
+int rt_seq_bd_len_guard(XAie_DevInst *dev, XAie_LocType tile, int bd_id, int64_t len_bytes);
+
 AieRC rt_seq_bd_desc(XAie_DevInst *dev, XAie_LocType tile, uint64_t dma_addr, const rt_seq_bd_args *a,
                      XAie_DmaDesc *desc);
 

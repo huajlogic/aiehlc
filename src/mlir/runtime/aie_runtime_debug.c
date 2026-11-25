@@ -4,6 +4,7 @@
  ******************************************************************************/
 
 #include "aie_runtime_debug.h"
+#include "aie_runtime_bdlimits.h"
 #include "aie_device_map.h"
 #include <stdio.h>
 #include <string.h>
@@ -1218,7 +1219,7 @@ AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw) {
     d.task_q_overflow = (raw & AIERT_DMA_TASK_Q_OVERFLOW_MASK) ? 1u : 0u;
     d.channel_running = (raw & AIERT_DMA_CHANNEL_RUNNING_MASK) ? 1u : 0u;
     d.task_q_size = (uint8_t)((raw & AIERT_DMA_TASK_Q_SIZE_MASK) >> AIERT_DMA_TASK_Q_SIZE_LSB);
-    d.cur_bd = (uint8_t)((raw & AIERT_DMA_CUR_BD_MASK) >> AIERT_DMA_CUR_BD_LSB);
+    d.cur_bd = (uint8_t)__Runtime_dma_cur_bd(raw);
     return d;
 }
 

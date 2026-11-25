@@ -410,6 +410,8 @@ void __Runtime_wait_event(XAie_DevInst *dev, struct_event ev);
 /* dataflow plan (dmaphop.plan): skip identical BD / ooo-channel rewrites; persistent kernel (go lock >= 0) */
 void __Runtime_plan_setup(int bd_once, int persistent_go_lock);
 int __Runtime_plan_first(void);
+/* sticky BD-length error: BDs refused with BDLEN_OVF (over the tile Buffer_Length field) so far */
+int __Runtime_bdlen_ovf(void);
 void __Runtime_tile_bd_config(XAie_DevInst *dev, XAie_LocType t, int bd, int addr, int len, int nd, int s0, int w0,
                               int s1, int w1, int s2, int w2, int iter_step, int iter_wrap, int acq, int acqv, int rel,
                               int relv, int next);

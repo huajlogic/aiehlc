@@ -7,6 +7,7 @@
 #include "aie_ctrlpkt_aot.h"
 #include "aie_ctrlpkt_encode.h"
 #include "aie_runtime_xaie_seq.h"
+#include "aie_runtime_bdlimits.h"
 #include "aie_device_map.h"
 #include <stdarg.h>
 #include "aie_runtime_debug.h"
@@ -4910,7 +4911,7 @@ static AieRC rt_ctrl_mm2s_wait(XAie_DevInst *dev, uint8_t shim_col, int32_t chan
            (unsigned)shim_col, channel, (unsigned)status,
            (unsigned)((status & AIERT_DMA_CHANNEL_RUNNING_MASK) != 0U),
            (unsigned)((status & AIERT_DMA_TASK_Q_SIZE_MASK) >> AIERT_DMA_TASK_Q_SIZE_LSB),
-           (unsigned)((status & AIERT_DMA_CUR_BD_MASK) >> AIERT_DMA_CUR_BD_LSB));
+           (unsigned)__Runtime_dma_cur_bd(status));
     return XAIE_ERR;
 }
 
@@ -7004,6 +7005,14 @@ static AieRC rt_sb_route(__Runtime_CtrlRowFabric *f) {
     return rc;
 }
 
+/* 1 when len_bytes is over the tile's BD Buffer_Length field (aie_runtime_bdlimits.h) */
+static int rt_bd_len_refused(XAie_DevInst *dev, XAie_LocType t, int64_t len_bytes) {
+    return !__Runtime_bd_len_ok((int)XAie_GetTileTypefromLoc(dev, t), len_bytes);
+}
+
+/* sticky BD-length error: number of BDs refused with BDLEN_OVF since load (0 = none) */
+int __Runtime_bdlen_ovf(void) { return rt_seq_bdlen_ovf_n; }
+
 static int rt_sb_in_window(XAie_DevInst *dev, XAie_LocType t) {
     return g_sb.active && dev == g_sb.f->dev && t.Row == 0U && t.Col >= g_sb.lo && t.Col <= g_sb.hi &&
            dev->TxnList.Next == NULL;
@@ -7014,7 +7023,8 @@ static void rt_sb_jit_call(const rt_sb_rec *r) {
     AieRC rc;
     if (r->kind == RT_AOT_CALL_BD || r->kind == RT_AOT_CALL_BD_OOO) {
         XAie_DmaDesc d;
-        rt_seq_bd_desc(dev, r->tile, r->addr, &r->args, &d);
+        if (rt_seq_bd_desc(dev, r->tile, r->addr, &r->args, &d) != XAIE_OK && rt_bd_len_refused(dev, r->tile, r->args.len))
+            return; /* BDLEN_OVF: printed + sticky in rt_seq_bd_desc; BD not programmed */
         RT_SB_CALL(dev, r->tile, rc, XAie_DmaWriteBd(dev, &d, r->tile, (uint8_t)r->args.bd_id));
     } else if (r->kind == RT_AOT_CALL_CH_OOO) {
         XAie_DmaChannelDesc c;
@@ -7354,6 +7364,14 @@ void __Runtime_tile_bd_config(XAie_DevInst *dev, XAie_LocType t, int bd, int add
      * (constant time -- a lookup per BD per launch cost tens of microseconds over 100 MemTile BDs) */
     if (g_rt_plan_bd_once && g_rt_plan_launch > 1)
         return;
+    if (!__Runtime_bd_len_ok((int)XAie_GetTileTypefromLoc(dev, t), (int64_t)len)) {
+        /* aie-rt would mask the length to the field width (0x20000 words -> 0): refuse, keep sticky */
+        rt_seq_bdlen_ovf_n++;
+        printf("[aie_runtime] BDLEN_OVF tile(%u,%u) bd=%d words=%u max=0x%X\n", (unsigned)t.Col, (unsigned)t.Row, bd,
+               (unsigned)__Runtime_bd_len_words(len),
+               (unsigned)__Runtime_bd_len_max_words((int)XAie_GetTileTypefromLoc(dev, t)));
+        return;
+    }
     XAie_DmaDesc d;
     XAie_DmaDescInit(dev, &d, t);
     if (nd > 0) {
@@ -7467,8 +7485,10 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
     } else if (__aot_hit) {
         memset(&DmaInst, 0, sizeof(DmaInst));
     } else {
-        rt_seq_bd_desc(dev, tile, dma_addr, &bd_args, &DmaInst);
-        RT_SB_CALL(dev, tile, bd_rc, XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id));
+        if (rt_seq_bd_desc(dev, tile, dma_addr, &bd_args, &DmaInst) != XAIE_OK && rt_bd_len_refused(dev, tile, len))
+            bd_rc = XAIE_INVALID_ARGS; /* BDLEN_OVF: printed + sticky in rt_seq_bd_desc; BD not programmed */
+        else
+            RT_SB_CALL(dev, tile, bd_rc, XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id));
     }
     AIEHLC_LOG(printf("[aie_runtime] bd_config_multidim tile(%u,%u) bd=%d addr=0x%lx len=%d next=%d "
                       "lock_acq=%d/%d lock_rel=%d/%d pkt=%d/%d ooo_bd=%d num_dims=%d rc=%d\n",
@@ -7575,8 +7595,10 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim_ooo(XAie_DevInst *dev, XAie_LocTyp
     } else if (__aot_hit) {
         memset(&DmaInst, 0, sizeof(DmaInst));
     } else {
-        rt_seq_bd_desc(dev, tile, dma_addr, &bd_args, &DmaInst);
-        RT_SB_CALL(dev, tile, bd_rc, XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id));
+        if (rt_seq_bd_desc(dev, tile, dma_addr, &bd_args, &DmaInst) != XAIE_OK && rt_bd_len_refused(dev, tile, len))
+            bd_rc = XAIE_INVALID_ARGS; /* BDLEN_OVF: printed + sticky in rt_seq_bd_desc; BD not programmed */
+        else
+            RT_SB_CALL(dev, tile, bd_rc, XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id));
     }
     AIEHLC_LOG(printf("[aie_runtime] bd_config_multidim_ooo tile(%u,%u) bd=%d addr=0x%lx len=%d next=%d "
                       "lock_acq=%d/%d lock_rel=%d/%d pkt=%d/%d ooo_bd=%d num_dims=%d "
