@@ -10,6 +10,8 @@
 //   GP_KEEP   B held in the MemTiles across launches (weight-resident)   default: when B's slice fits a MemTile
 //   GP_B_RING B chunked along K through a MemTile ring of this many buffers per (strip, parity) instead of
 //             staged whole (0)                                        default: 0 when B's slice fits, else 4
+//   GP_C_SPLIT each 64-row output tile written as this many row slices (1 or 2)  default: 1 when core DM
+//             fits, else 2
 //   GP_PARTS  each chunk in 2 row parts in different core memory banks (or 1 part)    default 2
 // Every count below (tiles per core, K chunks, strips) is derived from the shape; the limits are
 // static_asserts. The AIE clock is measured in the run (shim timer vs the A78 generic timer).
@@ -107,6 +109,28 @@
 #endif
 #endif
 
+// Core data memory (AIE-ML v2: 64 KB per core). Statics: the KA_TM x KA_TN x 4 B partial-sum tile (int8 acc,
+// bf16 facc), the output window's 2 slots (always ping-pong), the hosted input stream's slots (GP_CORE_S2MM
+// channels x 2 slots x one chunk) and the stack + runtime state (GP_DM_FIXED). The output tile goes out as
+// GP_C_SPLIT row slices of GP_C_ROWS rows: 1 when that fits, else 2 -- bf16's output tile is twice int8's,
+// so its whole-tile slots do not fit next to the fp32 partials. The C bytes in DDR are the same either way
+// (a tile is [8-row block][8-col block][8 x 8], so row slice h is the h-th contiguous part of it).
+#define GP_DM_BYTES (64 * 1024)
+#define GP_DM_FIXED (8 * 1024)
+#define GP_CORE_S2MM 2
+#define GP_ACC_BYTES (KA_TM * KA_TN * 4)
+#define GP_IN_BYTES (GP_CORE_S2MM * 2 * KA_TM * KA_KC)
+#define GP_OUT_TILE_BYTES (KA_TM * KA_TN * GP_ES)
+#ifndef GP_C_SPLIT
+#if GP_DM_FIXED + GP_ACC_BYTES + GP_IN_BYTES + 2 * GP_OUT_TILE_BYTES <= GP_DM_BYTES
+#define GP_C_SPLIT 1
+#else
+#define GP_C_SPLIT 2
+#endif
+#endif
+#define GP_C_ROWS (KA_TM / GP_C_SPLIT)
+#define GP_DM_USED (GP_DM_FIXED + GP_ACC_BYTES + GP_IN_BYTES + 2 * GP_OUT_TILE_BYTES / GP_C_SPLIT)
+
 #if GP_DTYPE != 1 && GP_DTYPE != 2
 #error "GP_DTYPE: 1 = int8, 2 = bf16"
 #endif
@@ -121,6 +145,9 @@ static_assert(GP_B_MT_BYTES <= GP_MT_BYTES, "B's MemTile buffers (whole slice, o
 static_assert(!(GP_B_RING && GP_KEEP), "a MemTile ring (GP_B_RING) is refilled every launch: no GP_KEEP");
 static_assert(GP_A_RING_BYTES <= GP_MT_BYTES, "A's ring must fit its MemTile");
 static_assert(GP_LAUNCHES >= 2, "GP_LAUNCHES >= 2 (launch 1 loads the kernel)");
+static_assert(GP_C_SPLIT == 1 || (GP_C_SPLIT == 2 && GP_DTYPE == 2), "GP_C_SPLIT: 1, or 2 (bf16 kernel only)");
+static_assert(GP_C_ROWS % 16 == 0, "an output row slice is whole 2 x 8-row block pairs");
+static_assert(GP_DM_USED <= GP_DM_BYTES, "core DM (64 KiB): partial sums + input slots + output slots + stack must fit");
 
 // AIEHLC_KERNEL_PROLOGUE_BEGIN
 #include "gemm_plan_tile.h"
@@ -232,14 +259,18 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
 #define BF_OP(p0, p1, r, kb) (((r) / (KA_TM / 16) ? (p1) : (p0)) + (((r) % (KA_TM / 16)) * (GP_KCE / 8) + (kb)) * 64)
     for (int t = 0; t < SH_TILES; t++) {
         const int arow = sa * (KA_M / 2) + t * KA_TM;
-        bfloat16 *__restrict y =
-            (bfloat16 *)aie::store_buffer(c, {arow, brow * GP_ES}, {KA_TM, KA_TN * GP_ES}, {.align = 64});
         for (int k = 0; k < SH_NK; k++) {
             auto xa = aie::load_buffer(a, {arow, k * KA_KC}, {KA_TM, KA_KC}, OPTS_A);
             auto xb = aie::load_buffer(b, {brow, k * KA_KC}, {KA_TN, KA_KC}, OPTS_B);
             const bfloat16 *a0p = BF_PART(xa, 0), *a1p = BF_PART(xa, 1);
             const bfloat16 *b0p = BF_PART(xb, 0), *b1p = BF_PART(xb, 1);
-            for (int mi = 0; mi < KA_TM / 8; mi += 2)
+            for (int h = 0; h < GP_C_SPLIT; h++) {
+                // the last chunk writes row slice h of the output tile (GP_C_ROWS rows) straight out
+                bfloat16 *__restrict y = nullptr;
+                if (k == SH_NK - 1)
+                    y = (bfloat16 *)aie::store_buffer(c, {arow + h * GP_C_ROWS, brow * GP_ES},
+                                                      {GP_C_ROWS, KA_TN * GP_ES}, {.align = 64});
+                for (int mi = h * (GP_C_ROWS / 8); mi < (h + 1) * (GP_C_ROWS / 8); mi += 2)
                 for (int ni = 0; ni < KA_TN / 8; ni += 2) {
                     float *f00 = facc + (mi * (KA_TN / 8) + ni) * 64, *f01 = f00 + 64;
                     float *f10 = f00 + (KA_TN / 8) * 64, *f11 = f10 + 64;
@@ -272,7 +303,7 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
                         c11.mac(va1, vb1);
                     }
                     if (k == SH_NK - 1) { // C tile [mi][ni][8 m][8 n], bf16 (RNE)
-                        bfloat16 *o = y + (mi * (KA_TN / 8) + ni) * 64;
+                        bfloat16 *o = y + ((mi - h * (GP_C_ROWS / 8)) * (KA_TN / 8) + ni) * 64;
                         aie::store_v(o, c00.to_vector<bfloat16>());
                         aie::store_v(o + 64, c01.to_vector<bfloat16>());
                         aie::store_v(o + (KA_TN / 8) * 64, c10.to_vector<bfloat16>());
@@ -284,10 +315,12 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
                         aie::store_v(f11, c11.to_vector<float>());
                     }
                 }
+                if (k == SH_NK - 1)
+                    aie::commit(c);
+            }
             aie::release(a);
             aie::release(b);
         }
-        aie::commit(c);
     }
 #endif
 }
