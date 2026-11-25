@@ -348,7 +348,17 @@ bool readGeometry(ModuleOp module, const std::map<int, Operand> &ops, int outArg
     const routing::TensorRoutingInfo *ci = routing::lookupTensorRoutingInfo(info, outArg);
     if (!ci || !ci->kernelBlock)
         return fail("the output needs a traced block sequence");
-    g.tiles = ci->kernelBlock.getRoundsI() * ci->kernelBlock.getRoundsJ();
+    // An output tile (TM rows) may be written as row slices (blocks of TM / n rows, n per tile, e.g. to
+    // fit its slots in core memory): the tiles are the output blocks over the slices per tile.
+    const int64_t outRows = ci->kernelBlock.getShape().empty() ? 0 : ci->kernelBlock.getShape()[0];
+    if (outRows <= 0 || outRows > g.TM || g.TM % outRows)
+        return fail("the output block's rows (" + std::to_string(outRows) + ") must divide the A block's rows (" +
+                    std::to_string(g.TM) + "): an output tile, or a row slice of one");
+    const int64_t slices = g.TM / outRows, blocks = ci->kernelBlock.getRoundsI() * ci->kernelBlock.getRoundsJ();
+    if (blocks % slices)
+        return fail("the output's " + std::to_string(blocks) + " blocks are not whole tiles of " +
+                    std::to_string(slices) + " row slices");
+    g.tiles = blocks / slices;
     return true;
 }
 
