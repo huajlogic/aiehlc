@@ -389,9 +389,14 @@ GEMMPLAN_T_KC = "#define GP_KC 8\n#define GP_C_DEPTH 2"
 GEMMPLAN_T_CASES = [
     ("gemm_plan tile 96x96 kc8 depth2: 32x2 output tiles/core, every block matches the DMA", [],
      "PASS:c (OFM, gather, 32x2 blocks/core): d1[12288]=rows/4@3072+i32x96@96 d2[768]=cols/4@192+j2x96@96"),
-    ("gemm_plan tile 96x96 kc32 depth1 (FEAS_PICK): {.depth = 1} on the output store is refused at this base",
+    # M3.3.6.2.1.2.4.1 PV (fix96_inner): {.depth = 1} on aie::store_buffer accepted (015dbd32 cherry-picked; was
+    # "an output window is always ping-pong" on 71129420), and the GT_CHUNK_P kernels (GP_GT 1 / 2) route the same blocks.
+    ("gemm_plan tile 96x96 kc32 depth1 (FEAS_PICK): {.depth = 1} on the output store is accepted",
      [(GEMMPLAN_T_KC, "#define GP_KC 32\n#define GP_C_DEPTH 1")],
-     "an output window is always ping-pong"),
+     "PASS:OK: every load_buffer / store_buffer matches the DMA"),
+    ("gemm_plan tile 96x96 kc32 depth1 GT_CHUNK_P (GP_GT 1): every block matches the DMA",
+     [(GEMMPLAN_T_KC, "#define GP_KC 32\n#define GP_C_DEPTH 1\n#define GP_GT 1")],
+     "PASS:OK: every load_buffer / store_buffer matches the DMA"),
     # M3.3.6.2.1.2.3.2 PX: the CORE1 stats block (GP_CORE1, default 0). Off: the same blocks as aa587c9f (the line of
     # the kc8 depth2 case above); on: the lock-wait timing touches only blocks load_buffer / store_buffer returned;
     # (the #error without -DGP_PEAK / the int8-peak static_assert are compile-time: `trace` does not stop on them,
@@ -403,6 +408,100 @@ GEMMPLAN_T_CASES = [
      [(GEMMPLAN_T_KC, GEMMPLAN_T_KC + "\n#define GP_CORE1 1\n#define GP_PEAK 498.37")],
      "PASS:c (OFM, gather, 32x2 blocks/core): d1[12288]=rows/4@3072+i32x96@96 d2[768]=cols/4@192+j2x96@96"),
 ]
+
+# M3.3.6.2.1.2.4.1 PV: x86 numerics of the fix96_inner chunk kernels (gemm_plan_tile.h GT_CHUNK_P / GT_CHUNK_P2) against
+# GT_CHUNK and a scalar int32 reference, on the aie_api_x86emu.h emulation (96 x 96 tile, 4 chunks of KC 32 / 8).
+GT_NUM_BASE = CCODE / "gemm_plan" / "gemm_plan_tile.h"
+GT_NUM_SRC = r"""
+#include AIEHLC_EMU_HEADER
+#include "gemm_plan_tile.h"
+typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
+#define NK 4
+#define NB (KA_TM / 8)
+alignas(64) static int8_t A[NK][KA_TM * KA_KC], B[NK][KA_TN * KA_KC];
+alignas(64) static int32_t accG[NB][8 * KA_TN], accP[NB][8 * KA_TN], accD[NB][8 * KA_TN];
+alignas(64) static int8_t yG[KA_TM * KA_TN], yP[KA_TM * KA_TN], yD[KA_TM * KA_TN];
+static int32_t ref[KA_TM][KA_TN];
+static int opA(int k, int m, int kk) { /* row m, k index kk (within chunk k) in GT_OP order */
+    const int r = m / 8, kb = kk / 8, T = KA_TM;
+    const int8_t *p = A[k] + (r / (T / 16) ? T / 2 * KA_KC : 0) + ((r % (T / 16)) * (KA_KC / 8) + kb) * 64;
+    return p[(m % 8) * 8 + kk % 8];
+}
+static int opB(int k, int n, int kk) {
+    const int r = n / 8, kb = kk / 8, T = KA_TN;
+    const int8_t *p = B[k] + (r / (T / 16) ? T / 2 * KA_KC : 0) + ((r % (T / 16)) * (KA_KC / 8) + kb) * 64;
+    return p[(kk % 8) * 8 + n % 8];
+}
+int main() {
+    unsigned s = 12345;
+    for (int k = 0; k < NK; k++) {
+        for (int i = 0; i < KA_TM * KA_KC; i++) A[k][i] = (int8_t)((s = s * 1103515245u + 12345u) >> 16);
+        for (int i = 0; i < KA_TN * KA_KC; i++) B[k][i] = (int8_t)((s = s * 1103515245u + 12345u) >> 16);
+    }
+    for (int m = 0; m < KA_TM; m++)
+        for (int n = 0; n < KA_TN; n++) {
+            int32_t t = 0;
+            for (int k = 0; k < NK; k++)
+                for (int kk = 0; kk < KA_KC; kk++) t += opA(k, m, kk) * opB(k, n, kk);
+            ref[m][n] = t;
+        }
+    int32_t *fG[NB], *fP[NB], *fD[NB];
+    for (int i = 0; i < NB; i++) fG[i] = accG[i], fP[i] = accP[i], fD[i] = accD[i];
+    long bad_i32 = 0, bad_y = 0;
+    for (int pass = 0; pass < 2; pass++) { /* pass 0: int32 partial sums (no last chunk); pass 1: int8 out */
+        for (int k = 0; k < NK; k++) {
+            const int8_t *a0 = A[k], *a1 = A[k] + KA_TM / 2 * KA_KC, *b0 = B[k], *b1 = B[k] + KA_TN / 2 * KA_KC;
+            const bool last = pass == 1 && k == NK - 1;
+            GT_CHUNK(fG, yG, 0, a0, a1, b0, b1, k == 0, last, 0, NB);
+            if (k == 0) { GT_CHUNK_P(fP, yP, 0, a0, a1, b0, b1, 1, 0, 0, NB) }
+            else if (last) { GT_CHUNK_P(fP, yP, 0, a0, a1, b0, b1, 0, 1, 0, NB) }
+            else { GT_CHUNK_P(fP, yP, 0, a0, a1, b0, b1, 0, 0, 0, NB) }
+            if (k % 2 == 1) {
+                const int8_t *q0 = A[k - 1], *q1 = A[k - 1] + KA_TM / 2 * KA_KC, *r0 = B[k - 1], *r1 = B[k - 1] + KA_TN / 2 * KA_KC;
+                if (k == 1) { GT_CHUNK_P2(fD, yD, 0, q0, q1, r0, r1, a0, a1, b0, b1, 1, 0, 0, NB, 2) }
+                else if (last) { GT_CHUNK_P2(fD, yD, 0, q0, q1, r0, r1, a0, a1, b0, b1, 0, 1, 0, NB, 2) }
+                else { GT_CHUNK_P2(fD, yD, 0, q0, q1, r0, r1, a0, a1, b0, b1, 0, 0, 0, NB, 2) }
+            }
+        }
+        if (pass == 0)
+            for (int m = 0; m < KA_TM; m++)
+                for (int n = 0; n < KA_TN; n++) {
+                    const int idx = (n / 8) * 64 + (m % 8) * 8 + n % 8;
+                    const int32_t g = accG[m / 8][idx], p = accP[m / 8][idx], d = accD[m / 8][idx];
+                    bad_i32 += (g != ref[m][n]) + (p != ref[m][n]) + (d != ref[m][n]);
+                }
+    }
+    for (int i = 0; i < KA_TM * KA_TN; i++) bad_y += (yP[i] != yG[i]) + (yD[i] != yG[i]);
+    std::printf("GTNUM tile=%dx%d kc=%d chunks=%d bad_i32=%ld bad_y=%ld\n", KA_TM, KA_TN, KA_KC, NK, bad_i32, bad_y);
+    return bad_i32 || bad_y;
+}
+"""
+GT_NUM_CASES = [
+    ("gt_chunk_p numerics 96x96 kc32: GT_CHUNK_P / GT_CHUNK_P2 == GT_CHUNK == scalar int32 (x86 emu)",
+     [("96", "96"), ("32", "32")], "PASS:GTNUM tile=96x96 kc=32 chunks=4 bad_i32=0 bad_y=0"),
+    ("gt_chunk_p numerics 96x64 kc64: GT_CHUNK_P / GT_CHUNK_P2 == GT_CHUNK == scalar int32 (x86 emu)",
+     [("96", "64"), ("64", "64")], "PASS:GTNUM tile=96x64 kc=64 chunks=4 bad_i32=0 bad_y=0"),
+]
+
+
+def run_gt_num(edits, expect):
+    """Compile GT_NUM_SRC with g++ on the x86 AIE API emulation; edits = [(TM, TN), (KC, KC)]."""
+    tm, tn = edits[0]
+    kc = edits[1][0]
+    with tempfile.TemporaryDirectory() as tmp:
+        shutil.copy(GT_NUM_BASE, tmp)
+        src = pathlib.Path(tmp) / "gtnum.cc"
+        src.write_text(f"#define KA_TM {tm}\n#define KA_TN {tn}\n#define KA_KC {kc}\n" + GT_NUM_SRC)
+        emu = REPO / "src" / "mlir" / "runtime" / "aie_api_x86emu.h"
+        cc = subprocess.run(["g++", "-std=c++20", "-O1", "-w", "-fsanitize=address", f"-DAIEHLC_EMU_HEADER=\"{emu}\"",
+                             "-I", tmp, "-o", str(pathlib.Path(tmp) / "gtnum"), str(src)],
+                            capture_output=True, text=True, timeout=600)
+        if cc.returncode != 0:
+            return False, cc.stdout + cc.stderr
+        p = subprocess.run([str(pathlib.Path(tmp) / "gtnum")], capture_output=True, text=True, timeout=600,
+                           env=dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"))
+        out = p.stdout + p.stderr
+    return p.returncode == 0 and expect[5:] in out, out
 
 
 def inline_cc(path):
@@ -418,6 +517,8 @@ def inline_cc(path):
 
 
 def run_case(cli, name, edits, expect, base=BASE):
+    if base == GT_NUM_BASE:
+        return run_gt_num(edits, expect)
     src = inline_cc(base) if base in (GEMMPLAN_BASE, GEMMPLAN_T_BASE) else base.read_text()
     if base == TEMPLATE_BASE:  # the library kernel alone: add the includes and a host launch
         src = TEMPLATE_HEAD + src + TEMPLATE_HOST
@@ -454,6 +555,7 @@ def main():
     cases += [(n, e, x, TEMPLATE_BASE) for n, e, x in TEMPLATE_CASES]
     cases += [(n, e, x, GEMMPLAN_BASE) for n, e, x in GEMMPLAN_CASES]
     cases += [(n, e, x, GEMMPLAN_T_BASE) for n, e, x in GEMMPLAN_T_CASES]
+    cases += [(n, e, x, GT_NUM_BASE) for n, e, x in GT_NUM_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]
     for name, edits, expect, base in cases:

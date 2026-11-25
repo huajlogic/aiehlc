@@ -220,4 +220,74 @@
                 aie::store_v(f11, c3.to_vector<int32_t>());                                                            \
             }                                                                                                          \
         }
+/* ---- GT_CHUNK_P (M3.3.6.2.1.2.4.1 fix96_inner, gemm_plan_tbody.cc GP_GT 1 / 2) -------------------------------
+ * GT_CHUNK with the inner loop at 64 x 64 level: first / last are compile-time constants (the kernel calls one
+ * specialisation per chunk kind, so no branch is left in the loop), the k blocks are flattened, and the loop over the
+ * pair columns is software-pipelined -- the accumulator reload / store of one 2 x 2 block overlaps the VMACs of the
+ * next. ns = 1: one chunk (a0 .. b1); ns = 2: two chunks (both input slots, a0 .. b1 then a0q .. b1q) per accumulator
+ * reload, i.e. 2 * KA_KC of K per int32 round trip. Same numerics as GT_CHUNK (kernel_trace_cases "gt_chunk_p"). */
+#define GT_KB(c0, c1, c2, c3, pa0, pa1, pb0, pb1)                                                                      \
+    for (int kb = 0; kb < KA_KC / 8; kb++)                                                                             \
+        chess_flatten_loop {                                                                                           \
+            const aie::vector<int8_t, 64> va0 = aie::load_v<64>((pa0) + kb * 64);                                      \
+            const aie::vector<int8_t, 64> va1 = aie::load_v<64>((pa1) + kb * 64);                                      \
+            const aie::vector<int8_t, 64> vb0 = aie::load_v<64>((pb0) + kb * 64);                                      \
+            const aie::vector<int8_t, 64> vb1 = aie::load_v<64>((pb1) + kb * 64);                                      \
+            c0.mac(va0, vb0);                                                                                          \
+            c1.mac(va0, vb1);                                                                                          \
+            c2.mac(va1, vb0);                                                                                          \
+            c3.mac(va1, vb1);                                                                                          \
+        }
+#define GT_CHUNK_P2(fp, y, ym0, a0, a1, b0, b1, a0q, a1q, b0q, b1q, first, last, m0, m1, ns)                           \
+    for (int mi = (m0); mi < (m1); mi += 2) {                                                                          \
+        const int8_t *__restrict pa0_ = GT_OP(a0, a1, mi, 0, KA_TM), *__restrict pa1_ = GT_OP(a0, a1, mi + 1, 0, KA_TM); \
+        const int8_t *__restrict qa0_ = GT_OP(a0q, a1q, mi, 0, KA_TM);                                                 \
+        const int8_t *__restrict qa1_ = GT_OP(a0q, a1q, mi + 1, 0, KA_TM);                                             \
+        int32_t *__restrict fr0_ = (fp)[mi], *__restrict fr1_ = (fp)[mi + 1];                                          \
+        int8_t *__restrict yr_ = (last) ? (y) + (mi - (ym0)) * (KA_TN / 8) * 64 : nullptr;                             \
+        for (int ni = 0; ni < KA_TN / 8; ni += 2)                                                                      \
+            chess_prepare_for_pipelining chess_loop_range(KA_TN / 16, KA_TN / 16) {                                    \
+                int32_t *__restrict f00 = fr0_ + ni * 64, *__restrict f10 = fr1_ + ni * 64;                            \
+                KaMM4 c0, c1, c2, c3;                                                                                  \
+                if (first) {                                                                                           \
+                    const aie::accum<acc32, 64> z_ = aie::zeros<acc32, 64>();                                          \
+                    c0 = KaMM4(z_);                                                                                    \
+                    c1 = KaMM4(z_);                                                                                    \
+                    c2 = KaMM4(z_);                                                                                    \
+                    c3 = KaMM4(z_);                                                                                    \
+                } else {                                                                                               \
+                    aie::accum<acc32, 64> q0_, q1_, q2_, q3_;                                                          \
+                    q0_.from_vector(aie::load_v<64>(f00));                                                             \
+                    q1_.from_vector(aie::load_v<64>(f00 + 64));                                                        \
+                    q2_.from_vector(aie::load_v<64>(f10));                                                             \
+                    q3_.from_vector(aie::load_v<64>(f10 + 64));                                                        \
+                    c0 = KaMM4(q0_);                                                                                   \
+                    c1 = KaMM4(q1_);                                                                                   \
+                    c2 = KaMM4(q2_);                                                                                   \
+                    c3 = KaMM4(q3_);                                                                                   \
+                }                                                                                                      \
+                const int8_t *__restrict pb0_ = GT_OP(b0, b1, ni, 0, KA_TN);                                           \
+                const int8_t *__restrict pb1_ = GT_OP(b0, b1, ni + 1, 0, KA_TN);                                       \
+                GT_KB(c0, c1, c2, c3, pa0_, pa1_, pb0_, pb1_)                                                          \
+                if ((ns) == 2) {                                                                                       \
+                    const int8_t *__restrict qb0_ = GT_OP(b0q, b1q, ni, 0, KA_TN);                                     \
+                    const int8_t *__restrict qb1_ = GT_OP(b0q, b1q, ni + 1, 0, KA_TN);                                 \
+                    GT_KB(c0, c1, c2, c3, qa0_, qa1_, qb0_, qb1_)                                                      \
+                }                                                                                                      \
+                if (last) {                                                                                            \
+                    int8_t *o_ = yr_ + ni * 64;                                                                        \
+                    aie::store_v(o_, c0.to_vector<int8_t>(0));                                                         \
+                    aie::store_v(o_ + 64, c1.to_vector<int8_t>(0));                                                    \
+                    aie::store_v(o_ + (KA_TN / 8) * 64, c2.to_vector<int8_t>(0));                                      \
+                    aie::store_v(o_ + (KA_TN / 8) * 64 + 64, c3.to_vector<int8_t>(0));                                 \
+                } else {                                                                                               \
+                    aie::store_v(f00, c0.to_vector<int32_t>());                                                        \
+                    aie::store_v(f00 + 64, c1.to_vector<int32_t>());                                                   \
+                    aie::store_v(f10, c2.to_vector<int32_t>());                                                        \
+                    aie::store_v(f10 + 64, c3.to_vector<int32_t>());                                                   \
+                }                                                                                                      \
+            }                                                                                                          \
+    }
+#define GT_CHUNK_P(fp, y, ym0, a0, a1, b0, b1, first, last, m0, m1)                                                    \
+    GT_CHUNK_P2(fp, y, ym0, a0, a1, b0, b1, a0, a1, b0, b1, first, last, m0, m1, 1)
 #endif

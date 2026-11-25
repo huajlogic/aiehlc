@@ -67,6 +67,12 @@
 #ifndef GP_C_DEPTH
 #define GP_C_DEPTH 2
 #endif
+// GP_GT: the generic int8 tile's chunk kernel: 0 GT_CHUNK (one loop nest, first / last tested in it), 1 GT_CHUNK_P
+// (one specialisation per chunk kind, k blocks flattened, pair columns software-pipelined), 2 GT_CHUNK_P2 over two
+// chunks per accumulator reload (both input slots held; SH_NK even)
+#ifndef GP_GT
+#define GP_GT 0
+#endif
 #if GP_CORE1
 // GP_CORE1 (default 0, M3.3.6.2.1.2.3.2): single-core utilization of the generic int8 tile kernel. Every core keeps
 // a stats block in its own data memory (gp_c1st: magic, core id, chunks, total cycles, DMA-lock wait cycles);
@@ -188,6 +194,7 @@ static_assert(!(GP_TM == 64 && GP_TN == 64 && GP_KC == 128),
 #endif
 static_assert(GP_TM % 16 == 0 && GP_TN % 16 == 0, "GP_TM / GP_TN: whole 16-row accumulator pairs");
 static_assert(GP_KC % 8 == 0 && GP_KCE % 8 == 0, "GP_KC: whole 8-deep k blocks");
+static_assert(GP_GT >= 0 && GP_GT <= 2 && (GP_GT != 2 || (GP_K / GP_KCE) % 2 == 0), "GP_GT: 0, 1 or 2 (2: an even number of K chunks)");
 static_assert(GP_C_DEPTH == 1 || GP_C_DEPTH == 2, "GP_C_DEPTH: 1 (one output buffer) or 2 (ping-pong)");
 static_assert(GP_C_DEPTH == 2 || (GP_DTYPE == 1 && !(KA_TM == 64 && KA_TN == 64 && KA_KC == 128)),
               "GP_C_DEPTH 1: the generic int8 tile kernel only (GT_CHUNK)");
@@ -380,6 +387,17 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
             const int8_t *a0p = GT_PART(xa, 0, KA_TM), *a1p = GT_PART(xa, 1, KA_TM);
             const int8_t *b0p = GT_PART(xb, 0, KA_TN), *b1p = GT_PART(xb, 1, KA_TN);
             GP_C1_ACQ(b1p);
+#if GP_GT == 2
+            // two chunks (both input slots) per accumulator reload: chunk k + 1 is acquired before chunk k is released
+            k++;
+            auto xa2 = aie::load_buffer(a, {arow, k * KA_KC}, {KA_TM, KA_KC}, OPTS_A);
+            auto xb2 = aie::load_buffer(b, {brow, k * KA_KC}, {KA_TN, KA_KC}, OPTS_B);
+            const int8_t *a0q = GT_PART(xa2, 0, KA_TM), *a1q = GT_PART(xa2, 1, KA_TM);
+            const int8_t *b0q = GT_PART(xb2, 0, KA_TN), *b1q = GT_PART(xb2, 1, KA_TN);
+#define GT_FIRST_K 1
+#else
+#define GT_FIRST_K 0
+#endif
             for (int h = 0; h < GP_C_SPLIT; h++) {
                 const int m0 = h * (GP_C_ROWS / 8), m1 = (h + 1) * (GP_C_ROWS / 8);
                 int8_t *__restrict y = nullptr;
@@ -388,12 +406,34 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
                     y = aie::store_buffer(c, {arow + h * GP_C_ROWS, brow}, {GP_C_ROWS, KA_TN}, GT_C_OPTS);
                     GP_C1_ACQ(y);
                 }
+#if GP_GT == 0
                 GT_CHUNK(accp, y, m0, a0p, a1p, b0p, b1p, k == 0, k == SH_NK - 1, m0, m1);
+#else
+#if GP_GT == 2
+#define GT_CALL(fi, la) GT_CHUNK_P2(accp, y, m0, a0p, a1p, b0p, b1p, a0q, a1q, b0q, b1q, fi, la, m0, m1, 2)
+#else
+#define GT_CALL(fi, la) GT_CHUNK_P(accp, y, m0, a0p, a1p, b0p, b1p, fi, la, m0, m1)
+#endif
+                // one specialisation per chunk kind (first / middle / last): no branch inside the pipelined loop
+                if (k == GT_FIRST_K) {
+                    GT_CALL(1, 0)
+                } else if (k == SH_NK - 1) {
+                    GT_CALL(0, 1)
+                } else {
+                    GT_CALL(0, 0)
+                }
+#undef GT_CALL
+#endif
                 if (k == SH_NK - 1)
                     aie::commit(c);
             }
+#undef GT_FIRST_K
             aie::release(a);
             aie::release(b);
+#if GP_GT == 2
+            aie::release(a);
+            aie::release(b);
+#endif
         }
     }
 #if GP_CORE1 && defined(__chess__)
