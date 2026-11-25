@@ -392,6 +392,21 @@ GEMMPLAN_T_CASES = [
     ("gemm_plan tile 96x96 kc32 depth1 (FEAS_PICK): {.depth = 1} on the output store is refused at this base",
      [(GEMMPLAN_T_KC, "#define GP_KC 32\n#define GP_C_DEPTH 1")],
      "an output window is always ping-pong"),
+    # M3.3.6.2.1.2.3.2 PX: the CORE1 stats block (GP_CORE1, default 0). Off: the same blocks as aa587c9f (the line of
+    # the kc8 depth2 case above); on: the lock-wait timing touches only blocks load_buffer / store_buffer returned;
+    # on without -DGP_PEAK, or with a peak that is not int8's, the build stops (C2: the peak is the dtype's own).
+    ("gemm_plan core1 off == aa587c9f: GP_CORE1 0 routes the same blocks",
+     [(GEMMPLAN_T_KC, GEMMPLAN_T_KC + "\n#define GP_CORE1 0")],
+     "PASS:c (OFM, gather, 32x2 blocks/core): d1[12288]=rows/4@3072+i32x96@96 d2[768]=cols/4@192+j2x96@96"),
+    ("gemm_plan core1 on (GP_PEAK int8 498.37): the stats timing adds no block access",
+     [(GEMMPLAN_T_KC, GEMMPLAN_T_KC + "\n#define GP_CORE1 1\n#define GP_PEAK 498.37")],
+     "PASS:c (OFM, gather, 32x2 blocks/core): d1[12288]=rows/4@3072+i32x96@96 d2[768]=cols/4@192+j2x96@96"),
+    ("gemm_plan core1 on without GP_PEAK: #error, no built-in peak",
+     [(GEMMPLAN_T_KC, GEMMPLAN_T_KC + "\n#define GP_CORE1 1")],
+     "GP_CORE1=1 needs -DGP_PEAK"),
+    ("gemm_plan core1 on with a non-int8 peak on the int8 kernel: refused (C2)",
+     [(GEMMPLAN_T_KC, GEMMPLAN_T_KC + "\n#define GP_CORE1 1\n#define GP_PEAK 250.0")],
+     "GP_PEAK: int8 needs the int8 measured peak"),
 ]
 
 

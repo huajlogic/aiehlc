@@ -67,6 +67,33 @@
 #ifndef GP_C_DEPTH
 #define GP_C_DEPTH 2
 #endif
+#if GP_CORE1
+// GP_CORE1 (default 0, M3.3.6.2.1.2.3.2): single-core utilization of the generic int8 tile kernel. Every core keeps
+// a stats block in its own data memory (gp_c1st: magic, core id, chunks, total cycles, DMA-lock wait cycles);
+// the host reads it after each launch over the array's AXI window and prints, twice,
+//   CORE1 impl=aiehlc board=<GP_BOARD> dtype=<dt> basis=<dt>:<GP_PEAK>:<peak json> util_core=X.XX% worst=(pm,pn) ...
+// window = total - wait (kernel cycles minus load_buffer / store_buffer lock waits); util_core = work /
+// (window x GP_PEAK), work = M N K / 16 MAC per core per launch; per core the median over launches 2 .. L, worst
+// of the 16 cores. The peak is the dtype's OWN measured MAC/cyc/core and comes only from -DGP_PEAK (C2): no default.
+#ifndef GP_PEAK
+#error "GP_CORE1=1 needs -DGP_PEAK=<this dtype's measured peak, MAC/cyc/core> (int8: tasks/gemm90/peak_int8.json, bf16: tasks/gemm90/peak.json)"
+#endif
+#if GP_DTYPE != 1
+#error "GP_CORE1: the stats block is in the generic int8 tile kernel only (GP_DTYPE 1)"
+#endif
+// int8 peak above the bf16 kernel's 256 MAC/cyc ceiling: a bf16 peak given with an int8 build is refused
+static_assert((double)(GP_PEAK) > 256.0 && (double)(GP_PEAK) <= 512.0,
+              "GP_PEAK: int8 needs the int8 measured peak (tasks/gemm90/peak_int8.json), 256 < peak <= 512");
+static_assert(!(GP_TM == 64 && GP_TN == 64 && GP_KC == 128),
+              "GP_CORE1: the generic int8 tile kernel only (not the hand-scheduled 64 x 64 x 128 K4 kernel)");
+#ifndef GP_BOARD
+#define GP_BOARD unset
+#endif
+#define GP_C1_STR2(x) #x
+#define GP_C1_STR(x) GP_C1_STR2(x)
+#define GP_C1_WORDS 8
+#define GP_C1_MAGIC 0x6790c0deu
+#endif
 #define KA_TM GP_TM
 #define KA_TN GP_TN
 #define KA_KC GP_KC
@@ -311,6 +338,19 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
     GT_ACC_DECL(14)
     GT_ACC_DECL(15)
 #endif
+#if GP_CORE1 && defined(__chess__)
+    // CORE1 stats (the host reads them from this core's data memory after the launch). Timing rule: the cycle
+    // counter is read after a volatile load from the block the lock ACQ just handed over, so the read cannot be
+    // scheduled before the acquire completes. Wait sum in 32 bits (one launch waits far below 2^32 cycles).
+    static volatile uint32_t gp_c1st[GP_C1_WORDS];
+    unsigned int gp_c1_wait = 0, gp_c1_w0 = 0;
+    const unsigned long long gp_c1_t0 = get_cycles();
+#define GP_C1_T0() (gp_c1_w0 = (unsigned int)get_cycles())
+#define GP_C1_ACQ(p) ((void)*(volatile const int8_t *)(p), gp_c1_wait += (unsigned int)get_cycles() - gp_c1_w0)
+#else
+#define GP_C1_T0() ((void)0)
+#define GP_C1_ACQ(p) ((void)0)
+#endif
     int32_t *const accp[KA_TM / 8] = {acc0, acc1, acc2, acc3
 #if KA_TM > 32
                                       , acc4, acc5
@@ -334,15 +374,20 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
     for (int t = 0; t < SH_TILES; t++) {
         const int arow = sa * (KA_M / 2) + t * KA_TM;
         for (int k = 0; k < SH_NK; k++) {
+            GP_C1_T0();
             auto xa = aie::load_buffer(a, {arow, k * KA_KC}, {KA_TM, KA_KC}, OPTS_A);
             auto xb = aie::load_buffer(b, {brow, k * KA_KC}, {KA_TN, KA_KC}, OPTS_B);
             const int8_t *a0p = GT_PART(xa, 0, KA_TM), *a1p = GT_PART(xa, 1, KA_TM);
             const int8_t *b0p = GT_PART(xb, 0, KA_TN), *b1p = GT_PART(xb, 1, KA_TN);
+            GP_C1_ACQ(b1p);
             for (int h = 0; h < GP_C_SPLIT; h++) {
                 const int m0 = h * (GP_C_ROWS / 8), m1 = (h + 1) * (GP_C_ROWS / 8);
                 int8_t *__restrict y = nullptr;
-                if (k == SH_NK - 1)
+                if (k == SH_NK - 1) {
+                    GP_C1_T0();
                     y = aie::store_buffer(c, {arow + h * GP_C_ROWS, brow}, {GP_C_ROWS, KA_TN}, GT_C_OPTS);
+                    GP_C1_ACQ(y);
+                }
                 GT_CHUNK(accp, y, m0, a0p, a1p, b0p, b1p, k == 0, k == SH_NK - 1, m0, m1);
                 if (k == SH_NK - 1)
                     aie::commit(c);
@@ -351,6 +396,19 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
             aie::release(b);
         }
     }
+#if GP_CORE1 && defined(__chess__)
+    {
+        const unsigned long long tot = get_cycles() - gp_c1_t0;
+        gp_c1st[1] = (uint32_t)(pm * GP_HW_COLS + pn);
+        gp_c1st[2] = (uint32_t)(SH_TILES * SH_NK);
+        gp_c1st[3] = (uint32_t)(tot & 0xffffffffULL);
+        gp_c1st[4] = (uint32_t)(tot >> 32);
+        gp_c1st[5] = gp_c1_wait;
+        gp_c1st[6] = gp_c1st[6] + 1u;
+        gp_c1st[7] = ~GP_C1_MAGIC;
+        gp_c1st[0] = GP_C1_MAGIC;
+    }
+#endif
 #else
     // bf16 (correctness first, as peak_bf16.cc): plain aie::mmul<8, 8, 8, bfloat16, bfloat16, accfloat>
     // 2 x 2 blocks over the 64 x 64 tile, fp32 partial sums in core memory between chunks, bf16 out at
@@ -565,6 +623,125 @@ static int32_t gp_got(void *vctx, long i, long jj) {
 #endif
 }
 
+#if GP_CORE1
+// CORE1 host side: the 16 cores are the kernel group's tiles, partition columns GP_C1_COL0 .. +GP_HW_COLS - 1, rows
+// GP_C1_ROW0 .. +GP_HW_ROWS - 1 (host.cc's host_canonicalized: cols 1..4, rows 3..6); which core is which comes
+// from the id word, not from the position. The stats block's data-memory offset is found once (after launch 1) by
+// scanning the tile's 64 KiB for magic .. ~magic; before every later launch the host clears the magic word and
+// after it waits for the core to write it again (so a launch's numbers are never a previous launch's).
+#ifndef GP_C1_COL0
+#define GP_C1_COL0 1
+#endif
+#ifndef GP_C1_ROW0
+#define GP_C1_ROW0 3
+#endif
+#define GP_C1_CORES (GP_HW_ROWS * GP_HW_COLS)
+#define GP_C1_DM_BYTES 0x10000u
+static unsigned long long gp_c1_tot[GP_LAUNCHES][GP_C1_CORES], gp_c1_win[GP_LAUNCHES][GP_C1_CORES];
+static long gp_c1_off[GP_C1_CORES];
+static int gp_c1_tile[GP_C1_CORES]; // core id -> tile index (partition col GP_C1_COL0 + ti % cols, row GP_C1_ROW0 + ti / cols)
+static int gp_c1_bad;
+#if defined(__aarch64__) && !defined(__AIESIM__) && !defined(__linux__)
+#define GP_C1_HW 1
+static uint32_t gp_c1_rd(int ti, uint32_t off) {
+    u32 w = 0;
+    XAie_DataMemRdWord(__Runtime_get_partition_dev(0),
+                       XAie_TileLoc(GP_C1_COL0 + ti % GP_HW_COLS, GP_C1_ROW0 + ti / GP_HW_COLS), off, &w);
+    return (uint32_t)w;
+}
+static void gp_c1_wr(int ti, uint32_t off, uint32_t v) {
+    XAie_DataMemWrWord(__Runtime_get_partition_dev(0),
+                       XAie_TileLoc(GP_C1_COL0 + ti % GP_HW_COLS, GP_C1_ROW0 + ti / GP_HW_COLS), off, v);
+}
+#endif
+// before launch `it` (> 0): clear every found block's magic word
+static void gp_c1_arm(int it) {
+#ifdef GP_C1_HW
+    for (int ti = 0; it > 0 && ti < GP_C1_CORES; ti++)
+        if (gp_c1_off[ti] >= 0)
+            gp_c1_wr(ti, (uint32_t)gp_c1_off[ti], 0u);
+#else
+    (void)it;
+#endif
+}
+// after launch `it`: read the 16 blocks (launch 0: find them first)
+static void gp_c1_collect(int it) {
+    for (int ti = 0; ti < GP_C1_CORES; ti++) {
+        uint32_t st[GP_C1_WORDS] = {0};
+#ifdef GP_C1_HW
+        if (it == 0) {
+            gp_c1_off[ti] = -1;
+            for (uint32_t o = 0; o + 4 * GP_C1_WORDS <= GP_C1_DM_BYTES && gp_c1_off[ti] < 0; o += 4)
+                if (gp_c1_rd(ti, o) == GP_C1_MAGIC && gp_c1_rd(ti, o + 4 * (GP_C1_WORDS - 1)) == ~GP_C1_MAGIC)
+                    gp_c1_off[ti] = (long)o;
+        }
+        if (gp_c1_off[ti] >= 0) {
+            for (int p = 0; p < 100000 && gp_c1_rd(ti, (uint32_t)gp_c1_off[ti]) != GP_C1_MAGIC; p++)
+                ;
+            for (int w = 0; w < GP_C1_WORDS; w++)
+                st[w] = gp_c1_rd(ti, (uint32_t)gp_c1_off[ti] + 4u * w);
+        }
+#else
+        gp_c1_off[ti] = -1;
+#endif
+        const unsigned long long t = (unsigned long long)st[3] | ((unsigned long long)st[4] << 32), w = st[5];
+        const int q = (int)st[1];
+        if (gp_c1_off[ti] < 0 || st[0] != GP_C1_MAGIC || st[7] != ~GP_C1_MAGIC || q < 0 || q >= GP_C1_CORES ||
+            st[2] != (uint32_t)(SH_TILES * SH_NK) || t == 0 || w >= t) {
+            if (gp_c1_bad < 8)
+                printf("[core1] BAD stats launch %d tile %d: off=%ld magic=%08x id=%d chunks=%u tot=%llu wait=%llu\n",
+                       it + 1, ti, gp_c1_off[ti], (unsigned)st[0], q, (unsigned)st[2], t, w);
+            gp_c1_bad++;
+            continue;
+        }
+        gp_c1_tile[q] = ti;
+        gp_c1_tot[it][q] = t;
+        gp_c1_win[it][q] = t - w;
+    }
+}
+static int gp_c1_cmp(const void *x, const void *y) {
+    const unsigned long long a = *(const unsigned long long *)x, b = *(const unsigned long long *)y;
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+// per core: median over launches 2 .. L of window and total; CORE1 = the worst core's util_core
+static void gp_c1_report(void) {
+    const int n = GP_LAUNCHES - 1;
+    const double work = (double)GP_M * GP_N * GP_K / GP_C1_CORES, peak = (double)(GP_PEAK);
+    double worst = 1e30;
+    int wq = 0;
+    unsigned long long wwin = 0, wtot = 0;
+    for (int q = 0; q < GP_C1_CORES; q++) {
+        unsigned long long sw[GP_LAUNCHES], stt[GP_LAUNCHES];
+        for (int l = 0; l < n; l++) {
+            sw[l] = gp_c1_win[l + 1][q];
+            stt[l] = gp_c1_tot[l + 1][q];
+        }
+        qsort(sw, n, sizeof(sw[0]), gp_c1_cmp);
+        qsort(stt, n, sizeof(stt[0]), gp_c1_cmp);
+        const double u = sw[n / 2] ? work / ((double)sw[n / 2] * peak) : 0.0;
+        printf("[core1] core(%d,%d) median of launches 2..%d: window %llu cyc total %llu cyc -> util_core %.2f%%\n",
+               q / GP_HW_COLS, q % GP_HW_COLS, GP_LAUNCHES, sw[n / 2], stt[n / 2], 100.0 * u);
+        if (u < worst) {
+            worst = u;
+            wq = q;
+            wwin = sw[n / 2];
+            wtot = stt[n / 2];
+        }
+    }
+    for (int rep = 0; rep < 2; rep++) { // twice: the PLM console can swallow a line
+        printf("CORE1 impl=aiehlc board=%s dtype=%s basis=%s:%.2f:%s util_core=%.2f%% worst=(%d,%d) "
+               "(worst of 16 cores = (%d,%d)) worst_tile=(%d,%d) window_cyc=%llu total_cyc=%llu work=%.0f launches=%d tile=tm%d_tn%d kc=%d "
+               "stats_bad=%d\n",
+               GP_C1_STR(GP_BOARD), gpref_dtype(GP_REF_DTYPE), gpref_dtype(GP_REF_DTYPE), peak,
+               GP_DTYPE == 1 ? "maxwell/tasks/gemm90/peak_int8.json" : "maxwell/tasks/gemm90/peak.json",
+               100.0 * worst, wq / GP_HW_COLS, wq % GP_HW_COLS, wq / GP_HW_COLS, wq % GP_HW_COLS,
+               GP_C1_COL0 + gp_c1_tile[wq] % GP_HW_COLS, GP_C1_ROW0 + gp_c1_tile[wq] / GP_HW_COLS, wwin, wtot, work,
+               GP_LAUNCHES, KA_TM, KA_TN, KA_KC, gp_c1_bad);
+        fflush(stdout);
+    }
+}
+#endif
+
 int main() {
     const long M = GP_M, N = GP_N, K = GP_K;
     const int launches = GP_LAUNCHES;
@@ -610,11 +787,17 @@ int main() {
             memset(Ct, 0xA5, cbytes);
             __Runtime_buffer_device_written(Ct, cbytes);
         }
+#if GP_CORE1
+        gp_c1_arm(it);
+#endif
         XTime t0, t1;
         XTime_GetTime(&t0);
         gemm_ka_run(A2, B2, Ct);
         XTime_GetTime(&t1);
         lms[it] = gp_ms(t0, t1);
+#if GP_CORE1
+        gp_c1_collect(it);
+#endif
         if (it == 0) { // the array is up and clocked: measure its clock
             aie_clk = gp_aie_clock();
             printf("GPLAN where=%s dtype=%s shape=%ldx%ldx%ld aie_mhz=%.1f clk_src=%s\n", "board", dts, M, N, K, aie_clk,
@@ -647,6 +830,9 @@ int main() {
     if (r.bad)
         printf("MISMATCH first C[%ld][%ld]: got %d want %d (rule %s)\n", r.first_bad_i, r.first_bad_j, (int)r.first_got,
                (int)r.first_want, gpref_rule(GP_REF_DTYPE));
+#if GP_CORE1
+    gp_c1_report();
+#endif
     printf("GOLDEN %s shape=%ldx%ldx%ld dtype=%s launch=%d checked=%ld bad=%ld in_crc=%08x ref_crc=%08x out_crc=%08x\n", r.pass ? "PASS" : "FAIL", M, N, K, dts, launches, r.checked, r.bad, (unsigned)in_crc, (unsigned)r.ref_crc, (unsigned)out_crc);
     return r.pass ? 0 : 1;
 }
