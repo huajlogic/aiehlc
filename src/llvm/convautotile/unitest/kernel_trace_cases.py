@@ -409,7 +409,7 @@ GEMMPLAN_T_CASES = [
      "PASS:c (OFM, gather, 32x2 blocks/core): d1[12288]=rows/4@3072+i32x96@96 d2[768]=cols/4@192+j2x96@96"),
 ]
 
-# M3.3.6.2.1.2.4.1 PV: x86 numerics of the fix96_inner chunk kernels (gemm_plan_tile.h GT_CHUNK_P / GT_CHUNK_P2) against
+# M3.3.6.2.1.2.4.1 PV: x86 numerics of the fix96_inner chunk kernels (gemm_plan_tile.h GT_CHUNK_P / _P2 / _K) against
 # GT_CHUNK and a scalar int32 reference, on the aie_api_x86emu.h emulation (96 x 96 tile, 4 chunks of KC 32 / 8).
 GT_NUM_BASE = CCODE / "gemm_plan" / "gemm_plan_tile.h"
 GT_NUM_SRC = r"""
@@ -419,8 +419,8 @@ typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
 #define NK 4
 #define NB (KA_TM / 8)
 alignas(64) static int8_t A[NK][KA_TM * KA_KC], B[NK][KA_TN * KA_KC];
-alignas(64) static int32_t accG[NB][8 * KA_TN], accP[NB][8 * KA_TN], accD[NB][8 * KA_TN];
-alignas(64) static int8_t yG[KA_TM * KA_TN], yP[KA_TM * KA_TN], yD[KA_TM * KA_TN];
+alignas(64) static int32_t accG[NB][8 * KA_TN], accP[NB][8 * KA_TN], accD[NB][8 * KA_TN], accK[NB][8 * KA_TN], accE[NB][8 * KA_TN];
+alignas(64) static int8_t yG[KA_TM * KA_TN], yP[KA_TM * KA_TN], yD[KA_TM * KA_TN], yK[KA_TM * KA_TN], yE[KA_TM * KA_TN];
 static int32_t ref[KA_TM][KA_TN];
 static int opA(int k, int m, int kk) { /* row m, k index kk (within chunk k) in GT_OP order */
     const int r = m / 8, kb = kk / 8, T = KA_TM;
@@ -445,8 +445,8 @@ int main() {
                 for (int kk = 0; kk < KA_KC; kk++) t += opA(k, m, kk) * opB(k, n, kk);
             ref[m][n] = t;
         }
-    int32_t *fG[NB], *fP[NB], *fD[NB];
-    for (int i = 0; i < NB; i++) fG[i] = accG[i], fP[i] = accP[i], fD[i] = accD[i];
+    int32_t *fG[NB], *fP[NB], *fD[NB], *fK[NB], *fE[NB];
+    for (int i = 0; i < NB; i++) fG[i] = accG[i], fP[i] = accP[i], fD[i] = accD[i], fK[i] = accK[i], fE[i] = accE[i];
     long bad_i32 = 0, bad_y = 0;
     for (int pass = 0; pass < 2; pass++) { /* pass 0: int32 partial sums (no last chunk); pass 1: int8 out */
         for (int k = 0; k < NK; k++) {
@@ -456,11 +456,17 @@ int main() {
             if (k == 0) { GT_CHUNK_P(fP, yP, 0, a0, a1, b0, b1, 1, 0, 0, NB) }
             else if (last) { GT_CHUNK_P(fP, yP, 0, a0, a1, b0, b1, 0, 1, 0, NB) }
             else { GT_CHUNK_P(fP, yP, 0, a0, a1, b0, b1, 0, 0, 0, NB) }
+            if (k == 0) GT_CHUNK_K(fK, yK, 0, a0, a1, b0, b1, a0, a1, b0, b1, 1, 0, 0, NB, 1)
+            else if (last) GT_CHUNK_K(fK, yK, 0, a0, a1, b0, b1, a0, a1, b0, b1, 0, 1, 0, NB, 1)
+            else GT_CHUNK_K(fK, yK, 0, a0, a1, b0, b1, a0, a1, b0, b1, 0, 0, 0, NB, 1)
             if (k % 2 == 1) {
                 const int8_t *q0 = A[k - 1], *q1 = A[k - 1] + KA_TM / 2 * KA_KC, *r0 = B[k - 1], *r1 = B[k - 1] + KA_TN / 2 * KA_KC;
                 if (k == 1) { GT_CHUNK_P2(fD, yD, 0, q0, q1, r0, r1, a0, a1, b0, b1, 1, 0, 0, NB, 2) }
                 else if (last) { GT_CHUNK_P2(fD, yD, 0, q0, q1, r0, r1, a0, a1, b0, b1, 0, 1, 0, NB, 2) }
                 else { GT_CHUNK_P2(fD, yD, 0, q0, q1, r0, r1, a0, a1, b0, b1, 0, 0, 0, NB, 2) }
+                if (k == 1) GT_CHUNK_K(fE, yE, 0, q0, q1, r0, r1, a0, a1, b0, b1, 1, 0, 0, NB, 2)
+                else if (last) GT_CHUNK_K(fE, yE, 0, q0, q1, r0, r1, a0, a1, b0, b1, 0, 1, 0, NB, 2)
+                else GT_CHUNK_K(fE, yE, 0, q0, q1, r0, r1, a0, a1, b0, b1, 0, 0, 0, NB, 2)
             }
         }
         if (pass == 0)
@@ -468,18 +474,19 @@ int main() {
                 for (int n = 0; n < KA_TN; n++) {
                     const int idx = (n / 8) * 64 + (m % 8) * 8 + n % 8;
                     const int32_t g = accG[m / 8][idx], p = accP[m / 8][idx], d = accD[m / 8][idx];
-                    bad_i32 += (g != ref[m][n]) + (p != ref[m][n]) + (d != ref[m][n]);
+                    const int32_t kk = accK[m / 8][idx], e = accE[m / 8][idx];
+                    bad_i32 += (g != ref[m][n]) + (p != ref[m][n]) + (d != ref[m][n]) + (kk != ref[m][n]) + (e != ref[m][n]);
                 }
     }
-    for (int i = 0; i < KA_TM * KA_TN; i++) bad_y += (yP[i] != yG[i]) + (yD[i] != yG[i]);
+    for (int i = 0; i < KA_TM * KA_TN; i++) bad_y += (yP[i] != yG[i]) + (yD[i] != yG[i]) + (yK[i] != yG[i]) + (yE[i] != yG[i]);
     std::printf("GTNUM tile=%dx%d kc=%d chunks=%d bad_i32=%ld bad_y=%ld\n", KA_TM, KA_TN, KA_KC, NK, bad_i32, bad_y);
     return bad_i32 || bad_y;
 }
 """
 GT_NUM_CASES = [
-    ("gt_chunk_p numerics 96x96 kc32: GT_CHUNK_P / GT_CHUNK_P2 == GT_CHUNK == scalar int32 (x86 emu)",
+    ("gt_chunk_p numerics 96x96 kc32: GT_CHUNK_P / _P2 / _K (ns 1, 2) == GT_CHUNK == scalar int32 (x86 emu)",
      [("96", "96"), ("32", "32")], "PASS:GTNUM tile=96x96 kc=32 chunks=4 bad_i32=0 bad_y=0"),
-    ("gt_chunk_p numerics 96x64 kc64: GT_CHUNK_P / GT_CHUNK_P2 == GT_CHUNK == scalar int32 (x86 emu)",
+    ("gt_chunk_p numerics 96x64 kc64: GT_CHUNK_P / _P2 / _K (ns 1, 2) == GT_CHUNK == scalar int32 (x86 emu)",
      [("96", "64"), ("64", "64")], "PASS:GTNUM tile=96x64 kc=64 chunks=4 bad_i32=0 bad_y=0"),
 ]
 

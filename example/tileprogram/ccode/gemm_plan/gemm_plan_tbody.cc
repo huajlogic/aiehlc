@@ -69,7 +69,8 @@
 #endif
 // GP_GT: the generic int8 tile's chunk kernel: 0 GT_CHUNK (one loop nest, first / last tested in it), 1 GT_CHUNK_P
 // (one specialisation per chunk kind, k blocks flattened, pair columns software-pipelined), 2 GT_CHUNK_P2 over two
-// chunks per accumulator reload (both input slots held; SH_NK even)
+// chunks per accumulator reload (both input slots held; SH_NK even), 3 GT_CHUNK_K (two accumulator sets, the
+// partial-sum round trip of one block overlaps the VMACs of the other), 4 GT_CHUNK_K over two chunks per reload
 #ifndef GP_GT
 #define GP_GT 0
 #endif
@@ -194,7 +195,9 @@ static_assert(!(GP_TM == 64 && GP_TN == 64 && GP_KC == 128),
 #endif
 static_assert(GP_TM % 16 == 0 && GP_TN % 16 == 0, "GP_TM / GP_TN: whole 16-row accumulator pairs");
 static_assert(GP_KC % 8 == 0 && GP_KCE % 8 == 0, "GP_KC: whole 8-deep k blocks");
-static_assert(GP_GT >= 0 && GP_GT <= 2 && (GP_GT != 2 || (GP_K / GP_KCE) % 2 == 0), "GP_GT: 0, 1 or 2 (2: an even number of K chunks)");
+static_assert(GP_GT >= 0 && GP_GT <= 4 && ((GP_GT != 2 && GP_GT != 4) || (GP_K / GP_KCE) % 2 == 0),
+              "GP_GT: 0 .. 4 (2 / 4: an even number of K chunks)");
+static_assert(GP_GT < 3 || (GP_TM / 16 * (GP_TN / 16)) % 2 == 0, "GP_GT 3 / 4: an even number of accumulator pairs per tile");
 static_assert(GP_C_DEPTH == 1 || GP_C_DEPTH == 2, "GP_C_DEPTH: 1 (one output buffer) or 2 (ping-pong)");
 static_assert(GP_C_DEPTH == 2 || (GP_DTYPE == 1 && !(KA_TM == 64 && KA_TN == 64 && KA_KC == 128)),
               "GP_C_DEPTH 1: the generic int8 tile kernel only (GT_CHUNK)");
@@ -387,7 +390,7 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
             const int8_t *a0p = GT_PART(xa, 0, KA_TM), *a1p = GT_PART(xa, 1, KA_TM);
             const int8_t *b0p = GT_PART(xb, 0, KA_TN), *b1p = GT_PART(xb, 1, KA_TN);
             GP_C1_ACQ(b1p);
-#if GP_GT == 2
+#if GP_GT == 2 || GP_GT == 4
             // two chunks (both input slots) per accumulator reload: chunk k + 1 is acquired before chunk k is released
             k++;
             auto xa2 = aie::load_buffer(a, {arow, k * KA_KC}, {KA_TM, KA_KC}, OPTS_A);
@@ -409,7 +412,11 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
 #if GP_GT == 0
                 GT_CHUNK(accp, y, m0, a0p, a1p, b0p, b1p, k == 0, k == SH_NK - 1, m0, m1);
 #else
-#if GP_GT == 2
+#if GP_GT == 4
+#define GT_CALL(fi, la) GT_CHUNK_K(accp, y, m0, a0p, a1p, b0p, b1p, a0q, a1q, b0q, b1q, fi, la, m0, m1, 2)
+#elif GP_GT == 3
+#define GT_CALL(fi, la) GT_CHUNK_K(accp, y, m0, a0p, a1p, b0p, b1p, a0p, a1p, b0p, b1p, fi, la, m0, m1, 1)
+#elif GP_GT == 2
 #define GT_CALL(fi, la) GT_CHUNK_P2(accp, y, m0, a0p, a1p, b0p, b1p, a0q, a1q, b0q, b1q, fi, la, m0, m1, 2)
 #else
 #define GT_CALL(fi, la) GT_CHUNK_P(accp, y, m0, a0p, a1p, b0p, b1p, fi, la, m0, m1)
@@ -430,7 +437,7 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
 #undef GT_FIRST_K
             aie::release(a);
             aie::release(b);
-#if GP_GT == 2
+#if GP_GT == 2 || GP_GT == 4
             aie::release(a);
             aie::release(b);
 #endif
