@@ -220,6 +220,7 @@ static_assert(GP_DM_USED <= GP_DM_BYTES, "core DM (64 KiB): fixed + partial sums
 
 // AIEHLC_KERNEL_PROLOGUE_BEGIN
 #include "gemm_plan_tile.h"
+#include "gemm_plan_gt.h"
 // AIEHLC_KERNEL_PROLOGUE_END
 
 // One body for the core and for the compiler's x86 trace: every operand block comes from

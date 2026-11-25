@@ -409,12 +409,13 @@ GEMMPLAN_T_CASES = [
      "PASS:c (OFM, gather, 32x2 blocks/core): d1[12288]=rows/4@3072+i32x96@96 d2[768]=cols/4@192+j2x96@96"),
 ]
 
-# M3.3.6.2.1.2.4.1 PV: x86 numerics of the fix96_inner chunk kernels (gemm_plan_tile.h GT_CHUNK_P / _P2 / _K) against
+# M3.3.6.2.1.2.4.1 PV: x86 numerics of the fix96_inner chunk kernels (gemm_plan_gt.h GT_CHUNK_P / _P2 / _K) against
 # GT_CHUNK and a scalar int32 reference, on the aie_api_x86emu.h emulation (96 x 96 tile, 4 chunks of KC 32 / 8).
 GT_NUM_BASE = CCODE / "gemm_plan" / "gemm_plan_tile.h"
 GT_NUM_SRC = r"""
 #include AIEHLC_EMU_HEADER
 #include "gemm_plan_tile.h"
+#include "gemm_plan_gt.h"
 typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
 #define NK 4
 #define NB (KA_TM / 8)
@@ -497,6 +498,8 @@ def run_gt_num(edits, expect):
     kc = edits[1][0]
     with tempfile.TemporaryDirectory() as tmp:
         shutil.copy(GT_NUM_BASE, tmp)
+        if (GT_NUM_BASE.parent / "gemm_plan_gt.h").exists():
+            shutil.copy(GT_NUM_BASE.parent / "gemm_plan_gt.h", tmp)
         src = pathlib.Path(tmp) / "gtnum.cc"
         src.write_text(f"#define KA_TM {tm}\n#define KA_TN {tn}\n#define KA_KC {kc}\n" + GT_NUM_SRC)
         emu = REPO / "src" / "mlir" / "runtime" / "aie_api_x86emu.h"
