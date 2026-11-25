@@ -125,14 +125,17 @@ template<> struct GenTraits<2>
 
     static const std::map<TileType, std::vector<PortTemplate>>& defaultPortTemplates() {
         static const std::map<TileType, std::vector<PortTemplate>> templates = {
+            // core: masters N 6 / S 4, slaves S 6 / N 4 (xaiemlgbl_reginit.c AieMlTileStrmMstr / Slv) -- a
+            // core's SOUTH slaves pair with the MemTile's 6 NORTH masters (was 4 / 4: a column's dataflow-plan
+            // streams up from the MemTiles found no free lane past four)
             {TileType::Core,
-             {{PortDirection::North, PortRole::Master, 4},
+             {{PortDirection::North, PortRole::Master, 6},
               {PortDirection::South, PortRole::Master, 4},
               {PortDirection::East, PortRole::Master, 4},
               {PortDirection::West, PortRole::Master, 4},
               {PortDirection::DMA, PortRole::Master, 4},
               {PortDirection::North, PortRole::Slave, 4},
-              {PortDirection::South, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 6},
               {PortDirection::East, PortRole::Slave, 4},
               {PortDirection::West, PortRole::Slave, 4},
               {PortDirection::DMA, PortRole::Slave, 4}}},

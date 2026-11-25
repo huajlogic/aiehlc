@@ -10,6 +10,7 @@
 // byte-identical to the original; all cross-boundary locals are carried in
 // FlowLoweringCtx (`c`).
 
+#include "dataflowplan/plantarget.h"
 #include "flowtransfer_internal.h"
 
 namespace blueprint_sched {
@@ -317,7 +318,7 @@ void FlowTransferConversion::applyKernelBlockShim(FlowLoweringCtx &c) const {
     // The round loop re-programmed the shim BD over MMIO and waited every round.
     {
         const int64_t blk = c.perTileShimLen, R = c.kb.rounds, RJ = c.kb.roundsJ;
-        constexpr int64_t kWrapMax = 1024; // shim BD dim wrap (aie2ps)
+        const int64_t kWrapMax = dfplan::planTarget().shimBdMaxWrap; // shim BD dim wrap (10-bit field: 1023)
         const bool backToBack = (RJ == R && c.kb.strideJBytes == blk) || (RJ == 1 && c.kb.strideIBytes == blk) ||
                                 (RJ > 1 && RJ < R && c.kb.strideJBytes == blk && c.kb.strideIBytes == RJ * blk);
         // A block over kWrapMax words splits into f-word chunks (f | blockWords): 3 dims.
@@ -414,7 +415,7 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
             for (int64_t d : outInfo->kernelBlock.getShape())
                 kbBlockBytes *= d;
         }
-        constexpr int64_t kIterWrapMax = 64; // 6-bit BD iteration counter
+        const int64_t kIterWrapMax = dfplan::planTarget().bdMaxIterWrap; // the BD iteration counter
         if (kbRounds > 1 && kbRounds <= kIterWrapMax && kbRounds == c.ooNumIterations &&
             kbBlockBytes == c.perRoundBytes && kbBlockBytes % 64 == 0) {
             // the descriptor the rest of the gather reads (BD length, round loop), as the GEMM tile-major one
@@ -479,8 +480,8 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
             // d0_wrap = the whole slice (2,560 words > the 1,024 shim wrap max:
             // aie-rt rejects the BD and the gather hangs in wait_io). Step the
             // rounds along d0 and fold an over-long run into d0 x d1 (both
-            // wraps <= 1,024 words).
-            constexpr int64_t kShimWrapMax = 1024;
+            // wraps <= 1,023 words: the 10-bit wrap field, plantarget.h).
+            const int64_t kShimWrapMax = dfplan::planTarget().shimBdMaxWrap;
             if (rowsPerRound == 0 && perTileD1Rows == 1 && c.ooNumIterations > 1 && stride0 == 4 &&
                 wrap0 % c.ooNumIterations == 0) {
                 const int64_t roundWords = wrap0 / c.ooNumIterations;
@@ -992,7 +993,7 @@ void FlowTransferConversion::computeMultipleInputShimBd(FlowLoweringCtx &c, Mult
     // Every output armed once (#pragma output_tile_major): the M rounds need no host loop
     // either. One BD walks them with its iteration (step = the round stride, <= 64 rounds:
     // the aie2ps iteration wrap is 6 bits), started once per round; the core's locks pace it.
-    constexpr int64_t kIterWrapMax = 64;
+    const int64_t kIterWrapMax = dfplan::planTarget().bdMaxIterWrap;
     if (passState->outputTileMajor && kWalk3D && p.outerRounds > 1 && p.outerRounds <= kIterWrapMax && !p.halo2D &&
         p.loopIterWrap <= 1 && p.loopRepeat == 1 && p.loopLen == full) {
         p.oneBd = true;

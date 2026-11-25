@@ -14,14 +14,23 @@
 #define TILINGLINALG_DATAFLOWPLAN_TARGET_H
 
 #include <cstdint>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 namespace dfplan {
 
 struct PlanTarget {
     const char *name;
+    int resGen; // the runtime's resource-table generation (aie_runtime_resource.h rt_res_gen)
     // ---- the array (aie_device_map.h): columns, core rows
     int arrayCols, coreRows;
     int pktIds; // packet ids (5-bit field, 0 reserved); the router hands one to every packet-switched output core
+    // shim tiles with a DMA (NoC shims), absolute columns; empty = every column (hwresource.cpp's layouts)
+    std::vector<int> shimDmaCols;
+    bool shimHasDma(int absCol) const {
+        return shimDmaCols.empty() || std::find(shimDmaCols.begin(), shimDmaCols.end(), absCol) != shimDmaCols.end();
+    }
     // ---- resources per tile
     int coreLocks, coreBds, coreS2mmChannels;
     int memLocks, memBds, memChannels; // MemTile: per direction
@@ -53,45 +62,107 @@ struct PlanTarget {
     int memBankLo(int ch) const { return memBdBank * (ch & 1); }
 };
 
-// The device the plan targets (AIE2PS -- the only generation the dataflow plans support today).
-inline const PlanTarget &planTarget() {
-    static const PlanTarget t{
-        "aie2ps",
-        /*arrayCols*/ 36,
-        /*coreRows*/ 4,
-        /*pktIds*/ 31,
-        /*coreLocks*/ 16,
-        /*coreBds*/ 16,
-        /*coreS2mmChannels*/ 2,
-        /*memLocks*/ 64,
-        /*memBds*/ 48,
-        /*memChannels*/ 6,
-        /*memBdBank*/ 24,
-        /*shimBds*/ 16,
-        /*shimMm2sChannels*/ 2,
-        /*memOwnBase*/ 0x80000,
-        /*memBytes*/ 0x80000,
-        /*memLockBdBias*/ 64,
-        /*coreOwnView*/ 0x70000,
-        /*coreNorthView*/ 0x60000,
-        /*coreSouthView*/ 0x40000,
-        /*coreOwnLockBias*/ 48,
-        /*coreNorthLockBias*/ 32,
-        /*coreSouthLockBias*/ 0,
-        /*bdWordBytes*/ 4,
-        /*coreBdMaxWrap*/ 255,
-        /*memBdMaxWrap*/ 1023,
-        /*shimBdMaxWrap*/ 1023,
-        /*bdMaxIterWrap*/ 64,
-        /*coreBdMaxLenWords*/ 0x3FFF,
-        /*memBdMaxLenWords*/ 0x1FFFF,
-        /*coreDmBytes*/ 0x10000,
-        /*coreMinStack*/ 4096,
-        /*coreStaticReserve*/ 4096,
-        /*chMaxRepeat*/ 256,
-        /*chStartQueue*/ 4,
+// The devices a plan can target (xaie2psgbl_* / xaiemlgbl_* params and reginit, aie_device_map.h): AIE2PS
+// (--aie-version 5: VEK385, palmyra) and AIE-ML (--aie-version 2). Their DMA, lock and memory facts agree;
+// the array differs (36 x 4 vs 38 x 8 core rows). The pipeline selects one per build (selectPlanTarget,
+// from the build's AIE generation); aie2ps unless told otherwise.
+inline const PlanTarget *planTargets() {
+    static const PlanTarget t[] = {
+        {
+            "aie2ps",
+            /*resGen*/ 5,
+            /*arrayCols*/ 36,
+            /*coreRows*/ 4,
+            /*pktIds*/ 31,
+            /*shimDmaCols*/ {},
+            /*coreLocks*/ 16,
+            /*coreBds*/ 16,
+            /*coreS2mmChannels*/ 2,
+            /*memLocks*/ 64,
+            /*memBds*/ 48,
+            /*memChannels*/ 6,
+            /*memBdBank*/ 24,
+            /*shimBds*/ 16,
+            /*shimMm2sChannels*/ 2,
+            /*memOwnBase*/ 0x80000,
+            /*memBytes*/ 0x80000,
+            /*memLockBdBias*/ 64,
+            /*coreOwnView*/ 0x70000,
+            /*coreNorthView*/ 0x60000,
+            /*coreSouthView*/ 0x40000,
+            /*coreOwnLockBias*/ 48,
+            /*coreNorthLockBias*/ 32,
+            /*coreSouthLockBias*/ 0,
+            /*bdWordBytes*/ 4,
+            /*coreBdMaxWrap*/ 255,
+            /*memBdMaxWrap*/ 1023,
+            /*shimBdMaxWrap*/ 1023,
+            /*bdMaxIterWrap*/ 64,
+            /*coreBdMaxLenWords*/ 0x3FFF,
+            /*memBdMaxLenWords*/ 0x1FFFF,
+            /*coreDmBytes*/ 0x10000,
+            /*coreMinStack*/ 4096,
+            /*coreStaticReserve*/ 4096,
+            /*chMaxRepeat*/ 256,
+            /*chStartQueue*/ 4,
+        },
+        {
+            "aie2",
+            /*resGen*/ 2,
+            /*arrayCols*/ 38,
+            /*coreRows*/ 8,
+            /*pktIds*/ 31,
+            /*shimDmaCols*/ {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35},
+            /*coreLocks*/ 16,
+            /*coreBds*/ 16,
+            /*coreS2mmChannels*/ 2,
+            /*memLocks*/ 64,
+            /*memBds*/ 48,
+            /*memChannels*/ 6,
+            /*memBdBank*/ 24,
+            /*shimBds*/ 16,
+            /*shimMm2sChannels*/ 2,
+            /*memOwnBase*/ 0x80000,
+            /*memBytes*/ 0x80000,
+            /*memLockBdBias*/ 64,
+            /*coreOwnView*/ 0x70000,
+            /*coreNorthView*/ 0x60000,
+            /*coreSouthView*/ 0x40000,
+            /*coreOwnLockBias*/ 48,
+            /*coreNorthLockBias*/ 32,
+            /*coreSouthLockBias*/ 0,
+            /*bdWordBytes*/ 4,
+            /*coreBdMaxWrap*/ 255,
+            /*memBdMaxWrap*/ 1023,
+            /*shimBdMaxWrap*/ 1023,
+            /*bdMaxIterWrap*/ 64,
+            /*coreBdMaxLenWords*/ 0x3FFF,
+            /*memBdMaxLenWords*/ 0x1FFFF,
+            /*coreDmBytes*/ 0x10000,
+            /*coreMinStack*/ 4096,
+            /*coreStaticReserve*/ 4096,
+            /*chMaxRepeat*/ 256,
+            /*chStartQueue*/ 4,
+        },
     };
     return t;
+}
+inline int &planTargetIndex() {
+    static int i = 0;
+    return i;
+}
+// "aie2ps" / "aie2"; false (target unchanged) for an unknown name
+inline bool selectPlanTarget(const char *name) {
+    for (int i = 0; i < 2; i++)
+        if (std::string(planTargets()[i].name) == name)
+            return (planTargetIndex() = i), true;
+    return false;
+}
+inline const PlanTarget &planTarget() { return planTargets()[planTargetIndex()]; }
+// the partition's first absolute column (plan columns are partition-relative): set by the pipeline
+inline int &planPartitionStartCol() {
+    static int c = 0;
+    return c;
 }
 
 } // namespace dfplan

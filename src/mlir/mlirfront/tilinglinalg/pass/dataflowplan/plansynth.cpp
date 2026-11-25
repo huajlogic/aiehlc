@@ -44,6 +44,8 @@
 
 #include <functional>
 #include <map>
+#include <regex>
+#include <set>
 #include <sstream>
 
 namespace dfplan {
@@ -693,6 +695,27 @@ bool synthesizeDataflowPlan(ModuleOp module, std::string &why) {
         return false;
     }
     std::string text = "module {\n" + os.str() + "}\n";
+    // every shim route must leave from a shim tile with a DMA (AIE-ML: only its NoC shim columns)
+    {
+        std::regex shimRoute("src = \\[([0-9]+), 0, [0-9]+\\], src_kind = \"shim\"");
+        std::set<int> bad;
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), shimRoute); it != std::sregex_iterator(); ++it) {
+            const int abs = std::stoi((*it)[1].str()) + planPartitionStartCol();
+            if (!planTarget().shimHasDma(abs))
+                bad.insert(abs);
+        }
+        if (!bad.empty()) {
+            std::string cols;
+            for (int c : bad)
+                cols += (cols.empty() ? "" : ", ") + std::to_string(c);
+            why = std::string("the plan streams from the shims of columns ") + cols + ", which have no DMA on " +
+                  planTarget().name + " (it has one on columns ";
+            for (size_t k = 0; k < planTarget().shimDmaCols.size(); k++)
+                why += (k ? ", " : "") + std::to_string(planTarget().shimDmaCols[k]);
+            why += "): this layout needs a shim DMA in every mesh column";
+            return false;
+        }
+    }
     OwningOpRef<ModuleOp> parsed = parseSourceString<ModuleOp>(text, module.getContext());
     if (!parsed) {
         why = "synthesized plan does not parse";

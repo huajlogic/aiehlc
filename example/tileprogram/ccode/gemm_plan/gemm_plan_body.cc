@@ -42,6 +42,9 @@
 #ifndef GP_HW_COLS
 #define GP_HW_COLS 4
 #endif
+#ifndef GP_PART_START
+#define GP_PART_START 2 /* the partition's first column: the control-packet column, the mesh right of it */
+#endif
 #include "simplegemm_peak.h"
 
 // Element bytes (int8 1, bf16 2). Ports and chunks are in BYTES: a chunk is KA_TM rows x KA_KC bytes for
@@ -300,7 +303,7 @@ static void gemm_ka_run(int8_t *A, int8_t *B, int8_t *C) {
     aieSetDevice(0);
     aieArray device;
     // the control-packet column + the mesh's columns
-    aieMesh mesh = device.partition({2, 2 + GP_HW_COLS, 0, 6}, GP_HW_ROWS, GP_HW_COLS);
+    aieMesh mesh = device.partition({GP_PART_START, GP_PART_START + GP_HW_COLS, 0, 6}, GP_HW_ROWS, GP_HW_COLS);
     gemm_ka<<<mesh>>>(A, B, C);
 }
 

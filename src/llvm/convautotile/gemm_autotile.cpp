@@ -73,7 +73,7 @@ std::vector<Choice> rankTilings(const Shape &s, const Board &b, std::string &why
     const long nk = kBytes / kChunkBytes;
     // the output gathers every core's tiles as packets: one packet id per core, from the ids the control
     // plane does not reserve (aie_runtime_resource.c)
-    const int pktFree = T.pktIds - __builtin_popcount(__Runtime_res_reserved_pktid_mask(RT_RES_GEN5) & ~1u);
+    const int pktFree = T.pktIds - __builtin_popcount(__Runtime_res_reserved_pktid_mask((rt_res_gen)T.resGen) & ~1u);
     const double cyc = s.elemBytes == 1 ? kCycChunkInt8 : kCycChunkBf16, macPerCyc = s.elemBytes == 1 ? 512 : 256;
     for (int rows = 2; rows <= T.coreRows; rows += 2) {
         const int strips = rows / 2;

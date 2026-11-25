@@ -4,6 +4,7 @@
  ******************************************************************************/
 #include "tilinglinalg_pipeline.h"
 #include "dataflowplan/dataflowplan.h"
+#include "dataflowplan/plantarget.h"
 #include "../../../../llvm/convautotile/block_io_names.h"
 
 #include "dmaptodmaphop.h"
@@ -1001,6 +1002,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
     bool reserveControlPlane = controlPlanAttr && controlPlanAttr.getInt() != 0;
     rt_res_gen resourceGen = __Runtime_res_gen_from_name(aieGen.c_str());
+    // the dataflow plan's device facts (and the flow-transfer helpers' DMA limits) for this generation
+    dfplan::selectPlanTarget(resourceGen == RT_RES_GEN5 ? "aie2ps" : "aie2");
+    dfplan::planPartitionStartCol() = partStartCol >= 0 ? partStartCol : 0;
 
     ControlShimPlacement ctrlPlacement;
     int dataStartCol = relStartCol;

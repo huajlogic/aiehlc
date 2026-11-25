@@ -208,10 +208,32 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 ## Stage 6: device table and measurement hygiene (L8, L10)
 
-- [ ] `kWrapMax` and every remaining device literal in the flow-transfer helpers read `plantarget.h`.
-- [ ] An aie2p entry in the device table; a plan build for an aie2p target compiles. Evidence:
-- [ ] A script that extracts the MAC inner loop from `kernel.lst` and compares its instruction
-      sequence between two builds; used in place of bundle counts. Evidence:
+- [x] `kWrapMax` and every remaining device literal in the flow-transfer helpers read `plantarget.h`.
+      Evidence: `flowtransfer_host.cpp` kWrapMax / kShimWrapMax -> `shimBdMaxWrap` (1023: the old 1024 was
+      one past the 10-bit field, which the driver writes as is), kIterWrapMax x 2 and `flowtransfer_common.cpp`
+      kIterMax -> `bdMaxIterWrap`; the pipeline selects the table per build. Builds after it: simplematmul2,
+      conv2dstem host.cc / kernel.cc / routing.cc identical to 3ff40966; gemm_plan, eltwise plan, conv plan
+      kernel.cc / routing.cc / aiehlc_plan.h identical to stage 5. (Not device facts, left as they are:
+      `kOffloadCoreRowMin`, the first row that can be a core, and `kKernelBdsPerWindow`, ping-pong.)
+- [x] An aie2 entry in the device table; a plan build for an aie2 target compiles. (Changed 2026-11-25 at the
+      user's request: aie2 instead of aie2p, which aiehlc does not target -- `--aie-version` is 2 (AIE-ML) or 5.)
+      Evidence: `plantarget.h` targets `aie2ps` / `aie2`, selected per build; its AIE-ML facts from
+      xaiemlgbl_params / reginit (BD fields, repeat, start queue, locks) and the array (38 x 8, shim DMA on the
+      NoC columns only). `--aie-version 2` on `gemm_plan_aie2.cc` (4 x 2 on NoC columns 2, 3): rc 0,
+      `[DataflowPlan] resources (aie2): core BDs 0 2 (x2), ...`, `Compilation finished successfully`, `flowcheck:
+      OK -- 20 flows, 6 replaced by the dataflow plan, 0 error(s)`, host ELF written. On the way: the 4 x 4 layout
+      is refused by name (`... shims of columns 4, 5, which have no DMA on aie2 ...`), and the router's AIE-ML
+      core ports were 4 / 4 where the hardware has 6 north masters / 6 south slaves (skill `aie2planbuild`).
+      Not run: no AIE-ML board in the farm. aie2ps gemm_plan.cc kernel.cc / routing.cc / aiehlc_plan.h unchanged.
+- [x] A script that extracts the MAC inner loop from `kernel.lst` and compares its instruction
+      sequence between two builds; used in place of bundle counts. Evidence: `script/perf/macloop.py`.
+      Two builds of gemm_plan.cc with byte-identical kernel.cc: `macloop: SAME -- every MAC block has the same
+      vector instruction sequence (1 block(s) schedule their scalar instructions differently)` -- the exact
+      sequence differs (a NOPX, one ADD moved), which is the rebuild noise a bundle count cannot tell from a
+      change; gemm_plan vs the conv kernel: `macloop: DIFFERENT -- 5 of 5 MAC block(s) changed, block count
+      5 -> 1`; the same kernel.cc compiled by chess 2026.1 and by 2026.2: `macloop: DIFFERENT -- 0 of 5 MAC
+      block(s) changed, block count 5 -> 7` (the newer compiler splits the loop differently). Used above:
+      stage 5's GEMM after the kernel-header change -> SAME.
 
 ## Log
 
@@ -222,4 +244,5 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 | 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | 57b2d949 |
 | 2026-11-24 | 3 | `--define` / `AIEHLC_DEFINES` reach every stage (macros injected into the source text); EXTRA_DEFS refused for a source macro; gemm_plan.cc + --define == the 4096 entry file (GOLDEN PASS, 3.138 ms) | 4c38e5e0 |
 | 2026-11-25 | 4 | `#pragma gemm_autotile`: mesh + A ring by a calibrated cost model, 8 shapes (int8 / bf16, N 512 / 768, K 1024..4096) GOLDEN PASS from one source, model within +-13 %; 32-core kernel load, packet-id limit as an error, channel start queue split | c0d9168b |
-| 2026-11-25 | 5 | per-core copies: `.share = broadcast` (row / column) and per-core streams; eltwise 0.365 ms (main: 57 ms, wrong) and kernel-only conv 0.098 ms (main 54.2 ms) GOLDEN PASS; GEMM unchanged | this commit |
+| 2026-11-25 | 5 | per-core copies: `.share = broadcast` (row / column) and per-core streams; eltwise 0.365 ms (main: 57 ms, wrong) and kernel-only conv 0.098 ms (main 54.2 ms) GOLDEN PASS; GEMM unchanged | d37fd2ef |
+| 2026-11-25 | 6 | device facts in the flow-transfer helpers from plantarget.h (shim wrap off-by-one fixed); aie2 (AIE-ML) target table, plan build compiles; MAC-loop comparison script `script/perf/macloop.py` | this commit |

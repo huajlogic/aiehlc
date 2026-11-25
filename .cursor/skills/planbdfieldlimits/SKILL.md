@@ -42,6 +42,12 @@ out of MemTile BDs: a bank (24 BDs) serves 3 channels, so 4 MM2S replays of ring
 chain cannot be placed (`MemTile (1, 1): out of DMA channels for B's replays`). Limits: `chMaxRepeat`,
 `chStartQueue`; a walk beyond 256 x 4 or not divisible is a build error.
 
+## 4. Dimension wrap: 10 bits on shim / MemTile BDs
+
+The driver writes a dimension's wrap as is (`DimDesc[i].Wrap`, mask `0x3FF`): 1023 is the largest, 1024
+becomes 0. `flowtransfer_host.cpp` allowed 1024 (`kWrapMax`, `kShimWrapMax`); it now reads
+`plantarget.h` `shimBdMaxWrap` (1023), as the plan does.
+
 ## Check
 
 `[DataflowPlan] stream ...` lines in the build log; grep host.cc for `iter_step_size=0` with

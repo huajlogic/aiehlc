@@ -326,6 +326,19 @@ operands on a 4-row mesh need 8 and the router refuses (`no free path`); a spati
 (the same kernel on the generated path: 57 ms and wrong), x per core + y per column 0.213 ms, conv 7x7 s2
 224 x 224 0.098 ms (54.2 ms on the generated path).
 
+### Device facts: one table per target
+
+`plantarget.h` holds every device fact the plan and the flow-transfer helpers use, per target: `aie2ps`
+(`--aie-version 5`: VEK385, palmyra) and `aie2` (AIE-ML, `--aie-version 2`), selected by the pipeline from the build's
+generation (`selectPlanTarget`). Their DMA, lock and memory facts agree; the array differs (36 x 4 vs 38 x 8
+core rows) and so do the shim tiles with a DMA: every column on aie2ps, only the NoC shim columns on AIE-ML
+(2, 3, 6, 7, 14, 15, ...). A plan whose shim streams leave from a column without one is refused by name
+(`the plan streams from the shims of columns 4, 5, which have no DMA on aie2 ...`). On AIE-ML the NoC columns
+come in pairs, so the control-packet plane (a column of its own with a shim DMA) does not fit next to them:
+`gemm_plan_aie2.cc` puts the 4 x 2 mesh on columns 2, 3 without the control plane, and builds (skill
+**aie2planbuild**; the router's AIE-ML core template needed the hardware's 6 NORTH masters / SOUTH slaves). The flow-transfer
+helpers' shim wrap (was 1024: one past the 10-bit field) and iteration limits read the same table.
+
 ### What else the compiler does with a plan
 
 | where | what |
