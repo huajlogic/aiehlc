@@ -1209,6 +1209,16 @@ analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr, Type 
                         llvm::errs() << "[KernelBlock] kernel window follows the kernel's blocks: " << kbu.blockElems
                                      << " elements x " << kbu.rounds << " round(s)\n";
                     }
+                    // gemm90 M3.3.2 bc5 (015dbd32): a kernel-only output store {.depth = 1} is ONE buffer (lockstep
+                    // with flowtransfer_kernel.cpp kbSingleOut: one self-chained core MM2S BD, EMPTY init 1).
+                    if (!paramInfo.isInput && kbu.check) {
+                        const routing::TensorRoutingInfo *ti =
+                            routing::lookupTensorRoutingInfo(tensorInfo, paramInfo.funcArgIndex);
+                        if (ti && ti->ppDepth && *ti->ppDepth == 1) {
+                            paramInfo.singleBuffer = true;
+                            llvm::errs() << "[KernelBlock] output window {.depth = 1}: one buffer\n";
+                        }
+                    }
                     if (failed(blueprint_sched::checkKernelBlock(
                             declareDataOp, kbu, paramInfo.bufferSize * defaultVectorWidth, paramInfo.numRounds,
                             paramInfo.isInput ? "input" : "output")))
@@ -1287,7 +1297,7 @@ analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr, Type 
     for (auto *p : outputParams) {
         p->windowName = "window_out_" + std::to_string(sortedOutputCount);
         p->bufferPingName = "buf_out_ping_" + std::to_string(sortedOutputCount);
-        p->bufferPongName = "buf_out_pong_" + std::to_string(sortedOutputCount);
+        p->bufferPongName = p->singleBuffer ? p->bufferPingName : "buf_out_pong_" + std::to_string(sortedOutputCount);
         p->acquireLockId = resourceMgr.allocateOutputAcquireLock();
         p->releaseLockId = resourceMgr.allocateOutputReleaseLock();
         p->acquireLockHwId = KernelResourceManager::toHardwareLockId(p->acquireLockId);
@@ -1297,7 +1307,8 @@ analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr, Type 
         // an input BD on the same tile. The host mirrors this numbering when it
         // reserves the ids it no longer emits (reserveOffloadedCoreBds).
         p->pingBdId = resourceMgr.allocateCoreWindowBdId();
-        p->pongBdId = resourceMgr.allocateCoreWindowBdId();
+        int32_t pongBd = resourceMgr.allocateCoreWindowBdId();
+        p->pongBdId = p->singleBuffer ? -1 : pongBd;
         sortedOutputCount++;
     }
 

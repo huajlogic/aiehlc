@@ -137,8 +137,9 @@ bool RoutingPort::rowContiguous() const {
 
 long RoutingPort::declaredBytes(int pp) const {
     // kernel.cc declares a ping AND a pong array for every window, except a
-    // single-buffered input the lowering follows (#routing.kernel_block).
-    const bool single = pp == 1 && !output && rowContiguous();
+    // single-buffered input the lowering follows (#routing.kernel_block) and
+    // an output store with {.depth = 1} (gemm90 M3.3.2 bc5).
+    const bool single = pp == 1 && (output ? opts.depth == 1 : rowContiguous());
     return blockBytes() * (single ? 1 : 2);
 }
 

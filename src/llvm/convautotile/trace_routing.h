@@ -69,14 +69,12 @@ struct RoutingPort {
     int rounds_i = 1, rounds_j = 1; // blocks per core = rounds_i * rounds_j
     BlockOpts opts;                 // the kernel's {.depth / .resident / .tile}
     // This port's core buffer count: .resident = 1, else .depth, else `dflt`.
-    // An output is always ping-pong: kernel.cc's output window alternates ping
-    // and pong whatever the depth (declaredBytes counts both), so a host BD
-    // for one buffer sends the first block only and the launch hangs in
-    // wait_io (simplegemm_opt0_baseline.cc). {.depth = 1} on a store is an
-    // analysis error (checkBlockOpts).
+    // An output is ping-pong unless the kernel asks for {.depth = 1} (gemm90 M3.3.2 bc5, 015dbd32): then ONE core
+    // buffer, the core acquires EMPTY before the first write and releases FULL at aie::commit, and one
+    // self-chained core MM2S BD drains it (flowtransfer_kernel.cpp emitCoreSingleBufferBd).
     int ppDepth(int dflt) const {
         if (output)
-            return 2;
+            return opts.depth == 1 ? 1 : 2;
         return opts.resident ? 1 : opts.depth > 0 ? opts.depth : dflt;
     }
     // Which mesh axes the port's blocks depend on (any dim).

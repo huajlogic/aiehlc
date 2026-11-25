@@ -274,6 +274,15 @@ LogicalResult emitCoreTileParams(FlowLoweringCtx &c, CoreTileCtx &t, const CoreT
         if (ti && ti->ppDepth && *ti->ppDepth >= 1)
             t.ppDepth = static_cast<int>(*ti->ppDepth);
     }
+    // gemm90 M3.3.2 bc5: a kernel-only output store with {.depth = 1} (#routing.kernel_block + pp_depth 1):
+    // ONE core buffer; its BD chains to itself and the locks (EMPTY init 1) pace every block.
+    if (!c.isInput && d.passState) {
+        const routing::TensorRoutingInfo *ti = routing::lookupTensorRoutingInfo(d.passState->tensorInfo, c.funcArgIdx);
+        if (ti && ti->kernelBlock && ti->ppDepth && *ti->ppDepth == 1) {
+            t.ppDepth = 1;
+            t.kbSingleOut = true;
+        }
+    }
     if (failed(computeCoreIterations(c, t, d)))
         return failure();
     if (c.kb.follow && c.isInput)
@@ -331,7 +340,7 @@ LogicalResult computeCoreIterations(FlowLoweringCtx &c, CoreTileCtx &t, const Co
     // the DMA fires exactly once. If the kernel needs multiple
     // rounds (numIterations > 1), the DMA cannot re-arm and the
     // kernel will deadlock on the second acquire_window call.
-    if (t.ppDepth == 1 && t.numIterations > 1 && !(c.kb.follow && c.isInput)) {
+    if (t.ppDepth == 1 && t.numIterations > 1 && !(c.kb.follow && c.isInput) && !t.kbSingleOut) {
         op.emitError("pp_depth=1 (single buffer) incompatible with "
                      "numIterations=")
             << t.numIterations << " (buffer_size=" << t.pingPongBufferSize

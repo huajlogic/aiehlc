@@ -409,6 +409,7 @@ struct CoreTileCtx {
     int64_t perCoreElements = 0;
     int64_t perCorePerKRound = 0;
     int ppDepth = 2;
+    bool kbSingleOut = false; // gemm90 M3.3.2: kernel-only output store {.depth = 1} (one self-chained core BD)
     int64_t pingPongBufferSize = 1;
     bool hostSpatialHaloPort = false;
     bool kSplitSlabPort = false;
