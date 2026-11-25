@@ -563,7 +563,7 @@ shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernel
 `plan_route` ops lowered in **DmaphopToRoutinghwPass** to ordinary routinghw ops (`passdmaphoptoroutinghw/planroutes.cpp`,
 router port model, around the generated routes + control plane) -- no text branch in routing.cc; `aiehlc_plan.h`
 (constants + the generated host `aiehlc_plan_arrange`, the DDR layout the shim BDs read).
-**Protocol + layout from the IR**: `plan_stream` carries `channels / slots / readers / parts / elem_bytes /
+**B staged by MemTile capacity**: held whole (`.keep`) when its column's strips fit, else a `memtile_ring` too (re-read from DDR per output tile; ring depth keeps every channel start <= 256, `plantarget.h` `chMaxRepeat`), so bf16 / large-K shapes build (`gemm_plan_4096x512x4096_{int8,bf16}.cc`; shape / dtype knobs `GP_M/N/K/DTYPE` in `gemm_plan_body.cc`). Work plan for generalizing: `doc/plan/dataflowplan_generalize.md`. **Protocol + layout from the IR**: `plan_stream` carries `channels / slots / readers / parts / elem_bytes /
 row_groups / strips`; any column count >= A strips (4 x 4 85.5 %, **4 x 2** `gemm_plan_4x2.cc` 86.5 %, both GOLDEN PASS).
 **Readback**: every plan op is tagged (`dfplan.tag`); `NN_DataflowPlanProgram.mlir` (the dfschedule program alone)
 edited and fed back with `AIEHLC_DFSCHEDULE_PLAN_IN` is lifted (ids, addresses, ring) and regenerated identically
@@ -1036,6 +1036,7 @@ Read the matching skill when the task fits:
 | GOLDEN FAIL with an identical match count every run and unchanged perf after changing BD dims; core BD wrap > 255 (8-bit field, MemTile / shim 10-bit) | bdwrapfieldwidth |
 | Persistent kernel (dataflow plan) passes launch 0 and hangs from launch 1 (`wait_io TIMEOUT` on the input shims), cores read `core_status=0 pc=0`; only on a non-16-core mesh | persistentkernelreload |
 | Dataflow plan with B `.stage = memtile` but no `.keep`: launch 0 passes, launch 1 hangs `wait_io TIMEOUT tile(c,0) ch=0 dir=1` on the B input shims (B MemTile locks `restored` though unbalanced) | planmemtilebperlaunch |
+| Dataflow-plan GEMM at a new shape hangs on the B input shims or GOLDEN FAILs ~96 % of outputs; B exactly 512 KiB per MemTile; shim BD `iter_step_size=0`; a channel started > 256 times | planbdfieldlimits |
 | A hand-written GemmSpace GEMM (simplematmul2) hangs in `wait_io TIMEOUT ... dir=1` / watchdog after a compiler update; `startio(..., 4)` became `(..., 1)`; `3D K BD is already the whole walk ... repeat 4 -> 1` | kwalkrepeatcollapse |
 | A launch slower after merging main with identical kernel / routing / DMA program: `__aie_launch` now invalidates every output (`__Runtime_sync_for_cpu`) -- allocate outputs uncached | postlaunchoutputinval |
 | A non-square mesh (4 x 2) places core groups on columns it does not have; `No free shim DMA slot` before a dataflow plan replaces the flows; a `#ifndef` / `#define` default missing in the trace harness or the kernel TU | nonsquaremeshplan |

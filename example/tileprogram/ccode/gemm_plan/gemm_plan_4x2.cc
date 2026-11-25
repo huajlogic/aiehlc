@@ -7,4 +7,5 @@
 // columns per strip, B replays per column as before, and the host lays A / B out with the generated
 // aiehlc_plan_arrange.
 #define GP_HW_COLS 2
+#define GP_N 256 // 2 x 8 strips on 2 columns: N = 2 x 2 x 64
 #include "gemm_plan.cc"

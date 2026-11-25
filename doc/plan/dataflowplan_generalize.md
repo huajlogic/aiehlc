@@ -72,12 +72,32 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 ## Stage 1: per-operand staging chosen by capacity; B streamed along K (L3, L4)
 
-- [ ] `plansynth` decides per operand: whole operand fits the MemTile budget -> `keep` (resident),
+- [x] `plansynth` decides per operand: whole operand fits the MemTile budget -> `keep` (resident),
       else `memtile_ring` streamed chunk by chunk along K. Roles are operand indices, not `"a"` / `"b"`.
-- [ ] The decision and the budget are printed (`[DataflowPlan] stream N: keep|ring, X B of Y B`).
-- [ ] int8 4096 x 512 x 4096 on VEK385: GOLDEN PASS + PERF. Evidence:
-- [ ] bf16 4096 x 512 x 4096 builds (no `exceed its 524288 B`). Evidence:
-- [ ] 7680 x 512 x 2560 int8: generated files unchanged, >= 85 % on VEK385. Evidence:
+      Evidence: B's staging by `memBytes` and by ONE BD's length (`memBdMaxLenWords`), ring depth by
+      `chMaxRepeat`; `role` is a label (the layout is `row_groups` / `strips`; `"a"` / `"b"` only give
+      their defaults); forced ring `gemm_plan_bring.cc` (7680 x 512 x 2560, B `memtile_ring 3`): `GOLDEN
+      PASS shape=7680x512x2560 dtype=int8 launch=8 checked=562176 bad=0` (VEK385).
+- [x] The decision and the budget are printed (`[DataflowPlan] stream N: keep|ring, X B of Y B`).
+      Evidence (int8 4096 build log): `[DataflowPlan] stream 1: held whole it needs 524288 B per MemTile
+      (524288 B left next to A's ring, one BD holds 524284 B): streamed as memtile_ring 2 (re-read from DDR
+      per output tile; keep ignored)` / `stream 0: memtile_ring 8, 131072 B per MemTile; stream 1:
+      memtile_ring 2, 65536 B per MemTile (of 524288)`.
+- [x] int8 4096 x 512 x 4096 on VEK385: GOLDEN PASS + PERF. Evidence: VEK385 `GOLDEN PASS
+      shape=4096x512x4096 dtype=int8 launch=101 checked=300032 bad=0 | PERF SUMMARY gemm_plan steady 3.136 ms
+      median (26.75 % of peak @ 1250 MHz)`; palmyra `GOLDEN PASS ... | PERF SUMMARY ... 9.203 ms median
+      (11.39 % of peak @ 1000 MHz)`. B is re-read from DDR for each of the 32 output tiles (64 MB per
+      launch against A's 16 MB): DDR traffic, not the cores, sets this number -- the tiling (stage 4)
+      is the lever. Found on the way: MemTile BD length 2^17 words truncates to 0, a shim BD iteration
+      step of 0 wraps to the largest step (skill `planbdfieldlimits`).
+- [x] bf16 4096 x 512 x 4096 builds (no `exceed its 524288 B`). Evidence: `[DataflowPlan] stream 1:
+      held whole it needs 1048576 B per MemTile ...: streamed as memtile_ring 4`, flowcheck OK; the kernel
+      link then ran out of core memory (`could not find free space ... in memory DMb`) -- stage 2.
+- [x] 7680 x 512 x 2560 int8: generated files unchanged, >= 85 % on VEK385. Evidence: `kernel.cc`,
+      `routing.cc`, `aiehlc_plan.h` byte-identical to the stage-0 build (`host.cc` differs only by the
+      generic body from bdca2fc1: shape knobs, GOLDEN via `gplan_ref.h`); VEK385 `GOLDEN PASS
+      shape=7680x512x2560 dtype=int8 launch=8 checked=562176 bad=0 | PERF SUMMARY gemm_plan steady 1.148 ms
+      median (85.62 % of peak @ 1250 MHz), best 1.147 ms (85.68 %)`; palmyra 2.613 ms (47.02 %).
 
 ## Stage 2: core data-memory budget owns the accumulator (L5)
 
@@ -123,4 +143,4 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 | date | stage | result | commit |
 |---|---|---|---|
-| 2026-11-24 | 0 | baseline re-measured (VEK385 85.5 % / 86.7 %, palmyra 87-89 % of its DDR bound); a plan-less GemmSpace GEMM (simplematmul2) hung on this branch -- fixed, files identical to 3ff40966 again (skill `kwalkrepeatcollapse`) | this commit |
+| 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | this commit |

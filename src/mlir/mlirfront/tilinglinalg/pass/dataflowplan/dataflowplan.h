@@ -32,6 +32,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OwningOpRef.h"
+#include <algorithm>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -135,7 +136,7 @@ struct PlanResources {
 // output tile (rounds tiles per core), hosted in one core's memory per (column, strip group).
 struct PlanStream {
     int arg = -1;
-    std::string role;              // "a": strips over mesh-row pairs; "b": strips over columns x 2
+    std::string role;              // a label ("a" / "b": the legacy row_groups / strips defaults)
     std::string stage;             // "memtile_ring" | "memtile"
     int ring = 0;                  // memtile_ring: FIFO buffers of 2 chunks
     bool residentLaunches = false; // loaded on the first launch only
@@ -155,7 +156,25 @@ struct PlanStream {
     std::vector<int> strips;
     int64_t chunkBytes() const { return (int64_t)chunkRows * chunkCols * elemBytes; }
     int buffers() const { return channels * slots; }
+    // rows of one tensor strip (the tensor split evenly over the strips the layout names)
+    int64_t stripRows() const {
+        int n = 0;
+        for (int x : strips)
+            n = std::max(n, x + 1);
+        return tensorRows / std::max(n, 1);
+    }
+    // strip group of the mesh row that hosts it: the g with hostRows[g] == meshRow, else -1
+    int groupOfHostRow(int meshRow) const {
+        for (size_t g = 0; g < hostRows.size(); g++)
+            if (hostRows[g] == meshRow)
+                return (int)g;
+        return -1;
+    }
 };
+
+// A ring stream whose strip is one chunk row tall (a GEMM B strip, one output column block): every
+// round (output tile) reads the same strip again -- held once in DDR, the shim BD re-reads it.
+inline bool repeatsPerRound(const PlanStream &s) { return s.rounds > 1 && s.stripRows() == s.chunkRows; }
 
 struct DataflowPlan {
     bool present = false;

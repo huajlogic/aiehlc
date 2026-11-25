@@ -221,13 +221,51 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
             sb.strips.push_back(c + C * k);
     }
     const int64_t ring = sa.ring, chunk = g.TM * g.KC * A.elemBytes;
-    const bool bLaunches = sb.keep;
     auto col = [&](int c) { return g.colLo + c; };
     auto row = [&](int pm) { return g.rowLo + pm; };
     if (g.memRows < 1)
         return fail("the partition has no MemTile row");
     // MemTile rows and shim MM2S channels: one per stream, in stream order from the top
     const int mtA = g.memRows, mtB = std::max(1, g.memRows - 1);
+    // B's staging, by MemTile capacity: held whole (memtile, `keep` across launches) when its column's
+    // strips fit next to what else that MemTile holds, else streamed chunk by chunk through a FIFO ring
+    // (memtile_ring), re-read from DDR for every output tile. An explicit stage = memtile_ring is kept.
+    {
+        const int perStripA = std::min(channels, C / SA), kA = channels / perStripA;
+        const int64_t aBytes = kA == 1 ? ring * 2 * chunk : ring * kA * chunk;
+        const int64_t bChunk = g.TN * g.KC * B.elemBytes, bWhole = (int64_t)sb.groups * NK * bChunk;
+        const int64_t room = T.memBytes - (mtA == mtB ? aBytes : 0);
+        const std::string want = dstr(B.df, "stage");
+        // held whole, the column's strips are ONE S2MM BD: its length field bounds it too
+        const bool bdFits = bWhole / T.bdWordBytes <= T.memBdMaxLenWords;
+        if (want == "memtile_ring" || bWhole > room || !bdFits) {
+            sb.stage = "memtile_ring";
+            // the shallowest ring (from .ring, default 2) whose MemTile channels start at most chMaxRepeat
+            // times and that divides the column's chunk stream (rounds x groups x K chunks)
+            const int64_t stream = R2 * (int64_t)sb.groups * NK, k = (int64_t)sb.groups * channels;
+            sb.ring = (int)dint(B.df, "ring", 2);
+            while (sb.ring < 64 && (stream % (sb.ring * k) || stream / (sb.ring * k) > T.chMaxRepeat))
+                sb.ring++;
+            const int64_t bRing = (int64_t)sb.ring * sb.groups * channels * bChunk;
+            if (bRing > room)
+                return fail("B's MemTile ring (" + std::to_string(sb.ring) + " x " + std::to_string(sb.groups) + " x " +
+                            std::to_string(channels) + " chunks = " + std::to_string(bRing) +
+                            " B) does not fit next to A's ring: " + std::to_string(room) + " B left");
+            if (want != "memtile_ring")
+                llvm::outs() << "[DataflowPlan] stream " << B.arg << ": held whole it needs " << bWhole
+                             << " B per MemTile (" << room << " B left next to A's ring, one BD holds "
+                             << T.memBdMaxLenWords * T.bdWordBytes << " B): streamed as memtile_ring " << sb.ring
+                             << " (re-read from DDR per output tile" << (sb.keep ? "; keep ignored" : "") << ")\n";
+            sb.keep = false;
+        }
+        llvm::outs() << "[DataflowPlan] stream " << A.arg << ": memtile_ring " << ring << ", " << aBytes
+                     << " B per MemTile; stream " << B.arg << ": " << sb.stage
+                     << (sb.stage == "memtile_ring" ? " " + std::to_string(sb.ring)
+                                                    : std::string(sb.keep ? " keep" : ""))
+                     << ", " << (sb.stage == "memtile_ring" ? (int64_t)sb.ring * sb.groups * channels * bChunk : bWhole)
+                     << " B per MemTile (of " << T.memBytes << ")\n";
+    }
+    const bool bLaunches = sb.keep, bRing = sb.stage == "memtile_ring";
     const int shimA = T.shimMm2sChannels - 1, shimB = std::max(0, T.shimMm2sChannels - 2);
     os << "dmaphop.plan {replace_args = [" << A.arg << ", " << B.arg << "], share_args = [" << A.arg << ", " << B.arg
        << "], persistent = " << (persistent ? "true" : "false") << ", bd_once = true}\n";
@@ -259,12 +297,14 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     // ---- B: per column its strips, one replay per (group, parity)
     for (int c = 0; c < C; c++) {
         MemtileChannels &mc = mtCh[mtB * 1000 + c];
-        const int s2mm = mc.pick(true, 1);
+        // a ring: one S2MM chain over every (group, parity) buffer, `ring` BDs per replay
+        const int replays = sb.groups * channels, perOut = bRing ? sb.ring : 1;
+        const int s2mm = mc.pick(true, bRing ? sb.ring * replays : 1);
         os << "dmaphop.plan_route {arg = " << B.arg << ", src = [" << col(c) << ", 0, " << shimB
            << "], src_kind = \"shim\", dsts = [[" << col(c) << ", " << mtB << ", " << s2mm << "]]}\n";
         for (int k = 0; k < sb.groups; k++)
             for (int q = 0; q < channels; q++) {
-                const int mm2s = mc.pick(false, 1);
+                const int mm2s = mc.pick(false, perOut);
                 if (s2mm < 0 || mm2s < 0)
                     return fail("MemTile (" + std::to_string(col(c)) + ", " + std::to_string(mtB) +
                                 "): out of DMA channels for B's replays");
@@ -279,8 +319,8 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
         const bool isA = st == &sa;
         os << "dmaphop.plan_stream {arg = " << st->op->arg << ", role = \"" << st->role
            << "\", share = \"neighbor\", stage = \"" << st->stage << "\", ";
-        if (isA)
-            os << "ring = " << ring << ", ";
+        if (st->stage == "memtile_ring")
+            os << "ring = " << st->ring << ", ";
         os << "resident = \"" << (!isA && bLaunches ? "launches" : "launch") << "\", chunk = " << list({g.TM, g.KC})
            << ", chunks = " << NK << ", rounds = " << R2 << ", tensor = " << list({isA ? g.M : g.N, g.K})
            << ", host_rows = " << list(st->hostRows) << ", first_rows = " << list(st->firstRows)
@@ -292,8 +332,11 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
     llvm::outs() << "[DataflowPlan] synthesized from the routing IR: " << R << " x " << C << " mesh, A strips " << SA
                  << " x B strips " << SB << ", " << R2 << " tiles / core, K chunks " << NK << ", A ring " << ring
                  << " over " << SA * perStrip << " column(s), " << sa.readers << " readers per stream, B "
-                 << (bLaunches ? "resident across launches" : "per launch") << ", host rows A" << list(sa.hostRows)
-                 << " B" << list(sb.hostRows) << (persistent ? ", persistent kernel" : "") << "\n";
+                 << (bRing       ? "ring " + std::to_string(sb.ring) + " (re-read per output tile)"
+                     : bLaunches ? std::string("resident across launches")
+                                 : std::string("per launch"))
+                 << ", host rows A" << list(sa.hostRows) << " B" << list(sb.hostRows)
+                 << (persistent ? ", persistent kernel" : "") << "\n";
     return true;
 }
 

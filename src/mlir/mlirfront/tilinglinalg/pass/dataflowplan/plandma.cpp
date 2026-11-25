@@ -200,14 +200,6 @@ void deriveRing(DataflowPlan &p, size_t si) {
     }
 }
 
-// Strip group of a core row for a stream: the g with hostRows[g] == mesh row.
-int groupOfHostRow(const PlanStream &s, int meshRow) {
-    for (size_t g = 0; g < s.hostRows.size(); g++)
-        if (s.hostRows[g] == meshRow)
-            return (int)g;
-    return -1;
-}
-
 // MemTile side of a memtile (resident) stream, per column: the column's strips held whole (one S2MM load,
 // on the first launch only when resident across launches; locks ready, free), replayed by one MM2S BD per
 // route -- the route's destination says which strip group (its host row) and which chunk parity (its
@@ -239,7 +231,7 @@ bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
         p.channels.back().tag = mtag(si, c, "ch_in", 0);
         for (size_t k = 0; k < u.out.size(); k++) {
             const PlanRoute *r = u.out[k];
-            const int g = groupOfHostRow(B, r->dsts[0].first.row - p.coreRowBase), q = r->dsts[0].second;
+            const int g = B.groupOfHostRow(r->dsts[0].first.row - p.coreRowBase), q = r->dsts[0].second;
             if (r->dsts.size() != 1 || g < 0 || q >= B.channels) {
                 why = "stream " + std::to_string(B.arg) +
                       ": a replay route must end on one core hosting a strip, "
@@ -394,7 +386,8 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
         why = S + "a chunk does not fit the core / MemTile / shim BD wrap limits";
         return false;
     }
-    int served = 0;
+    // a ring serves each (tensor strip, parity) stream once: count the distinct ones over the columns
+    std::set<std::pair<int, int>> served;
     for (int c = 0; c < p.meshCols; c++) {
         const MemtileUse u = memtileUse(p, s, p.colLo + c);
         if (!u.present)
@@ -405,7 +398,14 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
         }
         if (s.stage == "memtile_ring") {
             const int k = (int)u.parities.size();
-            served += k;
+            for (const PlanRoute *r : u.out) {
+                const int g = s.groupOfHostRow(r->dsts[0].first.row - p.coreRowBase);
+                if (g < 0) {
+                    why = S + "a ring route of column " + str(c) + " does not end on a strip's host row";
+                    return false;
+                }
+                served.insert({s.strips[c * groups + g], r->dsts[0].second});
+            }
             const int64_t perTile = u.chunksPerTile;
             if (k == 1 ? (s.rounds * perTile) % (2 * s.ring) : (s.rounds * perTile) % (s.ring * k)) {
                 why = S + "the ring does not divide column " + str(c) + "'s chunk stream";
@@ -416,10 +416,13 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
             return false;
         }
     }
-    if (s.stage == "memtile_ring" && served != (int)groups * s.channels) {
-        why = S + "the MemTile rings serve " + str(served) + " (strip group, parity) streams, the layout needs " +
-              str((int)groups * s.channels);
-        return false;
+    if (s.stage == "memtile_ring") {
+        const std::set<int> strips(s.strips.begin(), s.strips.end());
+        if (served.size() != strips.size() * s.channels) {
+            why = S + "the MemTile rings serve " + str((int)served.size()) +
+                  " (strip, parity) streams, the layout needs " + str((int)(strips.size() * s.channels));
+            return false;
+        }
     }
     return true;
 }
@@ -486,13 +489,42 @@ bool deriveDmaProgram(DataflowPlan &p, std::string &why) {
                 continue;
             const int64_t len = u.chunksPerTile * chunk;
             const int reps = ring ? s.rounds : (int)s.hostRows.size();
+            const bool again = ring && repeatsPerRound(s);
             p.shimBds.push_back({p.colLo + c, u.shimRoute->srcCh, p.res.shimBd[si][c], s.arg, true, off, len,
-                                 shimChunkDims(s, u.chunksPerTile), len, reps, reps, !ring && s.residentLaunches});
+                                 shimChunkDims(s, u.chunksPerTile), again ? 0 : len, again ? 1 : reps, reps,
+                                 !ring && s.residentLaunches});
             p.shimBds.back().tag = "shim/" + std::to_string(si) + "/" + std::to_string(c);
-            off += reps * len;
+            // the same part again every round: no BD iteration (its step field holds step - 1, so a step of 0
+            // cannot be written -- it wraps to the largest step), only the channel start's repeat re-reads it
+            off += (again ? 1 : reps) * len;
         }
     }
     deriveCoreSlots(p, p.streams[0], cores);
+    for (const PlanShimBd &sb : p.shimBds)
+        if (sb.iterWrap > 1 && sb.iterStep < planTarget().bdWordBytes) {
+            why = "shim BD " + std::to_string(sb.bd) + " of column " + std::to_string(sb.col) + " iterates " +
+                  std::to_string(sb.iterWrap) + " times with a step of " + std::to_string(sb.iterStep) +
+                  " B: the step field holds step - 1 words, a step below one word cannot be written (" + sb.tag + ")";
+            return false;
+        }
+    for (const PlanBd &bd : p.bds) {
+        const bool mem = bd.tiles[0].row >= 1 && bd.tiles[0].row <= p.memtileRows;
+        const int64_t maxW = mem ? planTarget().memBdMaxLenWords : planTarget().coreBdMaxLenWords;
+        if (bd.len / planTarget().bdWordBytes > maxW) {
+            why = std::string(mem ? "MemTile" : "core") + " BD " + std::to_string(bd.bd) + " of tile (" +
+                  std::to_string(bd.tiles[0].col) + ", " + std::to_string(bd.tiles[0].row) + ") is " +
+                  std::to_string(bd.len) + " B, a BD holds at most " + std::to_string(maxW) + " words (" + bd.tag + ")";
+            return false;
+        }
+    }
+    for (const PlanChannel &ch : p.channels)
+        if (ch.repeat < 1 || ch.repeat > planTarget().chMaxRepeat) {
+            why = "DMA channel " + std::to_string(ch.ch) + (ch.s2mm ? " S2MM" : " MM2S") + " of tile (" +
+                  std::to_string(ch.tiles[0].col) + ", " + std::to_string(ch.tiles[0].row) + ") would start " +
+                  std::to_string(ch.repeat) + " times, a channel start repeats at most " +
+                  std::to_string(planTarget().chMaxRepeat) + " (" + ch.tag + "): use a deeper ring";
+            return false;
+        }
     if (!deriveKernelParams(p, why))
         return false;
     p.persistentGoLock = p.persistent ? p.res.lockGo : -1;

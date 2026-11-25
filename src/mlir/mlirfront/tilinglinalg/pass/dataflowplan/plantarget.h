@@ -38,6 +38,10 @@ struct PlanTarget {
     // MemTile's / shim's: xaie2psgbl_params.h *_D0_WRAP_MASK); a wider wrap is silently truncated
     int coreBdMaxWrap, memBdMaxWrap, shimBdMaxWrap;
     int bdMaxIterWrap; // largest BD iteration count
+    // largest BD buffer length in 32-bit words, per tile kind (the field is 14 bits in a core tile's BD,
+    // 17 bits in a MemTile's: *_DMA_BD0_0_BUFFER_LENGTH_MASK); a longer one is silently truncated
+    int64_t coreBdMaxLenWords, memBdMaxLenWords;
+    int chMaxRepeat; // largest repeat count of a DMA channel's start (task queue): MaxRepeatCount
     int memBankLo(int ch) const { return memBdBank * (ch & 1); }
 };
 
@@ -68,6 +72,9 @@ inline const PlanTarget &planTarget() {
         /*memBdMaxWrap*/ 1023,
         /*shimBdMaxWrap*/ 1023,
         /*bdMaxIterWrap*/ 64,
+        /*coreBdMaxLenWords*/ 0x3FFF,
+        /*memBdMaxLenWords*/ 0x1FFFF,
+        /*chMaxRepeat*/ 256,
     };
     return t;
 }

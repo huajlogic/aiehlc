@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <sstream>
 
 namespace dfplan {
@@ -46,7 +47,27 @@ static std::string emitPlanArrange(const DataflowPlan &plan) {
             const MemtileUse u = memtileUse(plan, s, plan.colLo + c);
             if (!u.present)
                 continue;
-            if (s.stage == "memtile_ring") {
+            std::set<int> outGroups;
+            for (const PlanRoute *r : u.out)
+                outGroups.insert(s.groupOfHostRow(r->dsts[0].first.row - plan.coreRowBase));
+            if (s.stage == "memtile_ring" && (outGroups.size() > 1 || repeatsPerRound(s))) {
+                // one ring over several (group, parity) streams: the MemTile's S2MM chain hands chunk n to
+                // MM2S route n % k, so per chunk pair the routes' chunks follow each other in route order
+                const bool again = repeatsPerRound(s);
+                os << "        for (long t = 0; t < " << (again ? 1 : s.rounds) << "; t++) /* column " << c
+                   << (again ? ": one round, re-read by the shim every output tile" : "") << " */\n"
+                   << "            for (long jj = 0; jj < " << s.chunks / s.channels << "; jj++) {\n";
+                for (const PlanRoute *r : u.out) {
+                    const int g = s.groupOfHostRow(r->dsts[0].first.row - plan.coreRowBase), q = r->dsts[0].second;
+                    const int strip = s.strips[c * groups + g];
+                    os << "                for (long r = 0; r < " << s.chunkRows << "; r++, dst += " << rowB
+                       << ") /* strip " << strip << ", parity " << q << " */\n"
+                       << "                    memcpy(dst, src + ((" << strip * stripRows << "L + t * " << s.chunkRows
+                       << " + r) * " << s.tensorCols << " + (jj * " << s.channels << " + " << q << ") * " << s.chunkCols
+                       << ") * " << eb << ", " << rowB << ");\n";
+                }
+                os << "            }\n";
+            } else if (s.stage == "memtile_ring") {
                 unsigned mask = 0;
                 for (int q : u.parities)
                     mask |= 1u << q;

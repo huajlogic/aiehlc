@@ -119,15 +119,24 @@ and `deriveDmaProgram` turns the streams into the dfschedule DMA program (sectio
   column c = strip c / 2, parity c % 2); with fewer columns a column serves a strip's every parity
   (4 x 2) -- one MM2S channel per parity and an (empty, full) lock pair each; broadcast to the strip's
   host row in every column. B: the next MemTile row, a column's strips held whole, one MM2S replay per
-  (strip group, parity); `resident = "launches"` loads B on the first launch only. MemTile channels
+  (strip group, parity); `resident = "launches"` loads B on the first launch only. **B's staging follows
+  the MemTile capacity** (`plantarget.h` `memBytes`): when a column's strips do not fit next to what
+  else that MemTile holds (bf16 4096 x 512 x 4096: 1 MiB), B becomes a `memtile_ring` too -- one S2MM
+  chain over every (strip group, parity) buffer, chunk n to MM2S route n % k, re-read from DDR for every
+  output tile (the shim BD's iteration step is 0, `aiehlc_plan_arrange` lays one round out); the build
+  prints `[DataflowPlan] stream N: ... streamed as memtile_ring R`. Its ring is the shallowest (from
+  `.ring`, default 2) that divides the column's chunk stream and keeps every channel start at or below
+  `chMaxRepeat` (256, the task queue's repeat count; any channel above it is a build error). `.stage =
+  aie::stage::memtile_ring` on B forces the ring. MemTile channels
   are chosen so each channel's BD bank holds its chain; shim MM2S channels and MemTile rows go to the
-  streams top-down.
+  streams top-down. `role` is a label; the layout is `row_groups` / `strips` (`"a"` / `"b"` only give
+  their defaults to plans written without them).
 * **Shim** (dfschedule). One BD per stream and column on the channel its `plan_route` names; the DDR
   layout is one contiguous chunk stream per column, the columns one after the other -- generated into
   `aiehlc_plan.h` as `aiehlc_plan_arrange(arg, src, dst)` from the same streams and routes, which the
   host calls (`gemm_plan.cc`; byte-identical to the former hand-written `sh_arrange` on 4 x 4).
 
-Limits (errors name them): two shared operands (A ring, B resident), every stream the same reader
+Limits (errors name them): two shared operands (A ring, B resident or ring), every stream the same reader
 count (4 mesh rows), columns >= A strips, N = 2C block rows (one n tile per core), output tiles per
 core <= the shim BD's iteration limit (64), K / chunk a multiple of `channels`, the ring must divide
 each column's chunk stream, every MemTile chain must fit its channel's BD bank.

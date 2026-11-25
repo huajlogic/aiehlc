@@ -233,9 +233,7 @@ void readRoute(Reader &r, DataflowPlan &p) {
 void readStream(Reader &r, DataflowPlan &p) {
     PlanStream st;
     st.arg = (int)r.i64("arg", -1, true);
-    st.role = r.str("role", "");
-    if (st.role != "a" && st.role != "b")
-        r.err() << "role must be \"a\" (strips over mesh-row pairs) or \"b\" (strips over columns x 2)";
+    st.role = r.str("role", ""); // a label; the layout is row_groups / strips (a / b: their legacy defaults)
     if (r.str("share", "neighbor") != "neighbor")
         r.err() << "only share = \"neighbor\" is implemented";
     st.stage = r.str("stage", "");
@@ -350,6 +348,12 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
     // plans written before row_groups / strips: the 2 x 8 shared-operand grid they all used
     for (auto &st : plan.streams) {
         const int groups = (int)st.hostRows.size();
+        if ((st.rowGroups.empty() || st.strips.empty()) && st.role != "a" && st.role != "b") {
+            ops.front()->emitError() << "[dataflow plan] stream " << st.arg
+                                     << ": without row_groups / strips the role must be \"a\" (strips over mesh-row "
+                                        "pairs) or \"b\" (strips over columns x 2)";
+            return false;
+        }
         if (st.rowGroups.empty())
             for (int pm = 0; pm < plan.meshRows; pm++)
                 st.rowGroups.push_back(st.role == "a" ? pm / 2 : pm % 2);
