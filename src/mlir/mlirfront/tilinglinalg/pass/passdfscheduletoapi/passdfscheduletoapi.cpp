@@ -24,6 +24,8 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <iostream>
 #include <map>
 #include <set>
@@ -608,6 +610,10 @@ struct MemRefDeallocInnerPattern : public OpConversionPattern<memref::DeallocOp>
 };
 
 /// Inner pattern for memref.subview inside dfschedule.host.
+/// The byte offset MemRefSubviewInnerPattern gives a host-block subview (relative to its source), or nullopt
+/// (dynamic). Same math as the pattern below; used by the dataflow-plan slice rebase (ConfigDmaBdInnerPattern).
+static std::optional<int64_t> hostSubviewByteOffset(memref::SubViewOp op);
+
 /// Subviews of the DDR init alloc are pointer-offset views; lower to
 /// __runtime_buffer_offset(base, byteOffset).
 struct MemRefSubviewInnerPattern : public OpConversionPattern<memref::SubViewOp> {
@@ -675,6 +681,34 @@ struct MemRefSubviewInnerPattern : public OpConversionPattern<memref::SubViewOp>
         return success();
     }
 };
+
+static std::optional<int64_t> hostSubviewByteOffset(memref::SubViewOp op) {
+    auto staticOffsets = op.getStaticOffsets();
+    auto srcType = cast<MemRefType>(op.getSource().getType());
+    auto srcShape = srcType.getShape();
+    int64_t byteOffset = 0;
+    int64_t elemBytes = getElemSize(srcType.getElementType());
+    auto resType = cast<MemRefType>(op.getType());
+    SmallVector<int64_t> resStrides, srcStrides;
+    int64_t resOffset = 0, srcOffset = 0;
+    if (!resType.getLayout().isIdentity() && succeeded(getStridesAndOffset(resType, resStrides, resOffset)) &&
+        !ShapedType::isDynamic(resOffset)) {
+        if (srcType.getLayout().isIdentity() || failed(getStridesAndOffset(srcType, srcStrides, srcOffset)) ||
+            ShapedType::isDynamic(srcOffset))
+            srcOffset = 0;
+        byteOffset = (resOffset - srcOffset) * elemBytes;
+    } else {
+        SmallVector<int64_t> strides(srcShape.size(), elemBytes);
+        for (int i = (int)srcShape.size() - 2; i >= 0; --i)
+            strides[i] = strides[i + 1] * srcShape[i + 1];
+        for (size_t i = 0; i < staticOffsets.size(); ++i) {
+            if (ShapedType::isDynamic(staticOffsets[i]))
+                return std::nullopt;
+            byteOffset += staticOffsets[i] * strides[i];
+        }
+    }
+    return (byteOffset + 3) & ~3;
+}
 
 /// Inner pattern for dfschedule.buffer_view -> __runtime_buffer_offset(base, offset)
 struct BufferViewInnerPattern : public OpConversionPattern<dfschedule::BufferViewOp> {
@@ -1532,6 +1566,129 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
         }
 
+        // Dataflow-plan N-slices (`dfplan.slice` = [kind, stride, region], plandma.cpp): rebase this shim BD to
+        // the call's slice (__plan_slice, the prologue at the kernel-group load) -- an input BD by stride bytes,
+        // an output BD (kind 1, re-strided row-major by the plan) to the row-major origin of its tile-major
+        // region (dfschedule.plan_slice_org) + slice x stride. Only the BD's address word is rewritten.
+        if (auto sl = op->getAttrOfType<ArrayAttr>("dfplan.slice")) {
+            auto ival = [](Attribute a) { return mlir::cast<IntegerAttr>(a).getInt(); };
+            const int64_t kind = ival(sl[0]), stride = ival(sl[1]), region = ival(sl[2]);
+            int32_t col = -1, bdNum = -1;
+            if (auto dt = op.getTile().getDefiningOp<dfschedule::DeclareTileOp>())
+                col = dt.getCol();
+            if (auto c = op.getBdId().getDefiningOp<arith::ConstantOp>())
+                bdNum = (int32_t)mlir::cast<IntegerAttr>(c.getValue()).getInt();
+            if (col < 0 || bdNum < 0) {
+                llvm::errs() << "[DataflowPlan] ERROR: slices: shim BD without a constant tile / bd id\n";
+                return failure();
+            }
+            Value ptr = bufferVoidPtr;
+            int64_t delta = 0;
+            if (kind == 1) {
+                // the host argument the BD's pointer is an offset of, and that offset (compile-time constants)
+                std::function<std::optional<int64_t>(Value)> cst = [&](Value v) -> std::optional<int64_t> {
+                    if (!v)
+                        return std::nullopt;
+                    if (auto c = v.getDefiningOp<emitc::ConstantOp>())
+                        if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
+                            return i.getInt();
+                    if (auto c = v.getDefiningOp<arith::ConstantOp>())
+                        if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
+                            return i.getInt();
+                    if (auto c = v.getDefiningOp<emitc::CastOp>())
+                        return cst(c->getOperand(0));
+                    return std::nullopt;
+                };
+                int64_t off = 0;
+                bool ok = true;
+                Value v = bufferVoidPtr;
+                for (int guard = 0; guard < 16 && ok; guard++) {
+                    if (auto bv = v.getDefiningOp<dfschedule::BufferViewOp>()) { // not converted yet
+                        off += bv.getOffset();
+                        v = bv->getOperand(0);
+                        continue;
+                    }
+                    if (auto sv = v.getDefiningOp<memref::SubViewOp>()) { // not converted yet
+                        auto o = hostSubviewByteOffset(sv);
+                        ok = o.has_value();
+                        if (ok)
+                            off += *o, v = sv.getSource();
+                        continue;
+                    }
+                    if (auto uc = v.getDefiningOp<UnrealizedConversionCastOp>()) {
+                        v = uc->getOperand(0);
+                        continue;
+                    }
+                    auto call = v.getDefiningOp<emitc::CallOpaqueOp>();
+                    if (!call)
+                        break;
+                    auto argOf = [&](unsigned i, Value &val, std::optional<int64_t> &lit) {
+                        if (auto args = call.getArgs()) {
+                            if (i >= args->size())
+                                return false;
+                            Attribute a = (*args)[i];
+                            if (auto ix = dyn_cast<IntegerAttr>(a); ix && isa<IndexType>(ix.getType()))
+                                val = call->getOperand(ix.getInt());
+                            else if (auto in = dyn_cast<IntegerAttr>(a))
+                                lit = in.getInt();
+                            else
+                                return false;
+                            return true;
+                        }
+                        if (i >= call->getNumOperands())
+                            return false;
+                        val = call->getOperand(i);
+                        return true;
+                    };
+                    const StringRef callee = call.getCallee();
+                    Value base;
+                    std::optional<int64_t> lit;
+                    if (callee == "__runtime_buffer_arg") {
+                        ok = argOf(0, base, lit) && base;
+                        v = base;
+                    } else if (callee == "__runtime_buffer_offset") {
+                        Value o;
+                        std::optional<int64_t> ol;
+                        ok = argOf(0, base, lit) && base && argOf(1, o, ol);
+                        if (ok && !ol)
+                            ol = cst(o);
+                        ok = ok && ol.has_value();
+                        if (ok)
+                            off += *ol, v = base;
+                    } else
+                        break;
+                }
+                ok = ok && isa<BlockArgument>(v); // the host function's argument itself
+                if (ok)
+                    if (Value r = rewriter.getRemappedValue(v))
+                        v = r;
+                const auto &orgAttr =
+                    op->getParentOfType<ModuleOp>()->getAttrOfType<ArrayAttr>("dfschedule.plan_slice_org");
+                if (!ok || !orgAttr || region <= 0 || off % region || off / region >= (int64_t)orgAttr.size()) {
+                    llvm::errs() << "[DataflowPlan] ERROR: slices: output shim BD " << bdNum << " on column " << col
+                                 << ": its tile-major region offset (" << off << " B, region " << region
+                                 << " B) is not a compile-time region start (chain ends at "
+                                 << (v && v.getDefiningOp() ? v.getDefiningOp()->getName().getStringRef().str()
+                                                            : std::string(v ? "a block argument" : "nothing"))
+                                 << ")\n";
+                    return failure();
+                }
+                ptr = v;
+                delta = ival(orgAttr[off / region]);
+            }
+            auto i64Ty = rewriter.getIntegerType(64);
+            auto addr = rewriter.create<emitc::CallOpaqueOp>(
+                loc, TypeRange{i64Ty}, "__plan_slice_addr",
+                rewriter.getArrayAttr({rewriter.getIndexAttr(0), rewriter.getI64IntegerAttr(delta),
+                                       rewriter.getI64IntegerAttr(stride)}),
+                nullptr, ValueRange{ptr});
+            rewriter.create<emitc::CallOpaqueOp>(
+                loc, TypeRange{}, "__Runtime_shim_bd_set_addr",
+                rewriter.getArrayAttr({rewriter.getI32IntegerAttr(col), rewriter.getI32IntegerAttr(0),
+                                       rewriter.getI32IntegerAttr(bdNum), rewriter.getIndexAttr(0)}),
+                nullptr, ValueRange{addr.getResult(0)});
+        }
+
         // For core tiles with lock-based DMA (acquire_lock_val != 0),
         // emit XAie_LockSetValue to initialize locks.
         // Input (S2MM on core): DMA acquires lock 0, init lock 0 = N (N buffers ready for DMA)
@@ -2040,6 +2197,24 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
             if (once && go)
                 rewriter.create<emitc::VerbatimOp>(loc, "__Runtime_plan_setup(" + std::to_string(once.getInt()) + ", " +
                                                             std::to_string(go.getInt()) + ");");
+            // N-slices (plandma.cpp): call i of this host function serves slice i % S; __plan_slice_addr is the
+            // rebased address of a shim BD (base + delta + slice x stride), used by the per-BD rebase calls
+            if (auto sl = m->getAttrOfType<IntegerAttr>("dfschedule.plan_slices")) {
+                std::string args;
+                if (auto sa = m->getAttrOfType<ArrayAttr>("dfschedule.plan_slice_args"))
+                    for (Attribute a : sa)
+                        args += (args.empty() ? "" : ", ") + std::to_string(mlir::cast<IntegerAttr>(a).getInt());
+                const std::string S = std::to_string(sl.getInt());
+                rewriter.create<emitc::VerbatimOp>(
+                    loc, "/* dataflow plan: " + S + " slices over args " + args + " -- call i serves slice i % " + S +
+                             ", the shim BDs of those args are rebased per call */");
+                rewriter.create<emitc::VerbatimOp>(loc, "static uint32_t __plan_slice_calls = 0;");
+                rewriter.create<emitc::VerbatimOp>(loc, "const uint64_t __plan_slice = (uint64_t)(__plan_slice_calls++ % " +
+                                                            S + "u);");
+                rewriter.create<emitc::VerbatimOp>(
+                    loc, "auto __plan_slice_addr = [__plan_slice](const void *p, uint64_t d, uint64_t s) -> uint64_t "
+                         "{ return (uint64_t)(uintptr_t)p + d + __plan_slice * s; };");
+            }
         }
 
         // Get tiles operands (variadic)

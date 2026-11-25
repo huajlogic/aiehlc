@@ -190,6 +190,12 @@ void readHeader(Reader &r, DataflowPlan &p) {
     // `persistent = true`; the older `persistent_go_lock = N` reads as persistent (the go lock is allocated)
     p.persistent = r.flag("persistent") || r.i64("persistent_go_lock", -1) >= 0;
     p.bdOnce = r.flag("bd_once");
+    p.slices = (int)r.i64("slices", 1);
+    if (r.has("slice_args"))
+        for (int64_t a : r.ints("slice_args"))
+            p.sliceArgs.push_back((int)a);
+    if (p.slices < 1 || (p.slices > 1 && p.sliceArgs.empty()))
+        r.err() << "slices = " << p.slices << ": needs slices >= 2 with slice_args = [arg, ...] (or slices = 1)";
     if (r.has("share_args"))
         for (int64_t a : r.ints("share_args")) {
             if (!p.replaces((int)a))

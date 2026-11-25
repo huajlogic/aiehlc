@@ -216,6 +216,11 @@ static bool parsedOutputTileMajor = false;
 // kernel waits on (dataflow plan, doc/design/dmaphop_dataflow_plan.md).
 // Published as routing.persistent_kernel only when set.
 static bool parsedPersistentKernel = false;
+// Set by #pragma dataflow_slices(S, arg, ...): the dataflow plan runs the kernel as S slices -- call i of
+// the host function serves slice i % S and rebases the shim BDs of the listed args (an input by its whole
+// tensor, the output by its column block with the row stride ldc = S x its row). Published as
+// routing.dataflow_slices = [S, arg, ...] only when set (m3362124221 P2).
+static std::vector<int64_t> parsedDataflowSlices;
 static bool parsedControlPlanDedicatedShim = false;
 static bool parsedControlPlanShimBdCtrl = false;
 static int parsedControlPacketMode = 0;
@@ -3893,6 +3898,41 @@ class AieOutputTileMajorPragmaHandler : public clang::PragmaHandler {
     }
 };
 
+// #pragma dataflow_slices(S, arg, ...): integer literals. See parsedDataflowSlices.
+class AieDataflowSlicesPragmaHandler : public clang::PragmaHandler {
+  public:
+    AieDataflowSlicesPragmaHandler() : PragmaHandler("dataflow_slices") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        std::vector<int64_t> v;
+        bool bad = false;
+        PP.Lex(Tok);
+        if (Tok.isNot(clang::tok::l_paren))
+            bad = true;
+        while (!bad) {
+            PP.Lex(Tok);
+            if (Tok.is(clang::tok::r_paren))
+                break;
+            if (Tok.is(clang::tok::comma))
+                continue;
+            if (Tok.isNot(clang::tok::numeric_constant)) {
+                bad = true;
+                break;
+            }
+            v.push_back(std::stoll(PP.getSpelling(Tok)));
+        }
+        if (bad || v.size() < 2 || v[0] < 2) {
+            llvm::errs() << "[aiehlc] ERROR: #pragma dataflow_slices(S, arg, ...) needs S >= 2 and at least one "
+                            "argument index (integer literals)\n";
+            exit(2);
+        }
+        parsedDataflowSlices = v;
+        llvm::outs() << "[aiehlc] Detected #pragma dataflow_slices: " << v[0] << " slices over " << v.size() - 1
+                     << " arg(s)\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
 // Bare marker pragma: #pragma persistent_kernel. See parsedPersistentKernel.
 class AiePersistentKernelPragmaHandler : public clang::PragmaHandler {
   public:
@@ -4015,6 +4055,7 @@ public:
             PP.AddPragmaHandler(new AieKernelConfigOffloadPragmaHandler());
             PP.AddPragmaHandler(new AieOutputTileMajorPragmaHandler());
             PP.AddPragmaHandler(new AiePersistentKernelPragmaHandler());
+            PP.AddPragmaHandler(new AieDataflowSlicesPragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanDedicatedShimPragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanShimBdCtrlPragmaHandler());
             PP.AddPragmaHandler(new AieControlPacketModePragmaHandler());
@@ -5460,6 +5501,8 @@ public:
                                         fcAttrBuilder.getI64IntegerAttr(parsedOutputTileMajor ? 1 : 0));
                         if (parsedPersistentKernel) // #pragma persistent_kernel (dataflow plan)
                             module->setAttr("routing.persistent_kernel", fcAttrBuilder.getI64IntegerAttr(1));
+                        if (!parsedDataflowSlices.empty()) // #pragma dataflow_slices (dataflow plan)
+                            module->setAttr("routing.dataflow_slices", fcAttrBuilder.getI64ArrayAttr(parsedDataflowSlices));
                         module->setAttr("routing.control_plan_dedicated_shim",
                                         fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                         module->setAttr("routing.control_plan_shim_bd_ctrl",
@@ -6219,6 +6262,8 @@ public:
                                     fcAttrBuilder.getI64IntegerAttr(parsedOutputTileMajor ? 1 : 0));
                     if (parsedPersistentKernel) // #pragma persistent_kernel (dataflow plan)
                         module->setAttr("routing.persistent_kernel", fcAttrBuilder.getI64IntegerAttr(1));
+                    if (!parsedDataflowSlices.empty()) // #pragma dataflow_slices (dataflow plan)
+                        module->setAttr("routing.dataflow_slices", fcAttrBuilder.getI64ArrayAttr(parsedDataflowSlices));
                     module->setAttr("routing.control_plan_dedicated_shim",
                                     fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                     module->setAttr("routing.control_plan_shim_bd_ctrl",

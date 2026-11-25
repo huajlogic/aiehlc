@@ -173,6 +173,12 @@ struct DataflowPlan {
     bool persistent = false;   // kernel loaded once, later launches release a go lock (res.lockGo)
     int persistentGoLock = -1; // the go lock's core lock id once assigned
     bool bdOnce = false;       // identical BD / channel writes are skipped after the first launch
+    // N-slices (`slices = S, slice_args = [..]`, #pragma dataflow_slices): call i of the host function serves
+    // slice i % S; the shim BDs of the slice args are rebased per call (__Runtime_shim_bd_set_addr): an input
+    // stream by its whole tensor, the output by its column block, written row-major with ldc = S x its row.
+    // MemTile / core BDs, locks and bd_once are unchanged. 1 = no slicing.
+    int slices = 1;
+    std::vector<int> sliceArgs;
     std::vector<PlanRoute> routes;
     std::vector<PlanStream> streams;
     // ---- the derived DMA program (deriveDmaProgram) ----

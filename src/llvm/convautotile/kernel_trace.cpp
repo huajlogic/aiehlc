@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <fstream>
 #include <map>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <unistd.h>
@@ -1597,6 +1598,62 @@ void inferRoles(std::vector<TracePort> &ports, const std::map<std::string, PortF
 
 } // namespace
 
+// #pragma dataflow_slices(S, arg, ...) (dataflow plan N-slices, m3362124221 P2): the kernel runs as S slices,
+// call i of the host function serves slice i % S and rebases the shim BDs of the listed args -- an input by its
+// whole tensor (slice s laid out like slice 0, s tensors on), the output by its column block, written row-major
+// with ldc = S x its row (the compiler re-strides its shim S2MM BD). Returns false when there is no such pragma;
+// `err` set = the pragma is wrong for this kernel.
+static bool dataflowSlicesNote(const std::string &src, const std::vector<TracePort> &ports, std::string &note,
+                               std::string &err) {
+    static const std::regex rx(R"((?:^|\n)[ \t]*#[ \t]*pragma[ \t]+dataflow_slices\b([^\n]*))");
+    std::smatch m;
+    if (!std::regex_search(src, m, rx))
+        return false;
+    std::smatch a;
+    const std::string body = m[1].str();
+    static const std::regex lst(R"(^\s*\(\s*([0-9]+(?:\s*,\s*[0-9]+)+)\s*\)\s*$)");
+    if (!std::regex_match(body, a, lst)) {
+        err = "#pragma dataflow_slices(S, arg, ...): integer literals, S >= 2 and at least one argument index";
+        return true;
+    }
+    std::vector<long> v;
+    std::stringstream ss(a[1].str());
+    for (std::string t; std::getline(ss, t, ',');)
+        v.push_back(std::stol(t));
+    const long S = v[0];
+    if (S < 2) {
+        err = "#pragma dataflow_slices: " + std::to_string(S) + " slices (needs >= 2)";
+        return true;
+    }
+    std::ostringstream os;
+    std::set<long> seen;
+    for (size_t i = 1; i < v.size(); i++) {
+        const long arg = v[i];
+        if (arg < 0 || arg >= (long)ports.size() || !seen.insert(arg).second) {
+            err = "#pragma dataflow_slices: argument " + std::to_string(arg) + " is not a distinct kernel port (" +
+                  std::to_string(ports.size()) + " ports)";
+            return true;
+        }
+        const TracePort &p = ports[arg];
+        long bytes = p.elem_bytes;
+        for (int d : p.shape)
+            bytes *= d;
+        os << (i > 1 ? ", " : "") << p.var << " (arg " << arg << ") ";
+        if (p.output) {
+            if (p.shape.size() != 2) {
+                err = "#pragma dataflow_slices: output " + p.var + " must be 2-D (its column block is the slice)";
+                return true;
+            }
+            const long row = (long)p.shape[1] * p.elem_bytes;
+            os << "+" << row << " B per slice, row-major ldc " << S * row << " B";
+        } else
+            os << "+" << bytes << " B per slice";
+    }
+    note = "dataflow plan: slices=" + std::to_string(S) + " emits " + std::to_string(v.size() - 1) +
+           " shim rebases per slice: " + os.str();
+    return true;
+}
+
 KernelOnlyResult inferKernelOnly(std::string &src, const std::string &srcDir, const std::string &srcName) {
     s_traceIncludeDir = srcDir;
     KernelOnlyResult res;
@@ -1663,6 +1720,15 @@ KernelOnlyResult inferKernelOnly(std::string &src, const std::string &srcDir, co
             Derived d = convCrossCheck(k, tr, spaces, mesh.first, mesh.second, errs, rep);
             if (d.ok && errs.empty())
                 res.derived[k.name] = d;
+        }
+        {
+            std::string sn, se;
+            if (dataflowSlicesNote(src, k.ports, sn, se)) {
+                if (!se.empty())
+                    errs.push_back(se);
+                else
+                    res.notes.push_back(sn);
+            }
         }
         if (errs.empty() && !rewriteKernelRouted(src, k, plan, spaces, err))
             errs.push_back(err);

@@ -429,7 +429,24 @@ bool synthesizeDataflowPlan(ModuleOp module, std::string &why) {
         why = "synthesis";
         return false;
     }
-    std::string text = "module {\n" + os.str() + "}\n";
+    std::string body = os.str();
+    // #pragma dataflow_slices(S, arg, ...) -> `slices = S, slice_args = [..]` on the dmaphop.plan op
+    if (auto sl = module->getAttrOfType<ArrayAttr>("routing.dataflow_slices")) {
+        std::string ext = ", slices = ";
+        for (size_t i = 0; i < sl.size(); i++) {
+            const int64_t v = cast<IntegerAttr>(sl[i]).getInt();
+            ext += (i == 1 ? ", slice_args = [" : (i > 1 ? ", " : "")) + std::to_string(v);
+        }
+        ext += "]";
+        const std::string key = "bd_once = true}";
+        const size_t at = body.find(key);
+        if (at == std::string::npos) {
+            why = "slices: no dmaphop.plan header to extend";
+            return false;
+        }
+        body.insert(at + key.size() - 1, ext);
+    }
+    std::string text = "module {\n" + body + "}\n";
     OwningOpRef<ModuleOp> parsed = parseSourceString<ModuleOp>(text, module.getContext());
     if (!parsed) {
         why = "synthesized plan does not parse";

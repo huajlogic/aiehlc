@@ -44,6 +44,24 @@
     }
 /* last chunk of a tile: the accumulators are final -- int8 straight to the output tile (block bl at logical
  * L = bl ^ swz, as sh_convert did); no separate convert pass, and acc is never re-zeroed (chunk 0: K4_LDZ) */
+#if defined(GP_N_SLICES) && GP_N_SLICES > 1
+/* N-slices (#pragma dataflow_slices, m3362124221 P2): the output tile goes out ROW-MAJOR (KA_TN bytes per row) --
+ * the shim BD writes its rows at the row stride of the whole C (ldc = slices x N). Row r of blocks (mi, ni) and
+ * (mi, ni + 1) = 16 contiguous bytes (interleave_zip by 8, as simplegemm_dataflow.cc). */
+#define K4_OUT(p, c, bl)                                                                                               \
+    {                                                                                                                  \
+        const int L_ = (bl) ^ swz;                                                                                     \
+        int8_t *tt_ = y + (2 * (L_ >> 2)) * 8 * KA_TN + 2 * (L_ & 3) * 8;                                              \
+        const auto z0_ = aie::interleave_zip((c##0).to_vector<int8_t>(0), (c##1).to_vector<int8_t>(0), 8);            \
+        const auto z1_ = aie::interleave_zip((c##2).to_vector<int8_t>(0), (c##3).to_vector<int8_t>(0), 8);            \
+        for (int r_ = 0; r_ < 4; r_++) {                                                                               \
+            aie::store_v(tt_ + r_ * KA_TN, z0_.first.extract<16>(r_));                                                 \
+            aie::store_v(tt_ + (4 + r_) * KA_TN, z0_.second.extract<16>(r_));                                          \
+            aie::store_v(tt_ + (8 + r_) * KA_TN, z1_.first.extract<16>(r_));                                           \
+            aie::store_v(tt_ + (12 + r_) * KA_TN, z1_.second.extract<16>(r_));                                         \
+        }                                                                                                              \
+    }
+#else
 #define K4_OUT(p, c, bl)                                                                                               \
     {                                                                                                                  \
         const int L_ = (bl) ^ swz;                                                                                     \
@@ -53,6 +71,7 @@
         aie::store_v(tt_ + 8 * 64, (c##2).to_vector<int8_t>(0));                                                       \
         aie::store_v(tt_ + 8 * 64 + 64, (c##3).to_vector<int8_t>(0));                                                  \
     }
+#endif
 /* k-step with ping-pong operand registers: step s uses set (va, vb) if s is even, (wa, wb) if odd, and
  * reloads that set with step s + 2 -- no operand rotation, so no VMOVs (with rotation, 4 VMOVs per 4
  * VMACs saturated the move slot: 135 bundles per 128 MACs). A block has 16 steps, so (va, vb) =

@@ -639,6 +639,12 @@ void emitShimProgram(HostBuilder &h, const DataflowPlan &p, Block &host, SmallVe
         st.addTypes(dfschedule::BdHandleType::get(ctx));
         Operation *bdOp = b.create(st);
         tagOp(bdOp, s.tag);
+        // N-slices: an input stream's slice s is the s-th whole tensor (laid out like slice 0) -- rebase by it
+        if (p.slices > 1 && std::count(p.sliceArgs.begin(), p.sliceArgs.end(), s.arg))
+            for (const PlanStream &ps : p.streams)
+                if (ps.arg == s.arg)
+                    bdOp->setAttr("dfplan.slice",
+                                  b.getI64ArrayAttr({0, ps.tensorRows * ps.tensorCols * ps.elemBytes, 0}));
         Value bd = bdOp->getResult(0);
         Value io = b.create<dfschedule::ConfigCreateIoOp>(h.loc, dfschedule::IoHandleType::get(ctx), bd, t,
                                                           b.getI32IntegerAttr(s.ch), b.getStringAttr("MM2S"),
@@ -649,6 +655,84 @@ void emitShimProgram(HostBuilder &h, const DataflowPlan &p, Block &host, SmallVe
             start->setAttr("dfschedule.first_launch_only", b.getUnitAttr());
         events.push_back(start.getResult());
     }
+}
+
+// N-slices, the output arg (not a plan stream): C = A . B^T, core (pm, c) writes its tiles of A strip x B strip
+// (the streams' rowGroups / strips), TM x TN each, one shim S2MM BD per core walking the core's tiles (iteration).
+// Slice s is the column block [s x N, (s + 1) x N) of a row-major C with ldc = S x N x elem: the BD walks a tile's
+// TM rows at ldc (d1) and the core's tiles at TM x ldc (iteration); its address -- the core's first tile, row-major,
+// plus s x N x elem -- is set per call (`dfplan.slice` = [1, slice stride, tile-major region], and the module's
+// dfschedule.plan_slice_org = the row-major origin of tile-major region k = pm x cols + c). The tile itself must
+// arrive row-major (the kernel writes it so). Returns false with `why` when the BD cannot express it.
+static bool sliceOutputBds(ModuleOp hostModule, Block &host, DataflowPlan &p, int arg, std::string &why) {
+    const PlanStream *A = nullptr, *B = nullptr;
+    for (const PlanStream &s : p.streams)
+        (s.role == "a" ? A : B) = &s;
+    if (!A || !B) {
+        why = "slices: the output arg needs the plan's A and B streams";
+        return false;
+    }
+    auto nStrips = [](const PlanStream &s) {
+        int n = 0;
+        for (int x : s.strips)
+            n = std::max(n, x + 1);
+        return std::max(n, 1);
+    };
+    const int64_t eb = B->elemBytes, TM = A->chunkRows, TN = B->chunkRows, N = B->tensorRows;
+    const int64_t rowsA = A->tensorRows / nStrips(*A), rowsB = B->tensorRows / nStrips(*B);
+    const int64_t ldc = (int64_t)p.slices * N * eb, colStride = N * eb;
+    const int ga = (int)A->hostRows.size(), gb = (int)B->hostRows.size();
+    SmallVector<int64_t> org;
+    for (int pm = 0; pm < p.meshRows; pm++)
+        for (int c = 0; c < p.meshCols; c++) {
+            const int sa = A->strips[c * ga + A->rowGroups[pm]], sb = B->strips[c * gb + B->rowGroups[pm]];
+            org.push_back(sa * rowsA * ldc + sb * rowsB * eb);
+        }
+    int n = 0;
+    std::string bad;
+    host.walk([&](dfschedule::ConfigDmaBdOp op) {
+        if (op->hasAttr("dfplan.tag"))
+            return;
+        Value v = op.getBuffer();
+        int a = -1;
+        for (int guard = 0; guard < 32 && v; guard++) {
+            if (auto ba = dyn_cast<BlockArgument>(v)) {
+                if (ba.getOwner() == &host)
+                    a = (int)ba.getArgNumber();
+                break;
+            }
+            Operation *d = v.getDefiningOp();
+            if (!d || d->getNumOperands() == 0)
+                break;
+            v = d->getOperand(0);
+        }
+        if (a != arg)
+            return;
+        auto st = op->getAttrOfType<ArrayAttr>("dim_strides"), wr = op->getAttrOfType<ArrayAttr>("dim_wraps");
+        auto i64 = [](ArrayAttr x, int i) { return cast<IntegerAttr>(x[i]).getInt(); };
+        const int64_t step = op.getIterStepSize(), wrap = op.getIterWrap();
+        if (!st || !wr || st.size() != 2 || wr.size() != 2 || i64(st, 0) != 4 || i64(wr, 0) * 4 != TN * eb ||
+            i64(st, 1) != TN * eb || i64(wr, 1) != TM || step != TM * TN * eb || wrap * TM != rowsA) {
+            bad = "slices: output shim BD (arg " + std::to_string(arg) + ") is not one TM x TN tile per iteration " +
+                  "(tile-major, #pragma output_tile_major): the row stride ldc = " + std::to_string(ldc) +
+                  " B cannot be expressed on it";
+            return;
+        }
+        Builder b(op.getContext());
+        op->setAttr("dim_strides", b.getI32ArrayAttr({4, (int32_t)ldc}));
+        op->setAttr("iter_step_size", b.getI32IntegerAttr((int32_t)(TM * ldc)));
+        op->setAttr("dfplan.slice", b.getI64ArrayAttr({1, colStride, wrap * step}));
+        n++;
+    });
+    if (!bad.empty() || !n) {
+        why = bad.empty() ? "slices: no shim BD over the output arg " + std::to_string(arg) : bad;
+        return false;
+    }
+    Builder b(hostModule.getContext());
+    hostModule->setAttr("dfschedule.plan_slice_org", b.getI64ArrayAttr(org));
+    llvm::outs() << "[DataflowPlan] slices: output arg " << arg << ": " << n << " shim S2MM BDs re-strided row-major, "
+                 << "ldc " << ldc << " B, " << colStride << " B per slice\n";
+    return true;
 }
 
 } // namespace
@@ -693,6 +777,29 @@ bool materializeHostPlan(ModuleOp hostModule, DataflowPlan &p) {
     emitMemtileProgram(h, p);
     SmallVector<Value> events;
     emitShimProgram(h, p, host, events);
+    if (p.slices > 1) {
+        std::string sw;
+        for (int a : p.sliceArgs) {
+            bool stream = false;
+            for (const PlanStream &s : p.streams)
+                stream |= s.arg == a;
+            if (stream)
+                continue;
+            if (a >= (int)host.getNumArguments() || !sliceOutputBds(hostModule, host, p, a, sw)) {
+                llvm::errs() << "[DataflowPlan] ERROR: " << (sw.empty() ? "slices: bad arg " + std::to_string(a) : sw)
+                             << "\n";
+                return false;
+            }
+        }
+        hostModule->setAttr("dfschedule.plan_slices", b.getI64IntegerAttr(p.slices));
+        SmallVector<int64_t> sa(p.sliceArgs.begin(), p.sliceArgs.end());
+        hostModule->setAttr("dfschedule.plan_slice_args", b.getI64ArrayAttr(sa));
+        llvm::outs() << "[DataflowPlan] slices=" << p.slices << ": " << p.sliceArgs.size()
+                     << " shim rebases per slice (args";
+        for (int a : p.sliceArgs)
+            llvm::outs() << " " << a;
+        llvm::outs() << ")\n";
+    }
     b.setInsertionPoint(lastWait);
     b.create<dfschedule::ScheduleWaitOp>(lastWait->getLoc(), events);
     hostModule->setAttr("dfschedule.plan_bd_once", b.getI64IntegerAttr(p.bdOnce ? 1 : 0));

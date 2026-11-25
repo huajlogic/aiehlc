@@ -269,6 +269,26 @@ A build with no plan is byte-identical to before; the C-level and dmaphop-level 
 `gemm_plan.cc` generate byte-identical host.cc / kernel.cc / routing.cc / bcf; the routing and
 dmaphop IR round trips stay byte-identical (`script/test/routing_ir_roundtrip.sh`).
 
+### N-slices (`slices = S, slice_args = [..]`, m3362124221 P2)
+
+`#pragma dataflow_slices(S, arg, ...)` (published as `routing.dataflow_slices`) puts
+`slices = S, slice_args = [..]` on the `dmaphop.plan` op: the kernel runs as S slices, call i of
+the generated host function serves slice i % S (`__plan_slice`, a prologue at the kernel-group load).
+For every shim BD of a slice arg the host emits, right after the BD config,
+`__Runtime_shim_bd_set_addr(col, 0, bd, __plan_slice_addr(base, delta, stride))`:
+
+| slice arg | rebase |
+|---|---|
+| a plan stream (input, e.g. B) | its BD address + slice x the whole tensor (slice s laid out like slice 0, s tensors on) |
+| the output (C, legacy tile-major OOO S2MM BDs, `#pragma output_tile_major`) | the plan re-strides the BD row-major -- d1 = the tile's TM rows at ldc = S x N x elem, iteration = the core's tiles at TM x ldc -- and sets its address to the row-major origin of its tile-major region (`dfschedule.plan_slice_org`, from the A / B strips) + slice x N x elem |
+
+MemTile / core BDs, locks and `bd_once` are unchanged (`bd_once` skips the identical base write; the
+rebase runs every call). The output tile must arrive row-major (gemm_plan: `GP_N_SLICES`, K4_OUT).
+A BD that is not one TM x TN tile per iteration fails the build ("ldc cannot be expressed").
+`aiehlc-convtile trace` checks the pragma against the kernel's ports and reports the rebases
+(kernel_trace_cases "dataflow: slices=8 ..."). Example: `gemm_plan/gemm_plan_4096c_int8.cc`
+(4096^3 int8 as 8 slices of 4096 x 512 x 4096, `gemm_plan_slices.cc` host driver).
+
 ## 5. Traps
 
 * **The kernel never names the plan's resources.** Ids and addresses are allocated per build; only

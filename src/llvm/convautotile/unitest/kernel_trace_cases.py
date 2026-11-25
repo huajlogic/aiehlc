@@ -381,6 +381,16 @@ GEMMPLAN_CASES = [
     ("gemm_plan s1i8: resident MemTile B stage 0x20000 words, over a MemTile BD's 0x1FFFF -> 2 chained BDs (HG)",
      [],
      "PASS:the dataflow plan loads it as 2 chained MemTile BDs"),
+    # m3362124221 P2: #pragma dataflow_slices(S, arg, ...) -- the plan runs 4096^3 as 8 N-slices of this shape: each
+    # call rebases the shim BDs of B (arg 1, by its 2 MiB tensor) and C (arg 2, by its 512 B column block, row-major
+    # ldc 4096 B); a bad argument is refused.
+    ("dataflow: slices=8 emits 2 shim rebases per slice (B by its tensor, C row-major ldc 4096)",
+     [("#define GP_M 4096", "#pragma dataflow_slices(8, 1, 2)\n#define GP_M 4096")],
+     "PASS:slices=8 emits 2 shim rebases per slice: b (arg 1) +2097152 B per slice, c (arg 2) +512 B per slice, "
+     "row-major ldc 4096 B"),
+    ("dataflow: slices over a non-port argument is refused",
+     [("#define GP_M 4096", "#pragma dataflow_slices(8, 1, 5)\n#define GP_M 4096")],
+     "#pragma dataflow_slices: argument 5 is not a distinct kernel port (3 ports)"),
 ]
 # M3.3.6.2.1.2.3.1 XT: the tile knobs (gemm_plan_tbody.cc GP_TM / GP_TN / GP_KC / GP_C_DEPTH / GP_DM_FIXED) on the
 # >= 88 neighbour-shared tile (gemm_plan_s64t_int8.cc: 12288 x 768 x 2048 int8, 96 x 96, 6 x 6 accumulator pairs).
