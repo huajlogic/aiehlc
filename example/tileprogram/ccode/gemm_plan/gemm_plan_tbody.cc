@@ -175,7 +175,9 @@ static_assert(GP_B_MT_BYTES <= GP_MT_BYTES, "B's MemTile buffers (whole slice, o
 static_assert(!(GP_B_RING && GP_KEEP), "a MemTile ring (GP_B_RING) is refilled every launch: no GP_KEEP");
 static_assert(GP_A_RING_BYTES <= GP_MT_BYTES, "A's ring must fit its MemTile");
 static_assert(GP_LAUNCHES >= 2, "GP_LAUNCHES >= 2 (launch 1 loads the kernel)");
-static_assert(GP_C_SPLIT == 1 || (GP_C_SPLIT == 2 && GP_DTYPE == 2), "GP_C_SPLIT: 1, or 2 (bf16 kernel only)");
+static_assert(GP_C_SPLIT == 1 || (GP_C_SPLIT == 2 && (GP_DTYPE == 2 || !(KA_TM == 64 && KA_TN == 64 && KA_KC == 128))),
+              "GP_C_SPLIT: 1, or 2 (bf16 kernel, or the generic int8 tile kernel)");
+static_assert(KA_TM >= 32 && KA_TM <= 128, "the generic int8 tile kernel declares at most 8 partial-sum pair rows (GT_ACC_DECL)");
 static_assert(GP_C_ROWS % 16 == 0, "an output row slice is whole 2 x 8-row block pairs");
 static_assert(GP_DM_USED <= GP_DM_BYTES, "core DM (64 KiB): fixed + partial sums + input slots + output slots must fit");
 
@@ -274,13 +276,53 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
     }
 #else
 #if GP_DTYPE == 1
-    // int8, any other tile (GP_TM x GP_TN x GP_KC, gemm_plan_tile.h knobs): per chunk, GT_CHUNK walks the
-    // (KA_TM / 16) x (KA_TN / 16) pairs of 2 x 2 accumulators; int32 partial sums in core memory between
-    // chunks, int8 out at the last chunk. Same ports, options (A / B neighbour-shared) and 2 x 8 grid as above.
+    // int8, any other tile (GP_TM x GP_TN x GP_KC): per chunk, GT_CHUNK (gemm_plan_tile.h) walks the
+    // (KA_TM / 16) x (KA_TN / 16) pairs of 2 x 2 accumulators; int32 partial sums in core memory between chunks
+    // (one array per pair row), int8 out at the last chunk in GP_C_SPLIT row slices of GP_C_ROWS rows. Same
+    // ports, options (A / B neighbour-shared) and 2 x 8 grid as the 64 x 64 kernel.
     typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
     const int pm = aie::program_id(0), pn = aie::program_id(1);
     const int sa = pm >> 1, sb = pn + GP_HW_COLS * (pm & 1), brow = sb * KA_TN;
-    alignas(64) static int32_t acc[KA_TM * KA_TN];
+    GT_ACC_DECL(0)
+    GT_ACC_DECL(1)
+#if KA_TM > 32
+    GT_ACC_DECL(2)
+#endif
+#if KA_TM > 48
+    GT_ACC_DECL(3)
+#endif
+#if KA_TM > 64
+    GT_ACC_DECL(4)
+#endif
+#if KA_TM > 80
+    GT_ACC_DECL(5)
+#endif
+#if KA_TM > 96
+    GT_ACC_DECL(6)
+#endif
+#if KA_TM > 112
+    GT_ACC_DECL(7)
+#endif
+    int32_t *const accp[KA_TM / 16] = {acc0, acc1
+#if KA_TM > 32
+                                       , acc2
+#endif
+#if KA_TM > 48
+                                       , acc3
+#endif
+#if KA_TM > 64
+                                       , acc4
+#endif
+#if KA_TM > 80
+                                       , acc5
+#endif
+#if KA_TM > 96
+                                       , acc6
+#endif
+#if KA_TM > 112
+                                       , acc7
+#endif
+    };
     for (int t = 0; t < SH_TILES; t++) {
         const int arow = sa * (KA_M / 2) + t * KA_TM;
         for (int k = 0; k < SH_NK; k++) {
@@ -288,12 +330,15 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
             auto xb = aie::load_buffer(b, {brow, k * KA_KC}, {KA_TN, KA_KC}, OPTS_B);
             const int8_t *a0p = GT_PART(xa, 0, KA_TM), *a1p = GT_PART(xa, 1, KA_TM);
             const int8_t *b0p = GT_PART(xb, 0, KA_TN), *b1p = GT_PART(xb, 1, KA_TN);
-            int8_t *__restrict y = nullptr;
-            if (k == SH_NK - 1)
-                y = aie::store_buffer(c, {arow, brow}, {KA_TM, KA_TN}, GT_C_OPTS);
-            GT_CHUNK(acc, y, a0p, a1p, b0p, b1p, k == 0, k == SH_NK - 1);
-            if (k == SH_NK - 1)
-                aie::commit(c);
+            for (int h = 0; h < GP_C_SPLIT; h++) {
+                const int m0 = h * (GP_C_ROWS / 8), m1 = (h + 1) * (GP_C_ROWS / 8);
+                int8_t *__restrict y = nullptr;
+                if (k == SH_NK - 1)
+                    y = aie::store_buffer(c, {arow + h * GP_C_ROWS, brow}, {GP_C_ROWS, KA_TN}, GT_C_OPTS);
+                GT_CHUNK(accp, y, m0, a0p, a1p, b0p, b1p, k == 0, k == SH_NK - 1, m0, m1);
+                if (k == SH_NK - 1)
+                    aie::commit(c);
+            }
             aie::release(a);
             aie::release(b);
         }

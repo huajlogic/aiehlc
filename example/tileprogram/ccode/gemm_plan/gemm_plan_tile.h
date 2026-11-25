@@ -164,13 +164,19 @@
 #endif
 /* 8 x 8 operand block (row block r of a T-row chunk, k block kb; [r][kb][64], row blocks < T/16 in part 0) */
 #define GT_OP(p0, p1, r, kb, T) (((r) / ((T) / 16) ? (p1) : (p0)) + (((r) % ((T) / 16)) * (KA_KC / 8) + (kb)) * 64)
-/* one chunk over the tile: (KA_TM / 16) x (KA_TN / 16) pairs of 2 x 2 accumulators (aie::mmul<8, 8, 8>).
- * first: the accumulators start at zero; last: int8 (low byte, as K4_OUT) straight to the output tile y
- * ([mi][ni][8 m][8 n]); otherwise the int32 partial sums go back to f ([mi][ni][64]). */
-#define GT_CHUNK(f, y, a0, a1, b0, b1, first, last)                                                                    \
-    for (int mi = 0; mi < KA_TM / 8; mi += 2)                                                                          \
+/* The int32 partial sums: ONE array per accumulator pair row (16 rows x KA_TN: [2 row blocks][KA_TN / 8][64]),
+ * not one KA_TM x KA_TN array -- the compiler places the hosted windows from 0x78000 up in the core's DMb, the
+ * stack and statics from 0x70000, so a 96 x 96 x 4 B = 36864 B array has no contiguous hole; 6144 B pieces fill
+ * both sides. GT_ACC_DECL declares pair row i (the kernel declares rows 0 .. KA_TM / 16 - 1 and their table). */
+#define GT_ACC_DECL(i) alignas(64) static int32_t acc##i[16 * KA_TN];
+/* one chunk over pair rows m0 / 2 .. m1 / 2 - 1 of the tile (8-row blocks m0 .. m1 - 1) x all KA_TN / 16 pair
+ * columns: 2 x 2 accumulators (aie::mmul<8, 8, 8>) per (pair row, pair column). first: the accumulators start at
+ * zero; last: int8 (low byte, as K4_OUT) straight to the output slice y, whose first 8-row block is ym0
+ * ([mi][ni][8 m][8 n]); otherwise the int32 partial sums go back to fp[pair row]. */
+#define GT_CHUNK(fp, y, ym0, a0, a1, b0, b1, first, last, m0, m1)                                                      \
+    for (int mi = (m0); mi < (m1); mi += 2)                                                                            \
         for (int ni = 0; ni < KA_TN / 8; ni += 2) {                                                                    \
-            int32_t *f00 = (f) + (mi * (KA_TN / 8) + ni) * 64, *f01 = f00 + 64;                                        \
+            int32_t *f00 = (fp)[mi >> 1] + ni * 64, *f01 = f00 + 64;                                                   \
             int32_t *f10 = f00 + (KA_TN / 8) * 64, *f11 = f10 + 64;                                                    \
             KaMM4 c0, c1, c2, c3;                                                                                      \
             if (first) {                                                                                               \
@@ -202,7 +208,7 @@
                     c3.mac(va1, vb1);                                                                                  \
                 }                                                                                                      \
             if (last) {                                                                                                \
-                int8_t *o_ = (y) + (mi * (KA_TN / 8) + ni) * 64;                                                       \
+                int8_t *o_ = (y) + ((mi - (ym0)) * (KA_TN / 8) + ni) * 64;                                             \
                 aie::store_v(o_, c0.to_vector<int8_t>(0));                                                             \
                 aie::store_v(o_ + 64, c1.to_vector<int8_t>(0));                                                        \
                 aie::store_v(o_ + (KA_TN / 8) * 64, c2.to_vector<int8_t>(0));                                          \
