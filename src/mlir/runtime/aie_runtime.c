@@ -139,7 +139,8 @@ static inline unsigned long long __rt_prof_tic(void);
 
 #include "aie_host_split.h"
 #include "rt_bd_once.h"
-#if defined(AIEHLC_SHIM_TS) || defined(AIEHLC_B_SHIM_DELAY_NS) /* gemm90 PA: default off, aie_shim_ts.h */
+#if defined(AIEHLC_SHIM_TS) || defined(AIEHLC_B_SHIM_DELAY_NS) || defined(AIEHLC_A_SHIM_DELAY_NS) ||                \
+    defined(AIEHLC_LOCKSAMPLE) /* gemm90 PA/PAE: default off, aie_shim_ts.h */
 #include "aie_shim_ts.c"
 #endif
 /* GAP-RT1: always-on wait_io time in generic-timer ticks (XTime clock), independent of AIEHLC_PROFILING */
@@ -2886,7 +2887,9 @@ extern INTPTR MMUTableL2;
 #define RT_NC_SUPPORTED 1
 #endif
 #define RT_NC_BLOCK 0x200000UL
+#ifndef RT_NC_MAX /* PAE: the one-ELF sweep (AIEHLC_SWEEP_RERUN) re-runs main, 3 NC buffers per run */
 #define RT_NC_MAX 8
+#endif
 static struct {
     void *base;
     size_t bytes;
@@ -9613,6 +9616,9 @@ static void rt_wait_io_upto(XAie_DevInst *dev, struct_ioevent io_event, u8 thres
         RT_PROF_INC(g_wait_io_iters);
         rt_dsync_step();
         rt_wait_hook_step(); /* GHL: one chunk of independent host work */
+#ifdef AIEHLC_LOCKSAMPLE
+        rt_lks_poll(dev); /* PAE: one core status/PC sample per poll (default off, aie_shim_ts.c) */
+#endif
         AieRC rc = XAie_DmaGetPendingBdCount(dev, tile, channel, dir, &numPendingBDs);
         if (rc != XAIE_OK) {
             printf("[aie_runtime] wait_io ERROR: XAie_DmaGetPendingBdCount "

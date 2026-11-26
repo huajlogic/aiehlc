@@ -17,6 +17,16 @@
  *                                  the built-in table: point p = (launch-1) / AIEHLC_B_SHIM_DELAY_LAUNCHES (default
  *                                  101) so ONE ELF sweeps all d values; the host may replace the table at run time
  *                                  (__Runtime_b_shim_delay_table) or pin a point (__Runtime_b_shim_delay_select).
+ *   AIEHLC_A_SHIM_DELAY_NS=<d0[,d1,...]>   (gemm90 m33621242222122 PAE)
+ *                                  same table / point rule as AIEHLC_B_SHIM_DELAY_NS, but the busy-wait is before each
+ *                                  start-queue push of the A shim channel (shim MM2S AIEHLC_A_SHIM_CH, default 1 = the
+ *                                  A input of gemm_plan_4096c). Exclusive with AIEHLC_B_SHIM_DELAY_NS (#error).
+ *   AIEHLC_LOCKSAMPLE              lock-stall attribution sampler: in every rt_wait_io_upto poll iteration read ONE
+ *                                  core tile (round robin over cols AIEHLC_LOCKSAMPLE_COL0.., rows ..ROW0..) Core_Status,
+ *                                  Core_PC, Core_Status (read-only); a sample counts as a lock stall when both status
+ *                                  reads have a Lock_Stall_{S,W,N,E} bit; per-tile PC histogram of the stalled samples
+ *                                  over launches AIEHLC_LOCKSAMPLE_FROM..TO (default 2..101), printed after launch TO as
+ *                                  LKSAMP_CFG / LKSAMP / LKPC lines.
  *   AIEHLC_SHIM_TS_AIE_MHZ         AIE clock for ns -> cycles (default 1000, = GPLAN aie_mhz on palmyra213).
  *   AIEHLC_SHIM_TS_MAX             record capacity (default 16384; overflow is counted, not wrapped).
  *
@@ -28,7 +38,8 @@
 #ifndef AIE_SHIM_TS_H
 #define AIE_SHIM_TS_H
 
-#if defined(AIEHLC_SHIM_TS) || defined(AIEHLC_B_SHIM_DELAY_NS)
+#if defined(AIEHLC_SHIM_TS) || defined(AIEHLC_B_SHIM_DELAY_NS) || defined(AIEHLC_A_SHIM_DELAY_NS) ||                \
+    defined(AIEHLC_LOCKSAMPLE)
 #define AIEHLC_SHIM_TS_ANY 1
 
 #include <stdint.h>
@@ -45,6 +56,10 @@ uint32_t __Runtime_b_shim_delay_select(int i);
 /* d (ns) the next B push will wait; B pushes counted in the previous complete launch */
 uint32_t __Runtime_b_shim_delay_ns(void);
 uint32_t __Runtime_b_shim_pushes_last_launch(void);
+/* PAE: A = shim MM2S AIEHLC_A_SHIM_CH (default 1); pushes counted in the previous complete launch, and the d (ns) the
+ * next A push waits (the same table as above when AIEHLC_A_SHIM_DELAY_NS is the swept knob, else 0) */
+uint32_t __Runtime_a_shim_pushes_last_launch(void);
+uint32_t __Runtime_a_shim_delay_ns(void);
 /* print the SHIMTS records now (also done automatically after launch AIEHLC_LOCKSNAP_LAUNCH) */
 void __Runtime_shim_ts_dump(void);
 /* read-only lock / DMA snapshot of every column that had a shim push (also automatic after that launch) */
