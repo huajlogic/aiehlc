@@ -68,8 +68,10 @@ MemtileUse memtileUse(const DataflowPlan &p, const PlanStream &s, int col) {
         }
     } else {
         u.chunksPerTile = s.chunks;
-        u.s2mmBds = 1, u.mm2sBds.assign(u.out.size(), 1), u.locks = 2;
         u.bytes = (int64_t)s.hostRows.size() * s.chunks * chunk;
+        // held whole: one S2MM load, a chain of as many BDs as the MemTile BD length field needs
+        const int64_t maxBd = planTarget().memBdMaxLenWords * planTarget().bdWordBytes;
+        u.s2mmBds = (int)((u.bytes + maxBd - 1) / maxBd), u.mm2sBds.assign(u.out.size(), 1), u.locks = 2;
     }
     u.present = !u.out.empty();
     return u;
@@ -225,8 +227,25 @@ bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
         p.locks.back().tag = mtag(si, c, "lock", 0);
         p.locks.push_back({t, m.locks[1], 1, keep ? 0 : -1, false, keep});
         p.locks.back().tag = mtag(si, c, "lock", 1);
-        p.bds.push_back({t, m.bdIn, m.addr, groups * bLen, {}, 0, 0, m.locks[1], -1, m.locks[0], replays, -1});
-        p.bds.back().tag = mtag(si, c, "in", 0);
+        // the load: u.s2mmBds chained BDs (the first takes the free lock, the last releases the replays)
+        const int64_t total = groups * bLen, nIn = u.s2mmBds;
+        const int64_t piece = (total / nIn + T.bdWordBytes - 1) / T.bdWordBytes * T.bdWordBytes;
+        for (int64_t i = 0, off = 0; i < nIn; i++, off += piece) {
+            const bool first = i == 0, last = i == nIn - 1;
+            p.bds.push_back({t,
+                             m.bdIn + (int)i,
+                             m.addr + off,
+                             last ? total - off : piece,
+                             {},
+                             0,
+                             0,
+                             first ? m.locks[1] : -1,
+                             first ? -1 : 0,
+                             last ? m.locks[0] : -1,
+                             last ? replays : 0,
+                             last ? -1 : m.bdIn + (int)i + 1});
+            p.bds.back().tag = mtag(si, c, "in", (int)i);
+        }
         p.channels.push_back({t, true, u.s2mm, m.bdIn, 1, keep});
         p.channels.back().tag = mtag(si, c, "ch_in", 0);
         for (size_t k = 0; k < u.out.size(); k++) {

@@ -65,13 +65,20 @@ static void eltwise_run(int8_t *x, int8_t *y, int8_t *z) {
 int main() {
     const long n = (long)OPS_R * OPS_C, rows = OPS_R / 4, tr = 16, tc = 256;
     int8_t *x = (int8_t *)malloc(n), *y = (int8_t *)malloc(n), *z = (int8_t *)malloc(n), *ref = (int8_t *)malloc(n);
+#ifdef OPS_HIDDR /* the AIE reads and writes DDR_LOW1 (0x8_0000_0000 + 6 GB on palmyra), cached on the A78 */
+    int8_t *x2 = (int8_t *)(uintptr_t)(OPS_HIDDR), *y2 = x2 + n, *zt = y2 + n;
+#else
     int8_t *x2 = (int8_t *)__Runtime_alloc_uncached(n), *y2 = (int8_t *)__Runtime_alloc_uncached(n);
     int8_t *zt = (int8_t *)__Runtime_alloc_uncached(n); // tile-major: [mesh row][mesh col][round][16 x 256]
+#endif
     ops_fill(x, n, 11);
     ops_fill(y, n, 22);
     aiehlc_plan_arrange(0, x, x2);
     aiehlc_plan_arrange(1, y, y2);
     memset(zt, 0, n);
+#ifdef OPS_HIDDR
+    Xil_DCacheFlushRange((INTPTR)x2, 3 * n);
+#endif
     const int launches = 6;
     double first = 0, best = 1e9, sum = 0;
     for (int it = 0; it < launches; it++) {
@@ -88,6 +95,10 @@ int main() {
     }
     printf("PERF SUMMARY eltwise_plan first %.3f ms, steady %.3f ms mean, best %.3f ms (%.2f GB/s in+out)\n", first,
            sum / (launches - 1), best, 3.0 * n / (best * 1e6));
+#ifdef OPS_HIDDR
+    Xil_DCacheInvalidateRange((INTPTR)zt, n);
+    printf("[eltwise_plan] buffers in DDR_LOW1 at %p\n", (void *)x2);
+#endif
     for (long pm = 0; pm < 4; pm++) // tile-major -> row-major
         for (long pn = 0; pn < 4; pn++)
             for (long i = 0; i < rows / tr; i++)

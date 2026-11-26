@@ -230,9 +230,8 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
         const int64_t bChunk = g.TN * g.KC * B.elemBytes, bWhole = (int64_t)sb.groups * NK * bChunk;
         const int64_t room = T.memBytes - (mtA == mtB ? aBytes : 0);
         const std::string want = B.df.getStage().str();
-        // held whole, the column's strips are ONE S2MM BD: its length field bounds it too
-        const bool bdFits = bWhole / T.bdWordBytes <= T.memBdMaxLenWords;
-        if (want == "memtile_ring" || bWhole > room || !bdFits) {
+        // held whole, the column's strips are loaded by a chain of S2MM BDs (plandma), so only room bounds it
+        if (want == "memtile_ring" || bWhole > room) {
             sb.stage = "memtile_ring";
             // the shallowest ring (from .ring, default 2) whose MemTile channels start at most chMaxRepeat
             // times and that divides the column's chunk stream (rounds x groups x K chunks)
@@ -254,9 +253,9 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
                             " B) does not fit next to A's ring: " + std::to_string(room) + " B left");
             if (want != "memtile_ring")
                 llvm::outs() << "[DataflowPlan] stream " << B.arg << ": held whole it needs " << bWhole
-                             << " B per MemTile (" << room << " B left next to A's ring, one BD holds "
-                             << T.memBdMaxLenWords * T.bdWordBytes << " B): streamed as memtile_ring " << sb.ring
-                             << " (re-read from DDR per output tile" << (sb.keep ? "; keep ignored" : "") << ")\n";
+                             << " B per MemTile (" << room << " B left next to A's ring): streamed as memtile_ring "
+                             << sb.ring << " (re-read from DDR per output tile" << (sb.keep ? "; keep ignored" : "")
+                             << ")\n";
             sb.keep = false;
         }
         llvm::outs() << "[DataflowPlan] stream " << A.arg << ": memtile_ring " << ring << ", " << aBytes

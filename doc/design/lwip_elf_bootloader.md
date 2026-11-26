@@ -63,8 +63,11 @@ segment)? Without that, the design falls back to the JTAG paths in section 10.
 
 The app ELFs use `0x0 .. ~0x42C9_AE80` (1 GB `.heap` included), and AIE buffers come
 from that heap (`XAie_MemAllocate`), so the top 128 MB of the 2 GB is free for the
-supervisor. **`0x8_0000_0000` ("DDR_LOW1") is NOT usable on this board**: it
-mirrors `DDR_LOW0` (section 12).
+supervisor. **`0x8_0000_0000` ("DDR_LOW1")**: on the PDI this design was first built on it mirrored
+`DDR_LOW0` (section 12, item 1). On the PDI of 2026-11-25 it is **6 GB of real DDR**
+(`0x8_0000_0000 .. 0x9_7FFF_FFFF`, as `xparameters.h` says; `0x9_8000_0000 ..` aliases `DDR_LOW0`), the
+AIE shim DMA reaches it, and its contents survive between runs -- the qwen weight loader puts a model
+there (`src/aietensorop/qwen/board/qwen_board.py`). The supervisor still loads `PT_LOAD`s into `DDR_LOW0` only.
 
 ## 4. Components
 
@@ -305,7 +308,7 @@ Each item below was found on the board, not on paper.
 
 | # | Finding | Evidence | Resolution |
 |---|---|---|---|
-| 1 | **`0x8_0000_0000` mirrors `0x0`**: the design's "unused DDR_LOW1" is the same 2 GB of DDR | xsdb physical writes: a value written at `0x8_0000_0000` reads back at `0x0`, and `0x100000` ↔ `0x8_0010_0000` | supervisor moved to the top of DDR_LOW0 (section 3). The symptom was nasty: placing the app at `0x0` overwrote the supervisor's own MMU tables (`ESR 0x9600004A`, access-flag fault level 2) and then its code (`EC 0` loop) |
+| 1 | **`0x8_0000_0000` mirrors `0x0`** (on the PDI of that time; no longer on the PDI of 2026-11-25: 6 GB of real DDR_LOW1, measured 2026-11-26 by writing a marker at 5 offsets in each 2 GB window -- `0x8_0`, `0x8_8`, `0x9_0` distinct, `0x9_8` = `DDR_LOW0`): the design's "unused DDR_LOW1" is the same 2 GB of DDR | xsdb physical writes: a value written at `0x8_0000_0000` reads back at `0x0`, and `0x100000` ↔ `0x8_0010_0000` | supervisor moved to the top of DDR_LOW0 (section 3). The symptom was nasty: placing the app at `0x0` overwrote the supervisor's own MMU tables (`ESR 0x9600004A`, access-flag fault level 2) and then its code (`EC 0` loop) |
 | 2 | **`Xil_SetTlbAttributes` above 4 GB rewrites a 1 GB block.** The GEM port marks its `emac_bd_space` non-cacheable, which took the whole supervisor uncached | uploads crawled and the client gave up at 60 s | BD ring linked into its own MMU block (`.netboot_bd` section) |
 | 3 | **`p_memsz` includes the 1 GB `.heap` and `.stack`** (BSP `lscript` puts them in the one `PT_LOAD`) | both test ELFs: `memsz ≈ 0x4042_05C0` | copy `p_filesz` only; zero exactly the allocated `SHT_NOBITS` sections minus `.heap`/`.stack`. `crt0` cannot be trusted to: it skips BSS clearing when `APU_PWRCTL` flags a warm boot |
 | 4 | **This PDI gives the supervisor no way to stop a running app core.** `XPm_ForcePowerDown` -> `ERR XPm_ForcePowerdown: 0x2`; `XPm_ResetAssert(PM_RST_APU0_CORE1_WARM/COLD)` -> `0x7D2` `XPM_PM_NO_ACCESS` (even after `XPm_RequestNode`); `XPm_ReleaseNode` returns success but the core **keeps running**; `XPm_RequestWakeUp` of a running core -> `0x7DB` `XPM_ERR_WAKEUP` | PLM console | the kill chain (power-down, warm reset, cold reset) stays in `apu.c` for PDIs that permit it, and every attempt is logged. On this PDI, `STATUS` reports `app core busy`, `LOAD_RUN` is refused with that reason, and `apppaltest --netload` **re-bootstraps** the supervisor (`device program` frees core 1) and retries automatically. Lifting this needs a subsystem-permission change in BOOT.BIN |
