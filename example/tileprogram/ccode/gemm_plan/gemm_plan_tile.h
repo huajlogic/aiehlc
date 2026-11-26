@@ -227,12 +227,19 @@
    first): with {.parts = 2} the plan puts them in different memory banks (x.part(i)); with one part they
    are back to back, half a chunk apart */
 #if !defined(GP_PARTS) || GP_PARTS == 2
+/* one operand's two halves (PB: SH_BOUND_S takes A and B apart) */
+#define SH_PART2(x, w, l_, h_, rows)                                                                                   \
+    l_ = (const int8_t *)(x).part(w);                                                                                  \
+    h_ = (const int8_t *)(x).part((w) ^ 1);
 #define SH_PARTS(xa, xb, al_, ah_, bl_, bh_)                                                                           \
     al_ = (const int8_t *)(xa).part(pa);                                                                               \
     ah_ = (const int8_t *)(xa).part(pa ^ 1);                                                                           \
     bl_ = (const int8_t *)(xb).part(pb);                                                                               \
     bh_ = (const int8_t *)(xb).part(pb ^ 1);
 #else
+#define SH_PART2(x, w, l_, h_, rows)                                                                                   \
+    l_ = (const int8_t *)(x) + (w) * ((rows) / 2 * KA_KC);                                                             \
+    h_ = (const int8_t *)(x) + ((w) ^ 1) * ((rows) / 2 * KA_KC);
 #define SH_PARTS(xa, xb, al_, ah_, bl_, bh_)                                                                           \
     al_ = (const int8_t *)(xa) + pa * (KA_TM / 2 * KA_KC);                                                             \
     ah_ = (const int8_t *)(xa) + (pa ^ 1) * (KA_TM / 2 * KA_KC);                                                       \
@@ -265,6 +272,43 @@
         K4_LD(Y, ae + 256);                                                                                            \
         K4_BLK_HEAD(X, nAl, nBl);                                                                                      \
         GIVE;                                                                                                          \
+        K4_BLK_TAIL(X, nAl, nBl + 2048);                                                                               \
+        SH_RESET(nAl, nAh, nBl, nBh);                                                                                  \
+    }
+/* PB (m33621242222122, chunk-boundary static cut): K4_BLK_HEAD as two runs of k-steps [2, s) and [s, 16), so the
+ * two operands' lock code sits in different VMAC runs. A chunk boundary's take / give is per operand (A then B); in
+ * SH_BOUND_L the second operand's lock-id / slot arithmetic was a serial island between the first operand's lock
+ * operations and its own (lock operations do not share bundles with the VMAC stream). SH_BOUND_S takes A after
+ * k-step SH_SPLIT of block 15 and B after k-step 14 (gives likewise in the next chunk's block 0), so that arithmetic
+ * co-issues with the k-steps in between. Same blocks, same order of accesses per chunk as SH_BOUND_L. */
+#ifndef SH_SPLIT
+#define SH_SPLIT 12
+#endif
+#define K4_BLK_RUN(c, pa0, pb0, k0, k1)                                                                                \
+    {                                                                                                                  \
+        const int8_t *__restrict pa_ = (pa0);                                                                          \
+        const int8_t *__restrict pb_ = (pb0);                                                                          \
+        for (int ki = (k0); ki < (k1); ki += 2)                                                                        \
+            chess_flatten_loop {                                                                                       \
+                K4_STEP(c, pa_ + ki * 64, pb_ + ki * 64);                                                              \
+                K4_STEPW(c, pa_ + ki * 64 + 64, pb_ + ki * 64 + 64);                                                   \
+            }                                                                                                          \
+    }
+#define SH_BOUND_S(TAKE_A, TAKE_B, GIVE_A, GIVE_B)                                                                     \
+    {                                                                                                                  \
+        K4_ST(cur, X);                                                                                                 \
+        K4_LD(X, ae);                                                                                                  \
+        K4_BLK_RUN(Y, aY, bY, 2, SH_SPLIT);                                                                            \
+        TAKE_A;                                                                                                        \
+        K4_BLK_RUN(Y, aY, bY, SH_SPLIT, KA_KC / 8);                                                                    \
+        TAKE_B;                                                                                                        \
+        K4_BLK_TAIL(Y, nAl, nBl);                                                                                      \
+        K4_ST(cur + 256, Y);                                                                                           \
+        K4_LD(Y, ae + 256);                                                                                            \
+        K4_BLK_RUN(X, nAl, nBl, 2, SH_SPLIT);                                                                          \
+        GIVE_A;                                                                                                        \
+        K4_BLK_RUN(X, nAl, nBl, SH_SPLIT, KA_KC / 8);                                                                  \
+        GIVE_B;                                                                                                        \
         K4_BLK_TAIL(X, nAl, nBl + 2048);                                                                               \
         SH_RESET(nAl, nAh, nBl, nBh);                                                                                  \
     }

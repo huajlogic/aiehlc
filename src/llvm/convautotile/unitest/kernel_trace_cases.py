@@ -930,6 +930,30 @@ K4_NUM_CASES = [
      [("NK", "4")], "PASS:K4NUM tile=64x64 kc=128 chunks=4 walks=4 takes=12 gives=16 bad=0"),
     ("k4 peel numerics: 2 chunks (boundary straight into the last chunk) == scalar (x86 emu, 4 walks)",
      [("NK", "2")], "PASS:K4NUM tile=64x64 kc=128 chunks=2 walks=4 takes=4 gives=8 bad=0"),
+    # gemm90 m33621242222122 PB (chunk-boundary static cut): SH_BOUND_S takes / gives A after k-step SH_SPLIT and B after
+    # k-step 14 of the boundary blocks (gemm_plan_tile.h), so each operand's lock code sits in its own VMAC run. Same
+    # numerics as SH_BOUND_L for every walk; takes / gives counted per operand. Red (ccf3a5df: no SH_BOUND_S): no build.
+    ("k4 split-boundary numerics: SH_BOUND_S (A at k-step SH_SPLIT, B at 14) == scalar (x86 emu, 4 walks, 4 chunks)",
+     [("NK", "4"), ("BOUND", "S")],
+     "PASS:K4NUM tile=64x64 kc=128 chunks=4 walks=4 takes=12 gives=16 bad=0 bound=S takes_b=12 gives_b=16"),
+    ("k4 split-boundary numerics: SH_BOUND_S, 2 chunks (boundary straight into the last chunk) == scalar (x86 emu)",
+     [("NK", "2"), ("BOUND", "S")],
+     "PASS:K4NUM tile=64x64 kc=128 chunks=2 walks=4 takes=4 gives=8 bad=0 bound=S takes_b=4 gives_b=8"),
+]
+
+
+K4_BOUND_S_EDITS = [
+    ("#define T_GIVE gives++;",
+     "#define T_GIVE gives++;\n"
+     "static int takes_b, gives_b;\n"
+     "#define T_TAKE_A const int8_t *nAl, *nAh; { takes++; SH_PART2(A[kn_], pa, nAl, nAh, KA_TM); }\n"
+     "#define T_TAKE_B const int8_t *nBl, *nBh; { takes_b++; SH_PART2(B[kn_], pb, nBl, nBh, KA_TN); }\n"
+     "#define T_GIVE_A gives++;\n#define T_GIVE_B gives_b++;"),
+    ("SH_BOUND_L(T_TAKE, T_GIVE)", "SH_BOUND_S(T_TAKE_A, T_TAKE_B, T_GIVE_A, T_GIVE_B)"),
+    ("    gives++;\n    K4_OUT(cur + 256, Y, 15);", "    gives++;\n    gives_b++;\n    K4_OUT(cur + 256, Y, 15);"),
+    ('bad=%ld\\n", NK, takes, gives, bad);', 'bad=%ld bound=S takes_b=%d gives_b=%d\\n", NK, takes, gives, bad, takes_b, gives_b);'),
+    ("return bad != 0 || takes != 4 * (NK - 1) || gives != 4 * NK;",
+     "return bad != 0 || takes != 4 * (NK - 1) || gives != 4 * NK || takes_b != takes || gives_b != gives;"),
 ]
 
 
@@ -939,7 +963,13 @@ def run_k4_num(edits, expect):
     with tempfile.TemporaryDirectory() as tmp:
         shutil.copy(tile_h, tmp)
         src = pathlib.Path(tmp) / "k4num.cc"
-        src.write_text(f"#define NK {edits[0][1]}\n" + K4_NUM_SRC)
+        body = K4_NUM_SRC
+        if len(edits) > 1 and edits[1] == ("BOUND", "S"):  # PB: the split boundary SH_BOUND_S, per-operand counts
+            for a_, b_ in K4_BOUND_S_EDITS:
+                if a_ not in body:
+                    return False, f"k4 bound S anchor not found: {a_[:60]!r}"
+                body = body.replace(a_, b_)
+        src.write_text(f"#define NK {edits[0][1]}\n" + body)
         emu = REPO / "src" / "mlir" / "runtime" / "aie_api_x86emu.h"
         cc = subprocess.run(["g++", "-std=c++20", "-O1", "-w", "-fsanitize=address", f"-DAIEHLC_EMU_HEADER=\"{emu}\"",
                              "-I", tmp, "-o", str(pathlib.Path(tmp) / "k4num"), str(src)],

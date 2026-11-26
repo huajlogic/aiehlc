@@ -185,20 +185,27 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
 // boundary into chunk k (PK, m3362124222211: SH_BOUND_L): chunk k is taken after the 14 k-steps of block 15 of
 // chunk k - 1 that read only chunk k - 1, and chunk k - 1 is given back after the 14 k-steps of chunk k's block 0
 // (taking chunk k before giving chunk k - 1 back still overlaps the boundary with compute).
-#define GEMM_TAKE                                                                                                      \
-    const int8_t *nAl, *nAh, *nBl, *nBh;                                                                               \
+// PB (m33621242222122, chunk-boundary static cut, SH_BOUND_S): per operand -- A is taken / given after k-step
+// SH_SPLIT (12), B after k-step 14, so B's lock-id / slot arithmetic co-issues with the k-steps in between instead of
+// sitting between A's and B's lock operations (kcyc_lst: 8767168 -> 8759496 cyc per launch).
+#define GEMM_TAKE_A                                                                                                    \
+    const int8_t *nAl, *nAh;                                                                                           \
     {                                                                                                                  \
         auto xa = aie::load_buffer(a, {arow, kn_ * KA_KC}, {KA_TM, KA_KC}, OPTS_A);                                    \
-        auto xb = aie::load_buffer(b, {brow, kn_ * KA_KC}, {KA_TN, KA_KC}, OPTS_B);                                    \
-        SH_PARTS(xa, xb, nAl, nAh, nBl, nBh);                                                                          \
+        SH_PART2(xa, pa, nAl, nAh, KA_TM);                                                                             \
     }
-#define GEMM_GIVE                                                                                                      \
-    aie::release(a);                                                                                                   \
-    aie::release(b);
+#define GEMM_TAKE_B                                                                                                    \
+    const int8_t *nBl, *nBh;                                                                                           \
+    {                                                                                                                  \
+        auto xb = aie::load_buffer(b, {brow, kn_ * KA_KC}, {KA_TN, KA_KC}, OPTS_B);                                    \
+        SH_PART2(xb, pb, nBl, nBh, KA_TN);                                                                             \
+    }
+#define GEMM_GIVE_A aie::release(a);
+#define GEMM_GIVE_B aie::release(b);
 #define GEMM_NEXT_CHUNK(k)                                                                                             \
     {                                                                                                                  \
         const int kn_ = (k);                                                                                           \
-        SH_BOUND_L(GEMM_TAKE, GEMM_GIVE)                                                                               \
+        SH_BOUND_S(GEMM_TAKE_A, GEMM_TAKE_B, GEMM_GIVE_A, GEMM_GIVE_B)                                                 \
     }
 #if GP_DTYPE == 1
     typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4; // one mac_8x8_8x8: 512 int8 MAC / cycle
