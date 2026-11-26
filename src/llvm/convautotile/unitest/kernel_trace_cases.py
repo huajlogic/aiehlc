@@ -511,6 +511,121 @@ GT_NUM_CASES = [
 ]
 
 
+# m3362124222211 PK: x86 numerics of the hand-scheduled 64 x 64 x 128 int8 tile (gemm_plan_tile.h K4_* / SH_*) as the
+# N-sliced gemm_ka runs it -- chunk 0 (K4_BLKZ: every block starts with a mul, accumulators never zeroed -- they start
+# as garbage here so a missed init shows), the late-take / late-give chunk boundary SH_BOUND_L, the B pair pointers
+# P/Q (SH_INNER_G), the last chunk SH_INNER_O (one partial-sum pointer) with row-major K4_OUT (K4_ROW4: one VSHIFT
+# per 4 rows) -- for every (pa, pb) walk order, against a scalar int32 reference
+# (low byte, as the core's SRS shift 0 without saturation). Takes = NK - 1 boundaries, gives = NK chunks per walk.
+K4_NUM_BASE = "K4NUM"
+K4_NUM_SRC = r"""
+#include AIEHLC_EMU_HEADER
+#define GP_N_SLICES 8
+#define GP_PARTS 1
+#define KA_TM 64
+#define KA_TN 64
+#define KA_KC 128
+#include "gemm_plan_tile.h"
+typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4;
+alignas(64) static int8_t A[NK][KA_TM * KA_KC], B[NK][KA_TN * KA_KC];
+alignas(64) static int8_t Y[KA_TM * KA_TN];
+alignas(64) static int32_t acc[KA_TM * KA_TN];
+static int32_t ref[KA_TM][KA_TN];
+static int takes, gives;
+static int opA(int k, int m, int kk) { return A[k][((m / 8) * (KA_KC / 8) + kk / 8) * 64 + (m % 8) * 8 + kk % 8]; }
+static int opB(int k, int n, int kk) { return B[k][((n / 8) * (KA_KC / 8) + kk / 8) * 64 + (kk % 8) * 8 + n % 8]; }
+#define T_TAKE                                                                                                         \
+    const int8_t *nAl, *nAh, *nBl, *nBh;                                                                               \
+    {                                                                                                                  \
+        takes++;                                                                                                       \
+        SH_PARTS(A[kn_], B[kn_], nAl, nAh, nBl, nBh);                                                                  \
+    }
+#define T_GIVE gives++;
+static void tile(int pa, int pb) {
+    const int swz = (pa << 3) ^ (pb << 1);
+    int8_t *y = Y;
+    int32_t *__restrict ae = acc, *__restrict ao = acc + 2048;
+    KaMM4 X0, X1, X2, X3, Y0, Y1, Y2, Y3;
+    int32_t *cur, *nxt;
+    const int8_t *aY, *aX, *bY, *bYo, *bX, *bXo;
+    int dA;
+    const int8_t *Al, *Ah, *Bl, *Bh;
+    SH_PARTS(A[0], B[0], Al, Ah, Bl, Bh);
+    aie::vector<int8_t, 64> va0 = aie::load_v<64>(Al), va1 = aie::load_v<64>(Al + K4_H);
+    aie::vector<int8_t, 64> vb0 = aie::load_v<64>(Bl), vb1 = aie::load_v<64>(Bl + K4_H);
+    aie::vector<int8_t, 64> wa0 = aie::load_v<64>(Al + 64), wa1 = aie::load_v<64>(Al + K4_H + 64);
+    aie::vector<int8_t, 64> wb0 = aie::load_v<64>(Bl + 64), wb1 = aie::load_v<64>(Bl + K4_H + 64);
+    SH_RESET(Al, Ah, Bl, Bh);
+    {
+        aie::accum<acc32, 64> g_;
+        g_.from_vector(aie::broadcast<int32_t, 64>(0x5a5a));
+        X0 = X1 = X2 = X3 = Y0 = Y1 = Y2 = Y3 = KaMM4(g_);
+    }
+    K4_BLKZ(X, Al, Bl, Al, Bl + 2048);
+    SH_INNER_G(K4_STI, K4_LDN, K4_BLKZ);
+    K4_LDZ(Y, ae + 256);
+    { const int kn_ = 1; SH_BOUND_L(T_TAKE, T_GIVE) }
+    for (int j = 1; j < NK - 1; j++) {
+        SH_INNER_W(K4_STI, K4_LD);
+        { const int kn_ = j + 1; SH_BOUND_L(T_TAKE, T_GIVE) }
+    }
+    SH_INNER_O(K4_OUT, K4_LD);
+    K4_OUT(cur, X, 14);
+    K4_BLK(Y, aY, bY, aY, bY);
+    gives++;
+    K4_OUT(cur + 256, Y, 15);
+}
+int main() {
+    unsigned s = 12345;
+    for (int k = 0; k < NK; k++) {
+        for (int i = 0; i < KA_TM * KA_KC; i++) A[k][i] = (int8_t)((s = s * 1103515245u + 12345u) >> 16);
+        for (int i = 0; i < KA_TN * KA_KC; i++) B[k][i] = (int8_t)((s = s * 1103515245u + 12345u) >> 16);
+    }
+    for (int m = 0; m < KA_TM; m++)
+        for (int n = 0; n < KA_TN; n++) {
+            int32_t t = 0;
+            for (int k = 0; k < NK; k++)
+                for (int kk = 0; kk < KA_KC; kk++) t += opA(k, m, kk) * opB(k, n, kk);
+            ref[m][n] = t;
+        }
+    long bad = 0;
+    for (int pa = 0; pa < 2; pa++)
+        for (int pb = 0; pb < 2; pb++) {
+            for (int i = 0; i < KA_TM * KA_TN; i++) Y[i] = 0x5a;
+            tile(pa, pb);
+            for (int m = 0; m < KA_TM; m++)
+                for (int n = 0; n < KA_TN; n++) bad += Y[m * KA_TN + n] != (int8_t)ref[m][n];
+        }
+    std::printf("K4NUM tile=64x64 kc=128 chunks=%d walks=4 takes=%d gives=%d bad=%ld\n", NK, takes, gives, bad);
+    return bad != 0 || takes != 4 * (NK - 1) || gives != 4 * NK;
+}
+"""
+K4_NUM_CASES = [
+    ("k4 peel numerics: chunk 0 mul (K4_BLKZ) / SH_BOUND_L late take+give / SH_INNER_O + K4_OUT one VSHIFT per 4 rows == scalar (x86 emu, 4 walks)",
+     [("NK", "4")], "PASS:K4NUM tile=64x64 kc=128 chunks=4 walks=4 takes=12 gives=16 bad=0"),
+    ("k4 peel numerics: 2 chunks (boundary straight into the last chunk) == scalar (x86 emu, 4 walks)",
+     [("NK", "2")], "PASS:K4NUM tile=64x64 kc=128 chunks=2 walks=4 takes=4 gives=8 bad=0"),
+]
+
+
+def run_k4_num(edits, expect):
+    """Compile K4_NUM_SRC with g++ on the x86 AIE API emulation; edits = [("NK", chunks)]."""
+    tile_h = CCODE / "gemm_plan" / "gemm_plan_tile.h"
+    with tempfile.TemporaryDirectory() as tmp:
+        shutil.copy(tile_h, tmp)
+        src = pathlib.Path(tmp) / "k4num.cc"
+        src.write_text(f"#define NK {edits[0][1]}\n" + K4_NUM_SRC)
+        emu = REPO / "src" / "mlir" / "runtime" / "aie_api_x86emu.h"
+        cc = subprocess.run(["g++", "-std=c++20", "-O1", "-w", "-fsanitize=address", f"-DAIEHLC_EMU_HEADER=\"{emu}\"",
+                             "-I", tmp, "-o", str(pathlib.Path(tmp) / "k4num"), str(src)],
+                            capture_output=True, text=True, timeout=600)
+        if cc.returncode != 0:
+            return False, cc.stdout + cc.stderr
+        p = subprocess.run([str(pathlib.Path(tmp) / "k4num")], capture_output=True, text=True, timeout=600,
+                           env=dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"))
+        out = p.stdout + p.stderr
+    return p.returncode == 0 and expect[5:] in out, out
+
 def run_gt_num(edits, expect):
     """Compile GT_NUM_SRC with g++ on the x86 AIE API emulation; edits = [(TM, TN), (KC, KC)]."""
     tm, tn = edits[0]
@@ -546,6 +661,8 @@ def inline_cc(path):
 
 
 def run_case(cli, name, edits, expect, base=BASE):
+    if base == K4_NUM_BASE:
+        return run_k4_num(edits, expect)
     if base == GT_NUM_BASE:
         return run_gt_num(edits, expect)
     src = inline_cc(base) if base in (GEMMPLAN_BASE, GEMMPLAN_T_BASE) else base.read_text()
@@ -585,6 +702,7 @@ def main():
     cases += [(n, e, x, GEMMPLAN_BASE) for n, e, x in GEMMPLAN_CASES]
     cases += [(n, e, x, GEMMPLAN_T_BASE) for n, e, x in GEMMPLAN_T_CASES]
     cases += [(n, e, x, GT_NUM_BASE) for n, e, x in GT_NUM_CASES]
+    cases += [(n, e, x, K4_NUM_BASE) for n, e, x in K4_NUM_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]
     for name, edits, expect, base in cases:

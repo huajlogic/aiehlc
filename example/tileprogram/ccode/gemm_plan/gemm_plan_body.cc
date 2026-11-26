@@ -182,18 +182,23 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
      .parts = GP_PARTS,                                                                                                \
      .align = 64}
 #endif
-// boundary into chunk k: chunk k is taken before chunk k - 1 is given back (blocks 14 / 15 of chunk
-// k - 1 run with chunk k's first operands prefetched)
+// boundary into chunk k (PK, m3362124222211: SH_BOUND_L): chunk k is taken after the 14 k-steps of block 15 of
+// chunk k - 1 that read only chunk k - 1, and chunk k - 1 is given back after the 14 k-steps of chunk k's block 0
+// (taking chunk k before giving chunk k - 1 back still overlaps the boundary with compute).
+#define GEMM_TAKE                                                                                                      \
+    const int8_t *nAl, *nAh, *nBl, *nBh;                                                                               \
+    {                                                                                                                  \
+        auto xa = aie::load_buffer(a, {arow, kn_ * KA_KC}, {KA_TM, KA_KC}, OPTS_A);                                    \
+        auto xb = aie::load_buffer(b, {brow, kn_ * KA_KC}, {KA_TN, KA_KC}, OPTS_B);                                    \
+        SH_PARTS(xa, xb, nAl, nAh, nBl, nBh);                                                                          \
+    }
+#define GEMM_GIVE                                                                                                      \
+    aie::release(a);                                                                                                   \
+    aie::release(b);
 #define GEMM_NEXT_CHUNK(k)                                                                                             \
     {                                                                                                                  \
-        const int8_t *nAl, *nAh, *nBl, *nBh;                                                                           \
-        auto xa = aie::load_buffer(a, {arow, (k) * KA_KC}, {KA_TM, KA_KC}, OPTS_A);                                    \
-        auto xb = aie::load_buffer(b, {brow, (k) * KA_KC}, {KA_TN, KA_KC}, OPTS_B);                                    \
-        SH_PARTS(xa, xb, nAl, nAh, nBl, nBh);                                                                          \
-        SH_BOUND1(nAl, nBl);                                                                                           \
-        aie::release(a);                                                                                               \
-        aie::release(b);                                                                                               \
-        SH_BOUND2(nAl, nAh, nBl, nBh);                                                                                 \
+        const int kn_ = (k);                                                                                           \
+        SH_BOUND_L(GEMM_TAKE, GEMM_GIVE)                                                                               \
     }
 #if GP_DTYPE == 1
     typedef aie::mmul<8, 8, 8, int8_t, int8_t> KaMM4; // one mac_8x8_8x8: 512 int8 MAC / cycle
@@ -225,16 +230,15 @@ __global__ void gemm_ka(aie::port<input_window_int8 *, aie::IFM, aie::shape<KA_M
         aie::vector<int8_t, 64> wa0 = aie::load_v<64>(Al + 64), wa1 = aie::load_v<64>(Al + K4_H + 64);
         aie::vector<int8_t, 64> wb0 = aie::load_v<64>(Bl + 64), wb1 = aie::load_v<64>(Bl + K4_H + 64);
         SH_RESET(Al, Ah, Bl, Bh);
-        K4_LDZ(X, ae);
-        K4_LDZ(Y, ae + 256);
-        K4_BLK(X, Al, Bl, Al, Bl + 2048);
-        SH_INNER_W(K4_STI, K4_LDZ); // chunk 0: accumulators start from zero
+        K4_BLKZ(X, Al, Bl, Al, Bl + 2048);
+        SH_INNER_G(K4_STI, K4_LDN, K4_BLKZ); // chunk 0: every block starts with a mul (PK: no zeroing)
+        K4_LDZ(Y, ae + 256);                 // block 15 (in GEMM_NEXT_CHUNK) accumulates from zero
         GEMM_NEXT_CHUNK(1);
         for (int j = 1; j < SH_NK - 1; j++) {
             SH_INNER_W(K4_STI, K4_LD);
             GEMM_NEXT_CHUNK(j + 1);
         }
-        SH_INNER_W(K4_OUT, K4_LD); // last chunk: blocks go straight to the int8 output tile
+        SH_INNER_O(K4_OUT, K4_LD); // last chunk: blocks go straight to the int8 output tile
         K4_OUT(cur, X, 14);
         K4_BLK(Y, aY, bY, aY, bY);
         aie::release(a);

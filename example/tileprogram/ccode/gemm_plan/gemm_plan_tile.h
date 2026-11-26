@@ -48,18 +48,29 @@
 /* N-slices (#pragma dataflow_slices, m3362124221 P2): the output tile goes out ROW-MAJOR (KA_TN bytes per row) --
  * the shim BD writes its rows at the row stride of the whole C (ldc = slices x N). Row r of blocks (mi, ni) and
  * (mi, ni + 1) = 16 contiguous bytes (interleave_zip by 8, as simplegemm_dataflow.cc). */
+/* PK (m3362124222211): the 4 rows r0..r3 of a zipped 64-byte vector v at t, t + KA_TN, .. -- ONE VSHIFT (16 B down)
+ * per vector instead of three: rows 0 / 2 are quarters 0 / 2 of v, rows 1 / 3 quarters 0 / 2 of the shifted copy;
+ * quarter 2 is the low quarter of the high 256-bit half (a register move, not a vector-slot op). VSHIFT and
+ * VSHUFFLE take the VMAC's vector slot, so the last chunk's loop is 128 VMAC + its shifts / shuffles. */
+#define K4_ROW4(t, v)                                                                                                  \
+    {                                                                                                                  \
+        const aie::vector<int8_t, 64> v_ = (v);                                                                        \
+        const aie::vector<int8_t, 64> s_ = aie::shuffle_down_fill(v_, v_, 16);                                         \
+        aie::store_v((t), v_.extract<32>(0).extract<16>(0));                                                           \
+        aie::store_v((t) + 2 * KA_TN, v_.extract<32>(1).extract<16>(0));                                               \
+        aie::store_v((t) + KA_TN, s_.extract<32>(0).extract<16>(0));                                                   \
+        aie::store_v((t) + 3 * KA_TN, s_.extract<32>(1).extract<16>(0));                                               \
+    }
 #define K4_OUT(p, c, bl)                                                                                               \
     {                                                                                                                  \
         const int L_ = (bl) ^ swz;                                                                                     \
-        int8_t *tt_ = y + (2 * (L_ >> 2)) * 8 * KA_TN + 2 * (L_ & 3) * 8;                                              \
+        int8_t *__restrict tt_ = y + (2 * (L_ >> 2)) * 8 * KA_TN + 2 * (L_ & 3) * 8;                                            \
         const auto z0_ = aie::interleave_zip((c##0).to_vector<int8_t>(0), (c##1).to_vector<int8_t>(0), 8);            \
         const auto z1_ = aie::interleave_zip((c##2).to_vector<int8_t>(0), (c##3).to_vector<int8_t>(0), 8);            \
-        for (int r_ = 0; r_ < 4; r_++) {                                                                               \
-            aie::store_v(tt_ + r_ * KA_TN, z0_.first.extract<16>(r_));                                                 \
-            aie::store_v(tt_ + (4 + r_) * KA_TN, z0_.second.extract<16>(r_));                                          \
-            aie::store_v(tt_ + (8 + r_) * KA_TN, z1_.first.extract<16>(r_));                                           \
-            aie::store_v(tt_ + (12 + r_) * KA_TN, z1_.second.extract<16>(r_));                                         \
-        }                                                                                                              \
+        K4_ROW4(tt_, z0_.first);                                                                                       \
+        K4_ROW4(tt_ + 4 * KA_TN, z0_.second);                                                                          \
+        K4_ROW4(tt_ + 8 * KA_TN, z1_.first);                                                                           \
+        K4_ROW4(tt_ + 12 * KA_TN, z1_.second);                                                                         \
     }
 #else
 #define K4_OUT(p, c, bl)                                                                                               \
@@ -103,28 +114,101 @@
         K4_STEP(c, (npa), (npb));                                                                                      \
         K4_STEPW(c, (npa) + 64, (npb) + 64);                                                                           \
     }
+/* PK chunk 0: the block's first k-step is a mul (acc = A x B), so the accumulators are never zeroed (no VMOV.D
+ * on the vector slot, no K4_LDZ) */
+#define K4_STEPXM(c, l, m, A0, A1, B0, B1)                                                                             \
+    {                                                                                                                  \
+        const aie::vector<int8_t, 64> n0 = aie::load_v<64>(l), n1 = aie::load_v<64>((l) + K4_H);                       \
+        const aie::vector<int8_t, 64> m0 = aie::load_v<64>(m), m1 = aie::load_v<64>((m) + K4_H);                       \
+        (c##0).mul(A0, B0);                                                                                            \
+        (c##1).mul(A0, B1);                                                                                            \
+        (c##2).mul(A1, B0);                                                                                            \
+        (c##3).mul(A1, B1);                                                                                            \
+        A0 = n0;                                                                                                       \
+        A1 = n1;                                                                                                       \
+        B0 = m0;                                                                                                       \
+        B1 = m1;                                                                                                       \
+    }
+#define K4_BLKZ(c, pa0, pb0, npa, npb)                                                                                 \
+    {                                                                                                                  \
+        const int8_t *__restrict pa_ = (pa0);                                                                          \
+        const int8_t *__restrict pb_ = (pb0);                                                                          \
+        K4_STEPXM(c, pa_ + 2 * 64, pb_ + 2 * 64, va0, va1, vb0, vb1);                                                  \
+        K4_STEPW(c, pa_ + 2 * 64 + 64, pb_ + 2 * 64 + 64);                                                             \
+        for (int ki = 4; ki < KA_KC / 8; ki += 2)                                                                      \
+            chess_flatten_loop {                                                                                       \
+                K4_STEP(c, pa_ + ki * 64, pb_ + ki * 64);                                                              \
+                K4_STEPW(c, pa_ + ki * 64 + 64, pb_ + ki * 64 + 64);                                                   \
+            }                                                                                                          \
+        K4_STEP(c, (npa), (npb));                                                                                      \
+        K4_STEPW(c, (npa) + 64, (npb) + 64);                                                                           \
+    }
+#define K4_LDN(c, p)
+/* PK: K4_BLK split at its last two k-steps (the only ones that load from (npa, npb)), so the next chunk can be taken
+ * between them -- its lock code then shares bundles with the 8 VMACs whose operands are already in registers. */
+#define K4_BLK_HEAD(c, pa0, pb0)                                                                                       \
+    {                                                                                                                  \
+        const int8_t *__restrict pa_ = (pa0);                                                                          \
+        const int8_t *__restrict pb_ = (pb0);                                                                          \
+        for (int ki = 2; ki < KA_KC / 8; ki += 2)                                                                      \
+            chess_flatten_loop {                                                                                       \
+                K4_STEP(c, pa_ + ki * 64, pb_ + ki * 64);                                                              \
+                K4_STEPW(c, pa_ + ki * 64 + 64, pb_ + ki * 64 + 64);                                                   \
+            }                                                                                                          \
+    }
+#define K4_BLK_TAIL(c, npa, npb)                                                                                       \
+    {                                                                                                                  \
+        K4_STEP(c, (npa), (npb));                                                                                      \
+        K4_STEPW(c, (npa) + 64, (npb) + 64);                                                                           \
+    }
 /* 7 iterations: blocks 1 .. 14 of the current chunk (state: X = block 0 done, Y = block 1 loaded) */
 #define K4_STI(p, c, bl) K4_ST(p, c)
-#define SH_INNER_W(ST, LD)                                                                                             \
-    for (int i = 0; i < 7; i++) {                                                                                      \
-        ST(cur, X, 2 * i);                                                                                             \
-        LD(X, nxt);                                                                                                    \
-        K4_BLK(Y, aY, bY, aX, bX);                                                                                     \
-        ST(cur + 256, Y, 2 * i + 1);                                                                                   \
-        LD(Y, nxt + 256);                                                                                              \
-        const int8_t *aY2 = aX;                                                                                        \
-        K4_BLK(X, aX, bX, aY2, bYo);                                                                                   \
-        int32_t *t_ = cur + 512 + 0;                                                                                   \
-        cur = nxt;                                                                                                     \
-        nxt = t_;                                                                                                      \
-        aX = aY + 2048 + ((unsigned)(i - 2) < 2u ? dA : 0);                                                            \
-        aY = aY2;                                                                                                      \
-        const int8_t *tb = bY;                                                                                         \
-        bY = bYo;                                                                                                      \
-        bYo = tb;                                                                                                      \
-        tb = bX;                                                                                                       \
-        bX = bXo;                                                                                                      \
-        bXo = tb;                                                                                                      \
+#define SH_INNER_W(ST, LD) SH_INNER_G(ST, LD, K4_BLK)
+#define SH_INNER_G(ST, LD, BLK)                                                                                        \
+    {                                                                                                                  \
+        const int8_t *bP_ = bXo, *bQ_ = bX; /* PK: bY = bP_ + 2048, bX = bQ_, bYo = bQ_ + 2048; swapped every i */   \
+        for (int i = 0; i < 7; i++) {                                                                                  \
+            ST(cur, X, 2 * i);                                                                                         \
+            LD(X, nxt);                                                                                                \
+            BLK(Y, aY, bP_ + 2048, aX, bQ_);                                                                           \
+            ST(cur + 256, Y, 2 * i + 1);                                                                               \
+            LD(Y, nxt + 256);                                                                                          \
+            const int8_t *aY2 = aX;                                                                                    \
+            BLK(X, aX, bQ_, aY2, bQ_ + 2048);                                                                          \
+            int32_t *t_ = cur + 512 + 0;                                                                               \
+            cur = nxt;                                                                                                 \
+            nxt = t_;                                                                                                  \
+            aX = aY + 2048 + ((unsigned)(i - 2) < 2u ? dA : 0);                                                        \
+            aY = aY2;                                                                                                  \
+            const int8_t *tb = bP_;                                                                                    \
+            bP_ = bQ_;                                                                                                 \
+            bQ_ = tb;                                                                                                  \
+        }                                                                                                              \
+        bY = bP_ + 2048;                                                                                               \
+    }
+/* PK: the last chunk (ST = K4_OUT writes the output tile, not cur): only the partial-sum load pointer nxt is
+ * live -- nxt walks ao, ae + 512, ao + 512, ae + 1024, .. (step dn_ = -1536, +2048, ..), one pointer fewer */
+#define SH_INNER_O(ST, LD)                                                                                             \
+    {                                                                                                                  \
+        int dn_ = -1536;                                                                                               \
+        const int8_t *bP_ = bXo, *bQ_ = bX; /* bY = bP_ + 2048, bX = bQ_, bYo = bQ_ + 2048; swapped every i */        \
+        for (int i = 0; i < 7; i++) {                                                                                  \
+            ST(nxt, X, 2 * i);                                                                                         \
+            LD(X, nxt);                                                                                                \
+            K4_BLK(Y, aY, bP_ + 2048, aX, bQ_);                                                                        \
+            ST(nxt, Y, 2 * i + 1);                                                                                     \
+            LD(Y, nxt + 256);                                                                                          \
+            const int8_t *aY2 = aX;                                                                                    \
+            K4_BLK(X, aX, bQ_, aY2, bQ_ + 2048);                                                                       \
+            nxt += dn_;                                                                                                \
+            dn_ = 512 - dn_;                                                                                           \
+            aX = aY + 2048 + ((unsigned)(i - 2) < 2u ? dA : 0);                                                        \
+            aY = aY2;                                                                                                  \
+            const int8_t *tb = bP_;                                                                                    \
+            bP_ = bQ_;                                                                                                 \
+            bQ_ = tb;                                                                                                  \
+        }                                                                                                              \
+        bY = bP_ + 2048;                                                                                               \
     }
 /* pointer state for chunk g whose halves are (al_, ah_, bl_, bh_) */
 #define SH_RESET(al_, ah_, bl_, bh_)                                                                                   \
@@ -166,6 +250,24 @@
     K4_LD(Y, ae + 256);                                                                                                \
     K4_BLK(X, nAl, nBl, nAl, nBl + 2048);                                                                              \
     SH_RESET(nAl, nAh, nBl, nBh);
+/* PK chunk boundary (late take, late give-back): TAKE declares and fills (nAl, nAh, nBl, nBh) -- the next chunk's
+ * load_buffer -- and runs after the 14 k-steps of block 15 that read only the current chunk; GIVE (the current
+ * chunk's release) runs after the 14 k-steps of the next chunk's block 0. Same blocks, same order of accesses
+ * per chunk as SH_BOUND1 / SH_BOUND2; the lock code is no longer a serial island between two VMAC streams. */
+#define SH_BOUND_L(TAKE, GIVE)                                                                                         \
+    {                                                                                                                  \
+        K4_ST(cur, X);                                                                                                 \
+        K4_LD(X, ae);                                                                                                  \
+        K4_BLK_HEAD(Y, aY, bY);                                                                                        \
+        TAKE;                                                                                                          \
+        K4_BLK_TAIL(Y, nAl, nBl);                                                                                      \
+        K4_ST(cur + 256, Y);                                                                                           \
+        K4_LD(Y, ae + 256);                                                                                            \
+        K4_BLK_HEAD(X, nAl, nBl);                                                                                      \
+        GIVE;                                                                                                          \
+        K4_BLK_TAIL(X, nAl, nBl + 2048);                                                                               \
+        SH_RESET(nAl, nAh, nBl, nBh);                                                                                  \
+    }
 /* ---- generic tile (M3.3.6.2.1.2.3.1, gemm_plan_tbody.cc knobs GP_TM / GP_TN / GP_KC / GP_C_DEPTH) ---------- */
 /* the hand-scheduled 4 x 4-pair pipeline above (K4_* / SH_*) is the 64 x 64 x 128 tile; any other tile runs
  * the generic chunk (GT_CHUNK) */
