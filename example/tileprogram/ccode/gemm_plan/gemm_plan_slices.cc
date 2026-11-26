@@ -38,8 +38,8 @@ static int32_t gp_got_rm(void *vctx, long i, long j) {
 // rt_sts_point, 101 launches per point). Per point: `=== SWEEP point d_ns= b_pushes_per_launch=`, its GPLAN line, its
 // GP_LAUNCHES call lines, STEADY (median of its launches 2..N) and GOLDEN (sentinel before its last launch), i.e. each
 // point is a complete board log of its own. Host-only (EXTRA_DEFS); undefined -> the original main below.
-uint32_t __Runtime_b_shim_delay_ns(void);
-uint32_t __Runtime_b_shim_pushes_last_launch(void);
+extern "C" uint32_t __Runtime_b_shim_delay_ns(void);
+extern "C" uint32_t __Runtime_b_shim_pushes_last_launch(void);
 int main() {
     const long M = GP_M, Ns = GP_N, S = GP_N_SLICES, N = Ns * S, K = GP_K;
     const int launches = GP_LAUNCHES;
