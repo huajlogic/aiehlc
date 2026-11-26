@@ -2,7 +2,7 @@
 
 Date: 2026-11-16
 Status: draft, pending review
-Related: `tutorial/model/tiny-sdm-unet.md` (the current approach, which produces the orange), `docs/plans/2026-09-09-aiegraph-primitive-fusion-offload-design.md` (fused offload on ResNet, a different problem)
+Related: `tutorial/model/03_tiny-sdm-unet.md` (the current approach, which produces the orange), `docs/plans/2026-09-09-aiegraph-primitive-fusion-offload-design.md` (fused offload on ResNet, a different problem)
 
 ---
 

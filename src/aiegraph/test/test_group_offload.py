@@ -12,7 +12,7 @@ partition.json record and offload_reset of a whole group -- on small hand-made g
 ``data/bk_sdm_tiny_graph.json.gz`` = gzip of the tutorial build's
 ``ag_work/resnet18_graph.json`` (bk-sdm-tiny ``unet_sim_t32``, 537 calls; sha1 of the
 uncompressed file ab492860ba684e11b24a089563afb84aba99ebc0), the graph the board ELF
-of tutorial/model/tiny-sdm-unet.md is generated from.
+of tutorial/model/03_tiny-sdm-unet.md is generated from.
 """
 import gzip
 import hashlib

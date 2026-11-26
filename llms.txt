@@ -34,7 +34,7 @@ Status: end to end on the board for contractions (GEMM, conv2d), board-verified 
 
 ## Optional
 
-- [Models on the AIE](tutorial/model/resnet18.md): ResNet18, also [YOLO](tutorial/model/yolov26.md) and [tiny SD UNet](tutorial/model/tiny-sdm-unet.md)
+- [Models on the AIE](tutorial/model/README.md): [quickstart](tutorial/model/01_quickstart_resnet18.md), [ResNet18](tutorial/model/02_resnet18.md), also [YOLO](tutorial/model/04_yolov26.md) and [tiny SD UNet](tutorial/model/03_tiny-sdm-unet.md)
 - [aiegraph (Python)](doc/tutorial_aiegraph.md): ONNX / PyTorch model to int8 C, offload layers to AIE kernels
 - [Your own kernel in a model](doc/tutorial_userkernel.md)
 - [Performance](doc/reference/performance.md): control-plane cost, measured

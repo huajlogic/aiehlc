@@ -2,7 +2,7 @@
 
 This tutorial walks you step by step through deploying the UNet of **bk-sdm-tiny** (a small 256×256 Stable Diffusion model) to a first-generation VEK385 board (palmyra, A78 APU + AIE2PS): the A78 runs the C code TVM generates, and conv, Linear and attention run on the AIE. Then the text encoder and the VAE run on the host while every UNet step runs on the board, and together they generate a picture of an orange.
 
-The whole flow uses only **aiegraph**, the same framework as the [ResNet18](resnet18.md) and [YOLOv26](yolov26.md) tutorials. On the user side you write only `build_unet.py` (listed in full in section 5) and an offload declaration, `unet_offload.py`. All C text (AIE kernels, host glue, the board main) lives in aiegraph and in the templates under [`src/aiednn/`](../../src/aiednn/).
+The whole flow uses only **aiegraph**, the same framework as the [ResNet18](02_resnet18.md) and [YOLOv26](04_yolov26.md) tutorials. On the user side you write only `build_unet.py` (listed in full in section 5) and an offload declaration, `unet_offload.py`. All C text (AIE kernels, host glue, the board main) lives in aiegraph and in the templates under [`src/aiednn/`](../../src/aiednn/).
 
 Every command was run on palmyra213 (10.23.224.213); the results are in [Measured results](#measured-results) at the end.
 
@@ -468,6 +468,6 @@ The two images have the same composition and colors. The whole-image PSNR is onl
 | change the board main / PROF glue | [`src/aiegraph/boardmain.py`](../../src/aiegraph/boardmain.py) |
 | test one kernel on its own | [`kacc_bench.sh`](../../example/aiegraph/unet_bk_sdm_tiny/kacc_bench.sh) `--gemm` / `--bmm` |
 | see where the time goes | the `LAUNCH split` and `PROF` lines in the board log |
-| move a different CNN model | see [ResNet18](resnet18.md) and [YOLOv26](yolov26.md): the same aiegraph, with conv/gemm all offloaded at once by `aiegraph.cnn` / `aiegraph.cnn_chunk` |
+| move a different CNN model | see [ResNet18](02_resnet18.md) and [YOLOv26](04_yolov26.md): the same aiegraph, with conv/gemm all offloaded at once by `aiegraph.cnn` / `aiegraph.cnn_chunk` |
 
 Not done yet: GroupNorm and LayerNorm still run on the A78, conv im2col still runs on the A78, all data between layers goes through DDR, every launch is synchronous, and only 16 of the 144 tiles are used.

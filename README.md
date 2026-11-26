@@ -123,7 +123,7 @@ Other platforms (PetaLinux, AIE-ML, llvm-aie) and the simulator:
 |---|---|
 | [tutorial/aieprogram](tutorial/aieprogram/README.md) | The programming model, by operator family: contraction (GEMM, conv2d), elementwise, reduction, data movement, indexing; then GEMM optimization step by step (scheduling options, vector instructions). Every example checks itself on the board. |
 | [tutorial/aiednn](tutorial/aiednn/howto/templatekernel.md) | Writing a library-grade ML kernel for AIEDNN (a bf16 GEMM as a C++ template). |
-| [tutorial/model](tutorial/model) | Whole models on the AIE: [ResNet18](tutorial/model/resnet18.md), [yolov26](tutorial/model/yolov26.md), [tiny SD UNet](tutorial/model/tiny-sdm-unet.md). |
+| [tutorial/model](tutorial/model) | Whole models on the AIE ([chapter index](tutorial/model/README.md)): [quickstart](tutorial/model/01_quickstart_resnet18.md), [ResNet18](tutorial/model/02_resnet18.md), [yolov26](tutorial/model/04_yolov26.md), [tiny SD UNet](tutorial/model/03_tiny-sdm-unet.md). |
 | [doc/tutorial_aiegraph.md](doc/tutorial_aiegraph.md) | `aiegraph`: take a model from Python (ONNX / PyTorch) to int8 C, offload layers to AIE kernels, build the board ELF. |
 | [doc/tutorial_userkernel.md](doc/tutorial_userkernel.md) | Plugging your own AIE kernel into one layer of a model. |
 | [tutorial/tutorial.md](tutorial/tutorial.md) | The low-level driver API underneath: one kernel loaded, routed and run by hand. |

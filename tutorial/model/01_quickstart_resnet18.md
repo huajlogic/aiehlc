@@ -19,7 +19,7 @@ The kernel is the stem convolution that ships with the repo:
 
 For the full API see the [aiegraph user guide](../../doc/tutorial_aiegraph.md).
 For a deployment that puts **all** 21 weighted layers on the AIE, see
-[resnet18.md](resnet18.md).
+[02_resnet18.md](02_resnet18.md).
 
 ---
 
