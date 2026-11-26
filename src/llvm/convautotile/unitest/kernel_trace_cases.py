@@ -627,6 +627,119 @@ def run_pq_stub(expect):
     return p.returncode == 0 and expect[5:] in out, out
 
 
+# m3362124222212 PL (host_gap): the dataflow-plan write-once table (src/mlir/runtime/rt_bd_once.h) answers each
+# per-call shim BD config / ooo channel enable with an O(1) hashed lookup instead of a scan of every recorded write.
+# Stub (g++, x86): 200000 random (dev, col, row, kind, id, gen, addr, hash) checks over 300 keys (the 256-entry table
+# fills) replayed against the old linear scan -- same answer every time -- and the 4096^3 int8 plan's 36 per-call keys
+# (A BD15 / B BD14 / pre-queue BD0, BD1 on shims 1-4, C BD2-5, 7-10 on shims 3-4, 4 ooo channels) for 808 calls
+# (101 launches x 8): every call after the first is all hits at <= 1.5 index probes per lookup.
+# Red (no rt_bd_once.h): the stub reports BDONCE FAIL.
+BDONCE_H = REPO / "src" / "mlir" / "runtime" / "rt_bd_once.h"
+BDONCE_BASE = BDONCE_H.parent / "__bdonce_stub__"
+BDONCE_SRC = r"""
+#include <cstdio>
+#include <cstdint>
+#include <vector>
+#if __has_include("rt_bd_once.h")
+#include "rt_bd_once.h"
+#define BO_HAVE 1
+#else
+#define BO_HAVE 0
+#endif
+struct Ref { const void *dev; unsigned gen; uint8_t col, row, id, kind; uint64_t addr; uint32_t hash; };
+static Ref ref[256];
+static int ref_n = 0;
+static int ref_seen(const void *dev, unsigned gen, uint8_t col, uint8_t row, uint8_t kind, uint8_t id, uint64_t addr,
+                    uint32_t hash) {  /* aie_runtime.c rt_bd_once_seen before PL (linear scan) */
+    int slot = -1;
+    for (int i = 0; i < ref_n; i++)
+        if (ref[i].dev == dev && ref[i].col == col && ref[i].row == row && ref[i].kind == kind && ref[i].id == id) {
+            if (ref[i].gen == gen && ref[i].addr == addr && ref[i].hash == hash) return 1;
+            slot = i;
+            break;
+        }
+    if (slot < 0) {
+        if (ref_n >= 256) return 0;
+        slot = ref_n++;
+    }
+    ref[slot] = {dev, gen, col, row, id, kind, addr, hash};
+    return 0;
+}
+int main() {
+#if !BO_HAVE
+    std::printf("BDONCE FAIL: no rt_bd_once.h (linear scan only)\n");
+    return 1;
+#else
+    static rt_bd_once_tab T;
+    unsigned s = 2463534242u;
+    auto rnd = [&]() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; };
+    struct K { const void *dev; uint8_t col, row, kind, id; };
+    std::vector<K> keys;
+    static int d0, d1;
+    for (int i = 0; i < 300; i++)
+        keys.push_back({(rnd() & 1) ? (const void *)&d0 : (const void *)&d1, (uint8_t)(rnd() % 64), (uint8_t)(rnd() % 8),
+                        (uint8_t)(rnd() % 3), (uint8_t)(rnd() % 32)});
+    long ops = 0, mism = 0, hits = 0;
+    for (int i = 0; i < 200000; i++, ops++) {
+        const K &k = keys[rnd() % (i < 100000 ? 200 : 300)];
+        const unsigned gen = (rnd() % 64) ? 1u : 2u;
+        const uint64_t addr = 0x1000u * (rnd() % 3);
+        const uint32_t hash = rnd() % 2;
+        const int a = ref_seen(k.dev, gen, k.col, k.row, k.kind, k.id, addr, hash);
+        const int b = rt_bd_once_check(&T, k.dev, gen, k.col, k.row, k.kind, k.id, addr, hash);
+        mism += a != b;
+        hits += b;
+    }
+    static rt_bd_once_tab P;
+    std::vector<K> plan;
+    for (int c = 1; c <= 4; c++) {
+        plan.push_back({&d0, (uint8_t)c, 0, 0, 15}); plan.push_back({&d0, (uint8_t)c, 0, 0, 14});
+        plan.push_back({&d0, (uint8_t)c, 0, 0, 0}); plan.push_back({&d0, (uint8_t)c, 0, 0, 1});
+    }
+    for (int c = 3; c <= 4; c++) {
+        for (int b = 2; b <= 5; b++) plan.push_back({&d0, (uint8_t)c, 0, 0, (uint8_t)b});
+        for (int b = 7; b <= 10; b++) plan.push_back({&d0, (uint8_t)c, 0, 0, (uint8_t)b});
+        plan.push_back({&d0, (uint8_t)c, 0, 1, (uint8_t)(0 | (1 << 4))}); plan.push_back({&d0, (uint8_t)c, 0, 1, (uint8_t)(1 | (1 << 4))});
+    }
+    long first_miss = 0, later_miss = 0;
+    unsigned long p0 = 0;
+    for (int call = 0; call < 808; call++) {
+        if (call == 1) p0 = P.probes;
+        for (const K &k : plan) {
+            const int h = rt_bd_once_check(&P, k.dev, 1u, k.col, k.row, k.kind, k.id, 0x4000u + k.id, 7u);
+            (call ? later_miss : first_miss) += !h;
+        }
+    }
+    const double ppl = (double)(P.probes - p0) / (807.0 * plan.size());
+    const bool ok = mism == 0 && hits > 0 && first_miss == (long)plan.size() && later_miss == 0 && ppl <= 1.5;
+    std::printf("BDONCE ops=%ld mismatches=%ld plan_keys=%zu calls=808 first_misses=%ld later_misses=%ld probes_le_1.5=%d %s\n",
+                ops, mism, plan.size(), first_miss, later_miss, ppl <= 1.5 ? 1 : 0, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+#endif
+}
+"""
+BDONCE_CASES = [
+    ("dataflow plan bd_once O(1) table == linear scan (200000 checks, 256-entry fill) + 36-key plan all hits after call 0",
+     [], "PASS:BDONCE ops=200000 mismatches=0 plan_keys=36 calls=808 first_misses=36 later_misses=0 probes_le_1.5=1 OK"),
+]
+
+
+def run_bdonce_stub(expect):
+    """g++ the write-once stub against rt_bd_once.h (when present)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        if BDONCE_H.exists():
+            shutil.copy(BDONCE_H, tmp)
+        src = pathlib.Path(tmp) / "bdonce.cc"
+        src.write_text(BDONCE_SRC)
+        cc = subprocess.run(["g++", "-std=c++17", "-O1", "-w", "-I", tmp, "-o", str(pathlib.Path(tmp) / "bdonce"),
+                             str(src)], capture_output=True, text=True, timeout=600)
+        if cc.returncode != 0:
+            return False, cc.stdout + cc.stderr
+        p = subprocess.run([str(pathlib.Path(tmp) / "bdonce")], capture_output=True, text=True, timeout=600)
+        out = p.stdout + p.stderr
+    return p.returncode == 0 and expect[5:] in out, out
+
+
 # m3362124222211 PK: x86 numerics of the hand-scheduled 64 x 64 x 128 int8 tile (gemm_plan_tile.h K4_* / SH_*) as the
 # N-sliced gemm_ka runs it -- chunk 0 (K4_BLKZ: every block starts with a mul, accumulators never zeroed -- they start
 # as garbage here so a missed init shows), the late-take / late-give chunk boundary SH_BOUND_L, the B pair pointers
@@ -783,6 +896,8 @@ def run_case(cli, name, edits, expect, base=BASE):
         return run_gt_num(edits, expect)
     if base == PQ_BASE:
         return run_pq_stub(expect)
+    if base == BDONCE_BASE:
+        return run_bdonce_stub(expect)
     src = inline_cc(base) if base in (GEMMPLAN_BASE, GEMMPLAN_T_BASE) else base.read_text()
     if base == TEMPLATE_BASE:  # the library kernel alone: add the includes and a host launch
         src = TEMPLATE_HEAD + src + TEMPLATE_HOST
@@ -821,6 +936,7 @@ def main():
     cases += [(n, e, x, GEMMPLAN_T_BASE) for n, e, x in GEMMPLAN_T_CASES]
     cases += [(n, e, x, GT_NUM_BASE) for n, e, x in GT_NUM_CASES]
     cases += [(n, e, x, PQ_BASE) for n, e, x in PQ_CASES]
+    cases += [(n, e, x, BDONCE_BASE) for n, e, x in BDONCE_CASES]
     cases += [(n, e, x, K4_NUM_BASE) for n, e, x in K4_NUM_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]

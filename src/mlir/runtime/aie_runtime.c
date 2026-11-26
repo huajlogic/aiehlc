@@ -138,6 +138,7 @@ static inline unsigned long long __rt_prof_tic(void);
 #endif
 
 #include "aie_host_split.h"
+#include "rt_bd_once.h"
 /* GAP-RT1: always-on wait_io time in generic-timer ticks (XTime clock), independent of AIEHLC_PROFILING */
 static unsigned long long g_hs_wait_ticks = 0ULL;
 static unsigned int g_hs_wait_calls = 0U;
@@ -7281,15 +7282,8 @@ int __Runtime_ctrl_shim_bd_sync(void) { return rt_sb_ack_wait() == XAIE_OK ? 0 :
  * of its launch loop). Set once by the generated aiehlc_plan_host_setup(). */
 static int g_rt_plan_bd_once;
 static int g_rt_plan_go_lock = -1;
-#define RT_BD_ONCE_MAX 256
-static struct {
-    XAie_DevInst *dev;
-    unsigned gen;
-    uint8_t col, row, id, kind; /* kind 0 = BD, 1 = ooo channel (id = ch | dir << 4) */
-    uint64_t addr;
-    uint32_t hash;
-} s_bd_once[RT_BD_ONCE_MAX];
-static int s_bd_once_n;
+/* the write-once table: rt_bd_once.h (O(1) hashed lookup, PL m3362124222212; was a linear scan per write) */
+static rt_bd_once_tab s_bd_once;
 
 static unsigned g_rt_plan_launch; /* launches (calls of __Runtime_plan_setup, one per host call) */
 
@@ -7347,29 +7341,7 @@ static int rt_plan_go(XAie_DevInst *dev, struct_kernel_group kg) {
 static int rt_bd_once_seen(XAie_DevInst *dev, XAie_LocType t, uint8_t kind, uint8_t id, uint64_t addr, uint32_t hash) {
     if (!g_rt_plan_bd_once)
         return 0;
-    int slot = -1;
-    for (int i = 0; i < s_bd_once_n; i++)
-        if (s_bd_once[i].dev == dev && s_bd_once[i].col == t.Col && s_bd_once[i].row == t.Row &&
-            s_bd_once[i].kind == kind && s_bd_once[i].id == id) {
-            if (s_bd_once[i].gen == g_partition_gen && s_bd_once[i].addr == addr && s_bd_once[i].hash == hash)
-                return 1;
-            slot = i;
-            break;
-        }
-    if (slot < 0) {
-        if (s_bd_once_n >= RT_BD_ONCE_MAX)
-            return 0;
-        slot = s_bd_once_n++;
-    }
-    s_bd_once[slot].dev = dev;
-    s_bd_once[slot].gen = g_partition_gen;
-    s_bd_once[slot].col = (uint8_t)t.Col;
-    s_bd_once[slot].row = (uint8_t)t.Row;
-    s_bd_once[slot].kind = kind;
-    s_bd_once[slot].id = id;
-    s_bd_once[slot].addr = addr;
-    s_bd_once[slot].hash = hash;
-    return 0;
+    return rt_bd_once_check(&s_bd_once, dev, g_partition_gen, (uint8_t)t.Col, (uint8_t)t.Row, kind, id, addr, hash);
 }
 
 /* ---- dataflow plan DMA program (dfschedule.config.tile_bd / lock_set / channel_enable / channel_start) ----
@@ -7771,11 +7743,11 @@ struct_io __Runtime_dma_createio_4(XAie_LocType tile_loc, XAie_DmaDesc dma_desc,
  * Used on shim S2MM channels for gathering output from multiple core tiles.
  */
 void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int32_t channel, XAie_DmaDirection dir) {
+    if (rt_bd_once_seen(dev, tile, 1U, (uint8_t)(channel | ((int)dir << 4)), 0U, 0U))
+        return; /* checked first: a later call's enable costs one table probe (PL m3362124222212) */
     XAie_DmaChannelDesc DmaChannelDescInst;
     AieRC rc = XAIE_OK;
     rt_sb_rec aot_rec = {RT_AOT_CALL_CH_OOO, (uint8_t)channel, 0U, (uint8_t)dir, 0, tile, 0U, {}};
-    if (rt_bd_once_seen(dev, tile, 1U, (uint8_t)(channel | ((int)dir << 4)), 0U, 0U))
-        return;
     if (!rt_sb_aot_take(dev, &aot_rec, 0U)) {
         rt_seq_channel_ooo_desc(dev, tile, &DmaChannelDescInst);
         RT_SB_CALL(dev, tile, rc, XAie_DmaWriteChannel(dev, &DmaChannelDescInst, tile, (uint8_t)channel, dir));
