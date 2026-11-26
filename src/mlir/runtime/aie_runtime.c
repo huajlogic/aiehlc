@@ -139,6 +139,9 @@ static inline unsigned long long __rt_prof_tic(void);
 
 #include "aie_host_split.h"
 #include "rt_bd_once.h"
+#if defined(AIEHLC_SHIM_TS) || defined(AIEHLC_B_SHIM_DELAY_NS) /* gemm90 PA: default off, aie_shim_ts.h */
+#include "aie_shim_ts.c"
+#endif
 /* GAP-RT1: always-on wait_io time in generic-timer ticks (XTime clock), independent of AIEHLC_PROFILING */
 static unsigned long long g_hs_wait_ticks = 0ULL;
 static unsigned int g_hs_wait_calls = 0U;
@@ -7541,9 +7544,19 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
  * Host-readable call counter; P3 reports it as rebase writes per launch. */
 static volatile uint64_t g_shim_bd_rebase_n = 0;
 
-uint64_t __Runtime_shim_bd_rebase_count(void) { return g_shim_bd_rebase_n; }
+uint64_t __Runtime_shim_bd_rebase_count(void) {
+#ifdef AIEHLC_SHIM_TS_ANY
+    rt_sts_launch_end(); /* gemm_plan: read once after each launch, outside its XTime window */
+#endif
+    return g_shim_bd_rebase_n;
+}
 
-void __Runtime_shim_bd_rebase_count_reset(void) { g_shim_bd_rebase_n = 0; }
+void __Runtime_shim_bd_rebase_count_reset(void) {
+#ifdef AIEHLC_SHIM_TS_ANY
+    rt_sts_launch_begin(); /* gemm_plan: called once before each launch */
+#endif
+    g_shim_bd_rebase_n = 0;
+}
 
 /* a shim BD's address word(s) <- the device address of host pointer @addr (no rebase count) */
 static AieRC rt_shim_bd_addr_write(XAie_DevInst *dev, XAie_LocType tile, int bd, uint64_t addr, uint64_t *dma_out) {
@@ -7836,6 +7849,9 @@ struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id,
     AieRC rc = XAIE_OK;
     rt_sb_rec aot_rec = {RT_AOT_CALL_START, io.channel_id, io.bd_id, (uint8_t)io.direction, repeat, io.tile_loc, 0U,
                          {}};
+#ifdef AIEHLC_SHIM_TS_ANY
+    rt_sts_push(dev, io.tile_loc, io.channel_id, io.direction, io.bd_id);
+#endif
     if (!rt_sb_aot_take(dev, &aot_rec, 0U))
         RT_SB_CALL(dev, io.tile_loc, rc,
                    rt_seq_start_queue(dev, io.tile_loc, io.channel_id, io.direction, io.bd_id, repeat));
@@ -9549,6 +9565,9 @@ static void rt_wait_io_upto(XAie_DevInst *dev, struct_ioevent io_event, u8 thres
         }
     }
 #endif
+#ifdef AIEHLC_SHIM_TS_ANY
+    rt_sts_done(dev, tile, channel, dir);
+#endif
     g_hs_wait_ticks += ahs_now() - __hs_t0;
     g_hs_wait_calls++;
     RT_PROF_ADD(g_wait_io_cycles, g_wait_io_calls, __wio_t0);
@@ -9616,6 +9635,10 @@ struct_ioevent __Runtime_startio_prequeue(XAie_DevInst *dev, struct_io io, int32
     AieRC rc = XAIE_OK;
     if (next_addr)
         rc = rt_shim_bd_addr_write(dev, io.tile_loc, tgt, next_addr, NULL);
+#ifdef AIEHLC_SHIM_TS_ANY
+    if (rc == XAIE_OK)
+        rt_sts_push(dev, io.tile_loc, io.channel_id, io.direction, tgt);
+#endif
     if (rc == XAIE_OK)
         RT_SB_CALL(dev, io.tile_loc, rc, rt_seq_start_queue(dev, io.tile_loc, io.channel_id, io.direction, tgt, repeat));
     AIEHLC_LOG(printf("[aie_runtime] startio_prequeue shim(%u,0) ch=%u bd=%u (own %d alt %u) repeat=%d rc=%d\n",
