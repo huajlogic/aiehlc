@@ -48,7 +48,7 @@ before the host enters __Runtime_wait_io, i.e. hidden behind the host BD issue.
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 CAL_DEFAULTS = {
     "chunk_ovh_cyc": 0.0,    # core cycles per K-chunk not in the ISS count
@@ -259,13 +259,20 @@ def _unit_exp(tile: tuple, n: int) -> list:
     return _E_CACHE[key]
 
 
-def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, gran: int) -> Dict[str, Any]:
-    """gran = K sub-chunks per KC=128 chunk (1: KC=128, 2: KC=64).  Returns per-tile B wait / end (cycles)."""
+def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, gran: int,
+            a_depth: Optional[int] = None, t_a: float = 0.0) -> Dict[str, Any]:
+    """gran = K sub-chunks per KC=128 chunk (1: KC=128, 2: KC=64).  Returns per-tile B wait / end (cycles).
+
+    depth = B slot ring depth.  a_depth (phase PQ): A slot ring depth per core; None = A not modelled (the A wait
+    stays inside W, phase PM behaviour, byte-identical).  With a_depth, A is a per-core stream (one MemTile MM2S per
+    core, no broadcast): A chunk j arrives at max(arrival j-1, release of chunk j - a_depth) + t_a, and the core
+    acquires A before B (lock order a2/b2 ACQ, pb.txt:6), so a chunk starts at max(end j-1, A arrival, B arrival);
+    the A part of that wait is returned in 'await'."""
     N = P["chunks_per_launch"] * gran
     per_slice = N // P["slices"]
     t_b = P["b_chunk_bytes"] / gran / P["stream_b_per_cyc"]
     reload = P["breload_us"] * P["clk_mhz"] / P["slices"]
-    bwait, end = {}, {}
+    bwait, end, await_ = {}, {}, {}
     for c in (1, 2, 3, 4):
         col = [(c, r) for r in (3, 4, 5, 6)]
         w = [W[t] / gran for t in col]
@@ -274,6 +281,9 @@ def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, 
         fin = [[0.0] * N for _ in col]
         t_end = [0.0] * 4
         bw = [0.0] * 4
+        aw = [0.0] * 4
+        a_arr = [0.0] * 4
+        ta_g = t_a / gran
         arr = 0.0
         slice_ready = 0.0
         for j in range(N):
@@ -288,6 +298,14 @@ def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, 
             arr = a
             for i in range(4):
                 st = t_end[i]
+                if a_depth is not None:
+                    xa = a_arr[i] + ta_g
+                    if j >= a_depth:
+                        xa = max(xa, fin[i][j - a_depth] + ta_g)
+                    a_arr[i] = xa
+                    if xa > st:
+                        aw[i] += xa - st
+                        st = xa
                 if a > st:
                     bw[i] += a - st
                     st = a
@@ -296,7 +314,8 @@ def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, 
                 fin[i][j] = e
         for i, t in enumerate(col):
             bwait[t], end[t] = bw[i], t_end[i]
-    return {"bwait": bwait, "end": end, "wall": max(end.values())}
+            await_[t] = aw[i]
+    return {"bwait": bwait, "await": await_, "end": end, "wall": max(end.values())}
 
 
 def g90_fit_sigma(P: Dict[str, Any], W: Dict[tuple, float]) -> tuple:
@@ -394,10 +413,72 @@ def g90_price(P: Dict[str, Any]) -> list:
     return out
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Per-stream depths (phase PQ, sprint-1126121655): ``python3 -m costmodel.des --gemm90-price-ab A B``.
+# Generic g90_sim(a_depth=..., t_a=...) models the A ring next to the B ring.  W_i no longer carries the A wait:
+# W_i = (active - lock)/N + (nonb_lock_us_4_3 - base_a_us_4_3) per chunk (the rest, ASSUMED equal on every tile).
+# TWO fitted parameters, jointly (alternating bisection) on the PB base at A depth 2 / B depth 2:
+#   sigma (per-core jitter) -> base_b_us(4,3)=782.1 ; t_a (A per-chunk delivery, cycles) -> base_a_us(4,3)=152.0.
+# base_a_us 152.0 is a MEASURED calibration target at A depth 2 only; it is never used as the cost of another
+# A depth (the A wait at depth 1 is simulated: chunk j's A transfer cannot start before chunk j-1 is released).
+# gain_us = DES wall(A2,B2) - DES wall(A,B) (positive = faster than base 10225.8 us, pb.txt:11).
+# ---------------------------------------------------------------------------------------------------------------------
+def g90_work_ab(P: Dict[str, Any]) -> Dict[tuple, float]:
+    N = P["chunks_per_launch"]
+    rest = (P["nonb_lock_us_4_3"] - P["pb"]["base_a_us_4_3"]) * P["clk_mhz"] / N
+    return {tuple(int(x) for x in k.split(",")): (d["active"] - d["lock"]) / N + rest
+            for k, d in P["ml_tiles"].items()}
+
+
+def _bisect(f, lo: float, hi: float, target: float, n: int = 30) -> float:
+    for _ in range(n):
+        mid = 0.5 * (lo + hi)
+        if f(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def g90_fit_ab(P: Dict[str, Any], W: Dict[tuple, float], rounds: int = 6) -> tuple:
+    clk = P["clk_mhz"]
+    bmeas = P["pb"]["base_b_us_4_3"] * clk
+    ameas = P["pb"]["base_a_us_4_3"] * clk
+    t_b = P["b_chunk_bytes"] / P["stream_b_per_cyc"]
+    sigma, t_a = 0.0, t_b
+    for _ in range(rounds):
+        sigma = _bisect(lambda s: g90_sim(P, W, s, 2, 1, 2, t_a)["bwait"][(4, 3)], 0.0, 0.5 * min(W.values()), bmeas)
+        t_a = _bisect(lambda x: g90_sim(P, W, sigma, 2, 1, 2, x)["await"][(4, 3)], 0.0, 2.0 * max(W.values()), ameas)
+    return sigma, t_a
+
+
+def g90_price_ab(P: Dict[str, Any], pairs: list) -> list:
+    clk = P["clk_mhz"]
+    W = g90_work_ab(P)
+    sigma, t_a = g90_fit_ab(P, W)
+    base = g90_sim(P, W, sigma, 2, 1, 2, t_a)
+    out = []
+    for a, b in pairs:
+        r = base if (a, b) == (2, 2) else g90_sim(P, W, sigma, b, 1, a, t_a)
+        out.append(f"DESAB a={a} b={b} gain_us={_f1((base['wall'] - r['wall']) / clk)} "
+                   f"b_us={_f1(r['bwait'][(4, 3)] / clk)} a_us={_f1(r['await'][(4, 3)] / clk)}")
+    return out, dict(sigma=sigma, t_a=t_a, base_wall_us=base["wall"] / clk)
+
+
 if __name__ == "__main__":
     import sys as _sys
-    if _sys.argv[1:] != ["--gemm90-price"]:
-        _sys.stderr.write("usage: des.py --gemm90-price\n")
+    _a = _sys.argv[1:]
+    if _a == ["--gemm90-price"]:
+        for _l in g90_price(g90_load()):
+            print(_l)
+    elif len(_a) == 3 and _a[0] == "--gemm90-price-ab" and _a[1].isdigit() and _a[2].isdigit() \
+            and int(_a[1]) >= 1 and int(_a[2]) >= 1:
+        print(g90_price_ab(g90_load(), [(int(_a[1]), int(_a[2]))])[0][0])
+    elif _a == ["--gemm90-price-ab-fit"]:
+        _o, _f = g90_price_ab(g90_load(), [(2, 2), (1, 3), (2, 3), (1, 2)])
+        print(f"DESABFIT sigma_cyc={_f1(_f['sigma'])} t_a_cyc={_f1(_f['t_a'])} base_wall_us={_f1(_f['base_wall_us'])}")
+        for _l in _o:
+            print(_l)
+    else:
+        _sys.stderr.write("usage: des.py --gemm90-price | --gemm90-price-ab A B | --gemm90-price-ab-fit\n")
         _sys.exit(2)
-    for _l in g90_price(g90_load()):
-        print(_l)

@@ -18,7 +18,9 @@
   "d_median_us": -18.1,
   "base_b_us_4_3": 782.1,
   "lever_b_us_4_3": 753.9,
-  "ml_spread_pct": 3.63
+  "ml_spread_pct": 3.63,
+  "base_a_us_4_3": 152.0,
+  "base_a_src": "pb.txt:12 base_a_us=152.0 (A lock wait of tile (4,3) at A depth 2; calibration target of --gemm90-price-ab only, phase PQ)"
  },
  "nonb_lock_us_4_3": 247.6,
  "nonb_lock_src": "pb_4096c.log base_ml median lock_stall(4,3) 1029727 cyc - pb.txt:12 base_b_us(4,3) 782.1 us; ASSUMED equal on every tile",
