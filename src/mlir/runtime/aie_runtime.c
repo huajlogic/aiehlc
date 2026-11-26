@@ -743,7 +743,14 @@ AieRC __Runtime_core_perf_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t *a
 
 /* Print the core perf counters of every core tile armed at the last kernel launch
  * (needs AIEHLC_PROFILING and AIE_DEBUG_FLAG_CORE_PERF_COUNTER in g_runtime_debug_level).
- * One "[PERF] tag=.. tile=(c,r) ..." line per tile + one "[PERFSUM]" line. */
+ * One "PERFSNAP tiles=N span_cyc=S" line, then one "[PERF] tag=.. tile=(c,r) ..." line per tile + one "[PERFSUM]".
+ * All tiles' 4 counters are read into arrays BEFORE any printf: reading inside the print loop let each tile's
+ * ACTIVE keep counting through the previous tiles' UART prints (pl_4096c_prof.log:5297-5328, active_cyc 10.8M on
+ * (1,3) -> 388.9M on (4,6) while dact_cyc stayed 10.22-10.26M). span_cyc = host time of the read loop in AIE
+ * cycles at RT_CORE_PERF_AIE_MHZ (0 where there is no generic timer). */
+static uint32_t s_perf_rep_a[RT_CORE_PERF_MAX_TILES], s_perf_rep_v[RT_CORE_PERF_MAX_TILES];
+static uint32_t s_perf_rep_ss[RT_CORE_PERF_MAX_TILES], s_perf_rep_ls[RT_CORE_PERF_MAX_TILES];
+static AieRC s_perf_rep_rc[RT_CORE_PERF_MAX_TILES];
 void __Runtime_core_perf_report(int tag) {
     uint32_t amax = 0, amin = 0xffffffffu;
     unsigned long long asum = 0;
@@ -752,9 +759,20 @@ void __Runtime_core_perf_report(int tag) {
         return;
     }
     rt_core_perf_launch_snap(1); /* B: after the launch's last wait, before [PERFIO] */
+    /* loop 1: snapshot every tile's 4 counters, no printf */
+    const unsigned long long snap_t0 = ahs_now();
     for (int i = 0; i < s_core_perf_ntiles; i++) {
-        uint32_t a = 0, v = 0, ss = 0, ls = 0;
-        AieRC rc = __Runtime_core_perf_read(s_core_perf_probe_dev, s_core_perf_tiles[i], &a, &v, &ss, &ls);
+        s_perf_rep_a[i] = s_perf_rep_v[i] = s_perf_rep_ss[i] = s_perf_rep_ls[i] = 0;
+        s_perf_rep_rc[i] = __Runtime_core_perf_read(s_core_perf_probe_dev, s_core_perf_tiles[i], &s_perf_rep_a[i],
+                                                    &s_perf_rep_v[i], &s_perf_rep_ss[i], &s_perf_rep_ls[i]);
+    }
+    const unsigned long long snap_t1 = ahs_now();
+    printf("PERFSNAP tiles=%d span_cyc=%llu\n", s_core_perf_ntiles,
+           rt_core_perf_ticks_to_cyc(snap_t1 > snap_t0 ? snap_t1 - snap_t0 : 0ULL));
+    /* loop 2: print the snapshot (formats unchanged) */
+    for (int i = 0; i < s_core_perf_ntiles; i++) {
+        const uint32_t a = s_perf_rep_a[i], v = s_perf_rep_v[i], ss = s_perf_rep_ss[i], ls = s_perf_rep_ls[i];
+        const AieRC rc = s_perf_rep_rc[i];
         printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u vec_instr=%u stream_stall=%u lock_stall=%u\n", tag,
                (unsigned)s_core_perf_tiles[i].Col, (unsigned)s_core_perf_tiles[i].Row, (int)rc, a, v, ss, ls);
         /* launch window A->B: io_active = max(0, dACTIVE - ovl), compute = dACTIVE - dLOCK - dSTREAM,
