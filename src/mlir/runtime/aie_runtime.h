@@ -438,6 +438,11 @@ void __Runtime_dma_channel_start(XAie_DevInst *dev, XAie_LocType t, int ch, int 
                                  int first_only);
 struct_ioevent __Runtime_startio_first(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
 void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_ev);
+/* #pragma dataflow_slices pre-queue (SlicePrequeuePass; aie_runtime.c) */
+struct_ioevent __Runtime_startio_slice(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
+struct_ioevent __Runtime_startio_prequeue(XAie_DevInst *dev, struct_io io, int32_t own_bd, int32_t repeat,
+                                          uint64_t next_addr);
+void __Runtime_wait_io_pq(XAie_DevInst *dev, struct_ioevent io_ev);
 // Wait-idle hook (GHL): host work that is independent of the running launch (e.g. the
 // post-processing of a PREVIOUS launch's output) stepped from __Runtime_wait_io's
 // DMA poll, one fn(arg) call per poll iteration while the array computes. fn does a

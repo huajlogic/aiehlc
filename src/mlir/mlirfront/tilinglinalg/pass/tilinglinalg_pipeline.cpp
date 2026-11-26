@@ -1374,6 +1374,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<StartioInterleavePass>(), irDir, stage,
                                "StartioInterleavePass"))
         return false;
+    // #pragma dataflow_slices only (dfschedule.plan_slices): B -> C -> A issue order and call i+1's shim inputs
+    // pre-queued on an alt BD before call i's waits (gemm90 m3362124222211 PI); a no-op on every other module.
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<SlicePrequeuePass>(), irDir, stage,
+                               "SlicePrequeuePass"))
+        return false;
 
     // Inject declarative per-tile core trace (#pragma aie_trace) into the host
     // dispatch function. Runs on the pure-emitc host module so the injected

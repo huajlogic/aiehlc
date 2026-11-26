@@ -511,6 +511,122 @@ GT_NUM_CASES = [
 ]
 
 
+# gemm90 m3362124222211 PI: #pragma dataflow_slices pre-queue (SlicePrequeuePass, sliceprequeue_plan.h). A 2-call
+# sliced stub of the 4096^3 host function -- A (unsliced, shim ch1 BD15) and B (sliced, ch0 BD14) on columns 1-4,
+# C on columns 3-4 (S2MM ch0 BD2-5 / ch1 BD7-10, BDs 2..13 used) -- is planned with the pass's own rules and replayed
+# call by call with the runtime's own / alt BD choice. Green: call 0 pushes A/B on BD 0/1 before its first wait,
+# the first startios are B, C, A, <= 2 tasks per shim channel, a pre-queue never targets the in-flight BD, and
+# call 1 pushes no input of its own. Red (no planner): call 0's first wait comes with no BD 0/1 startio before it.
+PQ_PLAN_H = (REPO / "src" / "mlir" / "mlirfront" / "tilinglinalg" / "pass" / "passstartiointerleave" /
+             "sliceprequeue_plan.h")
+PQ_BASE = PQ_PLAN_H.parent / "__pq_stub__"
+PQ_SRC = r"""
+#include <cstdio>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+#if __has_include("sliceprequeue_plan.h")
+#include "sliceprequeue_plan.h"
+#define PQ_HAVE 1
+#else
+#define PQ_HAVE 0
+#endif
+struct E { int call; std::string kind; char arg; int col, ch, bd; };
+int main() {
+    struct S { char arg; int col, ch, bd, dir; bool sliced; int repeat; };
+    std::vector<S> ss;
+    for (int c = 1; c <= 4; c++) ss.push_back({'A', c, 1, 15, 0, false, 32});
+    for (int c = 1; c <= 4; c++) ss.push_back({'B', c, 0, 14, 0, true, 2});
+    for (int c = 3; c <= 4; c++) { ss.push_back({'C', c, 0, 2, 1, true, 128}); ss.push_back({'C', c, 1, 7, 1, true, 128}); }
+    std::map<int, std::set<int>> used;
+    for (auto &s : ss) used[s.col].insert(s.bd);
+    for (int c = 3; c <= 4; c++) for (int b = 2; b <= 13; b++) used[c].insert(b);
+    std::vector<int> order, alt(ss.size(), -1);
+#if PQ_HAVE
+    std::vector<sliceprequeue::Io> ios;
+    for (auto &s : ss) {
+        sliceprequeue::Io x; x.col = s.col; x.row = 0; x.ch = s.ch; x.bd = s.bd;
+        x.dir = s.dir ? sliceprequeue::S2MM : sliceprequeue::MM2S; x.sliced = s.sliced; x.repeat = s.repeat;
+        ios.push_back(x);
+    }
+    sliceprequeue::Plan p = sliceprequeue::plan(ios, used);
+    order = p.order; alt = p.altBd;
+#else
+    for (size_t i = 0; i < ss.size(); i++) order.push_back((int)i);
+#endif
+    // replay 2 calls: issue (skipped when pre-queued), pre-queue, waits; the runtime's per-channel state
+    std::map<std::pair<int, int>, int> pending, nextBd, curBd, depth;
+    std::vector<E> ev;
+    int conflicts = 0, qmax = 0, own_pushes_call1 = 0;
+    for (int call = 0; call < 2; call++) {
+        for (int i : order) {
+            auto &s = ss[i]; auto k = std::make_pair(s.col, s.ch + 2 * s.dir);
+            if (!s.dir && alt[i] >= 0 && pending[k]) { pending[k] = 0; curBd[k] = nextBd[k]; continue; }
+            curBd[k] = s.bd; depth[k]++;
+            ev.push_back({call, "start", s.arg, s.col, s.ch, s.bd});
+            if (call == 1 && !s.dir) own_pushes_call1++;
+        }
+        for (int i : order) {
+            auto &s = ss[i]; auto k = std::make_pair(s.col, s.ch + 2 * s.dir);
+            if (s.dir || alt[i] < 0) continue;
+#if PQ_HAVE
+            int t = sliceprequeue::pickTarget(curBd[k], s.bd, alt[i]);
+#else
+            int t = alt[i];
+#endif
+            if (t == curBd[k]) conflicts++;
+            pending[k] = 1; nextBd[k] = t; depth[k]++;
+            ev.push_back({call, "start", s.arg, s.col, s.ch, t});
+        }
+        for (auto &d : depth) qmax = d.second > qmax ? d.second : qmax;
+        for (int i : order) {
+            auto &s = ss[i]; auto k = std::make_pair(s.col, s.ch + 2 * s.dir);
+            ev.push_back({call, "wait", s.arg, s.col, s.ch, -1});
+            depth[k] = pending[k] && !s.dir ? 1 : 0;
+        }
+    }
+    std::set<int> pre; std::string first;
+    for (auto &e : ev) {
+        if (e.call == 0 && e.kind == "wait") break;
+        if (e.call == 0 && (e.arg == 'A' || e.arg == 'B') && (e.bd == 0 || e.bd == 1)) pre.insert(e.bd);
+    }
+    for (auto &e : ev)
+        if (e.call == 0 && e.kind == "start" && first.find(e.arg) == std::string::npos) first += e.arg;
+    std::string bds;
+    for (int b : pre) bds += (bds.empty() ? "" : ",") + std::to_string(b);
+    std::string ord;
+    for (char c : first) ord += (ord.empty() ? "" : ",") + std::string(1, c);
+    const bool ok = bds == "0,1" && ord == "B,C,A" && qmax <= 4 && conflicts == 0 && own_pushes_call1 == 0;
+    if (pre.empty())
+        std::printf("PQSTUB FAIL: no BD0/1 startio before wait(0)\n");
+    std::printf("PQSTUB calls=2 prequeue_bds=%s order=%s qmax=%d conflicts=%d call1_own_pushes=%d %s\n",
+                bds.empty() ? "-" : bds.c_str(), ord.c_str(), qmax, conflicts, own_pushes_call1, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+"""
+PQ_CASES = [
+    ("dataflow_slices_prequeue_altbd", [],
+     "PASS:PQSTUB calls=2 prequeue_bds=0,1 order=B,C,A qmax=2 conflicts=0 call1_own_pushes=0 OK"),
+]
+
+
+def run_pq_stub(expect):
+    """g++ the 2-call sliced stub against sliceprequeue_plan.h (when present)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        if PQ_PLAN_H.exists():
+            shutil.copy(PQ_PLAN_H, tmp)
+        src = pathlib.Path(tmp) / "pqstub.cc"
+        src.write_text(PQ_SRC)
+        cc = subprocess.run(["g++", "-std=c++17", "-O1", "-w", "-I", tmp, "-o", str(pathlib.Path(tmp) / "pqstub"),
+                             str(src)], capture_output=True, text=True, timeout=600)
+        if cc.returncode != 0:
+            return False, cc.stdout + cc.stderr
+        p = subprocess.run([str(pathlib.Path(tmp) / "pqstub")], capture_output=True, text=True, timeout=600)
+        out = p.stdout + p.stderr
+    return p.returncode == 0 and expect[5:] in out, out
+
+
 def run_gt_num(edits, expect):
     """Compile GT_NUM_SRC with g++ on the x86 AIE API emulation; edits = [(TM, TN), (KC, KC)]."""
     tm, tn = edits[0]
@@ -548,6 +664,8 @@ def inline_cc(path):
 def run_case(cli, name, edits, expect, base=BASE):
     if base == GT_NUM_BASE:
         return run_gt_num(edits, expect)
+    if base == PQ_BASE:
+        return run_pq_stub(expect)
     src = inline_cc(base) if base in (GEMMPLAN_BASE, GEMMPLAN_T_BASE) else base.read_text()
     if base == TEMPLATE_BASE:  # the library kernel alone: add the includes and a host launch
         src = TEMPLATE_HEAD + src + TEMPLATE_HOST
@@ -585,6 +703,7 @@ def main():
     cases += [(n, e, x, GEMMPLAN_BASE) for n, e, x in GEMMPLAN_CASES]
     cases += [(n, e, x, GEMMPLAN_T_BASE) for n, e, x in GEMMPLAN_T_CASES]
     cases += [(n, e, x, GT_NUM_BASE) for n, e, x in GT_NUM_CASES]
+    cases += [(n, e, x, PQ_BASE) for n, e, x in PQ_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]
     for name, edits, expect, base in cases:

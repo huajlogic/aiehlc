@@ -7573,6 +7573,20 @@ uint64_t __Runtime_shim_bd_rebase_count(void) { return g_shim_bd_rebase_n; }
 
 void __Runtime_shim_bd_rebase_count_reset(void) { g_shim_bd_rebase_n = 0; }
 
+/* a shim BD's address word(s) <- the device address of host pointer @addr (no rebase count) */
+static AieRC rt_shim_bd_addr_write(XAie_DevInst *dev, XAie_LocType tile, int bd, uint64_t addr, uint64_t *dma_out) {
+    uint64_t dma_addr = addr;
+    {
+        uint64_t offset = 0;
+        XAie_MemInst *mem = __vaddr_to_mem_offset((void *)(uintptr_t)addr, &offset);
+        if (mem)
+            dma_addr = XAie_MemGetDevAddr(mem) + offset;
+    }
+    if (dma_out)
+        *dma_out = dma_addr;
+    return XAie_DmaUpdateBdAddr(dev, tile, (u64)dma_addr, (u16)bd);
+}
+
 int __Runtime_shim_bd_set_addr(int col, int row, int bd, uint64_t addr) {
     if (row != 0) {
         printf("[aie_runtime] shim_bd_set_addr ERROR: tile(%d,%d) is not a shim tile (row must be 0)\n", col, row);
@@ -7592,14 +7606,8 @@ int __Runtime_shim_bd_set_addr(int col, int row, int bd, uint64_t addr) {
         return -1;
     }
     XAie_LocType tile = XAie_TileLoc((u8)col, 0);
-    uint64_t dma_addr = addr;
-    {
-        uint64_t offset = 0;
-        XAie_MemInst *mem = __vaddr_to_mem_offset((void *)(uintptr_t)addr, &offset);
-        if (mem)
-            dma_addr = XAie_MemGetDevAddr(mem) + offset;
-    }
-    AieRC rc = XAie_DmaUpdateBdAddr(dev, tile, (u64)dma_addr, (u16)bd);
+    uint64_t dma_addr = 0;
+    AieRC rc = rt_shim_bd_addr_write(dev, tile, bd, addr, &dma_addr);
     AIEHLC_LOG(printf("[aie_runtime] shim_bd_set_addr shim(%d,0) bd=%d addr=0x%llx dev=0x%llx rc=%d\n", col, bd,
                       (unsigned long long)addr, (unsigned long long)dma_addr, (int)rc));
     if (rc != XAIE_OK) {
@@ -9478,7 +9486,7 @@ static void rt_wait_io_timeout_dump(XAie_DevInst *dev) {
  * meaning both the start queue is empty and no BD is currently executing.
  * Reference: aeg_runtime_api.cpp waitDMAChannelTaskQueue / waitDMAChannelDone
  */
-void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
+static void rt_wait_io_upto(XAie_DevInst *dev, struct_ioevent io_event, u8 thresh) {
 #if AIEHLC_PROFILING
     /* M3.1.1 launch window A (aot-kco: startio comes from the control packet, no __Runtime_startio): no-op
      * unless pending, i.e. only before the launch's first wait_io's rt_sb_commit (off took A at startio) */
@@ -9518,15 +9526,15 @@ void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
         for (uint32_t iter = 0; iter < max_iters; iter++) {
             XAie_DmaWaitForDone(dev, tile, channel, dir, SIM_PER_CALL_US);
             AieRC prc = XAie_DmaGetPendingBdCount(dev, tile, channel, dir, &numPendingBDs);
-            if (prc == XAIE_OK && numPendingBDs == 0)
+            if (prc == XAIE_OK && numPendingBDs <= thresh)
                 break;
         }
     }
 #else
     const uint32_t max_iters = 50000000U;
-    u8 numPendingBDs = 1;
+    u8 numPendingBDs = (u8)(thresh + 1U);
     uint32_t iter = 0;
-    while (numPendingBDs > 0) {
+    while (numPendingBDs > thresh) {
         RT_PROF_INC(g_wait_io_iters);
         rt_dsync_step();
         rt_wait_hook_step(); /* GHL: one chunk of independent host work */
@@ -9537,7 +9545,7 @@ void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
                    (int)rc, (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)channel, (int)dir);
             return;
         }
-        if (numPendingBDs > 0 && ++iter >= max_iters) {
+        if (numPendingBDs > thresh && ++iter >= max_iters) {
             printf("[aie_runtime] wait_io TIMEOUT tile(%u,%u) ch=%u dir=%d pending=%u\n", (unsigned)tile.Col,
                    (unsigned)tile.Row, (unsigned)channel, (int)dir, (unsigned)numPendingBDs);
             rt_wait_io_timeout_dump(dev);
@@ -9579,6 +9587,82 @@ void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
     rt_core_perf_wio_mark(__hs_t0);
     rt_core_perf_site_read(); /* after the timed wait window (WINLINT: no printf inside it) */
 #endif
+}
+
+void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) { rt_wait_io_upto(dev, io_event, 0U); }
+
+/* ---- #pragma dataflow_slices pre-queue (gemm90 m3362124222211 PI) -----------------------------------------------
+ * SlicePrequeuePass (passstartiointerleave.cpp, sliceprequeue_plan.h) emits, in the sliced host function (call i
+ * serves slice i % S): __Runtime_startio_slice for every shim MM2S input (B, then C's S2MM, then A), then
+ * __Runtime_startio_prequeue for each of them (slice i+1, on the io's alt BD), then __Runtime_wait_io_pq for the
+ * inputs.  Per shim (col, MM2S ch): `pending` = a task for the next call is queued behind this call's; the next
+ * call's startio_slice then pushes nothing.  The pre-queue's hardware BD alternates between the io's own BD and
+ * its alt BD (never the in-flight one), so a queued / running BD is not rewritten (needs plan_bd_once: the
+ * per-call BD configs of a written BD are skipped; the per-call rebase of the own BD writes the same address).
+ * Start queue: <= 2 tasks per channel (aie-rt XAIE_DMA_MAX_QUEUE_SIZE 4).  Single-threaded host, like the rest
+ * of this file. */
+#define RT_PQ_COLS 64
+typedef struct {
+    uint8_t pending; /* a pre-queued task for the next call is behind this call's */
+    uint8_t next_bd; /* its hardware BD */
+    uint8_t cur_bd;  /* hardware BD of this call's task */
+} rt_pq_slot;
+static rt_pq_slot g_rt_pq[RT_PQ_COLS][2];
+
+static rt_pq_slot *rt_pq_of(struct_io io) {
+    if (io.direction != DMA_MM2S || io.tile_loc.Col >= RT_PQ_COLS || io.channel_id > 1U)
+        return NULL;
+    return &g_rt_pq[io.tile_loc.Col][io.channel_id];
+}
+
+struct_ioevent __Runtime_startio_slice(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
+    rt_pq_slot *q = rt_pq_of(io);
+    if (q && q->pending) { /* pre-queued by the previous call: already in the start queue */
+        q->pending = 0U;
+        q->cur_bd = q->next_bd;
+        struct_ioevent evt;
+        evt.io = io;
+        evt.io.bd_id = q->cur_bd;
+        evt.timeout_us = 10000;
+        return evt;
+    }
+    if (q)
+        q->cur_bd = io.bd_id;
+    return __Runtime_startio(dev, io, bd_id, repeat);
+}
+
+struct_ioevent __Runtime_startio_prequeue(XAie_DevInst *dev, struct_io io, int32_t own_bd, int32_t repeat,
+                                          uint64_t next_addr) {
+    struct_ioevent evt;
+    evt.io = io;
+    evt.timeout_us = 0U; /* not waited this call: the next call's __Runtime_wait_io_pq covers it */
+    rt_pq_slot *q = rt_pq_of(io);
+    if (!q || q->pending || own_bd < 0 || own_bd > 0xFF || repeat < 1 || repeat > 256)
+        return evt; /* the next call issues it itself */
+    rt_dsync_drain_inputs();
+    const uint8_t tgt = (q->cur_bd == io.bd_id) ? (uint8_t)own_bd : io.bd_id;
+    AieRC rc = XAIE_OK;
+    if (next_addr)
+        rc = rt_shim_bd_addr_write(dev, io.tile_loc, tgt, next_addr, NULL);
+    if (rc == XAIE_OK)
+        RT_SB_CALL(dev, io.tile_loc, rc, rt_seq_start_queue(dev, io.tile_loc, io.channel_id, io.direction, tgt, repeat));
+    AIEHLC_LOG(printf("[aie_runtime] startio_prequeue shim(%u,0) ch=%u bd=%u (own %d alt %u) repeat=%d rc=%d\n",
+                      (unsigned)io.tile_loc.Col, (unsigned)io.channel_id, (unsigned)tgt, (int)own_bd,
+                      (unsigned)io.bd_id, (int)repeat, (int)rc));
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] startio_prequeue FAILED rc=%d shim(%u,0) ch=%u bd=%u\n", (int)rc,
+               (unsigned)io.tile_loc.Col, (unsigned)io.channel_id, (unsigned)tgt);
+        return evt;
+    }
+    q->pending = 1U;
+    q->next_bd = tgt;
+    evt.io.bd_id = tgt;
+    return evt;
+}
+
+void __Runtime_wait_io_pq(XAie_DevInst *dev, struct_ioevent io_event) {
+    rt_pq_slot *q = rt_pq_of(io_event.io);
+    rt_wait_io_upto(dev, io_event, (q && q->pending) ? 1U : 0U);
 }
 
 /**
