@@ -836,6 +836,104 @@ def run_slicets_stub(expect):
     return p.returncode == 0 and expect[5:] in out, out
 
 
+# gemm90 m336212422221221 PG: AIEHLC_SLICE_GAP_DELAY_NS (aie_runtime.h, default off) -- the slice-gap delay knob. Stub
+# (g++, x86): the SLICEGAP-BEGIN/END block of aie_runtime.h compiled with AIEHLC_SLICE_GAP_SELFTEST and the table
+# 0,25000,50000,100000 (101 launches per point), driven like the 4096^3 int8 plan through the one-ELF sweep: 404
+# launches (rebase_count_reset each) x 8 calls x (4 A + 4 B __Runtime_startio_slice, 8 __Runtime_wait_io_pq) on a
+# fake host clock, the returned d spent as clock time right where the runtime busy-waits (before the issue stamp).
+# Expect every delay to land after a wait_ret and before the next call's FIRST issue (never inside a call, never on a
+# launch's first call): 7 boundaries per launch (2828), d = table[(launch-1)/101], the measured wait_ret -> issue gap
+# = base + d at every boundary, sum = 101 x 7 x 175000 ns. Red (no SLICEGAP block, e.g. the ix head 4b1dff17): FAIL.
+SLICEGAP_BASE = SLICETS_H.parent / "__slicegap_stub__"
+SLICEGAP_SRC = r"""
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#if __has_include("slicegap_block.h")
+#define AIEHLC_SLICE_GAP_SELFTEST 1
+#include "slicegap_block.h"
+#endif
+int main() {
+#ifndef AIE_SLICE_GAP_TBL_MAX
+    printf("SLICEGAP FAIL: no AIEHLC_SLICE_GAP_DELAY_NS block in aie_runtime.h\n");
+    return 1;
+#else
+    static const uint32_t tbl[] = {0, 25000, 50000, 100000};
+    static AieSliceGap g;
+    aie_slice_gap_init(&g, tbl, 4, 101);
+    uint64_t h = 1000;  // fake clock, ns
+    unsigned bnd = 0, after_wr = 0, before_issue = 0, misplaced = 0, d_bad = 0, gap_bad = 0, per_launch_bad = 0;
+    unsigned long long sum = 0;
+    for (int l = 0; l < 404; l++) {
+        aie_slice_gap_launch(&g);
+        uint64_t wr = 0;
+        int last_wr = 0;  // the event before this issue was a wait_ret
+        for (int c = 0; c < 8; c++) {
+            for (int i = 0; i < 8; i++) {
+                const uint32_t before = g.taken_cur;
+                const uint32_t d = aie_slice_gap_issue(&g);
+                const int took = g.taken_cur != before;
+                h += d;            // the runtime busy-waits here, then stamps the issue
+                const uint64_t issue = (h += 4);
+                if (took) {
+                    bnd++;
+                    sum += d;
+                    after_wr += last_wr;
+                    before_issue += i == 0;   // the call's first issue, nothing issued before it in this call
+                    misplaced += !(i == 0 && c >= 1 && last_wr);
+                    d_bad += d != tbl[l / 101];
+                    gap_bad += issue - wr != 4ull + 20ull + d;
+                } else {
+                    misplaced += i == 0 && c >= 1;  // a boundary left undelayed
+                    d_bad += d != 0;
+                }
+                last_wr = 0;
+                if (i == 3) h += 40;  // C startio between A and B
+            }
+            h += 1000;  // the slice computes
+            for (int i = 0; i < 8; i++) {
+                aie_slice_gap_wait_ret(&g);
+                wr = (h += 8);
+            }
+            last_wr = 1;
+            h += 20;
+        }
+        per_launch_bad += g.taken_cur != 7;
+    }
+    const int ok = bnd == 2828 && after_wr == bnd && before_issue == bnd && misplaced == 0 && d_bad == 0 &&
+                   gap_bad == 0 && per_launch_bad == 0 && sum == 101ull * 7 * 175000 && aie_slice_gap_point(&g) == 3;
+    printf("SLICEGAP points=4 launches=404 boundaries=%u per_launch=7 after_wait_ret=%u before_next_issue=%u "
+           "misplaced=%u d_bad=%u gap_bad=%u sum_ns=%llu %s\n",
+           bnd, after_wr, before_issue, misplaced, d_bad, gap_bad, sum, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+#endif
+}
+"""
+SLICEGAP_CASES = [
+    ("AIEHLC_SLICE_GAP_DELAY_NS delay lands after wait_ret(s) and before issue(s+1) (404 launches x 8 slices, 4-point table)",
+     [], "PASS:SLICEGAP points=4 launches=404 boundaries=2828 per_launch=7 after_wait_ret=2828 before_next_issue=2828 "
+         "misplaced=0 d_bad=0 gap_bad=0 sum_ns=123725000 OK"),
+]
+
+
+def run_slicegap_stub(expect):
+    """g++ the SLICEGAP stub against the SLICEGAP-BEGIN/END block of aie_runtime.h (when present)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        txt = SLICETS_H.read_text() if SLICETS_H.exists() else ""
+        b, e = txt.find("/* SLICEGAP-BEGIN */"), txt.find("/* SLICEGAP-END */")
+        if 0 <= b < e:
+            (pathlib.Path(tmp) / "slicegap_block.h").write_text(txt[b:e])
+        src = pathlib.Path(tmp) / "slicegap.cc"
+        src.write_text(SLICEGAP_SRC)
+        cc = subprocess.run(["g++", "-std=c++17", "-O1", "-Wall", "-Werror", "-I", tmp, "-o",
+                             str(pathlib.Path(tmp) / "slicegap"), str(src)], capture_output=True, text=True, timeout=600)
+        if cc.returncode != 0:
+            return False, cc.stdout + cc.stderr
+        p = subprocess.run([str(pathlib.Path(tmp) / "slicegap")], capture_output=True, text=True, timeout=600)
+        out = p.stdout + p.stderr
+    return p.returncode == 0 and expect[5:] in out, out
+
+
 # m3362124222211 PK: x86 numerics of the hand-scheduled 64 x 64 x 128 int8 tile (gemm_plan_tile.h K4_* / SH_*) as the
 # N-sliced gemm_ka runs it -- chunk 0 (K4_BLKZ: every block starts with a mul, accumulators never zeroed -- they start
 # as garbage here so a missed init shows), the late-take / late-give chunk boundary SH_BOUND_L, the B pair pointers
@@ -1026,6 +1124,8 @@ def run_case(cli, name, edits, expect, base=BASE):
         return run_bdonce_stub(expect)
     if base == SLICETS_BASE:
         return run_slicets_stub(expect)
+    if base == SLICEGAP_BASE:
+        return run_slicegap_stub(expect)
     src = inline_cc(base) if base in (GEMMPLAN_BASE, GEMMPLAN_T_BASE) else base.read_text()
     if base == TEMPLATE_BASE:  # the library kernel alone: add the includes and a host launch
         src = TEMPLATE_HEAD + src + TEMPLATE_HOST
@@ -1067,6 +1167,7 @@ def main():
     cases += [(n, e, x, BDONCE_BASE) for n, e, x in BDONCE_CASES]
     cases += [(n, e, x, K4_NUM_BASE) for n, e, x in K4_NUM_CASES]
     cases += [(n, e, x, SLICETS_BASE) for n, e, x in SLICETS_CASES]
+    cases += [(n, e, x, SLICEGAP_BASE) for n, e, x in SLICEGAP_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]
     for name, edits, expect, base in cases:

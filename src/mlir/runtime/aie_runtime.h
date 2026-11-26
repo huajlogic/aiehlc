@@ -1301,6 +1301,87 @@ static inline uint64_t aie_slice_ts_map(uint64_t h, uint64_t h0, uint64_t a0, ui
 }
 #endif
 /* SLICETS-END */
+
+// ---- AIEHLC_SLICE_GAP_DELAY_NS (gemm90 m336212422221221 PG): slice-gap delay knob, default OFF -------------------
+// -DAIEHLC_SLICE_GAP_DELAY_NS=<d0[,d1,...]> (EXTRA_DEFS): after the wait_ret of slice s (a call's
+// __Runtime_wait_io_pq returns) the NEXT slice's first __Runtime_startio_slice busy-waits d ns on the AIE timer
+// (PL-module timer of that call's shim tile, AIEHLC_SLICE_GAP_AIE_MHZ, default 1000) before it issues -- i.e. the
+// delay sits on the wait_ret(s) -> issue(s+1) boundary, BEFORE the SLICETS issue stamp. Per boundary: a launch of
+// <slices> calls has <slices>-1 boundaries (7 for the 8-slice 4096^3 int8 plan, pcp_ts_d0.txt:15); the first call
+// of a launch is never delayed (__Runtime_shim_bd_rebase_count_reset disarms). The list is a table: point
+// p = (launch-1) / AIEHLC_SLICE_GAP_LAUNCHES (default 101), clamped to the last entry, so ONE ELF sweeps every d
+// with AIEHLC_SWEEP_RERUN=<points> (the PAE one-ELF re-run of main in aie_shim_ts.c: with no A/B shim table
+// defined, the B table below is aliased to this list on an unused shim channel, so the re-run's
+// `=== SWEEP point d_ns=` line names the gap d and no shim push is delayed). After each point's last launch the
+// runtime prints (outside the timed window) `SLICEGAP point=<p> d_ns=<d> boundaries=<min> boundaries_max=<max>`.
+// Undefined: nothing below compiles and the runtime / generated host.cc are as before.
+// The state machine is plain C between SLICEGAP-BEGIN/END (kernel_trace_cases.py stub compiles it on x86).
+#if defined(AIEHLC_SLICE_GAP_DELAY_NS) && defined(AIEHLC_SWEEP_RERUN) && !defined(AIEHLC_A_SHIM_DELAY_NS) &&          \
+    !defined(AIEHLC_B_SHIM_DELAY_NS)
+#define AIEHLC_B_SHIM_DELAY_NS AIEHLC_SLICE_GAP_DELAY_NS
+#ifndef AIEHLC_SLICE_GAP_LAUNCHES
+#define AIEHLC_SLICE_GAP_LAUNCHES 101
+#endif
+#define AIEHLC_B_SHIM_DELAY_LAUNCHES AIEHLC_SLICE_GAP_LAUNCHES
+#undef AIEHLC_B_SHIM_CH
+#define AIEHLC_B_SHIM_CH 0xFF /* no shim channel: the B delay never fires */
+#endif
+/* SLICEGAP-BEGIN */
+#if defined(AIEHLC_SLICE_GAP_DELAY_NS) || defined(AIEHLC_SLICE_GAP_SELFTEST)
+#ifndef AIEHLC_SLICE_GAP_LAUNCHES
+#define AIEHLC_SLICE_GAP_LAUNCHES 101
+#endif
+#define AIE_SLICE_GAP_TBL_MAX 32
+typedef struct {
+    uint32_t tbl[AIE_SLICE_GAP_TBL_MAX];
+    int n;               /* table entries (0: not set -> no delay) */
+    uint32_t lpp;        /* launches per point */
+    uint32_t launch;     /* 1-based launch in progress (0: before the first) */
+    int armed;           /* a wait_ret of this launch is not yet followed by an issue */
+    uint32_t taken_cur;  /* delayed boundaries in the launch in progress */
+    uint32_t taken_last; /* ... in the last complete launch */
+} AieSliceGap;
+static inline void aie_slice_gap_init(AieSliceGap *g, const uint32_t *ns, int n, uint32_t lpp) {
+    if (n > AIE_SLICE_GAP_TBL_MAX)
+        n = AIE_SLICE_GAP_TBL_MAX;
+    for (int i = 0; i < n; i++)
+        g->tbl[i] = ns[i];
+    g->n = n > 0 ? n : 0;
+    g->lpp = lpp ? lpp : 1u;
+    g->launch = 0;
+    g->armed = 0;
+    g->taken_cur = g->taken_last = 0;
+}
+static inline int aie_slice_gap_point(const AieSliceGap *g) {
+    if (g->n <= 0)
+        return -1;
+    const uint32_t p = (g->launch ? g->launch - 1u : 0u) / g->lpp;
+    return p < (uint32_t)g->n ? (int)p : g->n - 1;
+}
+static inline uint32_t aie_slice_gap_ns(const AieSliceGap *g) {
+    const int p = aie_slice_gap_point(g);
+    return p >= 0 ? g->tbl[p] : 0u;
+}
+/* launch begin (__Runtime_shim_bd_rebase_count_reset): the launch's first issue is not a boundary */
+static inline void aie_slice_gap_launch(AieSliceGap *g) {
+    if (g->launch)
+        g->taken_last = g->taken_cur;
+    g->launch++;
+    g->taken_cur = 0;
+    g->armed = 0;
+}
+/* a call's wait (__Runtime_wait_io_pq) returned: the next issue closes the boundary */
+static inline void aie_slice_gap_wait_ret(AieSliceGap *g) { g->armed = 1; }
+/* a sliced issue (__Runtime_startio_slice, before its SLICETS stamp): d ns to busy-wait now (0: none) */
+static inline uint32_t aie_slice_gap_issue(AieSliceGap *g) {
+    if (!g->armed)
+        return 0u;
+    g->armed = 0;
+    g->taken_cur++;
+    return aie_slice_gap_ns(g);
+}
+#endif
+/* SLICEGAP-END */
 #if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
 // Print the SLICETS block now (once; later calls are no-ops). dev: for anchor 1 (NULL = the device of the records).
 void __Runtime_slice_ts_dump(XAie_DevInst *dev);

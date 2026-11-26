@@ -7667,7 +7667,65 @@ void __Runtime_slice_ts_dump(XAie_DevInst *dev) {
 }
 #endif
 
+#ifdef AIEHLC_SLICE_GAP_DELAY_NS
+/* AIEHLC_SLICE_GAP_DELAY_NS (aie_runtime.h, PG): wait_ret(s) -> issue(s+1) busy-wait, one table point per
+ * AIEHLC_SLICE_GAP_LAUNCHES launches */
+#ifndef AIEHLC_SLICE_GAP_AIE_MHZ
+#define AIEHLC_SLICE_GAP_AIE_MHZ 1000ULL
+#endif
+static const uint32_t s_slice_gap_builtin[] = {AIEHLC_SLICE_GAP_DELAY_NS};
+static AieSliceGap s_slice_gap;
+static int s_slice_gap_ready = 0;
+static uint32_t s_slice_gap_min = ~0U, s_slice_gap_max = 0U;
+static AieSliceGap *rt_slice_gap(void) {
+    if (!s_slice_gap_ready) {
+        aie_slice_gap_init(&s_slice_gap, s_slice_gap_builtin,
+                           (int)(sizeof(s_slice_gap_builtin) / sizeof(s_slice_gap_builtin[0])),
+                           (uint32_t)(AIEHLC_SLICE_GAP_LAUNCHES));
+        s_slice_gap_ready = 1;
+    }
+    return &s_slice_gap;
+}
+/* busy-wait d ns on the AIE timer (PL module) of the shim tile about to be issued (as the PA delay knob) */
+static void rt_slice_gap_delay(XAie_DevInst *dev, XAie_LocType shim, uint32_t d_ns) {
+    if (!d_ns || !dev)
+        return;
+    const uint64_t cyc = ((uint64_t)d_ns * AIEHLC_SLICE_GAP_AIE_MHZ + 999ULL) / 1000ULL;
+    u64 t0 = 0, t = 0;
+    if (XAie_ReadTimer(dev, shim, XAIE_PL_MOD, &t0) != XAIE_OK)
+        return;
+    do {
+        if (XAie_ReadTimer(dev, shim, XAIE_PL_MOD, &t) != XAIE_OK)
+            return;
+    } while ((uint64_t)(t - t0) < cyc);
+}
+/* launch end (outside the timed window): per-point boundary count, one SLICEGAP line after a point's last launch */
+static void rt_slice_gap_launch_end(void) {
+    AieSliceGap *g = rt_slice_gap();
+    if (!g->launch)
+        return;
+    const uint32_t l = g->launch - 1U, idx = l % g->lpp, pt = l / g->lpp;
+    if (l == 0U)
+        printf("SLICEGAP_CFG knob=AIEHLC_SLICE_GAP_DELAY_NS at=wait_ret_to_issue per=boundary points=%d "
+               "launches_per_point=%u mhz=%llu\n",
+               g->n, (unsigned)g->lpp, (unsigned long long)AIEHLC_SLICE_GAP_AIE_MHZ);
+    if (idx == 0U) {
+        s_slice_gap_min = ~0U;
+        s_slice_gap_max = 0U;
+    }
+    s_slice_gap_min = g->taken_cur < s_slice_gap_min ? g->taken_cur : s_slice_gap_min;
+    s_slice_gap_max = g->taken_cur > s_slice_gap_max ? g->taken_cur : s_slice_gap_max;
+    if (idx == g->lpp - 1U)
+        printf("SLICEGAP point=%u d_ns=%u boundaries=%u boundaries_max=%u launches=%u\n", (unsigned)pt,
+               (unsigned)aie_slice_gap_ns(g), (unsigned)s_slice_gap_min, (unsigned)s_slice_gap_max,
+               (unsigned)g->lpp);
+}
+#endif
+
 uint64_t __Runtime_shim_bd_rebase_count(void) {
+#ifdef AIEHLC_SLICE_GAP_DELAY_NS
+    rt_slice_gap_launch_end();
+#endif
 #if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
     /* the drivers read the count right after a launch's closing XTime: dump once launch N is done (untimed) */
     if (!s_slice_ts.dumped && s_slice_ts.launch >= (uint32_t)(AIEHLC_SLICE_TS))
@@ -7686,6 +7744,9 @@ void __Runtime_shim_bd_rebase_count_reset(void) {
     g_shim_bd_rebase_n = 0;
 #if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
     aie_slice_ts_launch(&s_slice_ts);
+#endif
+#ifdef AIEHLC_SLICE_GAP_DELAY_NS
+    aie_slice_gap_launch(rt_slice_gap()); /* the launch's first issue is not a boundary */
 #endif
 }
 
@@ -9741,6 +9802,10 @@ static rt_pq_slot *rt_pq_of(struct_io io) {
 }
 
 struct_ioevent __Runtime_startio_slice(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
+#ifdef AIEHLC_SLICE_GAP_DELAY_NS
+    /* PG: wait_ret(s) -> issue(s+1): the first sliced issue after a wait_ret waits d ns (before the SLICETS stamp) */
+    rt_slice_gap_delay(dev, io.tile_loc, aie_slice_gap_issue(rt_slice_gap()));
+#endif
 #if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
     rt_slice_ts_issue(dev); /* the call's first sliced issue opens its record (later ones are no-ops) */
 #endif
@@ -9797,6 +9862,9 @@ void __Runtime_wait_io_pq(XAie_DevInst *dev, struct_ioevent io_event) {
     rt_wait_io_upto(dev, io_event, (q && q->pending) ? 1U : 0U);
 #if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
     aie_slice_ts_wait_ret(&s_slice_ts, __aie_host_now()); /* the call's last return wins */
+#endif
+#ifdef AIEHLC_SLICE_GAP_DELAY_NS
+    aie_slice_gap_wait_ret(rt_slice_gap()); /* PG: arms the boundary to the next call's first sliced issue */
 #endif
 }
 
