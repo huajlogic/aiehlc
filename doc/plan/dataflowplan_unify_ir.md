@@ -50,6 +50,10 @@ regression script.
       paths + header) re-entered -> identical files; `gen_plan.py` ops -> plan-path dump re-entered -> identical.
       The `dmaphop.plan` header stays next to the paths until `erasePlanPaths`, so the plan-step dump is a complete,
       re-enterable plan; the paths' streams are ordered by `replace_args` on reading (IR order follows the flows).
+- [x] **Board, with the unified compiler** (2026-11-26, palmyra, every run GOLDEN PASS): `gemm_plan/step0..7` =
+      0.012 / 0.389 / 19.6 / 66.1 / 68.3 / 76.4 / 85.67 / 85.68 % of peak; `gemm_plan.cc` (= step 7) 85.68 % >= 85 %.
+      The blueprint dump of its own stage (`6_DmaphopTodfscheblueprintPass.mlir`) now shows the plan it carries.
+      Tutorial `tutorial/compilerinside/` walks these levels through the IR.
 - [ ] **Stage 2 + Stage 6 second part** (the transfer manifests): NOT done. The replaced generated flow still
       exists, tagged `dmaphop.plan_replaced`; its only remaining roles are the kernel's window (window_init, its
       core memory = the plan's chunk slots) and the blueprint transfer the core-side window config is derived from.

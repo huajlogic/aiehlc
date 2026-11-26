@@ -1228,8 +1228,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
                        "DmaphopTodfscheblueprintPass"))
         return false;
-    // the plan on the dfscheblueprint level: dfscheblueprint.plan on the shared tensors (resources follow in
-    // the readback dump once assigned)
+    // the plan on the dfscheblueprint level: the whole plan, typed (streams on the shared tensors' declare_data,
+    // routes + plan facts on the module; the assigned resources follow in the readback dump)
     dfplan::annotateBlueprint(module, dfplan::activePlan(), false);
     // ... and from here on the DMA program is derived from the plan the blueprint carries (checked to be the
     // dmaphop plan it was written from)
@@ -1242,6 +1242,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             return false;
         }
         dfplan::activePlan() = std::move(fromBlueprint);
+        // the blueprint dump of this stage shows the plan it carries (same stage number, rewritten)
+        dumpPipelineIRToFile(module, irDir, stage - 1, "DmaphopTodfscheblueprintPass");
     }
     mlir::OwningOpRef<mlir::ModuleOp> planBlueprintSnapshot = cast<ModuleOp>(module->clone());
     mlir::OwningOpRef<mlir::ModuleOp> planHostSnapshot;
