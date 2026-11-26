@@ -686,7 +686,29 @@ AieRC __Runtime_core_perf_setup(XAie_DevInst *dev, XAie_LocType tile) {
     rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 2, 0);
     if (rc != XAIE_OK)
         return rc;
-#ifdef AIEHLC_PERF_CTR2_MEMSTALL
+#if defined(AIEHLC_PERF_LOCKSPLIT)
+    /* PAE (default off): ctr1 / ctr2 = LOCK_STALL cycles while the PC is in range 0-1 / 2-3 (core PC events 0..3 =
+     * AIEHLC_PERF_LOCKSPLIT_R01_LO/HI, _R23_LO/HI, byte addresses of the linked kernel): combo0 = LOCK_STALL AND
+     * PC_RANGE_0_1, combo1 = LOCK_STALL AND PC_RANGE_2_3. ctr0 ACTIVE and ctr3 LOCK_STALL are unchanged. */
+    {
+        static const uint16_t pcs[4] = {AIEHLC_PERF_LOCKSPLIT_R01_LO, AIEHLC_PERF_LOCKSPLIT_R01_HI,
+                                        AIEHLC_PERF_LOCKSPLIT_R23_LO, AIEHLC_PERF_LOCKSPLIT_R23_HI};
+        for (uint8_t k = 0; k < 4; k++)
+            if ((rc = XAie_EventPCEnable(dev, tile, k, pcs[k])) != XAIE_OK)
+                return rc;
+        if ((rc = XAie_EventComboConfig(dev, tile, XAIE_CORE_MOD, XAIE_EVENT_COMBO0, XAIE_EVENT_COMBO_E1_AND_E2,
+                                        XAIE_EVENT_LOCK_STALL_CORE, XAIE_EVENT_PC_RANGE_0_1_CORE)) != XAIE_OK)
+            return rc;
+        if ((rc = XAie_EventComboConfig(dev, tile, XAIE_CORE_MOD, XAIE_EVENT_COMBO1, XAIE_EVENT_COMBO_E1_AND_E2,
+                                        XAIE_EVENT_LOCK_STALL_CORE, XAIE_EVENT_PC_RANGE_2_3_CORE)) != XAIE_OK)
+            return rc;
+        if ((rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 1, XAIE_EVENT_COMBO_EVENT_0_CORE,
+                                             XAIE_EVENT_COMBO_EVENT_0_CORE)) != XAIE_OK)
+            return rc;
+    }
+    rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 2, XAIE_EVENT_COMBO_EVENT_1_CORE,
+                                    XAIE_EVENT_COMBO_EVENT_1_CORE);
+#elif defined(AIEHLC_PERF_CTR2_MEMSTALL)
     /* ctr2 repurposed: memory (DM bank conflict) stall instead of stream stall. */
     rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 2, XAIE_EVENT_MEMORY_STALL_CORE,
                                     XAIE_EVENT_MEMORY_STALL_CORE);
@@ -784,7 +806,9 @@ void __Runtime_core_perf_report(int tag) {
     for (int i = 0; i < s_core_perf_ntiles; i++) {
         const uint32_t a = s_perf_rep_a[i], v = s_perf_rep_v[i], ss = s_perf_rep_ss[i], ls = s_perf_rep_ls[i];
         const AieRC rc = s_perf_rep_rc[i];
-#ifdef AIEHLC_PERF_CTR2_MEMSTALL
+#if defined(AIEHLC_PERF_LOCKSPLIT)
+        printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u lockpc_r01=%u lockpc_r23=%u lock_stall=%u\n", tag,
+#elif defined(AIEHLC_PERF_CTR2_MEMSTALL)
         printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u vec_instr=%u mem_stall=%u lock_stall=%u\n", tag,
 #else
         printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u vec_instr=%u stream_stall=%u lock_stall=%u\n", tag,
@@ -2957,6 +2981,13 @@ void *__Runtime_alloc_zone(uint64_t zone_base, uint64_t zone_size, size_t bytes)
 }
 
 void *__Runtime_alloc_uncached(size_t bytes) {
+#ifdef RT_STS_SWEEP
+    { /* PAE one-ELF sweep: a re-run of main gets the first run's buffers back (same order / sizes) */
+        void *rp = rt_sts_alloc_reuse(bytes);
+        if (rp)
+            return rp;
+    }
+#endif
 #ifdef RT_NC_SUPPORTED
     /* Whole 2 MB blocks (the L2 translation granule), as many as `bytes` needs: a buffer
      * over 2 MB used to fall back to cached memory silently, and every launch then
@@ -2977,9 +3008,19 @@ void *__Runtime_alloc_uncached(size_t bytes) {
             g_nc_n++;
             AIEHLC_LOG(printf("[aie_runtime] alloc_uncached(%zu) = %p (%zu x 2 MB, Normal NC)\n", bytes, p,
                               span / RT_NC_BLOCK););
+#ifdef RT_STS_SWEEP
+            rt_sts_alloc_note(p, bytes);
+#endif
             return p;
         }
         free(p);
+    }
+#endif
+#ifdef RT_STS_SWEEP
+    {
+        void *fp = __Runtime_Alloc(bytes);
+        rt_sts_alloc_note(fp, bytes);
+        return fp;
     }
 #endif
     return __Runtime_Alloc(bytes);

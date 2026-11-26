@@ -315,9 +315,32 @@ extern "C"
 #endif
 static int s_sw_reg = 0;
 static uint32_t s_sw_min = 0U, s_sw_max = 0U, s_sw_l1 = 0U;
+/* main's device buffers (__Runtime_alloc_uncached, in call order) of the first run are handed back to every re-run:
+ * the plan programs some shim BD addresses only at the first launch of the ELF, so a re-run must use the same
+ * A / B / C buffers (main re-fills A / B with the same data and re-arms the C sentinel itself) */
+#define RT_SW_ALLOC_MAX 16
+static void *s_sw_ap[RT_SW_ALLOC_MAX];
+static size_t s_sw_ab[RT_SW_ALLOC_MAX];
+static int s_sw_an = 0, s_sw_ai = 0, s_sw_run = 0;
+static void *rt_sts_alloc_reuse(size_t bytes) {
+    if (s_sw_run == 0)
+        return NULL;
+    if (s_sw_ai < s_sw_an && s_sw_ab[s_sw_ai] == bytes)
+        return s_sw_ap[s_sw_ai++];
+    printf("SWEEP_ALLOC_MISMATCH run=%d i=%d bytes=%zu\n", s_sw_run, s_sw_ai, bytes);
+    return NULL;
+}
+static void rt_sts_alloc_note(void *p, size_t bytes) {
+    if (s_sw_run == 0 && p && s_sw_an < RT_SW_ALLOC_MAX) {
+        s_sw_ap[s_sw_an] = p;
+        s_sw_ab[s_sw_an++] = bytes;
+    }
+}
 static void rt_sts_rerun(void) {
     for (int p = 1; p < (int)(AIEHLC_SWEEP_RERUN); p++) {
         fflush(stdout);
+        s_sw_run = p;
+        s_sw_ai = 0;
         (void)rt_sts_app_main();
     }
     fflush(stdout);
@@ -326,13 +349,16 @@ static void rt_sts_sweep_end(void) {
     const uint32_t lpp = (uint32_t)(s_sts_lpp > 0 ? s_sts_lpp : 1);
     const uint32_t l = s_sts_launch ? s_sts_launch - 1U : 0U, idx = l % lpp, pt = l / lpp;
     const uint32_t pu = RT_STS_SWEEP_PUSH;
-    if (idx == 0U) {
+    if (idx == (pt == 0U ? 1U : 0U)) {
+        /* point 0: after its 2nd launch (launch 1 of the ELF also loads the kernel: +4 pushes on mm2s0 and mm2s1) */
         printf("=== SWEEP point d_ns=%u " RT_STS_SWEEP_TAG "_pushes_per_launch=%u\n", (unsigned)__Runtime_b_shim_delay_ns(),
                (unsigned)pu);
-        s_sw_l1 = pu;
         s_sw_min = ~0U;
         s_sw_max = 0U;
-    } else {
+    }
+    if (idx == 0U)
+        s_sw_l1 = pu;
+    else {
         s_sw_min = pu < s_sw_min ? pu : s_sw_min;
         s_sw_max = pu > s_sw_max ? pu : s_sw_max;
     }
