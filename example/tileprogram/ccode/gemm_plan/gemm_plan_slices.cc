@@ -77,7 +77,7 @@ int main() {
     int fail = 0;
     for (int pt = 0; pt < (int)GP_SWEEP_POINTS; pt++) {
         uint64_t rb_min = ~0ULL, rb_max = 0;
-        uint32_t d_ns = 0, pmin = ~0U, pmax = 0;
+        uint32_t d_ns = 0, pmin = ~0U, pmax = 0, pu1 = 0;
         for (int it = 0; it < launches; it++) {
             if (it == launches - 1) { // sentinel: the checked C is written by this point's last launch
                 memset(Ct, 0xA5, cbytes);
@@ -94,16 +94,21 @@ int main() {
             lms[it] = gp_ms(t0, t1);
             const uint64_t rb = __Runtime_shim_bd_rebase_count();
             const uint32_t pu = __Runtime_b_shim_pushes_last_launch();
-            pmin = pu < pmin ? pu : pmin;
-            pmax = pu > pmax ? pu : pmax;
+            if (pt == 0 && it == 0)
+                pu1 = pu; // launch 1 also loads the kernel (+4 B pushes): reported apart, not in the per-launch count
+            else {
+                pmin = pu < pmin ? pu : pmin;
+                pmax = pu > pmax ? pu : pmax;
+            }
             rb_min = rb < rb_min ? rb : rb_min;
             rb_max = rb > rb_max ? rb : rb_max;
             if (pt == 0 && it == 0)
                 aie_clk = gp_aie_clock();
         }
+        // b_pushes_per_launch = the steady count (min == max over the point's launches, launch 1 of the ELF excluded)
         printf("=== SWEEP point d_ns=%u b_pushes_per_launch=%u\n", (unsigned)d_ns, (unsigned)pmax);
-        printf("SWEEPPT point=%d d_ns=%u b_pushes_min=%u b_pushes_max=%u\n", pt, (unsigned)d_ns, (unsigned)pmin,
-               (unsigned)pmax);
+        printf("SWEEPPT point=%d d_ns=%u b_pushes_min=%u b_pushes_max=%u launch1_pushes=%u\n", pt, (unsigned)d_ns,
+               (unsigned)pmin, (unsigned)pmax, (unsigned)pu1);
         printf("GPLAN where=%s dtype=%s shape=%ldx%ldx%ld slices=%ld aie_mhz=%.1f clk_src=%s\n", "board", dts, M, N, K, S,
                aie_clk, aie_clk > 0 ? "shim_timer/cntpct" : "none");
         printf("REBASE writes_per_launch=%llu min=%llu max=%llu slices=%ld\n", (unsigned long long)rb_max,
