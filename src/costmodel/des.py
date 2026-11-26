@@ -201,3 +201,203 @@ def host_from_split(split_detail: Dict[str, Any], rounds: int | None = None) -> 
     if rounds is not None:
         d["bds_pre"] = max(0, int(round(bd_per_launch - BDS_PER_ROUND * rounds)))
     return d
+
+
+# =====================================================================================================================
+# gemm90 int8 4096^3 B-buffer DES (phase PM, sprint-1126092352): ``python3 -m costmodel.des --gemm90-price``.
+# One launch = 8 slices x 32 tiles x 32 K-chunks per core (8192 chunks at KC=128).  Per mesh column the MemTile MM2S
+# broadcasts B chunk j to the column's 4 cores (COLUMN COUPLING): it may send chunk j only when EVERY core of the
+# column has released chunk j - depth (DEPTH: the core B slot ring, ppDepth 2 on the board), and the stream needs
+# t_b = chunk bytes / stream_b_per_cyc.  At each slice start B is reloaded (breload / slices after the column's last
+# core finished the slice).  Core i's work per chunk (everything but the B lock wait) is W_i + sigma*(E - 1),
+# E ~ Exp(1) (deterministic seeds): W_i from the PB base_ml per-tile counters, sigma = per-core jitter, the ONE
+# parameter fitted (bisection) so that depth 2 reproduces pb.txt:12 base_b_us(4,3).  Out of sample: the predicted
+# lock_stall of the other 15 tiles vs base_ml.  KC=64 variants: twice the chunks, W, sigma and t_b halved (linear,
+# ASSUMED).  Wall = max over the 16 tiles; des gain = wall(base) - wall(variant) with the base kernel's static work.
+# =====================================================================================================================
+import json as _json
+import math as _math
+import os as _os
+import random as _random
+
+_PM_JSON = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "params", "gemm90_pm.json")
+_LEV_JSON = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "params", "levers_gemm90.json")
+_TILES = [(c, r) for r in (3, 4, 5, 6) for c in (1, 2, 3, 4)]
+
+
+def _f1(x: float) -> str:
+    return f"{round(x + 0.0, 1):.1f}"
+
+
+def g90_load() -> Dict[str, Any]:
+    with open(_PM_JSON) as fh:
+        P = _json.load(fh)
+    with open(_LEV_JSON) as fh:
+        P["levers"] = _json.load(fh)
+    return P
+
+
+def g90_work(P: Dict[str, Any]) -> Dict[tuple, float]:
+    """W_i (cycles per KC=128 chunk, without the B lock wait) = (active - lock)/N + non-B lock share."""
+    N = P["chunks_per_launch"]
+    nonb = P["nonb_lock_us_4_3"] * P["clk_mhz"] / N
+    W = {}
+    for k, d in P["ml_tiles"].items():
+        c, r = (int(x) for x in k.split(","))
+        W[(c, r)] = (d["active"] - d["lock"]) / N + nonb
+    return W
+
+
+_E_CACHE: Dict[tuple, list] = {}
+
+
+def _unit_exp(tile: tuple, n: int) -> list:
+    key = (tile, n)
+    if key not in _E_CACHE:
+        rng = _random.Random(9001 + 10 * tile[0] + tile[1])
+        _E_CACHE[key] = [-_math.log(1.0 - rng.random()) - 1.0 for _ in range(n)]
+    return _E_CACHE[key]
+
+
+def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, gran: int) -> Dict[str, Any]:
+    """gran = K sub-chunks per KC=128 chunk (1: KC=128, 2: KC=64).  Returns per-tile B wait / end (cycles)."""
+    N = P["chunks_per_launch"] * gran
+    per_slice = N // P["slices"]
+    t_b = P["b_chunk_bytes"] / gran / P["stream_b_per_cyc"]
+    reload = P["breload_us"] * P["clk_mhz"] / P["slices"]
+    bwait, end = {}, {}
+    for c in (1, 2, 3, 4):
+        col = [(c, r) for r in (3, 4, 5, 6)]
+        w = [W[t] / gran for t in col]
+        s = sigma / gran
+        E = [_unit_exp(t, N) for t in col]
+        fin = [[0.0] * N for _ in col]
+        t_end = [0.0] * 4
+        bw = [0.0] * 4
+        arr = 0.0
+        slice_ready = 0.0
+        for j in range(N):
+            if j % per_slice == 0:
+                if j:
+                    slice_ready = max(t_end) + reload
+                a = max(arr + t_b, slice_ready)
+            else:
+                a = arr + t_b
+            if j >= depth:
+                a = max(a, max(f[j - depth] for f in fin) + t_b)
+            arr = a
+            for i in range(4):
+                st = t_end[i]
+                if a > st:
+                    bw[i] += a - st
+                    st = a
+                e = st + w[i] + s * E[i][j]
+                t_end[i] = e
+                fin[i][j] = e
+        for i, t in enumerate(col):
+            bwait[t], end[t] = bw[i], t_end[i]
+    return {"bwait": bwait, "end": end, "wall": max(end.values())}
+
+
+def g90_fit_sigma(P: Dict[str, Any], W: Dict[tuple, float]) -> tuple:
+    meas = P["pb"]["base_b_us_4_3"] * P["clk_mhz"]
+    lo, hi = 0.0, 0.5 * min(W.values())
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+        if g90_sim(P, W, mid, 2, 1)["bwait"][(4, 3)] < meas:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def g90_price(P: Dict[str, Any]) -> list:
+    out = []
+    clk, N = P["clk_mhz"], P["chunks_per_launch"]
+    W = g90_work(P)
+    sigma = g90_fit_sigma(P, W)
+    base = g90_sim(P, W, sigma, 2, 1)
+    b43 = base["bwait"][(4, 3)] / clk
+    bmeas = P["pb"]["base_b_us_4_3"]
+    b_err = abs(b43 - bmeas) / bmeas
+    # out of sample: lock_stall of the 15 other tiles (B wait + the assumed non-B share) vs base_ml
+    nonb = P["nonb_lock_us_4_3"] * clk
+    errs = []
+    for k, d in P["ml_tiles"].items():
+        t = tuple(int(x) for x in k.split(","))
+        if t != (4, 3):
+            errs.append(abs(base["bwait"][t] + nonb - d["lock"]) / d["lock"])
+    tile_mare = sum(errs) / len(errs)
+    calib_err = max(b_err, tile_mare, P["pb"]["ml_spread_pct"] / 100.0)
+    # lock-place calibration (attrib_pred, PK): end-to-end us per us of B lock wait moved off (4,3)
+    lm = P["levers"]["classes"]["lock_move"]
+    lp_pred = lm["disc"] * lm["dx_us"]
+    ca = P["levers"]["classes"]["core_active"]
+    ratio = round(ca["disc"], 1)
+    out.append(f"CALIB src=pb lockplace_pred_us={_f1(lp_pred)} lockplace_meas_us={_f1(P['pb']['d_median_us'])} "
+               f"core_active_ratio={_f1(ratio)} lock_move_disc={lm['disc']:.6f} dx_us={_f1(lm['dx_us'])} "
+               f"n_samples={lm['n_samples']} pred_src=tools/attrib_pred.py")
+    out.append(f"DES b_us(4,3)={_f1(b43)} b_meas_us={_f1(bmeas)} depth=2 col_coupling=1 sigma_cyc={_f1(sigma)} "
+               f"t_b_cyc={_f1(P['b_chunk_bytes'] / P['stream_b_per_cyc'])} breload_us={_f1(P['breload_us'])} "
+               f"b_err_pct={_f1(100 * b_err)} tile_lock_mare_pct={_f1(100 * tile_mare)} "
+               f"calib_err_pct={_f1(100 * calib_err)} base_wall_us={_f1(base['wall'] / clk)}")
+    gap = round(P["pb"]["base_median_us"] - P["gap"]["target85_int8_us"], 1)
+    bs = P["base"]
+    inner = (bs["chunk_cyc"] - bs["bnd_bundles"]) / bs["loop_bundles"]
+    rows = []
+    lo_band = P["compute_lo_band"]
+    for v in P["variants"]:
+        g = 128 // v["kc"]
+        fits = int(v["link"] == "ok" and v["dm_used"] is not None and v["dm_used"] <= P["dm_cap"])
+        bd = int(v["bd_ok"])
+        if v["bnd_bundles"] is not None:
+            d_bnd = g * v["bnd_bundles"] - bs["bnd_bundles"]
+            d_loop = (g * v["loop_bundles"] - bs["loop_bundles"]) * inner
+        else:
+            d_bnd, d_loop = 0, 0.0  # not linked: priced with the base kernel's static schedule
+        bnd_us = (d_bnd + d_loop) * N / clk       # extra boundary + loop cycles per launch (cost if > 0)
+        csplit_us = 0.0                           # no linked variant uses GP_C_SPLIT=2 (pd.txt GAP rows)
+        dm = v["dm_used"] if v["dm_used"] is not None else "-"
+        if v["kind"] == "buffer":
+            sim = g90_sim(P, W, sigma, v["depth"], g)
+            gain = (base["wall"] - sim["wall"]) / clk
+            pred = gain - bnd_us - csplit_us
+            lo, hi = pred - abs(pred) * calib_err, pred + abs(pred) * calib_err
+            st, ra = "-", "-"
+            lim = "fit" if not fits else ("boundary" if bnd_us > max(gain, 0.0) else "des_gain")
+            extra = f"des_gain_us={_f1(gain)} d_bnd_bundles={d_bnd} d_loop_cyc={_f1(d_loop)} csplit_us={_f1(csplit_us)}"
+        else:
+            static_cyc = -(d_bnd + d_loop)
+            static_us = static_cyc * N / clk
+            # a saving is scaled by the measured core_active ratio; a loss is charged 1:1 (never amplified)
+            pred = static_us * ratio if static_us > 0 else static_us
+            lo, hi = (pred * (1 - lo_band), pred) if pred > 0 else (pred - abs(pred) * lo_band, pred)
+            st, ra = _f1(static_us), _f1(ratio)
+            lim = "core_active_n1" if static_us > 0 else "boundary"
+            extra = f"static_cyc_per_chunk={_f1(static_cyc)} d_bnd_bundles={d_bnd} d_loop_cyc={_f1(d_loop)}"
+        el = int(fits and bd)
+        rows.append(dict(v=v["v"], kind=v["kind"], el=el, pred=pred, lo=lo))
+        out.append(f"LEVER v={v['v']} kind={v['kind']} dm_used={dm} fits={fits} bd_ok={bd} static_us={st} ratio={ra} "
+                   f"pred_us={_f1(pred)} pred_lo_us={_f1(lo)} pred_hi_us={_f1(hi)} boundary_us={_f1(bnd_us)} "
+                   f"limit={lim} {extra}")
+    el = [r for r in rows if r["el"]]
+    best = max(el, key=lambda r: (r["lo"], r["v"])) if el else None
+    go = bool(best and round(best["lo"], 1) >= gap)
+    out.append(f"LEVERTAB2 head={P['data_head']} vars_priced={len(el)} "
+               f"buffer_priced={sum(1 for r in el if r['kind'] == 'buffer')} "
+               f"compute_priced={sum(1 for r in el if r['kind'] == 'compute')} core_active_ratio={_f1(ratio)} "
+               f"des_b_err_pct={_f1(100 * b_err)} des_tol_pct=10.0 lockplace_pred_us={_f1(lp_pred)} "
+               f"verdict={'go' if go else 'lower_bound'} pick={best['v'] if best else 'none'} "
+               f"pick_kind={best['kind'] if best else 'none'} pred_us={_f1(best['pred'] if best else 0.0)} "
+               f"pred_lo_us={_f1(best['lo'] if best else 0.0)} "
+               f"lb_file={'-' if go else 'm33621242222122211/LOWER_BOUND.md'} gap_us={_f1(gap)}")
+    return out
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if _sys.argv[1:] != ["--gemm90-price"]:
+        _sys.stderr.write("usage: des.py --gemm90-price\n")
+        _sys.exit(2)
+    for _l in g90_price(g90_load()):
+        print(_l)
