@@ -230,9 +230,12 @@ bool deriveResident(DataflowPlan &p, size_t si, std::string &why) {
         const PlanResources::Mem &m = p.res.mem[si][c];
         const std::vector<Tile> t{u.mt};
         const int replays = (int)u.out.size();
-        p.locks.push_back({t, m.locks[0], 0, keep ? replays : -1, false, true});
+        // restored only when kept across launches: a stage refilled every launch is re-armed every launch
+        // (residentLocksRestored -- its readers never release `free`)
+        const bool restored = residentLocksRestored(keep);
+        p.locks.push_back({t, m.locks[0], 0, keep ? replays : -1, false, restored});
         p.locks.back().tag = mtag(si, c, "lock", 0);
-        p.locks.push_back({t, m.locks[1], 1, keep ? 0 : -1, false, true});
+        p.locks.push_back({t, m.locks[1], 1, keep ? 0 : -1, false, restored});
         p.locks.back().tag = mtag(si, c, "lock", 1);
         // the load: one BD, or a next_bd chain when the strips are over a MemTile BD's length (splitBdLen) --
         // the first BD acquires `free`, the last releases `ready` to the replays, the middle ones take no lock.

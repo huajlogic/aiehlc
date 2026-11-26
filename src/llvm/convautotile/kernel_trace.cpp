@@ -1603,8 +1603,13 @@ void inferRoles(std::vector<TracePort> &ports, const std::map<std::string, PortF
 // whole tensor (slice s laid out like slice 0, s tensors on), the output by its column block, written row-major
 // with ldc = S x its row (the compiler re-strides its shim S2MM BD). Returns false when there is no such pragma;
 // `err` set = the pragma is wrong for this kernel.
-static bool dataflowSlicesNote(const std::string &src, const std::vector<TracePort> &ports, std::string &note,
-                               std::string &err) {
+//
+// A sliced input staged whole in the MemTiles ({.stage = aie::stage::memtile}) is reloaded every call: kept
+// across launches ({.keep = true}) it would serve slice 0's data to every slice, so it is refused; refilled every
+// call, its (ready, free) MemTile lock pair is re-armed per call (dfplan::residentLocksRestored, m3362124221 P2b)
+// and the note says so.
+static bool dataflowSlicesNote(const std::string &src, const std::vector<TracePort> &ports,
+                               const std::map<std::string, BlockOpts> &opts, std::string &note, std::string &err) {
     static const std::regex rx(R"((?:^|\n)[ \t]*#[ \t]*pragma[ \t]+dataflow_slices\b([^\n]*))");
     std::smatch m;
     if (!std::regex_search(src, m, rx))
@@ -1625,7 +1630,8 @@ static bool dataflowSlicesNote(const std::string &src, const std::vector<TracePo
         err = "#pragma dataflow_slices: " + std::to_string(S) + " slices (needs >= 2)";
         return true;
     }
-    std::ostringstream os;
+    std::ostringstream os, mt;
+    std::string keepErr; // reported after every argument is checked to be a port
     std::set<long> seen;
     for (size_t i = 1; i < v.size(); i++) {
         const long arg = v[i];
@@ -1646,11 +1652,28 @@ static bool dataflowSlicesNote(const std::string &src, const std::vector<TracePo
             }
             const long row = (long)p.shape[1] * p.elem_bytes;
             os << "+" << row << " B per slice, row-major ldc " << S * row << " B";
-        } else
+        } else {
             os << "+" << bytes << " B per slice";
+            auto o = opts.find(p.var);
+            if (o != opts.end() && o->second.stage == 1) {
+                if (o->second.keep) {
+                    if (keepErr.empty())
+                        keepErr = "#pragma dataflow_slices: input " + p.var + " (arg " + std::to_string(arg) +
+                              ") is held in the MemTiles across launches ({.keep = true}) but rebased every call -- "
+                              "every slice would read slice 0's data; drop .keep for a sliced input";
+                    continue;
+                }
+                mt << "; " << p.var << ": MemTile stage refilled every call, its (ready, free) locks "
+                   << (dfplan::residentLocksRestored(false) ? "restored once" : "re-armed per call");
+            }
+        }
+    }
+    if (!keepErr.empty()) {
+        err = keepErr;
+        return true;
     }
     note = "dataflow plan: slices=" + std::to_string(S) + " emits " + std::to_string(v.size() - 1) +
-           " shim rebases per slice: " + os.str();
+           " shim rebases per slice: " + os.str() + mt.str();
     return true;
 }
 
@@ -1723,7 +1746,7 @@ KernelOnlyResult inferKernelOnly(std::string &src, const std::string &srcDir, co
         }
         {
             std::string sn, se;
-            if (dataflowSlicesNote(src, k.ports, sn, se)) {
+            if (dataflowSlicesNote(src, k.ports, tr.opts, sn, se)) {
                 if (!se.empty())
                     errs.push_back(se);
                 else

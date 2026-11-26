@@ -289,6 +289,14 @@ A BD that is not one TM x TN tile per iteration fails the build ("ldc cannot be 
 (kernel_trace_cases "dataflow: slices=8 ..."). Example: `gemm_plan/gemm_plan_4096c_int8.cc`
 (4096^3 int8 as 8 slices of 4096 x 512 x 4096, `gemm_plan_slices.cc` host driver).
 
+A sliced input staged whole in the MemTiles is refilled every call (m3362124221 P2b, from the PD board
+diagnosis: launch 1 call 2 hung with the MemTile B S2MM stalled on lock acquire, locks `ready = 4, free = 0`).
+Its (ready, free) pair is "restored" only when the stage is kept across launches
+(`dfplan::residentLocksRestored(keep)`, plantarget.h): the load takes `free` and the replays hand back `ready`,
+never `free`, so a stage refilled every launch ends a launch at (replays, 0) and the host re-arms it to (0, 1)
+with `__Runtime_tile_lock_set` every launch (it was `_restored`, written on launch 1 only). A sliced input kept
+across launches (`.keep = true`) is refused by the front end -- every slice would read slice 0's data.
+
 ## 5. Traps
 
 * **The kernel never names the plan's resources.** Ids and addresses are allocated per build; only

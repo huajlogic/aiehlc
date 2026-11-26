@@ -106,6 +106,17 @@ inline std::vector<int64_t> splitBdLen(int64_t bytes, int64_t maxWords, int64_t 
     return out;
 }
 
+// residentLocksRestored: does a resident MemTile stage's (ready, free) lock pair end each launch at the value the
+// next launch starts from? Kept across launches (keep): the load runs on the first launch only and the replays
+// hand `ready` back (acquire -1 / release +1), so yes -- the host writes the pair on launch 1 (and launch 2 when
+// `later` differs). Refilled every launch (no keep, e.g. a #pragma dataflow_slices input rebased per call): the
+// load takes `free` and nothing releases it (the replays hand back `ready`, not `free`), so the pair ends a launch
+// at (replays, 0) and must be re-armed to (0, 1) before every launch's load -- written as "restored" the second
+// launch's load waits on `free` forever (m3362124221 PD: 4096c slice 1, MemTile B S2MM lock-acquire stall).
+// The ONE place this is decided: the plan's DMA program (plandma.cpp deriveResident) and the front end's note
+// (convautotile/kernel_trace.cpp dataflowSlicesNote).
+inline bool residentLocksRestored(bool keep) { return keep; }
+
 } // namespace dfplan
 
 #endif
