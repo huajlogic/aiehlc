@@ -14,7 +14,7 @@ of them.
 |---|---|---|
 | **C** | `load_buffer` options + `#pragma persistent_kernel` | `example/tileprogram/ccode/gemm_plan/gemm_plan.cc` |
 | **routing IR** | `#routing.dataflow<...>` (typed: share, stage, ring, keep, parts, axis, per-core bases) on a tensor's `routingcreatescheduletensor`, `routing.persistent_kernel` | `AIEHLC_ROUTING_IR_IN` |
-| **dmaphop IR** | the dataflow decisions: `dmaphop.plan` / `plan_route` / `plan_stream` | `gen_plan.py`, `AIEHLC_DMAPHOP_IR_IN` |
+| **dmaphop IR** | the dataflow decisions: per stream a `create_path` with `#dmaphop.stream`, its routes as `create_hop`s; `dmaphop.plan` header (input also as `plan_route` / `plan_stream` ops) | `gen_plan.py`, `AIEHLC_DMAPHOP_IR_IN` |
 | **dfschedule IR** (derived) | the DMA program: `config.tile_bd` / `lock_set` / `channel_enable` / `channel_start` (MemTiles, cores), `config.dma_bd` + `create_io` + `start_io` (shim), module switches | dumped as `*_DataflowPlanToDfschedule.mlir` |
 
 Measured on vek385-6 (1.25 GHz array), per launch of 10.07 G MAC, GOLDEN PASS (187,758 sampled
@@ -182,7 +182,34 @@ each column's chunk stream, every MemTile chain must fit its channel's BD bank.
 
 ## 3. dmaphop level: the dataflow decisions
 
-Attribute-only ops (`assemblyFormat = "attr-dict"`, `td/dmaphopop.td`), read and validated by
+**In the hop graph (2026-11-26, `doc/plan/dataflowplan_unify_ir.md` stages 3-4).** After the plan step the
+plan's data movement is ordinary dmaphop: per stream ONE `dmaphop.create_path` carrying the stream as a typed
+`#dmaphop.stream<...>` (every field below), whose `dmaphop.create_hop` ops are the plan's routes -- the source
+`dmaphop.port` is the route's MM2S channel (`direction_channel`) on a `shim` / `mem` / `core` `dmaphop.tile`, the
+destination ports its S2MM channels, `route = i` on each hop keeps the router's order
+(`pass/dataflowplan/planpaths.cpp`). The `dmaphop.plan` header (replaced / shared args, persistent, BD
+write-once) and `dmaphop.plan_resources` stay: they are plan-wide facts, not data movement.
+
+```mlir
+%t = dmaphop.tile {TILETYPE = "shim", col = 1, row = 0} -> !dmaphop.tile
+%s = "dmaphop.port"(%t) {direction = "Out", direction_channel = 1 : i64, sym_name = "plan0_r0_src"} : ...
+%d = "dmaphop.port"(%m) {direction = "In", direction_channel = 0 : i64, sym_name = "plan0_r0_d0"} : ...
+%h = dmaphop.create_hop %s -> %d {route = 0 : i64} -> !dmaphop.hop
+...
+%p = dmaphop.create_path [%h, ...] {producers = [@plan0_r0_src, ...], consumers = [@plan0_r0_d0, ...],
+       tee_points = []} {stream = #dmaphop.stream<arg = 0, role = "a", share = "neighbor", channel = 0,
+       stage = "memtile_ring", ring = 10, resident = false, chunk = [64, 128], tensor = [7680, 2560], chunks = 20,
+       rounds = 60, host_rows = [0, 3], first_rows = [0, 2], channels = 2, slots = 2, readers = 2, parts = 2, ...>}
+```
+
+`collectDataflowPlan` reads either form -- these paths (this compiler's dumps, re-enterable with
+`AIEHLC_DMAPHOP_IR_IN`) or the attribute-only `plan_route` / `plan_stream` ops below (`plansynth.cpp`'s
+output, `gen_plan.py`, older dumps) -- validates it and writes the paths; DmaphopToRoutinghwPass takes the routes
+from the paths' hops (`takeDataflowPlanRoutes`) before the generated-flow conversion and routes them after it.
+The generated flow of a replaced argument is still emitted and tagged `dmaphop.plan_replaced` (its core end is the
+kernel's window; stage 2 of the unify plan).
+
+The attribute-only input form (`assemblyFormat = "attr-dict"`, `td/dmaphopop.td`), read and validated by
 `collectDataflowPlan` (`pass/dataflowplan/dataflowplan.cpp`) with errors at the op's location.
 Columns are partition-relative, rows absolute; `host_rows` / `first_rows` are mesh rows.
 
@@ -209,6 +236,18 @@ Edit a stream (e.g. `ring = 8`) and the DMA program follows; nothing BD-level is
 route names the stream it carries (`arg`); the derivation takes each stream's channels, MemTiles and
 replay targets from its routes. (`persistent_go_lock = N` from older plans still reads as
 `persistent = true`; the go lock is allocated.)
+
+## 3b. dfscheblueprint level: the plan the DMA program is derived from
+
+`DmaphopTodfscheblueprintPass` lowers the generated flows (the replaced ones too: their core end is the
+kernel's window); `annotateBlueprint` then writes the whole plan onto the blueprint, typed: each shared
+tensor's `declare_data` gets `dfscheblueprint.plan_stream = #dmaphop.stream<...>`, the module
+`dfscheblueprint.plan_routes = [#dmaphop.route<arg = 0, src = [1, 0, 1], src_shim = true, dsts = [1, 2, 1]>, ...]`
+(router order), `plan_args`, `plan_share_args`, `plan_persistent`, `plan_bd_once`, `plan_mesh = [col_lo,
+mesh_cols, mesh_rows, core_row_base, memtile_rows]` and, when resources were pinned, `plan_pinned`. The
+pipeline reads the plan back from there (`planFromBlueprint`, `planreadback.cpp`), checks it equals the
+dmaphop plan (`samePlanDataflow`) and derives the DMA program from it -- the blueprint IR alone describes
+every transfer of a plan build.
 
 ## 4. dfschedule level: the DMA program (derived)
 
@@ -288,7 +327,7 @@ Every op the plan materializes carries its role (`dfplan.tag`: `core/E/<buffer>`
 | dump | level | what |
 |---|---|---|
 | `NN_DataflowPlanProgram.mlir` | dfschedule | the plan's DMA program alone (tagged ops on their tiles; a shim transfer as a `config.tile_bd` record) -- the readback input format |
-| `NN_DataflowPlanReadback(dfscheblueprint).mlir` | dfscheblueprint | `dfscheblueprint.plan = {...}` (stream decisions + resources) on every shared tensor's `declare_data` (the normal blueprint dump carries the decisions) |
+| `NN_DataflowPlanReadback(dfscheblueprint).mlir` | dfscheblueprint | the whole plan, typed: `dfscheblueprint.plan_stream = #dmaphop.stream<...>` on every shared tensor's `declare_data`, `dfscheblueprint.plan_routes = [#dmaphop.route<...>, ...]` + `plan_args` / `plan_share_args` / `plan_persistent` / `plan_bd_once` / `plan_mesh` (/ `plan_pinned`) on the module, and the assigned resources (`plan_resources`). The normal blueprint dump carries the same minus the assigned resources, and the DMA program is derived from what `planFromBlueprint` reads back from it (checked equal to the dmaphop plan) |
 | `NN_DataflowPlanReadback(dmaphop).mlir` | dmaphop | the plan ops with `dmaphop.plan_resources` -- re-enterable with `AIEHLC_DMAPHOP_IR_IN` |
 
 `AIEHLC_DFSCHEDULE_PLAN_IN=<edited plan program>` reads an edited program back
@@ -348,7 +387,7 @@ helpers' shim wrap (was 1024: one past the 10-bit field) and iteration limits re
 | `DmaphopToRoutinghwPass` | no generated stream route for a tagged path |
 | `BlueprintToSchedulePass` (host) | for a replaced argument: core buffers / windows kept (the kernel signature is unchanged), no shim BD / create_io / start_io / wait; `resolveKernelBlock` skips its window check |
 | `ScheduleCanonicalizePass` | `host_canonicalized` keeps every memref argument (the plan's shim transfers read them) |
-| `DmaphopToRoutinghwPass` | the `dmaphop.plan_route` ops (kept in the routing clone only) lowered to ordinary `routinghw.connectsinglestreamswitchport` / `enableexttoaieshimport` ops (`passdmaphoptoroutinghw/planroutes.cpp`): BFS over the router's own port model (`hwresource.cpp`, the shim's DMA mux ports) around the routinghw ops already created and the control plane's ResourceMgr reservations; MemTile SOUTH/NORTH lanes kept tied (skill memtilepassthroughlane). RoutingHWVerify, the provenance / resource maps, RoutingHWLower and EmitC see them like any route -- no text branch in routing.cc |
+| `DmaphopToRoutinghwPass` | the plan paths' hops (kept in the routing clone only, taken out before the generated-flow conversion) lowered to ordinary `routinghw.connectsinglestreamswitchport` / `enableexttoaieshimport` ops (`passdmaphoptoroutinghw/planroutes.cpp`): BFS over the router's own port model (`hwresource.cpp`, the shim's DMA mux ports) around the routinghw ops already created and the control plane's ResourceMgr reservations; MemTile SOUTH/NORTH lanes kept tied (skill memtilepassthroughlane). RoutingHWVerify, the provenance / resource maps, RoutingHWLower and EmitC see them like any route -- no text branch in routing.cc |
 | kernel.cc | the KCO input blocks on core S2MM channels the plan's `channel_start` ops own are dropped |
 | aiehlc_plan.h | `AIEHLC_PLAN_*` constants for `aie_block_io_plan.h` and the persistent loop |
 | flowcheck | replaced flows are listed; every `plan_route` is simulated through routing.cc (`plan_routes` in `dmaphopprovenacemap.json`) |

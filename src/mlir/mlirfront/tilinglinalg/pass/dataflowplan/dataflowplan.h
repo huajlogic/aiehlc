@@ -284,9 +284,10 @@ bool deriveDmaProgram(DataflowPlan &plan, std::string &why);
 const PlanStream *streamOfRole(const DataflowPlan &p, const char *role);
 std::vector<const PlanRoute *> routesOf(const DataflowPlan &p, int arg, bool fromShim, int col);
 
-// Routing-level dataflow intent (`dataflow = {share = "neighbor", ...}` on the tensors'
-// routingcreatescheduletensor ops, `routing.persistent_kernel`) -> dmaphop.plan / plan_route /
-// plan_stream ops at the top of @main (plansynth.cpp). Explicit plan ops or no dataflow attrs: no-op.
+// Routing-level dataflow intent (#routing.dataflow on the tensors' routingcreatescheduletensor ops,
+// `routing.persistent_kernel`) -> dmaphop.plan / plan_route / plan_stream ops at the top of @main
+// (plansynth.cpp; collectDataflowPlan turns the routes / streams into plan paths). Explicit plan ops or no dataflow
+// attrs: no-op.
 bool synthesizeDataflowPlan(mlir::ModuleOp module, std::string &why);
 
 // The DMA program as dfschedule ops: MemTile + shim on the host module (after the kernel launch,
@@ -297,10 +298,28 @@ bool materializeKernelPlan(mlir::ModuleOp kernelModule, const DataflowPlan &plan
 // The plan is published to the later stages through this process-wide slot.
 DataflowPlan &activePlan();
 
-// ---- the plan's routes: lowered by DmaphopToRoutinghwPass (passdmaphoptoroutinghw/planroutes.cpp) ----
-// collectDataflowPlan keeps the plan_route ops; the pipeline erases them from the module the host / kernel
-// paths are cloned from.
-void erasePlanRoutes(mlir::ModuleOp module);
+// ---- the plan in the hop graph (planpaths.cpp) ----
+// After collectDataflowPlan the plan's data movement is ordinary dmaphop: per stream one dmaphop.create_path
+// carrying #dmaphop.stream (the stream) whose create_hop ops are the plan's routes (source port = the route's
+// MM2S channel on a shim / MemTile / core tile, destination ports = its S2MM channels, `route = i` on every hop:
+// the order the router takes them). DmaphopToRoutinghwPass lowers those hops with the plan router; the
+// pipeline erases the plan paths from the module the host / kernel paths are cloned from.
+// The plan's paths at the front of @main, replacing any dmaphop.plan_route / plan_stream ops (and earlier
+// plan paths). false + why when a route carries no stream.
+bool writePlanPaths(mlir::ModuleOp module, const DataflowPlan &plan, std::string &why);
+// Streams (in path order) and routes (by `route` index) from the plan paths; appended to plan.
+bool readPlanPaths(mlir::ModuleOp module, DataflowPlan &plan, std::string &why);
+bool hasPlanPaths(mlir::ModuleOp module);
+// The kernel argument a dmaphop.push moves (its data operand traced to @main's block argument), -1 if none.
+int traceKernelArg(mlir::Value v);
+// The typed attributes the plan travels in: #dmaphop.stream (one stream), #dmaphop.route (one route).
+mlir::Attribute streamToAttr(mlir::MLIRContext *ctx, const PlanStream &s);
+bool streamFromAttr(mlir::Attribute a, PlanStream &s);
+mlir::Attribute routeToAttr(mlir::MLIRContext *ctx, const PlanRoute &r);
+bool routeFromAttr(mlir::Attribute a, PlanRoute &r);
+// Erases the plan paths, their hops and the ports / tiles only they use, and the dmaphop.plan header /
+// plan_resources ops.
+void erasePlanPaths(mlir::ModuleOp module);
 
 // aiehlc_plan.h: the kernel side of the shared ports (aiehlc_share_load / _release, per-core init,
 // AIEHLC_PLAN_<name> constants, AIEHLC_PLAN_PERSISTENT / _GO_LOCK).
@@ -323,10 +342,14 @@ bool readBackDfscheduleFiles(mlir::MLIRContext *ctx, DataflowPlan &plan, std::st
 bool checkReadBack(mlir::ModuleOp host, mlir::ModuleOp kernel, const std::string &dumpPath, std::string &why);
 // dmaphop.plan_resources <-> PlanResources.
 void readPlanResources(mlir::Operation *op, DataflowPlan &plan);
+void readPlanResources(mlir::DictionaryAttr d, DataflowPlan &plan);
 std::string planResourcesText(const DataflowPlan &plan);
 // The plan on the dfscheblueprint level: dfscheblueprint.plan = {...} on every shared tensor's
 // declare_data (stream decisions; with resources once assigned).
 void annotateBlueprint(mlir::ModuleOp blueprint, const DataflowPlan &plan, bool withResources);
+// The plan as annotateBlueprint wrote it (no plan -> !present) and the check that it is the dmaphop plan.
+bool planFromBlueprint(mlir::ModuleOp blueprint, DataflowPlan &plan, std::string &why);
+bool samePlanDataflow(const DataflowPlan &a, const DataflowPlan &b, mlir::MLIRContext *ctx, std::string &why);
 // The dmaphop plan as read back: rings and a dmaphop.plan_resources op updated in a snapshot of the dmaphop
 // module (re-enterable with AIEHLC_DMAPHOP_IR_IN).
 void readBackDmaphop(mlir::ModuleOp dmaphopSnapshot, const DataflowPlan &plan);

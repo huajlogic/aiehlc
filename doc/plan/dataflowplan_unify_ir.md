@@ -32,7 +32,36 @@ regression script.
       source (plan sources included) byte-identical; `routing_ir_roundtrip.sh gemm_plan.cc` PASS (37 IR stage dumps
       identical). Printed form: `#routing.dataflow<share = "neighbor", stage = "memtile_ring", ring = 10, keep = false,
       parts = 2, axis = "", base_p0 = [], base_p1 = []>`. No board run needed: host.cc / kernel.cc / routing.cc identical.
-- [ ] Stages 2-4 (revised below: "the plan is the flow")
+- [x] **Stages 3.1 + 4** (2026-11-26, `planpaths.cpp`): the plan's routes are `dmaphop.create_hop`s of one
+      `dmaphop.create_path` per stream, the stream a typed `#dmaphop.stream` on it; `plan_route` / `plan_stream` are
+      an input form only (converted on entry, `gen_plan.py` keeps working), never in the IR after the plan step.
+      The paths sit in the `routing.RoutingCreate` region of their tensor's generated flow (ports are symbols);
+      DmaphopToRoutinghwPass takes the routes out of them before the generated-flow conversion and emits them at
+      the front of the routing function, as before. Evidence: gate 11 / 11 byte-identical (plan sources included);
+      `routing_ir_roundtrip.sh --stage dmaphop` PASS on `gemm_plan.cc` and `simpleeltwise_add_plan.cc` (36 IR stage
+      dumps identical); `gen_plan.py` old-op form -> its plan-path dump re-entered -> identical files.
+- [x] **Stage 3.2 [ASK] -> no** (default without an answer): the IR is one representation; which BFS routes the plan's
+      hops is an implementation detail, and one router would change every non-plan `routing.cc`.
+- [x] **Stage 6, first part** (2026-11-26): dfscheblueprint carries the WHOLE plan, typed -- `#dmaphop.stream` on each
+      shared tensor's `declare_data`, `#dmaphop.route`s + the plan-level facts (args, persistent, BD write-once,
+      mesh, pinned resources) on the module (`annotateBlueprint`) -- and the DMA program is derived from what
+      `planFromBlueprint` reads back (checked equal to the dmaphop plan, then adopted). Evidence (with 3.1 + 4):
+      gate 11 / 11 byte-identical; dmaphop round trips PASS (37 IR stage dumps); the read-back dmaphop dump (plan
+      paths + header) re-entered -> identical files; `gen_plan.py` ops -> plan-path dump re-entered -> identical.
+      The `dmaphop.plan` header stays next to the paths until `erasePlanPaths`, so the plan-step dump is a complete,
+      re-enterable plan; the paths' streams are ordered by `replace_args` on reading (IR order follows the flows).
+- [ ] **Stage 2 + Stage 6 second part** (the transfer manifests): NOT done. The replaced generated flow still
+      exists, tagged `dmaphop.plan_replaced`; its only remaining roles are the kernel's window (window_init, its
+      core memory = the plan's chunk slots) and the blueprint transfer the core-side window config is derived from.
+      Removing it needs a blueprint transfer that names a plan stream as its source (staged, multi-reader), so the
+      kernel-side window / memory come from the plan -- the two belong together; a follow-up.
+- [x] **Stage 5 [ASK] -> no** (default without an answer): `config.dma_bd` (a buffer operand, SSA packet / OOO ids, a
+      BD handle that must be consumed) and `config.tile_bd` (a hardware BD over a tile's own memory, no handle) are
+      different abstractions; one op would be a union of both.
+- [x] **Stage 7 -> evaluated, not changed**: the kernel already has ONE block-IO API; `aie_block_io_plan.h` is the
+      implementation the IR's plan selects (hosted slots, hand-on locks) and falls back to the window per operand.
+      Making a window "the one-reader case of the slot protocol" changes every non-plan kernel's code for no IR gain;
+      `aiehlc_plan.h` stays the one constant source both the host and the kernel compile read.
 
 ## Where the two representations meet today (survey 2026-11-26)
 

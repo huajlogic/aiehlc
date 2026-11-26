@@ -16,7 +16,7 @@ GOLDEN PASS).
 |---|---|---|
 | C | `load_buffer(..., {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring, .ring = 10})`, `{.keep = true}`, `#pragma persistent_kernel` | trace harness -> `KernelBlock` -> `dataflow` dict |
 | routing IR | `#routing.dataflow<...>` on `routingcreatescheduletensor`, `routing.persistent_kernel` | `plansynth.cpp` (dump `4_DataflowPlan.mlir`) |
-| dmaphop IR | `dmaphop.plan` / `plan_route` / `plan_stream` (dataflow decisions) | `collectDataflowPlan` (`dataflowplan.cpp`) |
+| dmaphop IR | per stream a `create_path` with `#dmaphop.stream`, routes as its `create_hop`s (`route = i`), `dmaphop.plan` header; input also as `plan_route` / `plan_stream` ops | `collectDataflowPlan` (`dataflowplan.cpp`), `planpaths.cpp` |
 | dfschedule IR (derived) | `config.tile_bd` / `lock_set` / `channel_enable` / `channel_start`, shim `config.dma_bd` + `start_io` | `plandma.cpp` derive + materialize; lowered by DfscheduleToApi / DfscheduleToKernelApi |
 
 ## Nothing in the plan is a literal
@@ -32,7 +32,7 @@ GOLDEN PASS).
   sync at commit); `aiehlc_plan.h` is constants only.
 
 ## Routes, protocol, layouts, readback (2026-11-24)
-- Routes: `plan_route` lowered in DmaphopToRoutinghwPass (`passdmaphoptoroutinghw/planroutes.cpp`) to routinghw ops;
+- Routes: the plan paths' hops (`takeDataflowPlanRoutes`) lowered in DmaphopToRoutinghwPass (`passdmaphoptoroutinghw/planroutes.cpp`) to routinghw ops;
   `[DataflowPlan] routed N plan net(s) in DmaphopToRoutinghwPass`. No `aiehlc_plan_routing()` any more.
 - Protocol: `plan_stream channels / slots / readers / parts / elem_bytes / row_groups / strips` (synthesized:
   channels = core S2MM count, slots = `{.depth}`, parts = `{.parts}`); header `AIEHLC_PLAN_READER(o, pm)`.

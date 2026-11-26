@@ -913,6 +913,15 @@ static bool readIROverride(mlir::MLIRContext &ctx, mlir::ModuleOp module, const 
         planOps = planOpsList.size();
         for (auto *op : planOpsList)
             op->erase();
+        // the plan as paths (#dmaphop.stream create_path + its hops) and the tags collectDataflowPlan puts on the
+        // generated flows it replaces are the plan too
+        noPlan->walk([&](mlir::Operation *op) {
+            if (op->getName().getStringRef() == "dmaphop.create_path" && op->hasAttr("stream"))
+                planOps++;
+            op->removeAttr("dmaphop.plan_replaced");
+        });
+        noPlan.get()->removeAttr("dmaphop.plan_replaced_args");
+        dfplan::erasePlanPaths(noPlan.get());
         stripDerivedAttrs(noPlan.get());
         llvm::raw_string_ostream os(after);
         noPlan->print(os);
@@ -1152,11 +1161,14 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             llvm::errs() << "[DataflowPlan] ERROR: cannot synthesize the plan from the routing IR: " << why << "\n";
             return false;
         }
-        dumpPipelineIRToFile(module, irDir, stage++, "DataflowPlan");
     }
     // the dmaphop plan as synthesized / read in: the readback writes the plan the build ends with into it
     mlir::OwningOpRef<mlir::ModuleOp> planDmaphopSnapshot = cast<ModuleOp>(module->clone());
-    if (!dfplan::collectDataflowPlan(module, dfplan::activePlan(), coreRowBase > 1 ? coreRowBase - 1 : 1))
+    // read + validated; its routes / streams become plan paths (#dmaphop.stream create_path + create_hop)
+    const bool planOk =
+        dfplan::collectDataflowPlan(module, dfplan::activePlan(), coreRowBase > 1 ? coreRowBase - 1 : 1);
+    dumpPipelineIRToFile(module, irDir, stage++, "DataflowPlan");
+    if (!planOk)
         return false;
     if (reserveControlPlane)
         finalizeControlPlacement(module, rtopology.getRM(), dataStartCol, ctrlPlacement);
@@ -1185,9 +1197,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
     // routing.cc and host.cc use the same packet IDs.
     mlir::ModuleOp routingDmaphopModule = cast<ModuleOp>(module->clone());
-    // The plan's routes are lowered by the routing path only (DmaphopToRoutinghwPass); the host / kernel
-    // paths never see them.
-    dfplan::erasePlanRoutes(module);
+    // The plan's paths are lowered by the routing path only (DmaphopToRoutinghwPass: their hops become the
+    // plan's circuit routes); the host / kernel paths never see them.
+    dfplan::erasePlanPaths(module);
 
     // Rename @main → @routing in the clone so that routing.cc emits
     // void routing(XAie_DevInst* dev) instead of void main().
@@ -1219,6 +1231,18 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // the plan on the dfscheblueprint level: dfscheblueprint.plan on the shared tensors (resources follow in
     // the readback dump once assigned)
     dfplan::annotateBlueprint(module, dfplan::activePlan(), false);
+    // ... and from here on the DMA program is derived from the plan the blueprint carries (checked to be the
+    // dmaphop plan it was written from)
+    if (dfplan::activePlan().present) {
+        dfplan::DataflowPlan fromBlueprint;
+        std::string why;
+        if (!dfplan::planFromBlueprint(module, fromBlueprint, why) ||
+            !dfplan::samePlanDataflow(fromBlueprint, dfplan::activePlan(), &ctx, why)) {
+            llvm::errs() << "[DataflowPlan] ERROR: dfscheblueprint: " << why << "\n";
+            return false;
+        }
+        dfplan::activePlan() = std::move(fromBlueprint);
+    }
     mlir::OwningOpRef<mlir::ModuleOp> planBlueprintSnapshot = cast<ModuleOp>(module->clone());
     mlir::OwningOpRef<mlir::ModuleOp> planHostSnapshot;
 

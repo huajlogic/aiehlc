@@ -558,12 +558,15 @@ read + write overlapped 33-36 GB/s; the PDI before it gave 16.1 / 3.58 GB/s seri
 .keep = true}` + `#pragma persistent_kernel` -> routing IR `#routing.dataflow<...>` (typed) on the tensor's
 `routingcreatescheduletensor` + `routing.persistent_kernel` -> plan synthesis
 (`pass/dataflowplan/plansynth.cpp`: host-tile matching, views, locks, MemTile ring / resident B,
-dump `4_DataflowPlan.mlir`) -> dmaphop dataflow ops `dmaphop.plan` / `plan_route` / `plan_stream`
-(`collectDataflowPlan` validates, tags replaced flows `dmaphop.plan_replaced`) -> the DMA program
+dump `4_DataflowPlan.mlir`) -> dmaphop: per stream a `create_path` carrying `#dmaphop.stream`, its routes as
+`create_hop`s, plus the `dmaphop.plan` header (`collectDataflowPlan` reads that or the attribute-only `plan_route` /
+`plan_stream` input form, validates, tags replaced flows `dmaphop.plan_replaced`, `planpaths.cpp`) -> dfscheblueprint
+carries the whole plan (`#dmaphop.stream` per shared `declare_data`, `#dmaphop.route`s on the module; the DMA
+program is derived from what `planFromBlueprint` reads back) -> the DMA program
 derived (`plandma.cpp`) as **dfschedule** ops `config.tile_bd` / `lock_set` / `channel_enable` /
 `channel_start` (MemTiles on the host module, cores on the kernel module via `declaretile.self`) +
 shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernelApi; routes: the
-`plan_route` ops lowered in **DmaphopToRoutinghwPass** to ordinary routinghw ops (`passdmaphoptoroutinghw/planroutes.cpp`,
+the plan paths' hops lowered in **DmaphopToRoutinghwPass** to ordinary routinghw ops (`passdmaphoptoroutinghw/planroutes.cpp`,
 router port model, around the generated routes + control plane) -- no text branch in routing.cc; `aiehlc_plan.h`
 (constants + the generated host `aiehlc_plan_arrange`, the DDR layout the shim BDs read).
 **B staged by MemTile capacity**: held whole (`.keep`) when its column's strips fit, else a `memtile_ring` too (re-read from DDR per output tile; ring depth keeps every channel start <= 256, `plantarget.h` `chMaxRepeat`), so bf16 / large-K shapes build (`gemm_plan_4096x512x4096_{int8,bf16}.cc`; shape / dtype knobs `GP_M/N/K/DTYPE` in `gemm_plan_body.cc`). Shape / dtype at build time: `aiehlc.sh --define GP_M=4096 ...` (also `AIEHLC_DEFINES`) reaches the front end, the

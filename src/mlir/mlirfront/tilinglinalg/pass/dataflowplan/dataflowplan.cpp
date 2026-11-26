@@ -35,15 +35,7 @@ std::set<int> DataflowPlan::coreS2mmChannels(int memtileRows) const {
     return out;
 }
 
-void erasePlanRoutes(ModuleOp module) {
-    SmallVector<Operation *> routes;
-    module.walk([&](Operation *op) {
-        if (op->getName().getStringRef() == "dmaphop.plan_route")
-            routes.push_back(op);
-    });
-    for (Operation *op : routes)
-        op->erase();
-}
+static bool isPlanRouteOrStreamName(StringRef n) { return n == "dmaphop.plan_route" || n == "dmaphop.plan_stream"; }
 
 DataflowPlan &activePlan() {
     static DataflowPlan p;
@@ -184,6 +176,12 @@ int traceArg(Value v) {
     return -1;
 }
 
+} // namespace
+
+int traceKernelArg(Value v) { return traceArg(v); }
+
+namespace {
+
 void readHeader(Reader &r, DataflowPlan &p) {
     for (int64_t a : r.ints("replace_args"))
         p.replacedArgs.push_back((int)a);
@@ -308,8 +306,12 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
         if (op->getName().getStringRef().starts_with("dmaphop.plan"))
             ops.push_back(op);
     });
-    if (ops.empty())
+    if (ops.empty() && !hasPlanPaths(module))
         return true;
+    if (ops.empty()) {
+        module.emitError() << "[dataflow plan] plan paths (#dmaphop.stream) without a dmaphop.plan header";
+        return false;
+    }
     bool ok = true;
     // header first: replace_args is needed to check the shim BDs
     for (Operation *op : ops)
@@ -325,21 +327,43 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
         ops.front()->emitError() << "[dataflow plan] plan ops without a dmaphop.plan header";
         return false;
     }
+    // routes + streams: the attribute-only plan_route / plan_stream ops (plansynth's output, gen_plan.py, an
+    // older dump) or the plan paths (#dmaphop.stream, this compiler's dumps) -- one or the other
+    bool opsForm = false;
     for (Operation *op : ops) {
         Reader r{op};
         StringRef n = op->getName().getStringRef();
         if (n == "dmaphop.plan_route")
-            readRoute(r, plan);
+            readRoute(r, plan), opsForm = true;
         else if (n == "dmaphop.plan_stream")
-            readStream(r, plan);
+            readStream(r, plan), opsForm = true;
         else if (n == "dmaphop.plan_resources") // pinned (read back from a dfschedule program)
             readPlanResources(op, plan);
         else if (n != "dmaphop.plan")
-            r.err() << "unknown plan op (the DMA program lives in dfschedule, derived from plan_stream)";
+            r.err() << "unknown plan op (the DMA program lives in dfschedule, derived from the stream)";
         ok &= r.ok;
     }
     if (!ok)
         return false;
+    if (opsForm && hasPlanPaths(module)) {
+        ops.front()->emitError() << "[dataflow plan] both plan_route / plan_stream ops and plan paths";
+        return false;
+    }
+    std::string why;
+    if (!opsForm && !readPlanPaths(module, plan, why)) {
+        ops.front()->emitError() << "[dataflow plan] " << why;
+        return false;
+    }
+    // the paths sit next to their tensors' flows, so their IR order is not the plan's: the streams are in
+    // replace_args order (the operand index o of the kernel side follows it)
+    if (!opsForm) {
+        auto rank = [&](const PlanStream &st) {
+            auto it = std::find(plan.replacedArgs.begin(), plan.replacedArgs.end(), st.arg);
+            return (size_t)(it - plan.replacedArgs.begin());
+        };
+        std::stable_sort(plan.streams.begin(), plan.streams.end(),
+                         [&](const PlanStream &x, const PlanStream &y) { return rank(x) < rank(y); });
+    }
     // the mesh the dmaphop stage placed: partition-relative columns, absolute rows
     int colHi = -1, rowHi = -1;
     plan.colLo = plan.coreRowBase = 1 << 20;
@@ -373,7 +397,6 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
                 for (int g = 0; g < groups; g++)
                     st.strips.push_back(st.role == "a" ? g : c + plan.meshCols * g);
     }
-    std::string why;
     if (!checkPlanLayout(plan, why)) {
         ops.front()->emitError() << "[dataflow plan] " << why;
         return false;
@@ -382,9 +405,17 @@ bool collectDataflowPlan(ModuleOp module, DataflowPlan &plan, int memtileRows) {
     Builder b(module.getContext());
     SmallVector<int64_t> args(plan.replacedArgs.begin(), plan.replacedArgs.end());
     module->setAttr("dmaphop.plan_replaced_args", b.getI64ArrayAttr(args));
-    for (Operation *op : ops) // the routes stay: the routing path lowers them (DmaphopToRoutinghwPass)
-        if (op->getName().getStringRef() != "dmaphop.plan_route")
-            op->erase();
+    // the routes + streams as plan paths (the routing path lowers their hops, DmaphopToRoutinghwPass); the
+    // header and any pinned resources stay with them, so the dmaphop dump after this step is a complete plan
+    // (re-enterable); erasePlanPaths removes all of it where the plan has been taken over
+    Operation *where = nullptr;
+    for (Operation *op : ops)
+        if (!isPlanRouteOrStreamName(op->getName().getStringRef()))
+            where = where ? where : op;
+    if (!writePlanPaths(module, plan, why)) {
+        where->emitError() << "[dataflow plan] " << why;
+        return false;
+    }
     llvm::outs() << "[DataflowPlan] plan: " << plan.routes.size() << " routes, " << plan.streams.size() << " streams"
                  << (plan.persistent ? ", persistent kernel" : "") << (plan.bdOnce ? ", BD write-once" : "")
                  << " (DMA program derived in dfschedule once the resources are assigned)\n";

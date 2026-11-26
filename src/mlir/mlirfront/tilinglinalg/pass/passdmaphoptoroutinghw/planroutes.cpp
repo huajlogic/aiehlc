@@ -18,6 +18,7 @@
 #include "routing/routingtopology.h"
 #include "routinghwmanager.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -270,78 +271,66 @@ bool routeNet(Fabric &f, Emitter &e, int sr, int sc, In src, ArrayRef<std::tuple
     return true;
 }
 
-SmallVector<int64_t> ints(Operation *op, StringRef n) {
-    SmallVector<int64_t> v;
-    if (auto a = op->getAttrOfType<ArrayAttr>(n))
-        for (Attribute x : a)
-            if (auto i = dyn_cast<IntegerAttr>(x))
-                v.push_back(i.getInt());
-    return v;
-}
-
 } // namespace
 
-LogicalResult lowerDataflowPlanRoutes(ModuleOp module, RoutingTopology &topo) {
-    SmallVector<Operation *> routes;
+FailureOr<PlanRouteSet> takeDataflowPlanRoutes(ModuleOp module) {
+    PlanRouteSet set{{}, nullptr, UnknownLoc::get(module.getContext())};
+    if (!dfplan::hasPlanPaths(module))
+        return set;
     module.walk([&](Operation *op) {
-        if (op->getName().getStringRef() == "dmaphop.plan_route")
-            routes.push_back(op);
+        // the routes go to the front of the routing function (where the plan's attribute-only route ops were)
+        if (!set.at && op->hasAttr("stream") && op->getName().getStringRef() == "dmaphop.create_path")
+            if (auto fn = op->getParentOfType<func::FuncOp>())
+                set.at = &fn.getBody().front(), set.loc = op->getLoc();
     });
-    if (routes.empty())
+    dfplan::DataflowPlan p;
+    std::string why;
+    if (!dfplan::readPlanPaths(module, p, why)) {
+        module.emitError() << "[dataflow plan] " << why;
+        return failure();
+    }
+    set.routes = p.routes;
+    dfplan::erasePlanPaths(module);
+    return set;
+}
+
+LogicalResult lowerDataflowPlanRoutes(ModuleOp module, RoutingTopology &topo, const PlanRouteSet &set) {
+    if (set.routes.empty())
         return success();
     Fabric f{*topo.getRM(), {}};
     collectUsed(module, f);
     int conns = 0;
-    for (Operation *op : routes) {
-        OpBuilder b(op);
-        Emitter e{b, op->getLoc(), {}};
-        SmallVector<int64_t> src = ints(op, "src");
-        auto kind = op->getAttrOfType<StringAttr>("src_kind");
-        if (src.size() != 3) {
-            op->emitError("[dataflow plan] plan_route: 'src' must be [col, row, channel]");
-            return failure();
-        }
-        const int sc = (int)src[0], sr = (int)src[1], ch = (int)src[2];
+    OpBuilder b(module.getContext());
+    b.setInsertionPointToStart(set.at);
+    const Location loc = set.loc;
+    for (const dfplan::PlanRoute &r : set.routes) {
+        Emitter e{b, loc, {}};
+        const int sc = r.src.col, sr = r.src.row, ch = r.srcCh;
         In s{PortDirection::DMA, ch};
-        const bool shim = kind ? kind.getValue() == "shim" : sr == 0;
+        const bool shim = r.srcShim;
         if (shim) {
             // A shim MM2S channel enters the switch on the SOUTH slave port the hardware model lists for it
             // (hwresource.cpp: the shim's SOUTH "mux" list, named from the mux side, e.g. 3 / 7 on AIE2PS).
             std::vector<int> mux = f.ports(sr, sc, true, PortDirection::South);
-            if (ch < 0 || ch >= (int)mux.size()) {
-                op->emitError("[dataflow plan] shim MM2S channel ") << ch << " does not exist";
-                return failure();
-            }
+            if (ch < 0 || ch >= (int)mux.size())
+                return emitError(loc) << "[dataflow plan] shim MM2S channel " << ch << " does not exist";
             s = {PortDirection::South, mux[ch]};
-            b.create<routinghw::EnableExtToAieShimPort>(op->getLoc(), b.getI32Type(), e.tile(sr, sc), "SOUTH", mux[ch]);
+            b.create<routinghw::EnableExtToAieShimPort>(loc, b.getI32Type(), e.tile(sr, sc), "SOUTH", mux[ch]);
         }
-        if (shim ? f.used.count({sr, sc, false, s.dir, s.idx}) != 0 : !f.free(sr, sc, false, s.dir, s.idx)) {
-            op->emitError("[dataflow plan] route source (")
-                << sc << ", " << sr << ") " << dirStr(s.dir) << " " << s.idx << " is already used by a generated route";
-            return failure();
-        }
+        if (shim ? f.used.count({sr, sc, false, s.dir, s.idx}) != 0 : !f.free(sr, sc, false, s.dir, s.idx))
+            return emitError(loc) << "[dataflow plan] route source (" << sc << ", " << sr << ") " << dirStr(s.dir)
+                                  << " " << s.idx << " is already used by a generated route";
         f.take(sr, sc, false, s.dir, s.idx);
         SmallVector<std::tuple<int, int, int>> dsts;
-        if (auto a = op->getAttrOfType<ArrayAttr>("dsts"))
-            for (Attribute x : a) {
-                auto d = dyn_cast<ArrayAttr>(x);
-                if (!d || d.size() != 3) {
-                    op->emitError("[dataflow plan] plan_route: each dst is [col, row, s2mm channel]");
-                    return failure();
-                }
-                auto I = [&](unsigned i) { return (int)cast<IntegerAttr>(d[i]).getInt(); };
-                dsts.push_back({I(1), I(0), I(2)});
-            }
+        for (const auto &[t, dch] : r.dsts)
+            dsts.push_back({t.row, t.col, dch});
         std::string why;
         const size_t before = f.used.size();
-        if (!routeNet(f, e, sr, sc, s, dsts, why)) {
-            op->emitError("[dataflow plan] route from (") << sc << ", " << sr << ") ch " << ch << ": " << why;
-            return failure();
-        }
+        if (!routeNet(f, e, sr, sc, s, dsts, why))
+            return emitError(loc) << "[dataflow plan] route from (" << sc << ", " << sr << ") ch " << ch << ": " << why;
         conns += (int)(f.used.size() - before) / 2;
-        op->erase();
     }
-    llvm::outs() << "[DataflowPlan] routed " << routes.size()
+    llvm::outs() << "[DataflowPlan] routed " << set.routes.size()
                  << " plan net(s) in DmaphopToRoutinghwPass as routinghw ops (~" << conns << " switch hops)\n";
     return success();
 }
