@@ -27,6 +27,18 @@
  *                                  reads have a Lock_Stall_{S,W,N,E} bit; per-tile PC histogram of the stalled samples
  *                                  over launches AIEHLC_LOCKSAMPLE_FROM..TO (default 2..101), printed after launch TO as
  *                                  LKSAMP_CFG / LKSAMP / LKPC lines.
+ *   AIEHLC_PERF_LOCKSPLIT_TABLE=<lo,hi,lo,hi, x AIEHLC_PERF_LOCKSPLIT_ROWS rows>   (gemm90 m336212422221221 PL)
+ *                                  host table of core PC ranges for the lock-stall split: row k = 2 ranges
+ *                                  [lo0,hi0] [lo1,hi1] (byte PCs of the linked kernel, from tools/lockpc_lst.py);
+ *                                  with AIEHLC_PERF_LOCKSPLIT semantics (ctr1 = LOCK_STALL in range 0, ctr2 = in range
+ *                                  1) the runtime arms row p for sweep point p (AIEHLC_SWEEP_RERUN=<rows> re-runs main,
+ *                                  one ELF covers every row) and re-arms the core PC events + zeroes ctr1/ctr2 of every
+ *                                  armed core tile before the point's first launch. `=== SWEEP point row=<k>` marks a
+ *                                  point. The host may replace the table (__Runtime_locksplit_table). Exclusive with
+ *                                  AIEHLC_PERF_LOCKSPLIT (fixed -D ranges) and with the shim delay tables (#error).
+ *                                  After the last launch of every point the read-only neighbour snapshot runs
+ *                                  (`LOCKSNAP tile=(c,r) lock=<l> value=<v> nbr=<S|W|N|E> of=(c,r)`, LOCKSNAP_NBR_DONE).
+ *   AIEHLC_LOCKSNAP_NBR            the neighbour snapshot alone (after launch AIEHLC_LOCKSNAP_LAUNCH).
  *   AIEHLC_SHIM_TS_AIE_MHZ         AIE clock for ns -> cycles (default 1000, = GPLAN aie_mhz on palmyra213).
  *   AIEHLC_SHIM_TS_MAX             record capacity (default 16384; overflow is counted, not wrapped).
  *
@@ -39,7 +51,7 @@
 #define AIE_SHIM_TS_H
 
 #if defined(AIEHLC_SHIM_TS) || defined(AIEHLC_B_SHIM_DELAY_NS) || defined(AIEHLC_A_SHIM_DELAY_NS) ||                \
-    defined(AIEHLC_LOCKSAMPLE)
+    defined(AIEHLC_LOCKSAMPLE) || defined(AIEHLC_PERF_LOCKSPLIT_TABLE) || defined(AIEHLC_LOCKSNAP_NBR)
 #define AIEHLC_SHIM_TS_ANY 1
 
 #include <stdint.h>
@@ -64,6 +76,12 @@ uint32_t __Runtime_a_shim_delay_ns(void);
 void __Runtime_shim_ts_dump(void);
 /* read-only lock / DMA snapshot of every column that had a shim push (also automatic after that launch) */
 int __Runtime_lock_snapshot(XAie_DevInst *dev);
+/* PL: read-only lock values of the 4 neighbour memory modules (S/W/N/E) of every core tile of the used columns */
+int __Runtime_lock_snapshot_nbr(XAie_DevInst *dev);
+/* PL (AIEHLC_PERF_LOCKSPLIT_TABLE): replace the PC-range table (rows x {lo0,hi0,lo1,hi1}); returns the rows kept.
+ * __Runtime_locksplit_row: the row armed for the launch in progress (-1: none). */
+int __Runtime_locksplit_table(const uint16_t *pcs, int rows);
+int __Runtime_locksplit_row(void);
 
 #ifdef __cplusplus
 }

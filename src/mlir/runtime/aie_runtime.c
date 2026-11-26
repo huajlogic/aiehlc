@@ -140,7 +140,8 @@ static inline unsigned long long __rt_prof_tic(void);
 #include "aie_host_split.h"
 #include "rt_bd_once.h"
 #if defined(AIEHLC_SHIM_TS) || defined(AIEHLC_B_SHIM_DELAY_NS) || defined(AIEHLC_A_SHIM_DELAY_NS) ||                \
-    defined(AIEHLC_LOCKSAMPLE) /* gemm90 PA/PAE: default off, aie_shim_ts.h */
+    defined(AIEHLC_LOCKSAMPLE) || defined(AIEHLC_PERF_LOCKSPLIT_TABLE) ||                                              \
+    defined(AIEHLC_LOCKSNAP_NBR) /* gemm90 PA/PAE/PL: default off, aie_shim_ts.h */
 #include "aie_shim_ts.c"
 #endif
 /* GAP-RT1: always-on wait_io time in generic-timer ticks (XTime clock), independent of AIEHLC_PROFILING */
@@ -686,13 +687,19 @@ AieRC __Runtime_core_perf_setup(XAie_DevInst *dev, XAie_LocType tile) {
     rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 2, 0);
     if (rc != XAIE_OK)
         return rc;
-#if defined(AIEHLC_PERF_LOCKSPLIT)
+#if defined(AIEHLC_PERF_LOCKSPLIT) || defined(AIEHLC_PERF_LOCKSPLIT_TABLE)
     /* PAE (default off): ctr1 / ctr2 = LOCK_STALL cycles while the PC is in range 0-1 / 2-3 (core PC events 0..3 =
      * AIEHLC_PERF_LOCKSPLIT_R01_LO/HI, _R23_LO/HI, byte addresses of the linked kernel): combo0 = LOCK_STALL AND
      * PC_RANGE_0_1, combo1 = LOCK_STALL AND PC_RANGE_2_3. ctr0 ACTIVE and ctr3 LOCK_STALL are unchanged. */
     {
+#if defined(AIEHLC_PERF_LOCKSPLIT_TABLE)
+        /* PL: the 4 PCs come from the host table row armed for the current sweep point (aie_shim_ts.c) */
+        uint16_t pcs[4];
+        rt_locksplit_pcs(pcs);
+#else
         static const uint16_t pcs[4] = {AIEHLC_PERF_LOCKSPLIT_R01_LO, AIEHLC_PERF_LOCKSPLIT_R01_HI,
                                         AIEHLC_PERF_LOCKSPLIT_R23_LO, AIEHLC_PERF_LOCKSPLIT_R23_HI};
+#endif
         for (uint8_t k = 0; k < 4; k++)
             if ((rc = XAie_EventPCEnable(dev, tile, k, pcs[k])) != XAIE_OK)
                 return rc;
@@ -728,6 +735,26 @@ AieRC __Runtime_core_perf_setup(XAie_DevInst *dev, XAie_LocType tile) {
     AIEHLC_LOG(printf("[aie_runtime] core_perf_setup OK tile(%u,%u)\n", (unsigned)tile.Col, (unsigned)tile.Row));
     return XAIE_OK;
 }
+
+#if defined(AIEHLC_PERF_LOCKSPLIT_TABLE)
+/* PL: called by rt_lst_launch_begin before the first launch of every sweep point: core PC events 0..3 <- the new row,
+ * ctr1 / ctr2 (LOCK_STALL in range 0 / 1) and ctr3 (LOCK_STALL total) <- 0 on every armed core tile, so the point's
+ * split and its total share one window. Tiles not armed yet (first launch) get the row in __Runtime_core_perf_setup. */
+static void rt_locksplit_rearm(void) {
+    XAie_DevInst *dev = s_core_perf_probe_dev;
+    uint16_t pcs[4];
+    if (dev == NULL)
+        return;
+    rt_locksplit_pcs(pcs);
+    for (int i = 0; i < s_core_perf_ntiles; i++) {
+        const XAie_LocType t = s_core_perf_tiles[i];
+        for (uint8_t k = 0; k < 4; k++)
+            (void)XAie_EventPCEnable(dev, t, k, pcs[k]);
+        for (uint8_t c = 1; c < 4; c++)
+            (void)XAie_PerfCounterSet(dev, t, XAIE_CORE_MOD, c, 0);
+    }
+}
+#endif
 
 int __Runtime_core_perf_probe_valid(void) { return s_core_perf_probe_valid; }
 
@@ -806,7 +833,7 @@ void __Runtime_core_perf_report(int tag) {
     for (int i = 0; i < s_core_perf_ntiles; i++) {
         const uint32_t a = s_perf_rep_a[i], v = s_perf_rep_v[i], ss = s_perf_rep_ss[i], ls = s_perf_rep_ls[i];
         const AieRC rc = s_perf_rep_rc[i];
-#if defined(AIEHLC_PERF_LOCKSPLIT)
+#if defined(AIEHLC_PERF_LOCKSPLIT) || defined(AIEHLC_PERF_LOCKSPLIT_TABLE)
         printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u lockpc_r01=%u lockpc_r23=%u lock_stall=%u\n", tag,
 #elif defined(AIEHLC_PERF_CTR2_MEMSTALL)
         printf("[PERF] tag=%d tile=(%u,%u) rc=%d active_cyc=%u vec_instr=%u mem_stall=%u lock_stall=%u\n", tag,
