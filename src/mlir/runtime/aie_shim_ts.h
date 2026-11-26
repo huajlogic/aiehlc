@@ -1,3 +1,7 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ******************************************************************************/
 /* aie_shim_ts.h -- gemm90 m33621242222122 PA: shim DMA timestamps, read-only lock snapshot, B-shim supply delay.
  *
  * Everything here is DEFAULT OFF. aie_runtime.c includes aie_shim_ts.c only when one of the two knobs is defined,

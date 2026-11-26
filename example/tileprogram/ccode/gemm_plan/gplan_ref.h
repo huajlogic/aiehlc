@@ -1,3 +1,7 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ******************************************************************************/
 /* gplan_ref.h -- gemm_plan M3.3.6.2.1.2 reference: one header for the x86 reference (gplan_ref_x86.c) and the
  * aarch64 baremetal board host (gemm_plan, copied byte-identical). Plain C99, no OS calls, no libm, no stdio.
  *

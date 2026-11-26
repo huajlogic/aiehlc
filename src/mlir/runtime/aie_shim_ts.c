@@ -1,3 +1,7 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ******************************************************************************/
 /* aie_shim_ts.c -- gemm90 m33621242222122 PA (see aie_shim_ts.h for the knobs).
  *
  * Not a separate translation unit: aie_runtime.c includes this file (after its own includes, so the static
