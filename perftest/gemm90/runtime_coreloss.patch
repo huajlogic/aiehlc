@@ -1,0 +1,92 @@
+diff --git a/src/mlir/runtime/aie_runtime.c b/src/mlir/runtime/aie_runtime.c
+index d9a5c9be..147bc87a 100644
+--- a/src/mlir/runtime/aie_runtime.c
++++ b/src/mlir/runtime/aie_runtime.c
+@@ -740,6 +740,72 @@ AieRC __Runtime_core_perf_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t *a
+     return XAIE_OK;
+ }
+ 
++/* Loss-table counters (skill coreloss). Always compiled, no AIEHLC_PROFILING: on every core tile of the
++ * mesh partition, core counters 0..3 = ACTIVE, MEMORY_STALL, LOCK_STALL, INSTR_VECTOR and memory-module
++ * counters 0..1 = DM bank conflicts of bank_a / bank_b (0..7), all zeroed. Arm right before a launch, read
++ * right after it. Uses the same core counters as the --profiling core-perf window: do not combine them.
++ * Returns the number of core tiles armed (0 when the partition does not exist). */
++#define RT_LOSS_MAX_TILES 64
++static XAie_DevInst *s_loss_dev;
++static XAie_LocType s_loss_tiles[RT_LOSS_MAX_TILES];
++static int s_loss_n;
++int __Runtime_core_loss_arm(int meshId, int bank_a, int bank_b) {
++    static const XAie_Events cev[4] = {XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_MEMORY_STALL_CORE,
++                                       XAIE_EVENT_LOCK_STALL_CORE, XAIE_EVENT_INSTR_VECTOR_CORE};
++    static const XAie_Events bev[8] = {XAIE_EVENT_CONFLICT_DM_BANK_0_MEM, XAIE_EVENT_CONFLICT_DM_BANK_1_MEM,
++                                       XAIE_EVENT_CONFLICT_DM_BANK_2_MEM, XAIE_EVENT_CONFLICT_DM_BANK_3_MEM,
++                                       XAIE_EVENT_CONFLICT_DM_BANK_4_MEM, XAIE_EVENT_CONFLICT_DM_BANK_5_MEM,
++                                       XAIE_EVENT_CONFLICT_DM_BANK_6_MEM, XAIE_EVENT_CONFLICT_DM_BANK_7_MEM};
++    XAie_DevInst *dev = __Runtime_get_partition_dev(meshId);
++    s_loss_dev = dev;
++    s_loss_n = 0;
++    if (dev == NULL || bank_a < 0 || bank_a > 7 || bank_b < 0 || bank_b > 7)
++        return 0;
++    const XAie_Events mev[2] = {bev[bank_a], bev[bank_b]};
++    for (u8 c = 0; c < dev->NumCols; c++)
++        for (u8 r = dev->AieTileRowStart; r < dev->AieTileRowStart + dev->AieTileNumRows; r++) {
++            if (s_loss_n >= RT_LOSS_MAX_TILES)
++                return s_loss_n;
++            const XAie_LocType t = XAie_TileLoc(c, r);
++            for (u8 k = 0; k < 4; k++) {
++                XAie_PerfCounterControlSet(dev, t, XAIE_CORE_MOD, k, cev[k], cev[k]);
++                XAie_PerfCounterSet(dev, t, XAIE_CORE_MOD, k, 0);
++            }
++            for (u8 k = 0; k < 2; k++) {
++                XAie_PerfCounterControlSet(dev, t, XAIE_MEM_MOD, k, mev[k], mev[k]);
++                XAie_PerfCounterSet(dev, t, XAIE_MEM_MOD, k, 0);
++            }
++            s_loss_tiles[s_loss_n++] = t;
++        }
++    return s_loss_n;
++}
++
++/* Read the armed tiles: out[i * 8 + 0..7] = col (partition-relative), row, active, memory stall, lock stall,
++ * vector instructions, bank_a conflicts, bank_b conflicts. Only tiles that ran (active > 0) are returned. */
++int __Runtime_core_loss_read(unsigned int *out, int max_tiles) {
++    int n = 0;
++    for (int i = 0; i < s_loss_n && n < max_tiles; i++) {
++        u32 v[6] = {0, 0, 0, 0, 0, 0};
++        for (u8 k = 0; k < 4; k++)
++            XAie_PerfCounterGet(s_loss_dev, s_loss_tiles[i], XAIE_CORE_MOD, k, &v[k]);
++        for (u8 k = 0; k < 2; k++)
++            XAie_PerfCounterGet(s_loss_dev, s_loss_tiles[i], XAIE_MEM_MOD, k, &v[4 + k]);
++        if (v[0] == 0)
++            continue;
++        unsigned int *o = out + n * 8;
++        o[0] = s_loss_tiles[i].Col;
++        o[1] = s_loss_tiles[i].Row;
++        o[2] = v[0];
++        o[3] = v[1];
++        o[4] = v[2];
++        o[5] = v[3];
++        o[6] = v[4];
++        o[7] = v[5];
++        n++;
++    }
++    return n;
++}
++
+ /* Print the core perf counters of every core tile armed at the last kernel launch
+  * (needs AIEHLC_PROFILING and AIE_DEBUG_FLAG_CORE_PERF_COUNTER in g_runtime_debug_level).
+  * One "[PERF] tag=.. tile=(c,r) ..." line per tile + one "[PERFSUM]" line. */
+diff --git a/src/mlir/runtime/aie_runtime.h b/src/mlir/runtime/aie_runtime.h
+index bf96579b..a5f9e1e2 100644
+--- a/src/mlir/runtime/aie_runtime.h
++++ b/src/mlir/runtime/aie_runtime.h
+@@ -401,6 +401,10 @@ void __Runtime_launch_words(unsigned long long *mmio_w, unsigned long long *cp_w
+ void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
+ // GAP-RT1: always-on wait_io time in generic-timer ticks (the XTime counter; aie_host_split.h ahs_now)
+ void __Runtime_host_split_wait_ticks(unsigned long long *ticks, unsigned int *calls);
++// Loss-table counters (skill coreloss): arm ACTIVE / MEMORY_STALL / LOCK_STALL / INSTR_VECTOR + DM bank
++// conflicts of two banks on every core of a mesh partition (zeroed); read = 8 words per core that ran.
++int __Runtime_core_loss_arm(int meshId, int bank_a, int bank_b);
++int __Runtime_core_loss_read(unsigned int *out, int max_tiles);
+ void __Runtime_ctrl_kernel_pkt_set(const void *blob, unsigned int bytes);
+ // Encode a kernel ELF once into the blob __Runtime_ctrl_kernel_pkt_set takes
+ // (malloc'd; NULL on failure) -- for callers that reload one kernel often.

@@ -343,6 +343,9 @@ static void ka_pack(const gp_elem_t *src, gp_elem_t *dst, long rows, long K, int
 #else
 void aiehlc_plan_arrange(int arg, const void *src, void *dst);
 #endif
+// Always-on runtime counter (aie_runtime.c): host time spent in wait_io, in XTime ticks. Per launch it is the
+// device time after the last start_io; the rest of the launch is the host-side launch cost.
+void __Runtime_host_split_wait_ticks(unsigned long long *ticks, unsigned int *calls);
 
 // AIE array clock, measured in the run: the shim PL-module Timer_Low (AIE cycles, the partition's first
 // column) against the A78 generic timer (CNTPCT, COUNTS_PER_SECOND), median of 3 windows of 20 ms
@@ -461,6 +464,7 @@ int main() {
     memset(Ct, 0, cbytes);
     __Runtime_buffer_device_written(Ct, cbytes);
     double *lms = (double *)malloc(sizeof(double) * launches);
+    double *wms = (double *)malloc(sizeof(double) * launches);
     double aie_clk = 0;
     for (int it = 0; it < launches; it++) {
         if (it == launches - 1) { // sentinel: the checked C is written by the last launch
@@ -468,10 +472,15 @@ int main() {
             __Runtime_buffer_device_written(Ct, cbytes);
         }
         XTime t0, t1;
+        unsigned long long wt0 = 0, wt1 = 0;
+        unsigned int wn = 0;
+        __Runtime_host_split_wait_ticks(&wt0, &wn);
         XTime_GetTime(&t0);
         gemm_ka_run(A2, B2, Ct);
         XTime_GetTime(&t1);
+        __Runtime_host_split_wait_ticks(&wt1, &wn);
         lms[it] = gp_ms(t0, t1);
+        wms[it] = gp_ms(0, (XTime)(wt1 - wt0));
         if (it == 0) { // the array is up and clocked: measure its clock
             aie_clk = gp_aie_clock();
             printf("GPLAN where=%s dtype=%s shape=%ldx%ldx%ld aie_mhz=%.1f clk_src=%s\n", "board", dts, M, N, K,
@@ -481,8 +490,10 @@ int main() {
     const double theory_ms =
         aie_clk > 0 ? (double)M * N * K / (GP_HW_ROWS * GP_HW_COLS * (double)GP_MAC_PER_CYC * aie_clk * 1e6) * 1e3 : 0;
     for (int it = 0; it < launches; it++)
-        printf("[gemm_plan] call %d: end to end %.3f ms -> %.2f %% of theory\n", it + 1, lms[it],
-               theory_ms > 0 ? 100.0 * theory_ms / lms[it] : 0.0);
+        printf("[gemm_plan] call %d: end to end %.3f ms -> %.2f %% of theory | wait_io %.3f ms -> %.2f %% | "
+               "host launch %.3f ms\n",
+               it + 1, lms[it], theory_ms > 0 ? 100.0 * theory_ms / lms[it] : 0.0, wms[it],
+               theory_ms > 0 && wms[it] > 0 ? 100.0 * theory_ms / wms[it] : 0.0, lms[it] - wms[it]);
     // steady: median of launches 2 .. N (launch 1 also loads the kernel)
     const int ns = launches - 1;
     double *st = lms + 1;

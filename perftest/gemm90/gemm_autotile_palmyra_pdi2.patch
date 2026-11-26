@@ -1,0 +1,24 @@
+diff --git a/src/llvm/convautotile/gemm_autotile.cpp b/src/llvm/convautotile/gemm_autotile.cpp
+index efc34c28..e5bdc956 100644
+--- a/src/llvm/convautotile/gemm_autotile.cpp
++++ b/src/llvm/convautotile/gemm_autotile.cpp
+@@ -22,14 +22,16 @@ namespace gemmtile {
+ 
+ namespace {
+ 
+-// Measured boards (script/perf/gemm_plan.py BOARDS): palmyra one controller, reads and writes do not
+-// overlap. VEK385 three interleaved controllers: one shim MM2S channel ~5.2 GB/s, and the aggregate DDR
++// Measured boards (script/perf/gemm_plan.py BOARDS). palmyra, PDI of 2026-11-25
++// (example/perf/ddr_microbench.cc, shim <-> MemTile, 4 MiB per column, median of 9): one shim channel
++// ~7.6 GB/s each way, reads 25-27.5 GB/s and writes ~25 GB/s from 4 columns on, and reads and writes
++// overlap (33-36 GB/s together). The PDI before it ran reads 16.1 / writes 3.58 GB/s, not overlapped. VEK385 three interleaved controllers: one shim MM2S channel ~5.2 GB/s, and the aggregate DDR
+ // read rate when B is re-read per output tile fitted on the stage-4 runs (84 MB / 3.14 ms, 168 MB / 6.21
+ // ms, 147 MB / 6.77 ms -> 26.7 / 27.0 / 21.7 GB/s): 24 GB/s, within +-12 % of all three. Its write
+ // rate was never binding (C is small): not measured.
+ const Board kBoards[] = {
+     {"vek385", 1250.0, 24.0, 100.0, true, 5.2},
+-    {"palmyra", 998.0, 16.1, 3.58, false, 3.6},
++    {"palmyra", 1000.0, 26.0, 25.0, true, 7.6},
+ };
+ 
+ // The 2 x 8 kernel (gemm_plan_body.cc): one chunk = 64 rows x 128 B of A and of B. Core cycles per chunk

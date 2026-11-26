@@ -535,22 +535,25 @@ the dataflow. Port buffers get **32 KB**, not 48
 (`checkPortBuffers`). Design: `doc/design/trace_to_routing.md` "Dataflow
 options"; skill **gemmdataflowoptions**.
 
-**int8 GEMM at 91.5 % of the core peak** (`example/tileprogram/ccode/simplegemm_peak.cc`):
+**int8 GEMM core MAC loop** (`example/tileprogram/ccode/simplegemm_peak.cc`; the 2x4 / shape-knob version that reaches
+**97.6 %** is `perftest/gemm90/simplegemm_peak_2x4.patch`, kept out of the tree because it changes the example's default):
 AIE2PS (`__AIE_ARCH__` 22) uses the aie2p mmul backend, where `mmul<8,8,8,int8,int8>`
 is ONE `mac_8x8_8x8` = **512 MAC/cycle per core** (not the 256 older docs assume).
 Both operands `{.resident}`, host-packed in mmul order (aligned 64-byte loads),
-2x2 register blocking (8 `dm` accumulators exist; the compiler overlaps a tile's
-write-back with the next tile's MACs), C written tile-major. K sets it: 32x32x384
-per core = 768 MAC instructions in **839 cycles** (91.5 %), 64x64x128 = 75.4 %
-(~19 cycles per 16x16 tile outside the K loop). Measured per core by klog `CYC`
-around the compute (validated: 2 passes = 2.09x); the ~226 ms launch is kernel
-load, not compute.
+2x2 register blocking, C written tile-major; the in-tree default is 32x32x384 per core (768 MAC
+instructions; 839 cycles = 91.5 % on an older toolchain, 891 = 86.2 % on palmyra 2026-11-25). Every
+accumulator group pays ~20-30 cycles outside its K loop, so K steps per group set it: with the patch,
+2x4 blocking (all 8 `dm` accumulators) and 16x32x1152 per core = 1152 MAC instructions in **1180 cycles**
+(97.6 %). Measured per core by klog `CYC` around the compute; the launch around it is kernel load.
 
 ### Explicit dataflow plans (C / routing / dmaphop -> code, no hand edits)
 
 The 2 x 8 shared-operand GEMM that `share2x8.py` reached by rewriting the generated files now
 comes from the compiler: **85.5 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
-alone** (1.147-1.153 ms per 10.07 G MAC, every launch, GOLDEN PASS). Three ways in, each lowering to the next:
+alone** (1.147-1.153 ms per 10.07 G MAC, every launch, GOLDEN PASS). palmyra on the PDI of 2026-11-25: **85.7 %** (1.435 ms
+at 1000 MHz, GOLDEN PASS), core-bound like VEK385 -- that PDI's DDR is no longer the limit
+(`example/perf/ddr_microbench.cc`, now with `kind=rdwr`: one shim channel ~7.6 GB/s, reads ~26 / writes ~25 GB/s,
+read + write overlapped 33-36 GB/s; the PDI before it gave 16.1 / 3.58 GB/s serialized and 47 %). Three ways in, each lowering to the next:
 `load_buffer {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring|memtile, .ring = N,
 .keep = true}` + `#pragma persistent_kernel` -> routing IR `dataflow = {...}` on the tensor's
 `routingcreatescheduletensor` + `routing.persistent_kernel` -> plan synthesis
@@ -1089,6 +1092,8 @@ Read the matching skill when the task fits:
 | resnetengine eager layer-major hangs ~1 run in 3 in a residual layer: `shim_bd_ctrl TIMEOUT ... owing an ack`, input shim with no task; or a few wrong logits | shimctrlpushloss |
 | AIE kernel: +1 errors / constant garbage right after ADDING a code path; statics above `DM_stack` overwritten | aiecorestackoverflow |
 | Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
+| int8 `aie::mmul` kernel below ~92 % of the core peak though its loop issues one VMAC per cycle; 2x2 vs 2x4 blocking, K per accumulator group, resident operand size limit, klog CYC efficiency | coremacpeak |
+| Where a kernel's missing % of peak goes: per-core loss table (VMAC / other instr / memory stall / lock stall / host launch) from core counters (`perftest/gemm90/` patches: `__Runtime_core_loss_arm/read`, gemm_plan `--define GP_LOSS=1`, `losstable.py`); lock stall or active larger than the launch | coreloss |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
 | Kernel codegen | kernelcodegen |

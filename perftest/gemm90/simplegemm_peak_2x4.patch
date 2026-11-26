@@ -1,0 +1,136 @@
+diff --git a/example/tileprogram/ccode/simplegemm_peak.cc b/example/tileprogram/ccode/simplegemm_peak.cc
+index c6eba6d9..ea6737c9 100644
+--- a/example/tileprogram/ccode/simplegemm_peak.cc
++++ b/example/tileprogram/ccode/simplegemm_peak.cc
+@@ -7,9 +7,18 @@
+  *   C[GP_M, GP_N] = A[GP_M, GP_K] . B[GP_N, GP_K]^T on the 4x4 mesh; core (pm, pn)
+  *   computes the (GP_M / 4) x (GP_N / 4) block (pm, pn) of C.
+  *
+- * Measured on palmyra (AIE2PS), all 16 cores identical, GOLDEN PASS:
+- *   32 x 32 x 384 per core: 768 MAC instructions in 839 cycles = 91.5 % of peak
+- *   64 x 64 x 128 per core: 1024 in 1359 cycles = 75.4 % (K too short, see below)
++ * Measured on palmyra (AIE2PS), 2026-11-25, all 16 cores identical, GOLDEN PASS
++ * (--define GP_M=.. GP_N=.. GP_K=.. GP_BN=..; CYC per core, MAC instructions = cm * cn * K / 512):
++ *   per core          blocking            MAC instr  cycles  of peak
++ *   32 x 32 x 384     2 x 2 (4 acc)          768       891    86.2 %
++ *   32 x 32 x 768     2 x 2 (4 acc)         1536      1624    94.6 %
++ *   32 x 32 x 768     2 x 4 (8 acc)         1536      1585    96.9 %
++ *   32 x 32 x 832     2 x 4 (8 acc)         1664      1713    97.1 %
++ *   16 x 32 x 1152    2 x 4 (8 acc)         1152      1180    97.6 %   <- the default
++ * Every accumulator group pays ~20-30 cycles outside its K loop (pipeline fill / drain, the int8
++ * write-back), so the efficiency is set by K steps per group: more K, fewer groups (2 x 4 uses all
++ * 8 dm accumulators, half the groups of 2 x 2). K is bounded by core memory: (cm + cn) x K bytes of
++ * resident operands; the port buffers may take ~57 KB (the stack shrinks to AIEHLC_DM_MIN_STACK).
+  * That is the core's compute. The launch around it is ~226 ms, nearly all of it
+  * kernel load (a cold launch, see tutorial 6.1): this example measures the
+  * kernel, not the launch.
+@@ -20,25 +29,35 @@
+  *   - both operands resident: A's and B's 64-row blocks are loaded once
+  *     ({.resident = true}) and stay in core memory, so the compute loop never
+  *     waits for the DMA;
+- *   - 2 x 2 register blocking: four accumulators (a 16 x 16 C tile) per K step,
+- *     so every 64-byte operand load feeds two MACs (4 loads, 4 MACs per step);
++ *   - 2 x GP_BN register blocking: 2 A tiles x 4 B tiles = all eight accumulators
++ *     (a 16 x 32 C tile) per K step: 6 aligned loads feed 8 MACs (GP_BN 2: 4 loads,
++ *     4 MACs, a 16 x 16 tile);
+  *   - operands host-packed in mmul order (simplegemm_peak.h), so each operand is
+  *     ONE aligned 64-byte load;
+  *   - the C block is written tile by tile (one 64-byte store per 8 x 8 tile) and
+  *     de-tiled by the host.
+  * Each core klogs the cycles of its compute loop (CYC) -- loads, MACs, the
+  * int8 write-back, everything between the operands arriving and the commit.
+- * Efficiency = (64 * 64 * GP_K MACs) / (CYC * 512).
++ * Efficiency = (cm * cn * GP_K MACs) / (CYC * 512), cm = GP_M / 4, cn = GP_N / 4.
+  ******************************************************************************/
+ #pragma aie_debug_level(AIE_KERNEL_CONFIG_TRACE)
+ #include "simplegemm_peak.h"
+ 
+-// Per core: a 32 x 32 block of C, K = 384 -- A's and B's 32 x 384 blocks (12 KB each) and C's ping-pong
+-// (2 x 1 KB) fit the 29 KB port region. K is what sets the efficiency: a 16 x 16 C tile costs ~19 cycles
+-// outside its K loop, so it needs many K steps (48 here) to amortise them.
+-#define GP_M 128
++// Per core: a 16 x 32 block of C, K = 1152 -- A's 16 x 1152 (18 KB) and B's 32 x 1152 (36 KB) resident
++// blocks and C's ping-pong (2 x 512 B): 55 KB of core memory, one 2 x 4 accumulator group per core.
++#ifndef GP_M
++#define GP_M 64
++#endif
++#ifndef GP_N
+ #define GP_N 128
+-#define GP_K 384
++#endif
++#ifndef GP_K
++#define GP_K 1152
++#endif
++// register blocking: 2 A tiles x GP_BN B tiles per K step (GP_BN 2: 4 accumulators, 4: 8 accumulators)
++#ifndef GP_BN
++#define GP_BN 4
++#endif
+ 
+ __global__ void gemm_peak(aie::port<input_window_int8 *, aie::IFM, aie::shape<GP_M, GP_K>> a,
+                           aie::port<input_window_int8 *, aie::WEIGHTS, aie::shape<GP_N, GP_K>> b,
+@@ -54,11 +73,56 @@ __global__ void gemm_peak(aie::port<input_window_int8 *, aie::IFM, aie::shape<GP
+     using MM = aie::mmul<8, 8, 8, int8_t, int8_t>;
+     const unsigned long long t0 = aie::tile::current().cycles();
+     for (int mi = 0; mi < cm / 8; mi += 2)
+-        for (int ni = 0; ni < cn / 8; ni += 2) {
++        for (int ni = 0; ni < cn / 8; ni += GP_BN) {
+             const int8_t *__restrict pa0 = x + mi * kt * 64;
+             const int8_t *__restrict pa1 = pa0 + kt * 64;
+             const int8_t *__restrict pb0 = w + ni * kt * 64;
+             const int8_t *__restrict pb1 = pb0 + kt * 64;
++#if GP_BN == 4
++            const int8_t *__restrict pb2 = pb1 + kt * 64;
++            const int8_t *__restrict pb3 = pb2 + kt * 64;
++            MM c00, c01, c02, c03, c10, c11, c12, c13;
++            {
++                const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0), a1 = aie::load_v<64>(pa1);
++                const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0), b1 = aie::load_v<64>(pb1);
++                const aie::vector<int8_t, 64> b2 = aie::load_v<64>(pb2), b3 = aie::load_v<64>(pb3);
++                c00.mul(a0, b0);
++                c01.mul(a0, b1);
++                c02.mul(a0, b2);
++                c03.mul(a0, b3);
++                c10.mul(a1, b0);
++                c11.mul(a1, b1);
++                c12.mul(a1, b2);
++                c13.mul(a1, b3);
++            }
++            for (int ki = 1; ki < kt; ki++)
++                chess_prepare_for_pipelining chess_loop_range(3, ) {
++                    const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0 + ki * 64);
++                    const aie::vector<int8_t, 64> a1 = aie::load_v<64>(pa1 + ki * 64);
++                    const aie::vector<int8_t, 64> b0 = aie::load_v<64>(pb0 + ki * 64);
++                    const aie::vector<int8_t, 64> b1 = aie::load_v<64>(pb1 + ki * 64);
++                    const aie::vector<int8_t, 64> b2 = aie::load_v<64>(pb2 + ki * 64);
++                    const aie::vector<int8_t, 64> b3 = aie::load_v<64>(pb3 + ki * 64);
++                    c00.mac(a0, b0);
++                    c01.mac(a0, b1);
++                    c02.mac(a0, b2);
++                    c03.mac(a0, b3);
++                    c10.mac(a1, b0);
++                    c11.mac(a1, b1);
++                    c12.mac(a1, b2);
++                    c13.mac(a1, b3);
++                }
++            int8_t *t = y + (mi * (cn / 8) + ni) * 64; // tiles (mi, ni..ni+3), then row mi + 1
++            int8_t *u = t + (cn / 8) * 64;
++            aie::store_v(t, c00.to_vector<int8_t>(0));
++            aie::store_v(t + 64, c01.to_vector<int8_t>(0));
++            aie::store_v(t + 128, c02.to_vector<int8_t>(0));
++            aie::store_v(t + 192, c03.to_vector<int8_t>(0));
++            aie::store_v(u, c10.to_vector<int8_t>(0));
++            aie::store_v(u + 64, c11.to_vector<int8_t>(0));
++            aie::store_v(u + 128, c12.to_vector<int8_t>(0));
++            aie::store_v(u + 192, c13.to_vector<int8_t>(0));
++#else
+             MM c00, c01, c10, c11;
+             {
+                 const aie::vector<int8_t, 64> a0 = aie::load_v<64>(pa0), a1 = aie::load_v<64>(pa1);
+@@ -84,6 +148,7 @@ __global__ void gemm_peak(aie::port<input_window_int8 *, aie::IFM, aie::shape<GP
+             aie::store_v(t + 64, c01.to_vector<int8_t>(0));
+             aie::store_v(t + (cn / 8) * 64, c10.to_vector<int8_t>(0));
+             aie::store_v(t + (cn / 8) * 64 + 64, c11.to_vector<int8_t>(0));
++#endif
+         }
+     const unsigned long long t1 = aie::tile::current().cycles();
+     klog("CYC", (int)(t1 - t0));

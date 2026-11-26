@@ -29,9 +29,18 @@ import json
 # time = reads / rd + writes / wr predicts all four within 0.1 ms -- reads and writes do NOT
 # overlap on one controller, and writes are slow. VEK385 was never DDR-bound (lower bounds).
 BOARDS = {
+    # PDI of 2026-11-25 (example/perf/ddr_microbench.cc, 4 MiB per column, median of 9): one shim channel
+    # ~7.6 GB/s each way, reads 25-27.5 / writes ~25 GB/s from 4 columns on, and reads and writes overlap
+    # (33-36 GB/s together)
     'palmyra': {
-        'aie_mhz': 1000, 'mcs': 1, 'ddr_rd_gbps': 16.1, 'ddr_wr_gbps': 3.58,
+        'aie_mhz': 1000, 'mcs': 1, 'ddr_rd_gbps': 26.0, 'ddr_wr_gbps': 25.0, 'rw_overlap': True,
         # 0x8_0000_0000 mirrors 0x0 on palmyra (one controller, 2 GB)
+        'zones': [{'name': 'DDR_LOW0', 'base': 0x0, 'size': 0x80000000, 'mc': 0, 'heap': True}],
+        'shim_ch_gbps': 7.6,
+    },
+    # the PDI before it: the fit above (reads and writes serialized); the --check runs were measured on it
+    'palmyra_pdi1': {
+        'aie_mhz': 1000, 'mcs': 1, 'ddr_rd_gbps': 16.1, 'ddr_wr_gbps': 3.58,
         'zones': [{'name': 'DDR_LOW0', 'base': 0x0, 'size': 0x80000000, 'mc': 0, 'heap': True}],
         'shim_ch_gbps': 3.6,
     },
@@ -90,7 +99,8 @@ def predict(board, design, s, weights_fixed):
     t_core = tiles * s['nk'] * d['cyc_chunk'] / f
     terms = {'core': t_core}
     reads = s['M'] * s['K'] + (0 if weights_fixed else s['N'] * s['K'])
-    terms['ddr'] = reads / (b['ddr_rd_gbps'] * 1e9) + s['M'] * s['N'] / (b['ddr_wr_gbps'] * 1e9)
+    rd, wr = reads / (b['ddr_rd_gbps'] * 1e9), s['M'] * s['N'] / (b['ddr_wr_gbps'] * 1e9)
+    terms['ddr'] = max(rd, wr) if b.get('rw_overlap') else rd + wr
     terms['shim-A'] = s['M'] * s['K'] / (4 * b['shim_ch_gbps'] * 1e9)
     # B reloaded every launch: the cores wait for their column's B before the first MAC
     prefill = 0.0 if weights_fixed else s['N'] * s['K'] / 4 / (2 * b['shim_ch_gbps'] * 1e9)
@@ -155,10 +165,10 @@ def plan(board, m, n, k, weights_fixed, top=3):
 
 # measured end-to-end % of the board's true peak (steady state), for --check
 MEASURED = [
-    ('palmyra', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, True, 64.7),
-    ('palmyra', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, False, 58.4),
-    ('palmyra', '2x8', {'R': 30, 'NT': 2, 'K': 1792}, True, 55.1),
-    ('palmyra', '2x8', {'R': 42, 'NT': 1, 'K': 2560}, True, 52.2),
+    ('palmyra_pdi1', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, True, 64.7),
+    ('palmyra_pdi1', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, False, 58.4),
+    ('palmyra_pdi1', '2x8', {'R': 30, 'NT': 2, 'K': 1792}, True, 55.1),
+    ('palmyra_pdi1', '2x8', {'R': 42, 'NT': 1, 'K': 2560}, True, 52.2),
     ('vek385', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, True, 71.5),
     ('vek385', '4x4', {'R': 21, 'NT': 3, 'K': 2560}, False, 67.9),
     ('vek385', '2x8', {'R': 60, 'NT': 1, 'K': 2560}, True, 84.5),  # current tile kernel (R42 / R30: older kernel)
