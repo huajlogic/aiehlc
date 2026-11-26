@@ -378,12 +378,15 @@ static void gp_pl_perf_zero(void) {
 static void gemm_ka_run_pl(int8_t *A, int8_t *B, int8_t *C) {
     static long calls = 0;
     const long last0 = (long)(GP_LAUNCHES - 1) * GP_PL_CALLS; // first call of the last launch
+    // the call index within this run of main: AIEHLC_SWEEP_RERUN re-runs main in the same process (statics persist),
+    // and each run's last launch gets its own [PERF] window (m336212422221221 PX)
+    const long cr = calls % ((long)GP_LAUNCHES * GP_PL_CALLS);
     if (calls == 0)
         g_runtime_debug_level |= 0x100; // AIE_DEBUG_FLAG_CORE_PERF_COUNTER: armed by the first kernel start
-    if (calls == last0)
+    if (cr == last0)
         gp_pl_perf_zero();
     gemm_ka_run(A, B, C);
-    if (calls == last0 + GP_PL_CALLS - 1)
+    if (cr == last0 + GP_PL_CALLS - 1)
         __Runtime_core_perf_report(GP_LAUNCHES - 1);
     calls++;
 }

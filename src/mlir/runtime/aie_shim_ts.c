@@ -12,6 +12,9 @@
  *   rt_sts_launch_end()                  __Runtime_shim_bd_rebase_count       (gemm_plan: after each launch, outside
  *                                        the XTime window); after launch AIEHLC_LOCKSNAP_LAUNCH it prints SHIMTS +
  *                                        LOCKSNAP (read-only).
+ * PL (gemm90 m336212422221221): AIEHLC_PERF_LOCKSPLIT_TABLE = host table of core PC-range rows (2 ranges per row),
+ * row p armed for sweep point p (rt_lst_* below, rt_locksplit_rearm in aie_runtime.c); __Runtime_lock_snapshot_nbr =
+ * read-only neighbour (S/W/N/E memory module) lock snapshot after the last launch of each point.
  * Timestamps are the shim tile's PL-module timer (XAie_ReadTimer, AIE clock). Per-column timers are NOT re-synced
  * here (the record carries the column), so cross-column deltas need the PCP's own alignment.
  */
@@ -126,7 +129,73 @@ static void rt_sts_delay(XAie_DevInst *dev, XAie_LocType shim, uint32_t d_ns) {
     } while ((uint64_t)(t - t0) < cyc);
 }
 #else
+#ifdef AIEHLC_PERF_LOCKSPLIT_TABLE
+static int s_sts_lpp = AIEHLC_B_SHIM_DELAY_LAUNCHES; /* PL: the row sweep's launches per point */
+#endif
 uint32_t __Runtime_b_shim_delay_ns(void) { return 0U; }
+#endif
+
+/* ---------------------------------------------------------------------------------------------- lock-split table */
+#ifdef AIEHLC_PERF_LOCKSPLIT_TABLE
+#if defined(AIEHLC_PERF_LOCKSPLIT)
+#error "AIEHLC_PERF_LOCKSPLIT_TABLE and AIEHLC_PERF_LOCKSPLIT (fixed -D ranges) are exclusive"
+#endif
+#ifdef RT_STS_DELAY_LIST
+#error "AIEHLC_PERF_LOCKSPLIT_TABLE and a shim delay table are exclusive (one swept table per ELF)"
+#endif
+#ifndef AIEHLC_PERF_LOCKSPLIT_ROWS
+#define AIEHLC_PERF_LOCKSPLIT_ROWS 5
+#endif
+#define RT_LST_MAX 16
+/* row k = {lo0, hi0, lo1, hi1}: core PC events 0..3 (byte PCs of the linked kernel) */
+static const uint16_t s_lst_builtin[] = {AIEHLC_PERF_LOCKSPLIT_TABLE};
+static uint16_t s_lst_tbl[RT_LST_MAX][4];
+static int s_lst_n = -1, s_lst_row = -1;
+static void rt_locksplit_rearm(void); /* aie_runtime.c: re-arm the PC events + zero ctr1..3 of the armed core tiles */
+static void rt_lst_init(void) {
+    if (s_lst_n >= 0)
+        return;
+    int n = (int)(sizeof(s_lst_builtin) / sizeof(s_lst_builtin[0])) / 4;
+    if (n > RT_LST_MAX)
+        n = RT_LST_MAX;
+    for (int r = 0; r < n; r++)
+        for (int k = 0; k < 4; k++)
+            s_lst_tbl[r][k] = s_lst_builtin[4 * r + k];
+    s_lst_n = n;
+}
+int __Runtime_locksplit_table(const uint16_t *pcs, int rows) {
+    rt_lst_init();
+    if (pcs && rows > 0) {
+        if (rows > RT_LST_MAX)
+            rows = RT_LST_MAX;
+        for (int r = 0; r < rows; r++)
+            for (int k = 0; k < 4; k++)
+                s_lst_tbl[r][k] = pcs[4 * r + k];
+        s_lst_n = rows;
+    }
+    return s_lst_n;
+}
+int __Runtime_locksplit_row(void) { return s_lst_row; }
+/* the 4 PC event addresses of the row armed now (row 0 before the first launch) */
+static void rt_locksplit_pcs(uint16_t pcs[4]) {
+    rt_lst_init();
+    const int r = s_lst_row < 0 ? 0 : (s_lst_row < s_lst_n ? s_lst_row : s_lst_n - 1);
+    for (int k = 0; k < 4; k++)
+        pcs[k] = s_lst_n > 0 ? s_lst_tbl[r][k] : 0U;
+}
+/* rt_sts_launch_begin: a new point starts at launch p*lpp+1 -> arm row p (clamped to the last row) */
+static void rt_lst_launch_begin(void) {
+    rt_lst_init();
+    const uint32_t lpp = (uint32_t)(s_sts_lpp > 0 ? s_sts_lpp : 1);
+    const uint32_t l = s_sts_launch ? s_sts_launch - 1U : 0U;
+    if (l % lpp != 0U && s_lst_row >= 0)
+        return;
+    int r = (int)(l / lpp);
+    if (r >= s_lst_n)
+        r = s_lst_n - 1;
+    s_lst_row = r;
+    rt_locksplit_rearm();
+}
 #endif
 uint32_t __Runtime_b_shim_pushes_last_launch(void) { return s_sts_b_push_last; }
 uint32_t __Runtime_a_shim_pushes_last_launch(void) { return s_sts_a_push_last; }
@@ -289,6 +358,48 @@ int __Runtime_lock_snapshot(XAie_DevInst *dev) {
     return n;
 }
 
+/* PL: READ-ONLY neighbour snapshot. For every core tile (c,r) of the used columns, the lock values of the memory
+ * modules a core can acquire from besides its own: S (c,r-1), W (c-1,r), N (c,r+1), E (c+1,r) -- core rows only (the
+ * MemTile below the first core row has its own 64-lock space, read by __Runtime_lock_snapshot). XAie_LockGetValue
+ * only: no acquire / release, no BD or queue write. One `LOCKSNAP tile=<neighbour> lock= value= nbr= of=` line per
+ * non-zero lock (each neighbour module once per core tile), then LOCKSNAP_NBR_DONE. */
+int __Runtime_lock_snapshot_nbr(XAie_DevInst *dev) {
+    static const int dc[4] = {0, -1, 0, 1}, dr[4] = {-1, 0, 1, 0};
+    static const char dn[4] = {'S', 'W', 'N', 'E'};
+    int n = 0, reads = 0;
+    if (!dev)
+        dev = s_sts_dev;
+    if (!dev) {
+        printf("LOCKSNAP_NBR_DONE n=0 err=no_dev\n");
+        return 0;
+    }
+    const int r0 = (int)dev->AieTileRowStart, r1 = (int)dev->AieTileRowStart + (int)dev->AieTileNumRows;
+    printf("LOCKSNAP_NBR_CFG launch=%u readonly=1 rows=%d..%d dirs=S,W,N,E src=lock_get_value\n",
+           (unsigned)s_sts_launch, r0, r1 - 1);
+    for (int col = 0; col < RT_STS_COLS; col++) {
+        if (!s_sts_col_used[col])
+            continue;
+        for (int r = r0; r < r1; r++)
+            for (int d = 0; d < 4; d++) {
+                const int nc = col + dc[d], nr = r + dr[d];
+                if (nc < 0 || nc >= (int)dev->NumCols || nr < r0 || nr >= r1)
+                    continue;
+                const XAie_LocType t = XAie_TileLoc((uint8_t)nc, (uint8_t)nr);
+                for (uint8_t l = 0U; l < 16U; l++) {
+                    u32 v = 0U;
+                    reads++;
+                    if (XAie_LockGetValue(dev, t, XAie_LockInit(l, 0), &v) != XAIE_OK || v == 0U)
+                        continue;
+                    printf("LOCKSNAP tile=(%d,%d) lock=%u value=%u nbr=%c of=(%d,%d)\n", nc, nr, (unsigned)l,
+                           (unsigned)v, dn[d], col, r);
+                    n++;
+                }
+            }
+    }
+    printf("LOCKSNAP_NBR_DONE n=%d reads=%d\n", n, reads);
+    return n;
+}
+
 /* ---------------------------------------------------------------------------------------------- one-ELF sweep */
 /* AIEHLC_SWEEP_RERUN=<points> (PAE, default off): the app's own main runs one point (GP_LAUNCHES launches, its call
  * lines, STEADY and GOLDEN); an atexit handler registered at the first launch runs main again points-1 times, so ONE
@@ -296,8 +407,8 @@ int __Runtime_lock_snapshot(XAie_DevInst *dev) {
  * generated host.cc) untouched. The runtime prints `=== SWEEP point d_ns=<d> <a|b>_pushes_per_launch=<n>` after the
  * first launch of each point (before that point's GPLAN) and `SWEEPPT ...` after its last launch. */
 #if defined(AIEHLC_SWEEP_RERUN) && AIEHLC_SWEEP_RERUN > 1
-#ifndef RT_STS_DELAY_LIST
-#error "AIEHLC_SWEEP_RERUN needs a delay table (AIEHLC_A_SHIM_DELAY_NS or AIEHLC_B_SHIM_DELAY_NS)"
+#if !defined(RT_STS_DELAY_LIST) && !defined(AIEHLC_PERF_LOCKSPLIT_TABLE)
+#error "AIEHLC_SWEEP_RERUN needs a table (AIEHLC_A_SHIM_DELAY_NS, AIEHLC_B_SHIM_DELAY_NS or AIEHLC_PERF_LOCKSPLIT_TABLE)"
 #endif
 #define RT_STS_SWEEP 1
 #include <stdlib.h>
@@ -351,8 +462,18 @@ static void rt_sts_sweep_end(void) {
     const uint32_t pu = RT_STS_SWEEP_PUSH;
     if (idx == (pt == 0U ? 1U : 0U)) {
         /* point 0: after its 2nd launch (launch 1 of the ELF also loads the kernel: +4 pushes on mm2s0 and mm2s1) */
+#ifdef AIEHLC_PERF_LOCKSPLIT_TABLE
+        {
+            uint16_t pcs[4];
+            rt_locksplit_pcs(pcs);
+            printf("=== SWEEP point row=%d\n", s_lst_row);
+            printf("LKTABLE row=%d r0=%u-%u r1=%u-%u " RT_STS_SWEEP_TAG "_pushes_per_launch=%u\n", s_lst_row,
+                   (unsigned)pcs[0], (unsigned)pcs[1], (unsigned)pcs[2], (unsigned)pcs[3], (unsigned)pu);
+        }
+#else
         printf("=== SWEEP point d_ns=%u " RT_STS_SWEEP_TAG "_pushes_per_launch=%u\n", (unsigned)__Runtime_b_shim_delay_ns(),
                (unsigned)pu);
+#endif
         s_sw_min = ~0U;
         s_sw_max = 0U;
     }
@@ -445,6 +566,9 @@ static void rt_lks_dump(void) {
 
 static void rt_sts_launch_begin(void) {
     s_sts_launch++;
+#ifdef AIEHLC_PERF_LOCKSPLIT_TABLE
+    rt_lst_launch_begin();
+#endif
 #ifdef RT_STS_SWEEP
     if (!s_sw_reg) {
         s_sw_reg = 1;
@@ -460,6 +584,17 @@ static void rt_sts_launch_end(void) {
     s_sts_a_push_last = s_sts_a_push_cur;
 #ifdef RT_STS_SWEEP
     rt_sts_sweep_end();
+#endif
+#ifdef AIEHLC_PERF_LOCKSPLIT_TABLE
+    {
+        /* after the last launch of each point (every point is a re-run of main: lpp launches) */
+        const uint32_t lpp = (uint32_t)(s_sts_lpp > 0 ? s_sts_lpp : 1);
+        if (s_sts_launch && s_sts_launch % lpp == 0U)
+            (void)__Runtime_lock_snapshot_nbr(s_sts_dev);
+    }
+#elif defined(AIEHLC_LOCKSNAP_NBR)
+    if (s_sts_launch == (uint32_t)AIEHLC_LOCKSNAP_LAUNCH)
+        (void)__Runtime_lock_snapshot_nbr(s_sts_dev);
 #endif
 #ifdef AIEHLC_LOCKSAMPLE
     if (!s_lks_done && s_sts_launch == (uint32_t)AIEHLC_LOCKSAMPLE_TO) {
