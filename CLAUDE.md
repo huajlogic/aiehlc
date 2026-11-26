@@ -535,32 +535,38 @@ the dataflow. Port buffers get **32 KB**, not 48
 (`checkPortBuffers`). Design: `doc/design/trace_to_routing.md` "Dataflow
 options"; skill **gemmdataflowoptions**.
 
-**int8 GEMM at 91.5 % of the core peak** (`example/tileprogram/ccode/simplegemm_peak.cc`):
+**int8 GEMM core MAC loop** (`example/tileprogram/ccode/simplegemm_peak.cc`; the 2x4 / shape-knob version that reaches
+**97.6 %** is `perftest/gemm90/simplegemm_peak_2x4.patch`, kept out of the tree because it changes the example's default):
 AIE2PS (`__AIE_ARCH__` 22) uses the aie2p mmul backend, where `mmul<8,8,8,int8,int8>`
 is ONE `mac_8x8_8x8` = **512 MAC/cycle per core** (not the 256 older docs assume).
 Both operands `{.resident}`, host-packed in mmul order (aligned 64-byte loads),
-2x2 register blocking (8 `dm` accumulators exist; the compiler overlaps a tile's
-write-back with the next tile's MACs), C written tile-major. K sets it: 32x32x384
-per core = 768 MAC instructions in **839 cycles** (91.5 %), 64x64x128 = 75.4 %
-(~19 cycles per 16x16 tile outside the K loop). Measured per core by klog `CYC`
-around the compute (validated: 2 passes = 2.09x); the ~226 ms launch is kernel
-load, not compute.
+2x2 register blocking, C written tile-major; the in-tree default is 32x32x384 per core (768 MAC
+instructions; 839 cycles = 91.5 % on an older toolchain, 891 = 86.2 % on palmyra 2026-11-25). Every
+accumulator group pays ~20-30 cycles outside its K loop, so K steps per group set it: with the patch,
+2x4 blocking (all 8 `dm` accumulators) and 16x32x1152 per core = 1152 MAC instructions in **1180 cycles**
+(97.6 %). Measured per core by klog `CYC` around the compute; the launch around it is kernel load.
 
 ### Explicit dataflow plans (C / routing / dmaphop -> code, no hand edits)
 
 The 2 x 8 shared-operand GEMM that `share2x8.py` reached by rewriting the generated files now
 comes from the compiler: **85.5 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
-alone** (1.147-1.153 ms per 10.07 G MAC, every launch, GOLDEN PASS). Three ways in, each lowering to the next:
+alone** (1.147-1.153 ms per 10.07 G MAC, every launch, GOLDEN PASS). palmyra on the PDI of 2026-11-25: **85.7 %** (1.435 ms
+at 1000 MHz, GOLDEN PASS), core-bound like VEK385 -- that PDI's DDR is no longer the limit
+(`example/perf/ddr_microbench.cc`, now with `kind=rdwr`: one shim channel ~7.6 GB/s, reads ~26 / writes ~25 GB/s,
+read + write overlapped 33-36 GB/s; the PDI before it gave 16.1 / 3.58 GB/s serialized and 47 %). Three ways in, each lowering to the next:
 `load_buffer {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring|memtile, .ring = N,
-.keep = true}` + `#pragma persistent_kernel` -> routing IR `dataflow = {...}` on the tensor's
+.keep = true}` + `#pragma persistent_kernel` -> routing IR `#routing.dataflow<...>` (typed) on the tensor's
 `routingcreatescheduletensor` + `routing.persistent_kernel` -> plan synthesis
 (`pass/dataflowplan/plansynth.cpp`: host-tile matching, views, locks, MemTile ring / resident B,
-dump `4_DataflowPlan.mlir`) -> dmaphop dataflow ops `dmaphop.plan` / `plan_route` / `plan_stream`
-(`collectDataflowPlan` validates, tags replaced flows `dmaphop.plan_replaced`) -> the DMA program
+dump `4_DataflowPlan.mlir`) -> dmaphop: per stream a `create_path` carrying `#dmaphop.stream`, its routes as
+`create_hop`s, plus the `dmaphop.plan` header (`collectDataflowPlan` reads that or the attribute-only `plan_route` /
+`plan_stream` input form, validates, tags replaced flows `dmaphop.plan_replaced`, `planpaths.cpp`) -> dfscheblueprint
+carries the whole plan (`#dmaphop.stream` per shared `declare_data`, `#dmaphop.route`s on the module; the DMA
+program is derived from what `planFromBlueprint` reads back) -> the DMA program
 derived (`plandma.cpp`) as **dfschedule** ops `config.tile_bd` / `lock_set` / `channel_enable` /
 `channel_start` (MemTiles on the host module, cores on the kernel module via `declaretile.self`) +
 shim `config.dma_bd`/`start_io`, lowered by DfscheduleToApi / DfscheduleToKernelApi; routes: the
-`plan_route` ops lowered in **DmaphopToRoutinghwPass** to ordinary routinghw ops (`passdmaphoptoroutinghw/planroutes.cpp`,
+the plan paths' hops lowered in **DmaphopToRoutinghwPass** to ordinary routinghw ops (`passdmaphoptoroutinghw/planroutes.cpp`,
 router port model, around the generated routes + control plane) -- no text branch in routing.cc; `aiehlc_plan.h`
 (constants + the generated host `aiehlc_plan_arrange`, the DDR layout the shim BDs read).
 **B staged by MemTile capacity**: held whole (`.keep`) when its column's strips fit, else a `memtile_ring` too (re-read from DDR per output tile; ring depth keeps every channel start <= 256, `plantarget.h` `chMaxRepeat`), so bf16 / large-K shapes build (`gemm_plan_4096x512x4096_{int8,bf16}.cc`; shape / dtype knobs `GP_M/N/K/DTYPE` in `gemm_plan_body.cc`). Shape / dtype at build time: `aiehlc.sh --define GP_M=4096 ...` (also `AIEHLC_DEFINES`) reaches the front end, the
@@ -982,6 +988,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/resnetlaye1timeoutdebug.md](doc/resnetlaye1timeoutdebug.md)** — Step-by-step summary of the ResNet-18 layer-01 `--aie-offload` timeout debug: symptom, allconv review, source/pragma bisection, KCO absolute-column root cause + fix, `-O3` (2232 → 1282 ms), lessons
 - **[doc/debug/troubleshoot_aie_offload_timeout.md](doc/debug/troubleshoot_aie_offload_timeout.md)** — `--aie-offload` main.elf hangs (`ENTER` without `EXIT`, `wait_io TIMEOUT`): reading the deadlock, allconv review, HW bisection (committed stem passes, control-plane WIP hangs standalone too), `AIE_DEBUG_LOG`-gated timeout dump
 - **[doc/design/op_mapping_programming_model.md](doc/design/op_mapping_programming_model.md)** — Op + mapping model on top of convautotile: native-support plan (op/mapping in routing IR, `OpMappingToTilingPass`, more ops), evaluation, and §4 the Triton block-load kernel style (`aie::program_id`, `aie::load_buffer/store_buffer` in tensor coordinates, checked against the derived DMA by `aie_block_io.h`), its x86 emulator `simpleconv2ddebug/emu_conv2d_spatial.sh`, and why a load is an assertion, not a request, on a DMA-streamed array; §5 kernel analysis: kernel-only sources (`aie::shape` ports, no `conv`/`map`, `simpleconv2dkernel_port.cc`) whose DMA is inferred from the traced `load_buffer` calls and verified (too big/small, out of tensor, data used without load, use after release, never committed, loop order, data-dependent schedule, coverage), plus static bounds (`kernel_static.cpp`: names the constant behind an out-of-block access, e.g. `oc_t = 15` -> fits with 16); `aiehlc-convtile trace`; §6 tensor form (`simpleconv2dkernel.cc`: `aie::in<aie::tensor>`, `.pad` / `.reuse`, block views, `aie::autotune`; `kernel_front.cpp` lowers it via a logical trace + staged layout, `emu_conv2d_tensor.sh`); §7 vector kernels: `simpleconv2dkernel_port.cc` on `aie::mmul<8,8,8>`, traced via the AIE API x86 emulation `src/mlir/runtime/aie_api_x86emu.h` (ASan + vector alignment checks)
+- **[tutorial/compilerinside/README.md](tutorial/compilerinside/README.md)** — the compiler inside, per performance level (0.01 / ~14 / ~50 / ~80 / 85 % on palmyra, `gemm_plan/step0..7`): how the IR lowers at each level and what each one-word source change moves at routing (`#routing.dataflow`), dmaphop (plan paths: `create_hop` / `create_path` + `#dmaphop.stream`), dfscheblueprint (the plan typed on `declare_data` / module) and dfschedule; excerpts from real dumps, measured 2026-11-26
 - **[tutorial/aieprogram/README.md](tutorial/aieprogram/README.md)** — kernel-only programming tutorials by operator family, then GEMM optimization: `01_contraction/` (GEMM: every host/kernel line, pid -> tile figures, trace -> DMA -> routing / dmap / dmaphop / dfschedule / routinghw pipeline figure; conv2d), `02_elementwise/` .. `05_indexing/` (4x4 by redundant broadcast -- a mesh row's data broadcast, work split by `pn`; reduction in two levels; model + limits; their kernels pass the kernel analysis but the lowering still derives windows from the GEMM model -- pending), `06_gemm_optimization/` (step 0 baseline 90.6 ms -> `.depth`/`.resident` 101.1 ms (slower: compute-bound) -> `aie::mmul` + `.tile` 79.6 ms; conv scheduling + vector with `output_tile_major`); listings synced by `sync_code.py`, figures from `img/make_figures.py`
 - **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` for `aie::SpatialPolicy`
 - **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based spatial op spaces (GemmSpace, Conv2dSpace)
@@ -1052,7 +1059,7 @@ Read the matching skill when the task fits:
 | A hand-written GemmSpace GEMM (simplematmul2) hangs in `wait_io TIMEOUT ... dir=1` / watchdog after a compiler update; `startio(..., 4)` became `(..., 1)`; `3D K BD is already the whole walk ... repeat 4 -> 1` | kwalkrepeatcollapse |
 | A launch slower after merging main with identical kernel / routing / DMA program: `__aie_launch` now invalidates every output (`__Runtime_sync_for_cpu`) -- allocate outputs uncached | postlaunchoutputinval |
 | A non-square mesh (4 x 2) places core groups on columns it does not have; `No free shim DMA slot` before a dataflow plan replaces the flows; a `#ifndef` / `#define` default missing in the trace harness or the kernel TU | nonsquaremeshplan |
-| Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `dataflow = {...}`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
+| Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `#routing.dataflow<...>`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
 | Kernel-only kernel without options hangs in `wait_io TIMEOUT ... dir=0` (output) but works with `{.depth = 2}`; output `pp_depth=1`, one output MM2S BD with `next_bd=-1` vs ping/pong `window_init`; `{.depth = 1} on aie::store_buffer` error | outputpingponghang |
 | A dialect attribute's dumped IR does not parse back (`expected integer value`, `failed to parse ...Attr parameter ... ArrayRef<int64_t>`, `AIEHLC_*_IR_IN ... does not parse / verify`, roundtrip FAIL at the re-entry build): `struct(params)` with an `ArrayRefParameter` | mlirattrarrayroundtrip |
 | Adding/reading tiling or per-tensor DMA info in routing IR (halo, shim_dma, pp_depth, kernel rounds); "where did `tensor_N.halo` / `routing.spatial_out_rounds` go"; value reads 0 inside a conversion pattern | routingirtilingcarriers |
@@ -1090,6 +1097,8 @@ Read the matching skill when the task fits:
 | resnetengine eager layer-major hangs ~1 run in 3 in a residual layer: `shim_bd_ctrl TIMEOUT ... owing an ack`, input shim with no task; or a few wrong logits | shimctrlpushloss |
 | AIE kernel: +1 errors / constant garbage right after ADDING a code path; statics above `DM_stack` overwritten | aiecorestackoverflow |
 | Kernel cycle counters around `acquire_greater_equal` read ~2 cycles; measuring AIE clock | aiecoretimerlock |
+| int8 `aie::mmul` kernel below ~92 % of the core peak though its loop issues one VMAC per cycle; 2x2 vs 2x4 blocking, K per accumulator group, resident operand size limit, klog CYC efficiency | coremacpeak |
+| Where a kernel's missing % of peak goes: per-core loss table (VMAC / other instr / memory stall / lock stall / host launch) from core counters (`perftest/gemm90/` patches: `__Runtime_core_loss_arm/read`, gemm_plan `--define GP_LOSS=1`, `losstable.py`); lock stall or active larger than the launch | coreloss |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
 | Kernel codegen | kernelcodegen |

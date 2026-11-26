@@ -29,7 +29,7 @@ import sys
 
 _ADDR = re.compile(r"^\s+(\d+)\s+0x")
 _IMM = re.compile(r"\b(?:MOV|MOVX|MOVA|MOVXM|MOVS)\s+(r\d+|lc|m\d+),\s*#(-?\d+)")
-_LC_REG = re.compile(r"\bMOVX?\s+lc,\s*(r\d+)")
+_LC_REG = re.compile(r"\bMOV[AXS]?\s+lc,\s*(r\d+)")
 _JNZD = re.compile(r"\bJNZD\s+(r\d+),")
 _JL = re.compile(r"\bJL\s+#(\d+)")
 _LABEL = re.compile(r"^\.label\s+(\S+)")
@@ -126,7 +126,7 @@ class Counter:
         # lc set in a bundle before the ZLS body
         for j in range(a - 1, -1, -1):
             t = bs[j]["txt"]
-            m = re.search(r"\bMOVX?\s+lc,\s*#(\d+)", t)
+            m = re.search(r"\bMOV[AXS]?\s+lc,\s*#(\d+)", t)  # chess uses MOV, MOVX or MOVA
             if m:
                 return int(m.group(1))
             m = _LC_REG.search(t)
@@ -224,8 +224,12 @@ def analyse(path, func="gemm_kacc", entry="_main"):
             pre += C.cost(callee, r1)["cyc"]
             seen_ms = seen_ms or callee == "memset"
     main_cyc = main_pre = 0
-    if entry in C.funcs:
-        mres = C.cost(entry)
+    main_error = None
+    try:
+        mres = C.cost(entry) if entry in C.funcs else None
+    except ValueError as e:  # a persistent kernel's main loops forever (no counted back branch)
+        mres, main_error = None, str(e)
+    if mres is not None:
         main_cyc = mres["cyc"] - kern["cyc"] * sum(1 for c in mres["calls"] if c["callee"] == name)
         mi0, mi1, _ = C.funcs[entry]
         for x in C.bundles(mi0, mi1):
@@ -236,9 +240,13 @@ def analyse(path, func="gemm_kacc", entry="_main"):
             if m:
                 main_pre += C.cost(C.by_addr.get(int(m.group(1))))["cyc"]
     frame = max([int(v) for v in re.findall(r"PADDXM \[sp\], #(\d+)", "\n".join(x["txt"] for x in bs))] or [0])
-    return dict(func=name, kernel=kern["cyc"], main=main_cyc, total=kern["cyc"] + main_cyc, pre=main_pre + pre,
-                post=kern["cyc"] + main_cyc - main_pre - pre, vmac=kern["vmac"], frame=frame, spill=kern["spill"],
-                loops=kern["loops"], calls=kern["calls"])
+    r = dict(func=name, kernel=kern["cyc"], main=main_cyc, total=kern["cyc"] + main_cyc, pre=main_pre + pre,
+             post=kern["cyc"] + main_cyc - main_pre - pre, vmac=kern["vmac"], frame=frame, spill=kern["spill"],
+             static_eff=round(kern["vmac"] / kern["cyc"], 4) if kern["cyc"] else 0.0,
+             loops=kern["loops"], calls=kern["calls"])
+    if main_error:
+        r["main_error"] = main_error  # main not counted (main = 0): e.g. a persistent kernel's endless go-lock loop
+    return r
 
 
 def call_r1(items, k, lo):

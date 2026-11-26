@@ -57,6 +57,31 @@ Which files `estimate()` loads is fixed in code: UNet `KLN_PARAMS` (`estimate.py
 (`estimate.py:351-367`) and reported in the result's `"params"`. Only **palmyra213** has a full set;
 `board_params()` raises for any other board (`estimate.py:63-68`).
 
+### 1.5 Static core cycles from the kernel listing (`tools/kcyc_lst.py`)
+
+An AIE core is a statically scheduled VLIW machine: chess packs each cycle's instructions into one bundle,
+the core issues one bundle per cycle in order (no reordering, no cache, no branch prediction), so without
+stalls the core time of a kernel is its bundle count along the executed path. `kcyc_lst.py LST --func F`
+walks the `kernel.lst` of F, multiplies every zero-overhead loop body by its `lc` (`MOV` / `MOVX` / `MOVA lc,
+#n`) and every counted loop by its `JNZD` trip, adds callees, and reports `kernel` cycles, `vmac` and
+`static_eff = vmac / kernel`. A persistent kernel's `_main` (an endless go-lock loop) is skipped
+(`main_error`), the kernel itself still counts. What it cannot see are stalls (DM bank conflicts, lock and
+stream waits): those come from the core counters (`perftest/gemm90/`, skill **coreloss**).
+
+Validation, the int8 dataflow-plan GEMM (`gemm_plan.cc`, 7680 x 512 x 2560, 60 tiles of 20 K chunks per core,
+palmyra, 2026-11-25): the static count against the board's counted VMAC + other-instruction cycles per core
+(median of 16 cores):
+
+| build | `kcyc_lst` kernel cycles | board VMAC + other | error | static_eff |
+|---|---|---|---|---|
+| gemm_plan | 1,312,595 | 1,316,294 | 0.28 % | 93.6 % |
+| accumulator spill moved before the chunk locks | 1,344,335 | 1,348,122 | 0.28 % | 91.4 % |
+| hand-on lock id as its own expression | 1,310,913 | 1,314,680 | 0.29 % | 93.7 % |
+
+`vmac` is exact (1,228,800). So a kernel change can be ranked from its listing before a board run; the
+launch is then `kernel / (1 - stall share)`, the stall share measured once per design (4.6 % memory + 3.7 % lock
+for gemm_plan).
+
 ## 2. Module map
 
 | module | role |
@@ -70,7 +95,7 @@ Which files `estimate()` loads is fixed in code: UNet `KLN_PARAMS` (`estimate.py
 | `ap_sites.py`, `cc_sites.py` | static N features of resnet18 (ap_gemm) / yolo26n (kacc_chunk) builds |
 | `bdgraph.py` | build-JSON (`dfscheduleprovenancemap`) form of `estimate()`: BD counts, issue time, DDR floor (`bdgraph.py:209`, `:451`) |
 | `cli.py`, `__main__.py` | `python -m costmodel` (§3) |
-| `tools/` | fitting / measurement / report tools (moved from `script/perf/`, §5) |
+| `tools/` | fitting / measurement / report tools (moved from `script/perf/`, §5); `tools/kcyc_lst.py`: static core cycles from a `kernel.lst` (§1.5) |
 | `params/` | frozen per-board parameters (moved from `script/perf/params/`) |
 | `example/` | three runnable examples (`example/README.md`) |
 | `test/` | the cost-model tests and their data (`test/data/costmodel/`): `python3 -m pytest -q src/costmodel/test` |

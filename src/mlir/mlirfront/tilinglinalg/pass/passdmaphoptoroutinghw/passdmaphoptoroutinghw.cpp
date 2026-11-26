@@ -1234,6 +1234,14 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     // Create routing context
     RoutingContext routingCtx;
 
+    // Dataflow plan: its routes come from its paths (#dmaphop.stream), taken out before anything below walks
+    // the dmaphop tiles / ports, and lowered after the generated flows' connections exist.
+    FailureOr<PlanRouteSet> planRoutes = takeDataflowPlanRoutes(cast<ModuleOp>(module));
+    if (failed(planRoutes)) {
+        signalPassFailure();
+        return;
+    }
+
     // Pre-populate routingCtx by walking dmaphop.tile and dmaphop.port ops.
     // This must happen BEFORE applyPartialConversion because the conversion
     // framework may process ops in any order — port/tile erasure patterns
@@ -1328,7 +1336,7 @@ void DmaphopToRoutinghwPass::runOnOperation() {
         return;
     }
     // Dataflow plan routes: lowered here like every other flow, around the connections just created.
-    if (failed(lowerDataflowPlanRoutes(cast<ModuleOp>(module), rtopology_)))
+    if (failed(lowerDataflowPlanRoutes(cast<ModuleOp>(module), rtopology_, *planRoutes)))
         signalPassFailure();
 }
 

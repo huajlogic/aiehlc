@@ -720,27 +720,22 @@ static void attachTensorRoutingInfo(OpBuilder &builder, ArrayRef<routing::create
             // load_buffer {.share / .stage / .ring / .keep} -> routing-level dataflow intent; a .stage without
             // .share plans a per-core stream (share = "none", with the core's block origin)
             if (kb.share || kb.stage) {
-                llvm::SmallVector<mlir::NamedAttribute> df;
-                df.push_back(builder.getNamedAttr("share", builder.getStringAttr(kb.share == 2 ? "broadcast"
-                                                                                 : kb.share    ? "neighbor"
-                                                                                               : "none")));
-                if (kb.share != 1) { // per-core copies: where each core's blocks start
-                    df.push_back(builder.getNamedAttr("base_p0", builder.getI64ArrayAttr(kb.baseP0)));
-                    df.push_back(builder.getNamedAttr("base_p1", builder.getI64ArrayAttr(kb.baseP1)));
-                }
-                if (kb.stage)
-                    df.push_back(builder.getNamedAttr(
-                        "stage", builder.getStringAttr(kb.stage == 2 ? "memtile_ring" : "memtile")));
-                if (kb.ring)
-                    df.push_back(builder.getNamedAttr("ring", builder.getI64IntegerAttr(kb.ring)));
-                if (kb.keep)
-                    df.push_back(builder.getNamedAttr("resident", builder.getStringAttr("launches")));
-                if (kb.parts > 1)
-                    df.push_back(builder.getNamedAttr("parts", builder.getI64IntegerAttr(kb.parts)));
-                if (kb.share == 2)
-                    df.push_back(builder.getNamedAttr("axis", builder.getStringAttr(kb.axis == 2 ? "column" : "row")));
-                decl->setAttr("dataflow", builder.getDictionaryAttr(df));
-                llvm::outs() << "[TilingLinalg] tensor_" << i << " dataflow=" << decl->getAttr("dataflow") << "\n";
+                const bool perCore = kb.share != 1; // per-core copies: where each core's blocks start
+                decl.setDataflowAttr(routing::DataflowAttr::get(
+                    ctx,
+                    kb.share == 2 ? "broadcast"
+                    : kb.share    ? "neighbor"
+                                  : "none",
+                    kb.stage == 2 ? "memtile_ring"
+                    : kb.stage    ? "memtile"
+                                  : "",
+                    kb.ring, kb.keep != 0, kb.parts > 1 ? kb.parts : 1,
+                    kb.share == 2 ? (kb.axis == 2 ? "column" : "row") : "",
+                    mlir::DenseI64ArrayAttr::get(ctx, perCore ? llvm::ArrayRef<int64_t>(kb.baseP0)
+                                                              : llvm::ArrayRef<int64_t>()),
+                    mlir::DenseI64ArrayAttr::get(ctx, perCore ? llvm::ArrayRef<int64_t>(kb.baseP1)
+                                                              : llvm::ArrayRef<int64_t>())));
+                llvm::outs() << "[TilingLinalg] tensor_" << i << " dataflow=" << decl.getDataflowAttr() << "\n";
             }
         }
     }
@@ -808,8 +803,9 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
         auto tensorValue = builder.create<bufferization::ToTensorOp>(builder.getUnknownLoc(), tensorType, memrefArg);
 
         // Feed into createscheduletensor — same as before
-        auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(),
-                                                           vals, dimnum, nullptr, nullptr, nullptr, nullptr, nullptr);
+        auto tensor =
+            builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(), vals,
+                                                 dimnum, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         tensorDecls.push_back(tensor);
         tensorValues.push_back(tensor);
         isInputFlags.push_back(tp.isInput);
@@ -917,6 +913,15 @@ static bool readIROverride(mlir::MLIRContext &ctx, mlir::ModuleOp module, const 
         planOps = planOpsList.size();
         for (auto *op : planOpsList)
             op->erase();
+        // the plan as paths (#dmaphop.stream create_path + its hops) and the tags collectDataflowPlan puts on the
+        // generated flows it replaces are the plan too
+        noPlan->walk([&](mlir::Operation *op) {
+            if (op->getName().getStringRef() == "dmaphop.create_path" && op->hasAttr("stream"))
+                planOps++;
+            op->removeAttr("dmaphop.plan_replaced");
+        });
+        noPlan.get()->removeAttr("dmaphop.plan_replaced_args");
+        dfplan::erasePlanPaths(noPlan.get());
         stripDerivedAttrs(noPlan.get());
         llvm::raw_string_ostream os(after);
         noPlan->print(os);
@@ -1156,11 +1161,14 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             llvm::errs() << "[DataflowPlan] ERROR: cannot synthesize the plan from the routing IR: " << why << "\n";
             return false;
         }
-        dumpPipelineIRToFile(module, irDir, stage++, "DataflowPlan");
     }
     // the dmaphop plan as synthesized / read in: the readback writes the plan the build ends with into it
     mlir::OwningOpRef<mlir::ModuleOp> planDmaphopSnapshot = cast<ModuleOp>(module->clone());
-    if (!dfplan::collectDataflowPlan(module, dfplan::activePlan(), coreRowBase > 1 ? coreRowBase - 1 : 1))
+    // read + validated; its routes / streams become plan paths (#dmaphop.stream create_path + create_hop)
+    const bool planOk =
+        dfplan::collectDataflowPlan(module, dfplan::activePlan(), coreRowBase > 1 ? coreRowBase - 1 : 1);
+    dumpPipelineIRToFile(module, irDir, stage++, "DataflowPlan");
+    if (!planOk)
         return false;
     if (reserveControlPlane)
         finalizeControlPlacement(module, rtopology.getRM(), dataStartCol, ctrlPlacement);
@@ -1189,9 +1197,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
     // routing.cc and host.cc use the same packet IDs.
     mlir::ModuleOp routingDmaphopModule = cast<ModuleOp>(module->clone());
-    // The plan's routes are lowered by the routing path only (DmaphopToRoutinghwPass); the host / kernel
-    // paths never see them.
-    dfplan::erasePlanRoutes(module);
+    // The plan's paths are lowered by the routing path only (DmaphopToRoutinghwPass: their hops become the
+    // plan's circuit routes); the host / kernel paths never see them.
+    dfplan::erasePlanPaths(module);
 
     // Rename @main → @routing in the clone so that routing.cc emits
     // void routing(XAie_DevInst* dev) instead of void main().
@@ -1220,9 +1228,23 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
                        "DmaphopTodfscheblueprintPass"))
         return false;
-    // the plan on the dfscheblueprint level: dfscheblueprint.plan on the shared tensors (resources follow in
-    // the readback dump once assigned)
+    // the plan on the dfscheblueprint level: the whole plan, typed (streams on the shared tensors' declare_data,
+    // routes + plan facts on the module; the assigned resources follow in the readback dump)
     dfplan::annotateBlueprint(module, dfplan::activePlan(), false);
+    // ... and from here on the DMA program is derived from the plan the blueprint carries (checked to be the
+    // dmaphop plan it was written from)
+    if (dfplan::activePlan().present) {
+        dfplan::DataflowPlan fromBlueprint;
+        std::string why;
+        if (!dfplan::planFromBlueprint(module, fromBlueprint, why) ||
+            !dfplan::samePlanDataflow(fromBlueprint, dfplan::activePlan(), &ctx, why)) {
+            llvm::errs() << "[DataflowPlan] ERROR: dfscheblueprint: " << why << "\n";
+            return false;
+        }
+        dfplan::activePlan() = std::move(fromBlueprint);
+        // the blueprint dump of this stage shows the plan it carries (same stage number, rewritten)
+        dumpPipelineIRToFile(module, irDir, stage - 1, "DmaphopTodfscheblueprintPass");
+    }
     mlir::OwningOpRef<mlir::ModuleOp> planBlueprintSnapshot = cast<ModuleOp>(module->clone());
     mlir::OwningOpRef<mlir::ModuleOp> planHostSnapshot;
 

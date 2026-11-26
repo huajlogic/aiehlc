@@ -1,0 +1,50 @@
+diff --git a/example/tileprogram/ccode/gemm_plan/gemm_plan_body.cc b/example/tileprogram/ccode/gemm_plan/gemm_plan_body.cc
+index 73d936f7..759f01bc 100644
+--- a/example/tileprogram/ccode/gemm_plan/gemm_plan_body.cc
++++ b/example/tileprogram/ccode/gemm_plan/gemm_plan_body.cc
+@@ -346,6 +346,13 @@ void aiehlc_plan_arrange(int arg, const void *src, void *dst);
+ // Always-on runtime counter (aie_runtime.c): host time spent in wait_io, in XTime ticks. Per launch it is the
+ // device time after the last start_io; the rest of the launch is the host-side launch cost.
+ void __Runtime_host_split_wait_ticks(unsigned long long *ticks, unsigned int *calls);
++// --define GP_LOSS=1: core loss-table counters on launches 3..6, one DM bank pair each (skill coreloss;
++// perftest/gemm90/losstable.py turns the LOSS lines into the table).
++int __Runtime_core_loss_arm(int meshId, int bank_a, int bank_b);
++int __Runtime_core_loss_read(unsigned int *out, int max_tiles);
++#ifndef GP_LOSS
++#define GP_LOSS 0
++#endif
+ 
+ // AIE array clock, measured in the run: the shim PL-module Timer_Low (AIE cycles, the partition's first
+ // column) against the A78 generic timer (CNTPCT, COUNTS_PER_SECOND), median of 3 windows of 20 ms
+@@ -474,6 +481,12 @@ int main() {
+         XTime t0, t1;
+         unsigned long long wt0 = 0, wt1 = 0;
+         unsigned int wn = 0;
++        const int loss = GP_LOSS && it >= 2 && it <= 5; // banks (0,1) (2,3) (4,5) (6,7)
++        XTime ta = 0, tb = 0;
++        if (loss) {
++            __Runtime_core_loss_arm(0, 2 * (it - 2), 2 * (it - 2) + 1);
++            XTime_GetTime(&ta);
++        }
+         __Runtime_host_split_wait_ticks(&wt0, &wn);
+         XTime_GetTime(&t0);
+         gemm_ka_run(A2, B2, Ct);
+@@ -481,6 +494,18 @@ int main() {
+         __Runtime_host_split_wait_ticks(&wt1, &wn);
+         lms[it] = gp_ms(t0, t1);
+         wms[it] = gp_ms(0, (XTime)(wt1 - wt0));
++        if (loss) {
++            static unsigned int lv[64 * 8];
++            const int n = __Runtime_core_loss_read(lv, 64);
++            XTime_GetTime(&tb);
++            for (int i = 0; i < n; i++) {
++                const unsigned int *v = lv + i * 8;
++                printf("LOSS launch=%d banks=%d,%d window_us=%.1f launch_us=%.1f wait_us=%.1f tile=%u,%u active=%u "
++                       "memstall=%u lockstall=%u vec=%u conflA=%u conflB=%u\n",
++                       it + 1, 2 * (it - 2), 2 * (it - 2) + 1, gp_ms(ta, tb) * 1e3, lms[it] * 1e3, wms[it] * 1e3,
++                       v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++            }
++        }
+         if (it == 0) { // the array is up and clocked: measure its clock
+             aie_clk = gp_aie_clock();
+             printf("GPLAN where=%s dtype=%s shape=%ldx%ldx%ld aie_mhz=%.1f clk_src=%s\n", "board", dts, M, N, K,

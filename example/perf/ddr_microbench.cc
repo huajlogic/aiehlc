@@ -90,7 +90,9 @@ static int pend(XAie_DevInst *D, XAie_LocType t, u8 ch, XAie_DmaDirection dir) {
 #define MT_R_OFF 0u
 #define MT_W_OFF (256u << 10)
 #define DDR_BYTES (4u << 20) /* per column per rep */
+#ifndef DDR_NCOL
 #define DDR_NCOL 4
+#endif
 #define DDR_REPS 9 /* odd: the median is one real rep */
 static AieRC shimbd(XAie_DevInst *D, u8 col, XAie_MemInst *m, uint32_t n, u16 b) {
     XAie_LocType S = XAie_TileLoc(col, 0);
@@ -116,19 +118,24 @@ static XAie_MemInst *alloc64(XAie_DevInst *D, uint32_t cap) {
 static inline uint32_t pat(uint32_t i, uint32_t salt) { return (i * 2654435761u) ^ salt; }
 static uint32_t g_mt[MT_LEN / 4];
 
-/* kind 0 = read (DDR -> memtile), 1 = write (memtile -> DDR); columns 0..ncol-1 concurrently */
-static void ddr_point(XAie_DevInst *D, int kind, int ncol, XAie_MemInst **buf) {
+/* kind 0 = read (DDR -> memtile), 1 = write (memtile -> DDR), 2 = both at once (read into buf[c], write from
+ * the memtile into wbuf[c]); columns 0..ncol-1 concurrently. bytes= counts both directions for kind 2. */
+static void ddr_point(XAie_DevInst *D, int kind, int ncol, XAie_MemInst **buf, XAie_MemInst **wbuf) {
     const uint32_t n = DDR_BYTES, rep = n / MT_LEN;
+    const int rd = kind != 1, wr = kind != 0;
     for (int c = 0; c < ncol; c++) {
-        uint32_t *p = (uint32_t *)XAie_MemGetVAddr(buf[c]);
         const uint32_t salt = 0x5C000000u + 64 * kind + 8 * ncol + c;
-        if (kind == 0) {
+        if (rd) {
+            uint32_t *p = (uint32_t *)XAie_MemGetVAddr(buf[c]);
             for (uint32_t i = 0; i < n / 4; i++) p[i] = pat(i, salt);
             XAie_MemSyncForDev(buf[c]);
-        } else {
+        }
+        if (wr) {
+            uint32_t *p = (uint32_t *)XAie_MemGetVAddr(wbuf[c]);
             for (uint32_t i = 0; i < n / 4; i++) p[i] = 0xDEADBEEFu;
-            XAie_MemSyncForDev(buf[c]);
-            for (uint32_t i = 0; i < MT_LEN / 4; i++) g_mt[i] = pat(i, salt);
+            XAie_MemSyncForDev(wbuf[c]);
+            for (uint32_t i = 0; i < MT_LEN / 4; i++)
+                g_mt[i] = pat(i, salt ^ 0x00A50000u);
             CK(XAie_DataMemBlockWrite(D, XAie_TileLoc(c, MT_ROW), MT_W_OFF, g_mt, MT_LEN));
         }
     }
@@ -136,18 +143,21 @@ static void ddr_point(XAie_DevInst *D, int kind, int ncol, XAie_MemInst **buf) {
     int fails = 0, nr = 0;
     for (int r = 0; r < DDR_REPS && !fails; r++) {
         AieRC rc = XAIE_OK;
-        for (int c = 0; c < ncol; c++)
-            rc = (AieRC)(rc | (kind == 0 ? (shimbd(D, c, buf[c], n, 0) | mtbd(D, c, MT_R_OFF, MT_LEN, 0))
-                                         : (shimbd(D, c, buf[c], n, 1) | mtbd(D, c, MT_W_OFF, MT_LEN, 1))));
+        for (int c = 0; c < ncol; c++) {
+            if (rd)
+                rc = (AieRC)(rc | shimbd(D, c, buf[c], n, 0) | mtbd(D, c, MT_R_OFF, MT_LEN, 0));
+            if (wr)
+                rc = (AieRC)(rc | shimbd(D, c, wbuf[c], n, 1) | mtbd(D, c, MT_W_OFF, MT_LEN, 1));
+        }
         u64 a0 = 0, a1 = 0;
         XAie_ReadTimer(D, XAie_TileLoc(0, 0), XAIE_PL_MOD, &a0);
         uint64_t c0 = cntpct();
         for (int c = 0; c < ncol; c++) {
             XAie_LocType S = XAie_TileLoc(c, 0), M = XAie_TileLoc(c, MT_ROW);
-            if (kind == 0)
+            if (rd)
                 rc = (AieRC)(rc | XAie_DmaChannelSetStartQueue(D, M, 0, DMA_S2MM, 0, rep, XAIE_DISABLE) |
                              XAie_DmaChannelPushBdToQueue(D, S, 1, DMA_MM2S, 0));
-            else
+            if (wr)
                 rc = (AieRC)(rc | XAie_DmaChannelPushBdToQueue(D, S, 0, DMA_S2MM, 1) |
                              XAie_DmaChannelSetStartQueue(D, M, 0, DMA_MM2S, 1, rep, XAIE_DISABLE));
         }
@@ -155,8 +165,9 @@ static void ddr_point(XAie_DevInst *D, int kind, int ncol, XAie_MemInst **buf) {
         for (uint32_t p = 0; p < 200000000u && left; p++) {
             left = 0;
             for (int c = 0; c < ncol; c++) {
-                int x = kind == 0 ? pend(D, XAie_TileLoc(c, MT_ROW), 0, DMA_S2MM) : pend(D, XAie_TileLoc(c, 0), 0, DMA_S2MM);
-                int y = kind == 0 ? pend(D, XAie_TileLoc(c, 0), 1, DMA_MM2S) : 0;
+                int x =
+                    rd ? (pend(D, XAie_TileLoc(c, MT_ROW), 0, DMA_S2MM) | pend(D, XAie_TileLoc(c, 0), 1, DMA_MM2S)) : 0;
+                int y = wr ? pend(D, XAie_TileLoc(c, 0), 0, DMA_S2MM) : 0;
                 left += (x | y) != 0;
             }
         }
@@ -175,14 +186,16 @@ static void ddr_point(XAie_DevInst *D, int kind, int ncol, XAie_MemInst **buf) {
     if (!fails)
         for (int c = 0; c < ncol; c++) {
             const uint32_t salt = 0x5C000000u + 64 * kind + 8 * ncol + c;
-            if (kind == 0) {
+            if (rd) {
                 CK(XAie_DataMemBlockRead(D, XAie_TileLoc(c, MT_ROW), MT_R_OFF, g_mt, MT_LEN));
                 const uint32_t base = (n - MT_LEN) / 4;
                 for (uint32_t i = 0; i < MT_LEN / 4; i++) bad += g_mt[i] != pat(base + i, salt);
-            } else {
-                XAie_MemSyncForCPU(buf[c]);
-                const uint32_t *o = (const uint32_t *)XAie_MemGetVAddr(buf[c]);
-                for (uint32_t i = 0; i < n / 4; i++) bad += o[i] != pat(i % (MT_LEN / 4), salt);
+            }
+            if (wr) {
+                XAie_MemSyncForCPU(wbuf[c]);
+                const uint32_t *o = (const uint32_t *)XAie_MemGetVAddr(wbuf[c]);
+                for (uint32_t i = 0; i < n / 4; i++)
+                    bad += o[i] != pat(i % (MT_LEN / 4), salt ^ 0x00A50000u);
             }
         }
     /* insertion sort of the per-rep times: min = tr[0], median = tr[nr/2] */
@@ -190,9 +203,10 @@ static void ddr_point(XAie_DevInst *D, int kind, int ncol, XAie_MemInst **buf) {
         for (int j = i; j > 0 && tr[j - 1] > tr[j]; j--) {
             uint64_t t = tr[j]; tr[j] = tr[j - 1]; tr[j - 1] = t;
         }
+    static const char *kn[] = {"rd", "wr", "rdwr"};
     say("MB ddr kind=%s cols=%d reps=%d bytes=%llu cntpct=%llu cntpct_min_rep=%llu cntpct_med_rep=%llu cntfrq=%llu "
         "aie_cyc=%llu data=%s",
-        kind == 0 ? "rd" : "wr", ncol, nr, (unsigned long long)n * ncol * nr, (unsigned long long)tk,
+        kn[kind], ncol, nr, (unsigned long long)n * ncol * nr * (rd + wr), (unsigned long long)tk,
         (unsigned long long)(nr ? tr[0] : 0), (unsigned long long)(nr ? tr[nr / 2] : 0), (unsigned long long)cntfrq(),
         (unsigned long long)cy, (bad || fails) ? "BAD" : "OK");
     if (bad || fails) g_fail++;
@@ -286,11 +300,16 @@ static void bench_ddr(XAie_DevInst *D) {
         CK(XAie_DmaChannelEnable(D, M, 0, DMA_S2MM));
         CK(XAie_DmaChannelEnable(D, M, 0, DMA_MM2S));
     }
-    XAie_MemInst *b[DDR_NCOL];
+    XAie_MemInst *b[DDR_NCOL], *w[DDR_NCOL];
     for (int c = 0; c < DDR_NCOL; c++)
-        if (!(b[c] = alloc64(D, DDR_BYTES))) { say("MB ddr alloc failed"); g_fail++; return; }
-    for (int kind = 0; kind < 2; kind++)
-        for (int nc = 1; nc <= DDR_NCOL; nc++) ddr_point(D, kind, nc, b);
+        if (!(b[c] = alloc64(D, DDR_BYTES)) || !(w[c] = alloc64(D, DDR_BYTES))) {
+            say("MB ddr alloc failed");
+            g_fail++;
+            return;
+        }
+    for (int kind = 0; kind < 3; kind++)
+        for (int nc = 1; nc <= DDR_NCOL; nc++)
+            ddr_point(D, kind, nc, b, w);
     bench_burst(D, b[0]);
 }
 

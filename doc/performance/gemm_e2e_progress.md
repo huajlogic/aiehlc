@@ -889,3 +889,111 @@ stack, accumulators and output already occupy banks 0-3).
     data in b0, output buffers in b3. No full 4 KB piece is free elsewhere.
 - The code for both was not kept.
 
+
+## palmyra on the PDI of 2026-11-25: DDR no longer binds; the 95 % question (2026-11-25)
+
+**DDR re-measured** (`example/perf/ddr_microbench.cc`, new `kind=rdwr`: read and write on every column at
+once; shim <-> MemTile, 4 MiB per column, median of 9 reps). One shim channel ~7.6 GB/s each way (a stream
+lane carries ~8 B per 1 GHz cycle on aie2ps, not 4); reads 25-27.5 GB/s and writes ~25 GB/s from 4 columns
+on; read + write together 33-36 GB/s -- they overlap. The PDI before it: 16.1 / 3.58 GB/s, serialized.
+AIE clock 1000 MHz (`MB clk`). `gemm_plan.py` carries these (`palmyra`; `gemm_autotile.cpp`'s copy is
+`perftest/gemm90/gemm_autotile_palmyra_pdi2.patch`, not yet validated on the board; the old
+profile is `palmyra_pdi1`, which the `--check` runs were measured on).
+
+**gemm_plan end to end: 85.66 %** (7680 x 512 x 2560 int8, 1.435 ms per launch, GOLDEN PASS; 47 % on the
+old PDI). Core-bound, like VEK385 (85.7 %); the model predicts 83.8 %.
+
+**Core loop alone: 97.6 %** (`simplegemm_peak.cc` + `perftest/gemm90/simplegemm_peak_2x4.patch`, operands resident, klog CYC): 16 x 32 x 1152 per core,
+2 x 4 blocking (all 8 accumulators), 1152 MAC instructions in 1180 cycles. Every accumulator group pays
+~20-30 cycles outside its K loop, so the efficiency is K steps per group (skill **coremacpeak**).
+
+**Why the two differ, and what 95 % end to end would need.** A core reaches 97 % only when one accumulator
+group runs ~600+ MAC instructions between its fill and its drain. Streaming designs cannot give it that:
+
+| design | what limits it | measured / bound |
+|---|---|---|
+| gemm_plan (2 x 8 shared, partial sums in core memory per 128-B K chunk) | static schedule 94.7 % (21632 bundles / 20480 MACs per tile) before any stall; bank conflicts ~5 %, lock waits ~3 %, fill ~1.5 % | 85.7 % |
+| same, KC 256 | 2 slots per channel only (16 KB chunks + 16 KB accumulators + C + stack): ~15 % lock waits | slower than KC 128 (VEK385) |
+| same, 2 x 4 blocking | the 8-accumulator store / reload per chunk cannot overlap a MAC: 169 bundles per 128 MACs | 75.7 % static |
+| cascade K-split (group 16 x 32 in registers, partials over the cascade) | 2 KB in + 2 KB out per group at 64 B/cycle = 64 cycles; a K slice of 1280 to reach 95 % needs 60 KB of operands per group, streamed at 48 B/cycle | <= 71-91 % for slices that fit |
+| weight-stationary (B resident per core, A streamed, accumulators in registers for the whole K) | B (Nc x K) + 2 A blocks (16 x K) must fit ~48 KB, A intake 512 / Nc B/cycle; K >= ~600 per group for 97 % leaves Nc <= ~40 -> 13+ B/cycle of A; at K 384 (Nc 64-96) one 2 x 2 block pays ~35 cycles: `simplegemm_ws.cc` measured | 84.4 % (1365 cycles / 1152 MAC instr) |
+
+So on this array (64 KB core memory, 8 accumulator registers, 2 x 8 B/cycle into a core) a DDR-fed int8 GEMM
+has to give up either K per accumulator group (static overhead) or buffer slots (lock waits); none of the
+five designs above reaches 95 % end to end, and the best measured is gemm_plan's 85.7 %.
+
+**Compared with RSN-XNN (ISCA 2025, arXiv 2411.17966), on its timing basis (2026-11-25).** RSN reports, on
+VCK190 (AIE1, FP32, 384 of 400 tiles), 6.78 TFLOPS with operands generated in the PL and 6.75 TFLOPS for a
+6144^3 GEMM through DRAM: ~88 % of the 384 tiles' peak. Its duration includes neither the host copy into DDR
+nor the kernel start. gemm_plan now prints, per launch, the host time in `wait_io`
+(`__Runtime_host_split_wait_ticks`, always on) next to the end-to-end time; the difference is the host-side
+launch cost (shim BD re-arm, go lock, cache sync). palmyra, 7680 x 512 x 2560, launches 2-8, GOLDEN PASS:
+
+| basis | per launch | of peak |
+|---|---|---|
+| end to end (our usual figure) | 1.435 ms | 85.65 % |
+| `wait_io` only (RSN basis; slightly generous, it starts after the last `start_io`) | 1.422 ms | **86.4 %** |
+| host launch cost | 0.012 ms | 0.8 points |
+
+(The first launch adds 1.38 ms of ELF load, outside the steady median and outside RSN's basis too.)
+
+**RSN's shape does not help here.** One N = 512 slab of RSN's problem, 6144 x 512 x 6144, runs at **6.440 ms =
+36.6 %** (GOLDEN PASS): B's column strip needs 786 KB per MemTile with 512 KB left next to A's ring, so the plan
+streams B as `memtile_ring 2`, re-read from DDR for every output tile, and the launch is DDR-bound. On this array
+a fast shape needs B's K strip to fit the MemTile (K 2560 does); a large K needs a K split first.
+
+## Loss tables: gemm_plan on palmyra and VEK385 (2026-11-25)
+
+Measured with the loss counters (`perftest/gemm90/`: `runtime_coreloss.patch` = `__Runtime_core_loss_arm` /
+`_read`, `gemm_plan_loss.patch` = `gemm_plan.cc --define GP_LOSS=1`, `losstable.py`; skill **coreloss**): one ELF, 7680 x 512 x 2560
+int8, 4 x 4, GOLDEN PASS on both boards, launches 3-6 (one DM bank pair each), per core, median over the 16
+cores. Shares of the launch time:
+
+| item | palmyra (1000 MHz, 1.435 ms) | VEK385 (1250 MHz, 1.150 ms) |
+|---|---|---|
+| VMAC (1,228,860 vector instructions; 1,228,800 MAC instructions expected) | 85.6 % | 85.5 % |
+| other instructions (chunk / tile boundaries, accumulator spill, convert) | 6.1 % | 6.1 % |
+| memory stall (DM bank conflicts) | 4.6 % | 4.7 % |
+| lock stall (incl. the go-lock wait of the host launch and the launch fill) | 3.7 % | 3.7 % |
+| host launch (end to end - `wait_io`; inside the lock stall row) | 1.1 % | 0.8 % |
+
+DM bank conflicts per core per launch: banks 4-7 (operand chunks) 41-45 k each, banks 2-3 ~2 k, banks 0-1 ~0,
+on both boards. Every core within ~0.3 points of the median.
+
+- **The two boards are the same, cycle for cycle**: with DDR no longer binding on palmyra, the design is
+  core-bound everywhere and its losses are properties of the kernel and the plan's memory layout.
+- **"Other instructions" 6.1 %** matches the static bound of the kernel listing (94.7 %, "Static bound of the
+  current kernel" above), so the schedule itself is the largest single loss.
+- **Memory stall 4.6 %** is all in the four operand banks; the earlier share2x8 experiments ("Operand-memory bank
+  bandwidth is the binding limit") moved it into lock stall rather than removing it.
+- The share2x8 table above (VEK385, 81.8 % VMAC, `--perfcnt`) is kept: it measured the hand-generated design
+  at 82.5 %; this one is the compiler-generated gemm_plan at 85.5 %.
+
+**Where the 6.1 % "other instructions" go (kernel.lst of the same build).** One 64 x 64 tile = 20 K chunks of
+1024 MAC instructions:
+
+| part | bundles | MAC instr | extra bundles | share of the tile |
+|---|---|---|---|---|
+| 18 middle chunks: 7 loop iterations x 131 bundles per 128 MACs | 16506 | 16128 | 378 | 1.7 % |
+| 18 middle chunk boundaries (lock chain, pointer reset, loop setup): 159 bundles per 128 MACs | 2862 | 2304 | 558 | 2.6 % |
+| tile prologue + chunk 0 (zero start, 146-bundle loop) + last chunk (int8 out, 139-bundle loop) | 2451 | 2048 | 403 | 1.8 % |
+| **tile** | **21819** | **20480** | **1339** | **6.1 %** (= the measured row) |
+
+A middle boundary spends ~16 bundles with no MAC on the shared-operand lock protocol
+(`aie_block_io_plan.h`): per operand the lock id is computed from the chunk count and the reader
+(`AND` / `OR` / `ADD`), then `ACQ`, `ADD`, two `NOPX`, `REL` (hand-on), all serialized by the memory fence.
+Removing that chain entirely is worth ~1.3 points; the inner loop's 3 extra bundles per 128 MACs and the
+first / last chunk are worth ~1.7 % together but have resisted earlier attempts (see "Static bound of the
+current kernel").
+
+**Trying to shrink the chunk boundary (2026-11-25, not kept).** Board: palmyra, 8 launches, GOLDEN PASS each.
+
+| attempt | middle boundary (bundles per 128 MACs) | palmyra steady (other instr) | why |
+|---|---|---|---|
+| baseline | 153 (+5 loop setup) | 1.435 ms, 85.63 % (6.1 %) | -- |
+| spill block 14's accumulators before the next chunk's locks (they do not depend on it) | 189 | 1.468 ms, 83.72 % (8.1 %) | the spill used to overlap block 15's MACs; ahead of the plan's memory fence it cannot |
+| hand-on lock id as its own expression of loop invariants (`aie_block_io_plan.h`) | 152 | 1.434 ms, 85.72 % (6.0 %): noise | chess folds it back to `acq + 2` for one operand; for the other the id is ready early, yet `REL` still follows `ACQ` by 3 `NOPX`: the gap is the lock unit, not the arithmetic |
+| counting reader locks (DMA releases +readers, no hand-on) | not built | -- | unsafe: a reader two chunks ahead of its partner would take the partner's unit of an older chunk and read a buffer that is not filled yet; the hand-on turn lock is what orders the readers |
+
+So the ~16 lock bundles per boundary are the protocol's floor on this hardware (per operand: id, `ACQ`,
+3 cycles, `REL`), and chess does not fill the gap with MACs. The design's ceiling stays ~86-87 % (array basis).
