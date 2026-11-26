@@ -1,0 +1,73 @@
+{
+ "note": "gemm90 int8 4096^3 lever formulas (moved from maxwell/tasks/gemm90/m336212422221221/levers.json). Class discounts are written by `attrib_pred.py --calibrate --write`; do not type numbers into 'classes'.",
+ "go_rule_us": 130.0,
+ "pred_src": "tools/attrib_pred.py",
+ "b_group": [
+  "b_lockplace",
+  "b_mtpp",
+  "b_share"
+ ],
+ "formulas": {
+  "b_lockplace": "b_us * lock_move_disc",
+  "b_mtpp": "b_us * buffer_decouple_disc",
+  "b_share": "b_us * buffer_decouple_disc",
+  "a_lockplace": "a_us * lock_move_disc",
+  "go_place": "go_us * lock_move_disc",
+  "issue_ahead": "gap_slope_after * 7 * max(0, 0 - gap_slack_us)"
+ },
+ "lever_class": {
+  "b_lockplace": "lock_move",
+  "b_mtpp": "buffer_decouple",
+  "b_share": "buffer_decouple",
+  "a_lockplace": "lock_move",
+  "go_place": "lock_move",
+  "issue_ahead": "core_active"
+ },
+ "calib_check": {
+  "class": "lock_move",
+  "label": "lockplace",
+  "tol_us": 20.0
+ },
+ "classes": {
+  "lock_move": {
+   "kind": "delta",
+   "src": "m3362124222212221/pb.txt",
+   "lines": [
+    11,
+    12
+   ],
+   "tag": "RESULT",
+   "meas_key": "d_median_us",
+   "x_base_key": "base_b_us_4_3",
+   "x_lever_key": "lever_b_us_4_3",
+   "meaning": "end-to-end us per us of B lock wait moved off the (4,3) tile (PB base vs lock-place lever, same head)",
+   "disc": -0.641844,
+   "disc_src": "m3362124222212221/pb.txt:11-12",
+   "n_samples": 1,
+   "meas_us": -18.1,
+   "dx_us": 28.2
+  },
+  "core_active": {
+   "kind": "ratio",
+   "src": "m33621242222122/lower_bound.txt",
+   "lines": [
+    4
+   ],
+   "regex": "= (?P<meas>[0-9.]+) us \\(PB PRED (?P<pred>[0-9.]+) us; measured is",
+   "meaning": "measured / predicted core-active saving (ratio source, n_samples=1)",
+   "disc": 8.987179,
+   "disc_src": "m33621242222122/lower_bound.txt:4",
+   "n_samples": 1,
+   "source_kind": "ratio",
+   "meas_us": 70.1,
+   "pred_us": 7.8
+  },
+  "buffer_decouple": {
+   "kind": "uncalibrated",
+   "priced_by": "src/costmodel/des.py (phase PM: depth + column coupling)",
+   "disc": null,
+   "disc_src": "UNCALIBRATED: src/costmodel/des.py (phase PM: depth + column coupling)",
+   "n_samples": 0
+  }
+ }
+}
