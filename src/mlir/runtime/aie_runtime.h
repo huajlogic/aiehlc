@@ -1228,4 +1228,82 @@ AieRC __Runtime_ctrl_row_read(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t 
 AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr, const uint32_t *data,
                                    uint32_t nwords, int32_t bd_id, int32_t mm2s_ch);
 
+// ---- AIEHLC_SLICE_TS (gemm90 m33621242222122 PT): per-slice host timestamps in the AIE timer domain ----------------
+// Compile-time knob, default OFF: undefined or 0 compiles nothing below and leaves the runtime as before (the
+// generated host.cc never names it). -DAIEHLC_SLICE_TS=<N> (EXTRA_DEFS, e.g. run_board.sh ... -DAIEHLC_SLICE_TS=101):
+//   issue     host count at the call's first __Runtime_startio_slice (entry: the call's first sliced input issue)
+//   wait_ret  host count when the call's last __Runtime_wait_io_pq returns
+// One record per call (= per slice; a dataflow_slices launch is <slices> calls, call i serves slice i % slices),
+// stored in a preallocated array of AIEHLC_SLICE_TS_CAP records (no malloc, no print in the timed loop: two XTime
+// reads per call). A launch = the calls after one __Runtime_shim_bd_rebase_count_reset() (gemm_plan drivers call it
+// before each launch's timed window). Domain aie_timer: host counts are mapped onto the free-running core timer of
+// tile (AIEHLC_SLICE_TS_COL, AIEHLC_SLICE_TS_ROW) (default (1,3), the gemm kernel group's first core) through two
+// anchors (XAie_ReadTimer between two host reads, host = midpoint; __Runtime_aie_trace_profile_anchor): anchor 0
+// right before the first record, anchor 1 at the dump. The dump runs once, from __Runtime_shim_bd_rebase_count()
+// once launch N has finished (the drivers read the count after the launch's closing XTime, i.e. outside the timed
+// window), or explicitly via __Runtime_slice_ts_dump(dev). Lines:
+//   SLICETS_CFG knob=AIEHLC_SLICE_TS launches=<l> calls=<n> dropped=<d> fields=issue,wait_ret domain=aie_timer
+//               tile=<c>,<r> aie0= host0= aie1= host1= cps= aie_per_host=<f>
+//   SLICETS launch=<l> slice=<s> call=<k> issue=<aie cyc> wait_ret=<aie cyc> dur_cyc=<wait_ret-issue>
+//   SLICETS_DONE n=<calls>
+// The record logic is plain C between the SLICETS-BEGIN/END markers (kernel_trace_cases.py stub compiles it on x86).
+/* SLICETS-BEGIN */
+#if (defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS) || defined(AIEHLC_SLICE_TS_SELFTEST)
+#ifndef AIEHLC_SLICE_TS_CAP
+#define AIEHLC_SLICE_TS_CAP 1024u /* >= 101 launches x 8 slices */
+#endif
+typedef struct {
+    uint64_t issue, wait_ret; /* host counts (mapped to AIE cycles at the dump) */
+    uint32_t launch, slice;   /* launch = 1-based count of rebase_count_reset() calls, slice = call within it */
+} AieSliceTsRec;
+typedef struct {
+    AieSliceTsRec rec[AIEHLC_SLICE_TS_CAP];
+    uint32_t n, dropped, launch, lcall;
+    int phase; /* 0 no call open, 1 issued (later startio_slice of the same call ignored), 2 a wait returned */
+    int cur;   /* rec index of the open call, -1 = dropped */
+    int dumped;
+} AieSliceTs;
+static inline void aie_slice_ts_launch(AieSliceTs *s) {
+    s->launch++;
+    s->lcall = 0;
+    s->phase = 0;
+}
+static inline void aie_slice_ts_issue(AieSliceTs *s, uint64_t now) {
+    if (s->phase == 1)
+        return;
+    if (s->n < AIEHLC_SLICE_TS_CAP) {
+        AieSliceTsRec *r = &s->rec[s->n];
+        r->issue = now;
+        r->wait_ret = 0;
+        r->launch = s->launch;
+        r->slice = s->lcall;
+        s->cur = (int)s->n++;
+    } else {
+        s->dropped++;
+        s->cur = -1;
+    }
+    s->lcall++;
+    s->phase = 1;
+}
+static inline void aie_slice_ts_wait_ret(AieSliceTs *s, uint64_t now) {
+    if (s->phase == 0)
+        return;
+    if (s->cur >= 0)
+        s->rec[s->cur].wait_ret = now;
+    s->phase = 2;
+}
+/* host count h -> AIE cycles on the line through the anchors (h0, a0), (h1, a1); 0 when the anchors are unusable */
+static inline uint64_t aie_slice_ts_map(uint64_t h, uint64_t h0, uint64_t a0, uint64_t h1, uint64_t a1) {
+    if (h1 <= h0 || a1 <= a0)
+        return 0;
+    const double d = (double)(int64_t)(h - h0) * ((double)(a1 - a0) / (double)(h1 - h0));
+    return (uint64_t)((int64_t)a0 + (int64_t)(d < 0 ? d - 0.5 : d + 0.5));
+}
+#endif
+/* SLICETS-END */
+#if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
+// Print the SLICETS block now (once; later calls are no-ops). dev: for anchor 1 (NULL = the device of the records).
+void __Runtime_slice_ts_dump(XAie_DevInst *dev);
+#endif
+
 #endif // AIE_RUNTIME_H

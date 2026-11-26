@@ -740,6 +740,102 @@ def run_bdonce_stub(expect):
     return p.returncode == 0 and expect[5:] in out, out
 
 
+# gemm90 m33621242222122 PT: AIEHLC_SLICE_TS (aie_runtime.h, default off) -- per-slice host timestamps (issue = the
+# call's first __Runtime_startio_slice, wait_ret = its last __Runtime_wait_io_pq return) mapped onto the AIE timer
+# through two (host, aie) anchors. Stub (g++, x86): the SLICETS-BEGIN/END block of aie_runtime.h compiled with
+# AIEHLC_SLICE_TS_SELFTEST, driven like the 4096^3 int8 plan: 101 launches (rebase_count_reset each) x 8 calls x
+# (4 + 4 startio_slice, 8 wait_io_pq) on a fake host clock, anchors on aie = 7000 + 5/4 x host. Expect one record per
+# call (808), launch 1..101 / slice 0..7, issue < wait_ret, the map exact (|err| = 0 cyc), nothing dropped, and past
+# the 1024-record array the overflow counted (30 more launches = 240 calls -> 216 stored, 24 dropped).
+# Red (no SLICETS block, e.g. ccf3a5df): the stub reports SLICETS FAIL.
+SLICETS_H = REPO / "src" / "mlir" / "runtime" / "aie_runtime.h"
+SLICETS_BASE = SLICETS_H.parent / "__slicets_stub__"
+SLICETS_SRC = r"""
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#if __has_include("slicets_block.h")
+#define AIEHLC_SLICE_TS_SELFTEST 1
+#include "slicets_block.h"
+#endif
+int main() {
+#ifndef AIEHLC_SLICE_TS_CAP
+    printf("SLICETS FAIL: no AIEHLC_SLICE_TS block in aie_runtime.h\n");
+    return 1;
+#else
+    static AieSliceTs s;
+    s.cur = -1;
+    uint64_t h = 123456;  // fake host clock
+    const uint64_t h0 = 100000, a0 = 7000 + 5 * h0 / 4;
+    for (int l = 0; l < 101; l++) {
+        aie_slice_ts_launch(&s);
+        for (int c = 0; c < 8; c++) {
+            for (int i = 0; i < 4; i++) aie_slice_ts_issue(&s, h += 4);  // A: 4 shim startio_slice
+            h += 40;                                                     // C startio
+            for (int i = 0; i < 4; i++) aie_slice_ts_issue(&s, h += 4);  // B: 4 more (same call)
+            h += 1000;                                                   // the slice computes
+            for (int i = 0; i < 8; i++) aie_slice_ts_wait_ret(&s, h += 8);
+            h += 20;
+        }
+    }
+    const uint64_t h1 = h + 1000, a1 = 7000 + 5 * h1 / 4;
+    unsigned order = 0, slices_ok = 1, launch_ok = 1;
+    long long err = 0;
+    for (unsigned i = 0; i < s.n; i++) {
+        const AieSliceTsRec &r = s.rec[i];
+        order += r.issue < r.wait_ret;
+        slices_ok &= r.slice == i % 8;
+        launch_ok &= r.launch == i / 8 + 1;
+        const long long e1 = (long long)aie_slice_ts_map(r.issue, h0, a0, h1, a1) - (long long)(7000 + 5 * r.issue / 4);
+        const long long e2 =
+            (long long)aie_slice_ts_map(r.wait_ret, h0, a0, h1, a1) - (long long)(7000 + 5 * r.wait_ret / 4);
+        err = llabs(e1) > err ? llabs(e1) : err;
+        err = llabs(e2) > err ? llabs(e2) : err;
+    }
+    const unsigned n101 = s.n, d101 = s.dropped;
+    for (int l = 0; l < 30; l++) {
+        aie_slice_ts_launch(&s);
+        for (int c = 0; c < 8; c++) {
+            aie_slice_ts_issue(&s, h += 4);
+            aie_slice_ts_wait_ret(&s, h += 1000);
+        }
+    }
+    const bool ok = n101 == 808 && d101 == 0 && order == 808 && slices_ok && launch_ok && err == 0 &&
+                    s.n == AIEHLC_SLICE_TS_CAP && s.dropped == 240 - (AIEHLC_SLICE_TS_CAP - 808) &&
+                    aie_slice_ts_map(5, 10, 1, 10, 2) == 0;
+    printf("SLICETS launches=%u calls=%u dropped=%u issue_lt_wait=%u slices_ok=%u launch_ok=%u map_err_max=%lld "
+           "cap=%u overflow_dropped=%u %s\n",
+           s.launch - 30, n101, d101, order, slices_ok, launch_ok, err, (unsigned)AIEHLC_SLICE_TS_CAP, s.dropped,
+           ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+#endif
+}
+"""
+SLICETS_CASES = [
+    ("AIEHLC_SLICE_TS per-slice issue / wait_ret records + host->AIE timer map (101 launches x 8 slices, 1024 cap)",
+     [], "PASS:SLICETS launches=101 calls=808 dropped=0 issue_lt_wait=808 slices_ok=1 launch_ok=1 map_err_max=0 "
+         "cap=1024 overflow_dropped=24 OK"),
+]
+
+
+def run_slicets_stub(expect):
+    """g++ the SLICETS stub against the SLICETS-BEGIN/END block of aie_runtime.h (when present)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        txt = SLICETS_H.read_text() if SLICETS_H.exists() else ""
+        b, e = txt.find("/* SLICETS-BEGIN */"), txt.find("/* SLICETS-END */")
+        if 0 <= b < e:
+            (pathlib.Path(tmp) / "slicets_block.h").write_text(txt[b:e])
+        src = pathlib.Path(tmp) / "slicets.cc"
+        src.write_text(SLICETS_SRC)
+        cc = subprocess.run(["g++", "-std=c++17", "-O1", "-Wall", "-Werror", "-I", tmp, "-o",
+                             str(pathlib.Path(tmp) / "slicets"), str(src)], capture_output=True, text=True, timeout=600)
+        if cc.returncode != 0:
+            return False, cc.stdout + cc.stderr
+        p = subprocess.run([str(pathlib.Path(tmp) / "slicets")], capture_output=True, text=True, timeout=600)
+        out = p.stdout + p.stderr
+    return p.returncode == 0 and expect[5:] in out, out
+
+
 # m3362124222211 PK: x86 numerics of the hand-scheduled 64 x 64 x 128 int8 tile (gemm_plan_tile.h K4_* / SH_*) as the
 # N-sliced gemm_ka runs it -- chunk 0 (K4_BLKZ: every block starts with a mul, accumulators never zeroed -- they start
 # as garbage here so a missed init shows), the late-take / late-give chunk boundary SH_BOUND_L, the B pair pointers
@@ -898,6 +994,8 @@ def run_case(cli, name, edits, expect, base=BASE):
         return run_pq_stub(expect)
     if base == BDONCE_BASE:
         return run_bdonce_stub(expect)
+    if base == SLICETS_BASE:
+        return run_slicets_stub(expect)
     src = inline_cc(base) if base in (GEMMPLAN_BASE, GEMMPLAN_T_BASE) else base.read_text()
     if base == TEMPLATE_BASE:  # the library kernel alone: add the includes and a host launch
         src = TEMPLATE_HEAD + src + TEMPLATE_HOST
@@ -938,6 +1036,7 @@ def main():
     cases += [(n, e, x, PQ_BASE) for n, e, x in PQ_CASES]
     cases += [(n, e, x, BDONCE_BASE) for n, e, x in BDONCE_CASES]
     cases += [(n, e, x, K4_NUM_BASE) for n, e, x in K4_NUM_CASES]
+    cases += [(n, e, x, SLICETS_BASE) for n, e, x in SLICETS_CASES]
     if len(sys.argv) > 2:  # a name filter
         cases = [c for c in cases if sys.argv[2] in c[0]]
     for name, edits, expect, base in cases:

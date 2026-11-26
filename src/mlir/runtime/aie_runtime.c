@@ -7541,9 +7541,90 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
  * Host-readable call counter; P3 reports it as rebase writes per launch. */
 static volatile uint64_t g_shim_bd_rebase_n = 0;
 
-uint64_t __Runtime_shim_bd_rebase_count(void) { return g_shim_bd_rebase_n; }
+#if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
+/* AIEHLC_SLICE_TS (aie_runtime.h): per-slice issue / wait_ret host counts, mapped to the AIE timer at the dump. */
+#ifndef AIEHLC_SLICE_TS_COL
+#define AIEHLC_SLICE_TS_COL 1
+#endif
+#ifndef AIEHLC_SLICE_TS_ROW
+#define AIEHLC_SLICE_TS_ROW 3
+#endif
+static AieSliceTs s_slice_ts;
+static AieTraceProfile s_slice_ts_prof; /* anchors only (host0/host1 + one tile's aie0/aie1) */
+static XAie_DevInst *s_slice_ts_dev = NULL;
+static int s_slice_ts_anchored = 0;
 
-void __Runtime_shim_bd_rebase_count_reset(void) { g_shim_bd_rebase_n = 0; }
+/* host-before -> XAie_ReadTimer(core tile) -> host-after; host = midpoint (as __aie_trace_anchor_all) */
+static void rt_slice_ts_anchor(XAie_DevInst *dev, int which) {
+    const XAie_LocType t = XAie_TileLoc(AIEHLC_SLICE_TS_COL, AIEHLC_SLICE_TS_ROW);
+    uint64_t v = 0;
+    const uint64_t hb = __aie_host_now();
+    __Runtime_read_aie_timer(dev, t, &v);
+    const uint64_t ha = __aie_host_now();
+    __Runtime_aie_trace_profile_anchor(&s_slice_ts_prof, which, t, v, hb + (ha - hb) / 2);
+}
+
+static inline void rt_slice_ts_issue(XAie_DevInst *dev) {
+    if (!s_slice_ts_anchored && dev) {
+        __Runtime_aie_trace_profile_init(&s_slice_ts_prof);
+        __Runtime_aie_trace_profile_set_clock(&s_slice_ts_prof, __aie_host_cps());
+        s_slice_ts.cur = -1;
+        s_slice_ts_dev = dev;
+        rt_slice_ts_anchor(dev, 0);
+        s_slice_ts_anchored = 1;
+    }
+    aie_slice_ts_issue(&s_slice_ts, __aie_host_now());
+}
+
+void __Runtime_slice_ts_dump(XAie_DevInst *dev) {
+    if (s_slice_ts.dumped)
+        return;
+    s_slice_ts.dumped = 1;
+    if (!dev)
+        dev = s_slice_ts_dev;
+    if (!s_slice_ts_anchored || !dev) {
+        printf("SLICETS_CFG knob=AIEHLC_SLICE_TS launches=%u calls=0 dropped=%u fields=issue,wait_ret domain=none "
+               "(no sliced call recorded)\n",
+               (unsigned)s_slice_ts.launch, (unsigned)s_slice_ts.dropped);
+        printf("SLICETS_DONE n=0\n");
+        return;
+    }
+    rt_slice_ts_anchor(dev, 1);
+    const AieTraceAnchor *a = &s_slice_ts_prof.anchor[0];
+    const uint64_t h0 = s_slice_ts_prof.host0, h1 = s_slice_ts_prof.host1;
+    const double k = (h1 > h0) ? (double)(a->aie1 - a->aie0) / (double)(h1 - h0) : 0.0;
+    printf("SLICETS_CFG knob=AIEHLC_SLICE_TS launches=%u calls=%u dropped=%u fields=issue,wait_ret domain=aie_timer "
+           "tile=%u,%u aie0=%llu host0=%llu aie1=%llu host1=%llu cps=%llu aie_per_host=%.6f\n",
+           (unsigned)s_slice_ts.launch, (unsigned)s_slice_ts.n, (unsigned)s_slice_ts.dropped, (unsigned)a->col,
+           (unsigned)a->row, (unsigned long long)a->aie0, (unsigned long long)h0, (unsigned long long)a->aie1,
+           (unsigned long long)h1, (unsigned long long)s_slice_ts_prof.cps, k);
+    for (uint32_t i = 0; i < s_slice_ts.n; i++) {
+        const AieSliceTsRec *r = &s_slice_ts.rec[i];
+        const uint64_t ai = aie_slice_ts_map(r->issue, h0, a->aie0, h1, a->aie1);
+        const uint64_t aw = r->wait_ret ? aie_slice_ts_map(r->wait_ret, h0, a->aie0, h1, a->aie1) : 0;
+        printf("SLICETS launch=%u slice=%u call=%u issue=%llu wait_ret=%llu dur_cyc=%lld\n", (unsigned)r->launch,
+               (unsigned)r->slice, (unsigned)i, (unsigned long long)ai, (unsigned long long)aw,
+               aw ? (long long)(aw - ai) : -1LL);
+    }
+    printf("SLICETS_DONE n=%u\n", (unsigned)s_slice_ts.n);
+}
+#endif
+
+uint64_t __Runtime_shim_bd_rebase_count(void) {
+#if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
+    /* the drivers read the count right after a launch's closing XTime: dump once launch N is done (untimed) */
+    if (!s_slice_ts.dumped && s_slice_ts.launch >= (uint32_t)(AIEHLC_SLICE_TS))
+        __Runtime_slice_ts_dump(s_slice_ts_dev);
+#endif
+    return g_shim_bd_rebase_n;
+}
+
+void __Runtime_shim_bd_rebase_count_reset(void) {
+    g_shim_bd_rebase_n = 0;
+#if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
+    aie_slice_ts_launch(&s_slice_ts);
+#endif
+}
 
 /* a shim BD's address word(s) <- the device address of host pointer @addr (no rebase count) */
 static AieRC rt_shim_bd_addr_write(XAie_DevInst *dev, XAie_LocType tile, int bd, uint64_t addr, uint64_t *dma_out) {
@@ -9588,6 +9669,9 @@ static rt_pq_slot *rt_pq_of(struct_io io) {
 }
 
 struct_ioevent __Runtime_startio_slice(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
+#if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
+    rt_slice_ts_issue(dev); /* the call's first sliced issue opens its record (later ones are no-ops) */
+#endif
     rt_pq_slot *q = rt_pq_of(io);
     if (q && q->pending) { /* pre-queued by the previous call: already in the start queue */
         q->pending = 0U;
@@ -9635,6 +9719,9 @@ struct_ioevent __Runtime_startio_prequeue(XAie_DevInst *dev, struct_io io, int32
 void __Runtime_wait_io_pq(XAie_DevInst *dev, struct_ioevent io_event) {
     rt_pq_slot *q = rt_pq_of(io_event.io);
     rt_wait_io_upto(dev, io_event, (q && q->pending) ? 1U : 0U);
+#if defined(AIEHLC_SLICE_TS) && AIEHLC_SLICE_TS
+    aie_slice_ts_wait_ret(&s_slice_ts, __aie_host_now()); /* the call's last return wins */
+#endif
 }
 
 /**
