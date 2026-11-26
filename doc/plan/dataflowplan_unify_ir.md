@@ -23,6 +23,17 @@ regression script.
 
 ---
 
+## Status (evidence per stage)
+
+- [x] **Stage 0** (2026-11-26): open work committed (`97dac2e2`), main merged (`9315c6b2`), gate script
+      `script/test/plan_regress.sh`, snapshot of 11 sources, all `flowcheck: OK` (`simpleeltwise_add_none` is a plan
+      source -- per-core copies, "8 replaced by the dataflow plan" -- so it moved to the plan list).
+- [x] **Stage 1** (2026-11-26): `#routing.dataflow` typed; `compare` -> 11 / 11 `ok`, every generated file of every
+      source (plan sources included) byte-identical; `routing_ir_roundtrip.sh gemm_plan.cc` PASS (37 IR stage dumps
+      identical). Printed form: `#routing.dataflow<share = "neighbor", stage = "memtile_ring", ring = 10, keep = false,
+      parts = 2, axis = "", base_p0 = [], base_p1 = []>`. No board run needed: host.cc / kernel.cc / routing.cc identical.
+- [ ] Stages 2-4 (revised below: "the plan is the flow")
+
 ## Where the two representations meet today (survey 2026-11-26)
 
 | level | generic | plan | where |
@@ -58,8 +69,8 @@ Sources used by the gate:
 
 | kind | source |
 |---|---|
-| non-plan | `example/tileprogram/ccode/simplematmul2.cc`, `simplegemm_kernel_port.cc`, `simplegemm_dataflow.cc`, `simpleconv2d.cc`, `simpleconv2dkernel_port_less.cc`, `simpleeltwise_add_none.cc` |
-| plan | `gemm_plan/gemm_plan.cc`, `gemm_plan/gemm_plan_4x2.cc`, `gemm_plan/gemm_plan_bring.cc`, `simpleeltwise_add_plan.cc`, `simpleconv2dkernel_port_plan.cc` |
+| non-plan | `example/tileprogram/ccode/simplematmul2.cc`, `simplegemm_kernel_port.cc`, `simplegemm_dataflow.cc`, `simpleconv2d.cc`, `simpleconv2dkernel_port_less.cc` |
+| plan | `simpleeltwise_add_none.cc` (per-core copies), `gemm_plan/gemm_plan.cc`, `gemm_plan/gemm_plan_4x2.cc`, `gemm_plan/gemm_plan_bring.cc`, `simpleeltwise_add_plan.cc`, `simpleconv2dkernel_port_plan.cc` |
 
 ---
 
@@ -189,6 +200,31 @@ change spelling).
 commit.
 
 ---
+
+## Stages 2-4, revised (2026-11-26): the plan IS the flow
+
+Reading the lowering showed the "stand-in" flow is not dead weight: its core end is the kernel's window argument
+(`window_init` in kernel.cc, the kernel signature) and its core memory, which the plan's chunk slots live in
+(`planresource.cpp`, "the replaced windows"); only its host part (shim BDs, `create_io`, schedule) is already
+skipped (`passblueprinttoschedule.cpp:194`). Deleting the flow (Stage 2 as first written) would mean rebuilding the
+window and its memory from the plan. The cleaner unification keeps ONE flow per tensor and makes it the plan's:
+
+1. `#dmaphop.stream<...>` (typed, every `PlanStream` field) on the tensor's `create_path`(s); the plan's routes are
+   `create_hop`s of those paths (source `dmaphop.port` = the route's MM2S channel on a shim / MemTile / core tile,
+   destination ports = its S2MM channels; `route = i` on each hop keeps the router's order); the plan header
+   (persistent, bd_once) becomes module control switches.
+2. `collectDataflowPlan` reads the paths (old `dmaphop.plan*` ops, e.g. from `gen_plan.py` or an old
+   `AIEHLC_DMAPHOP_IR_IN` file, are converted to paths on entry -- one reader downstream); `plan_route` /
+   `plan_stream` / `plan` ops and the `dmaphop.plan_replaced` tag disappear from the IR after the plan step.
+3. Downstream keys on "the path carries a stream": DmaphopToRoutinghw lowers such a path's hops with the plan
+   router (`planroutes.cpp`) instead of erasing it, the provenance map / flowcheck JSON keep their keys
+   (`plan_routes`, `plan_replaced`), the blueprint host lowering keeps skipping the host part.
+4. The read-back dump (`DataflowPlanReadback(dmaphop)`) writes the same form.
+
+Gate: every generated file of every source byte-identical (plan included), dmaphop-stage round trip
+(`routing_ir_roundtrip.sh --stage dmaphop`) PASS on `gemm_plan.cc` and `simpleeltwise_add_plan.cc`, the old-op form
+(`gen_plan.py` output) still builds identically. The original Tasks 2.x-4 below stay as the record of the first
+design; 2.1 (plan-owned core memory) is not needed once the window is the plan flow's own.
 
 ## Stage 2: no stand-in flows
 

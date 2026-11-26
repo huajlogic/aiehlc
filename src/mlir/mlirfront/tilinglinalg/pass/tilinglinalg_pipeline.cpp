@@ -720,27 +720,22 @@ static void attachTensorRoutingInfo(OpBuilder &builder, ArrayRef<routing::create
             // load_buffer {.share / .stage / .ring / .keep} -> routing-level dataflow intent; a .stage without
             // .share plans a per-core stream (share = "none", with the core's block origin)
             if (kb.share || kb.stage) {
-                llvm::SmallVector<mlir::NamedAttribute> df;
-                df.push_back(builder.getNamedAttr("share", builder.getStringAttr(kb.share == 2 ? "broadcast"
-                                                                                 : kb.share    ? "neighbor"
-                                                                                               : "none")));
-                if (kb.share != 1) { // per-core copies: where each core's blocks start
-                    df.push_back(builder.getNamedAttr("base_p0", builder.getI64ArrayAttr(kb.baseP0)));
-                    df.push_back(builder.getNamedAttr("base_p1", builder.getI64ArrayAttr(kb.baseP1)));
-                }
-                if (kb.stage)
-                    df.push_back(builder.getNamedAttr(
-                        "stage", builder.getStringAttr(kb.stage == 2 ? "memtile_ring" : "memtile")));
-                if (kb.ring)
-                    df.push_back(builder.getNamedAttr("ring", builder.getI64IntegerAttr(kb.ring)));
-                if (kb.keep)
-                    df.push_back(builder.getNamedAttr("resident", builder.getStringAttr("launches")));
-                if (kb.parts > 1)
-                    df.push_back(builder.getNamedAttr("parts", builder.getI64IntegerAttr(kb.parts)));
-                if (kb.share == 2)
-                    df.push_back(builder.getNamedAttr("axis", builder.getStringAttr(kb.axis == 2 ? "column" : "row")));
-                decl->setAttr("dataflow", builder.getDictionaryAttr(df));
-                llvm::outs() << "[TilingLinalg] tensor_" << i << " dataflow=" << decl->getAttr("dataflow") << "\n";
+                const bool perCore = kb.share != 1; // per-core copies: where each core's blocks start
+                decl.setDataflowAttr(routing::DataflowAttr::get(
+                    ctx,
+                    kb.share == 2 ? "broadcast"
+                    : kb.share    ? "neighbor"
+                                  : "none",
+                    kb.stage == 2 ? "memtile_ring"
+                    : kb.stage    ? "memtile"
+                                  : "",
+                    kb.ring, kb.keep != 0, kb.parts > 1 ? kb.parts : 1,
+                    kb.share == 2 ? (kb.axis == 2 ? "column" : "row") : "",
+                    mlir::DenseI64ArrayAttr::get(ctx, perCore ? llvm::ArrayRef<int64_t>(kb.baseP0)
+                                                              : llvm::ArrayRef<int64_t>()),
+                    mlir::DenseI64ArrayAttr::get(ctx, perCore ? llvm::ArrayRef<int64_t>(kb.baseP1)
+                                                              : llvm::ArrayRef<int64_t>())));
+                llvm::outs() << "[TilingLinalg] tensor_" << i << " dataflow=" << decl.getDataflowAttr() << "\n";
             }
         }
     }
@@ -808,8 +803,9 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
         auto tensorValue = builder.create<bufferization::ToTensorOp>(builder.getUnknownLoc(), tensorType, memrefArg);
 
         // Feed into createscheduletensor — same as before
-        auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(),
-                                                           vals, dimnum, nullptr, nullptr, nullptr, nullptr, nullptr);
+        auto tensor =
+            builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(), vals,
+                                                 dimnum, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         tensorDecls.push_back(tensor);
         tensorValues.push_back(tensor);
         isInputFlags.push_back(tp.isInput);

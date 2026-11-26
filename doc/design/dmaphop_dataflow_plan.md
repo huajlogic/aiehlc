@@ -13,7 +13,7 @@ of them.
 | level | what you write | example |
 |---|---|---|
 | **C** | `load_buffer` options + `#pragma persistent_kernel` | `example/tileprogram/ccode/gemm_plan/gemm_plan.cc` |
-| **routing IR** | `dataflow = {...}` on a tensor's `routingcreatescheduletensor`, `routing.persistent_kernel` | `AIEHLC_ROUTING_IR_IN` |
+| **routing IR** | `#routing.dataflow<...>` (typed: share, stage, ring, keep, parts, axis, per-core bases) on a tensor's `routingcreatescheduletensor`, `routing.persistent_kernel` | `AIEHLC_ROUTING_IR_IN` |
 | **dmaphop IR** | the dataflow decisions: `dmaphop.plan` / `plan_route` / `plan_stream` | `gen_plan.py`, `AIEHLC_DMAPHOP_IR_IN` |
 | **dfschedule IR** (derived) | the DMA program: `config.tile_bd` / `lock_set` / `channel_enable` / `channel_start` (MemTiles, cores), `config.dma_bd` + `create_io` + `start_io` (shim), module switches | dumped as `*_DataflowPlanToDfschedule.mlir` |
 
@@ -113,10 +113,11 @@ shape (81 -> 81.8 %), `__restrict` output + division-free check + one fence (-> 
 
 ```mlir
 module attributes {routing.persistent_kernel = 1 : i64, ...} {
-  %A = routing.routingcreatescheduletensor ... {dataflow = {ring = 10 : i64, share = "neighbor",
-                                                 stage = "memtile_ring"}, kernel_block = ...}
-  %B = routing.routingcreatescheduletensor ... {dataflow = {resident = "launches", share = "neighbor",
-                                                 stage = "memtile"}, kernel_block = ...}
+  %A = routing.routingcreatescheduletensor ... {dataflow = #routing.dataflow<share = "neighbor",
+         stage = "memtile_ring", ring = 10, keep = false, parts = 2, axis = "", base_p0 = [], base_p1 = []>,
+         kernel_block = ...}
+  %B = routing.routingcreatescheduletensor ... {dataflow = #routing.dataflow<share = "neighbor",
+         stage = "memtile", ring = 0, keep = true, parts = 2, axis = "", base_p0 = [], base_p1 = []>, ...}
 ```
 
 `routing.persistent_kernel` is a control switch (module attribute); the per-tensor intent is on

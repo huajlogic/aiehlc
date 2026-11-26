@@ -349,7 +349,7 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     bool planned = false;
     if (auto fn = op->getParentOfType<func::FuncOp>())
         fn.walk([&](routing::createscheduletensor t) {
-            if (t->hasAttr("dataflow") && funcArgIdx >= 0 && traceToFuncArgIndex(t->getOperand(0)) == funcArgIdx)
+            if (t.getDataflowAttr() && funcArgIdx >= 0 && traceToFuncArgIndex(t->getOperand(0)) == funcArgIdx)
                 planned = true;
         });
     auto dio = planned ? router.createDataIOAtPoint(dioNameStream.str(), Point{0, targetCoreTile.c}, dmaDirection, 0)

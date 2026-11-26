@@ -105,6 +105,32 @@ def ShimDmaAttr : routingattr<"ShimDma"> {
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
+// A tensor's dataflow intent, from the kernel's load_buffer {.share / .stage / .ring / .keep / .parts / .axis}
+// (doc/design/dmaphop_dataflow_plan.md): how the dataflow plan should move it. Strings are "" when not
+// given (stage: no staging; axis: row), ring 0 = not given, parts 1 = one part; base_p0 / base_p1 are
+// the per-core block origins of a per-core copy (share != "neighbor"), empty otherwise. Every field is
+// printed and the arrays are DenseI64ArrayAttr (`array<i64: ..>`, empty `array<i64>`) so the dump
+// parses back (skill mlirattrarrayroundtrip).
+def DataflowAttr : routingattr<"Dataflow"> {
+  let mnemonic = "dataflow";
+  let summary = "dataflow-plan intent of one tensor (share, staging, ring, residency, parts)";
+  let cppNamespace = "routing";
+  let parameters = (ins
+    StringRefParameter<"neighbor | broadcast | none">:$share,
+    StringRefParameter<"memtile | memtile_ring | empty">:$stage,
+    "int64_t":$ring,
+    "bool":$keep,
+    "int64_t":$parts,
+    StringRefParameter<"row | column | empty">:$axis,
+    "::mlir::DenseI64ArrayAttr":$base_p0,
+    "::mlir::DenseI64ArrayAttr":$base_p1
+  );
+  let assemblyFormat = [{
+    `<` `share` `=` $share `,` `stage` `=` $stage `,` `ring` `=` $ring `,` `keep` `=` $keep `,`
+    `parts` `=` $parts `,` `axis` `=` $axis `,` `base_p0` `=` $base_p0 `,` `base_p1` `=` $base_p1 `>`
+  }];
+}
+
 // The blocks a kernel-only kernel takes on ONE port, as its traced
 // aie::load_buffer / store_buffer calls give them (convautotile kernel
 // analysis): per core `rounds_i * rounds_j` blocks of `shape` elements, block

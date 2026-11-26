@@ -555,7 +555,7 @@ at 1000 MHz, GOLDEN PASS), core-bound like VEK385 -- that PDI's DDR is no longer
 (`example/perf/ddr_microbench.cc`, now with `kind=rdwr`: one shim channel ~7.6 GB/s, reads ~26 / writes ~25 GB/s,
 read + write overlapped 33-36 GB/s; the PDI before it gave 16.1 / 3.58 GB/s serialized and 47 %). Three ways in, each lowering to the next:
 `load_buffer {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring|memtile, .ring = N,
-.keep = true}` + `#pragma persistent_kernel` -> routing IR `dataflow = {...}` on the tensor's
+.keep = true}` + `#pragma persistent_kernel` -> routing IR `#routing.dataflow<...>` (typed) on the tensor's
 `routingcreatescheduletensor` + `routing.persistent_kernel` -> plan synthesis
 (`pass/dataflowplan/plansynth.cpp`: host-tile matching, views, locks, MemTile ring / resident B,
 dump `4_DataflowPlan.mlir`) -> dmaphop dataflow ops `dmaphop.plan` / `plan_route` / `plan_stream`
@@ -1055,7 +1055,7 @@ Read the matching skill when the task fits:
 | A hand-written GemmSpace GEMM (simplematmul2) hangs in `wait_io TIMEOUT ... dir=1` / watchdog after a compiler update; `startio(..., 4)` became `(..., 1)`; `3D K BD is already the whole walk ... repeat 4 -> 1` | kwalkrepeatcollapse |
 | A launch slower after merging main with identical kernel / routing / DMA program: `__aie_launch` now invalidates every output (`__Runtime_sync_for_cpu`) -- allocate outputs uncached | postlaunchoutputinval |
 | A non-square mesh (4 x 2) places core groups on columns it does not have; `No free shim DMA slot` before a dataflow plan replaces the flows; a `#ifndef` / `#define` default missing in the trace harness or the kernel TU | nonsquaremeshplan |
-| Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `dataflow = {...}`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
+| Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `#routing.dataflow<...>`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
 | Kernel-only kernel without options hangs in `wait_io TIMEOUT ... dir=0` (output) but works with `{.depth = 2}`; output `pp_depth=1`, one output MM2S BD with `next_bd=-1` vs ping/pong `window_init`; `{.depth = 1} on aie::store_buffer` error | outputpingponghang |
 | A dialect attribute's dumped IR does not parse back (`expected integer value`, `failed to parse ...Attr parameter ... ArrayRef<int64_t>`, `AIEHLC_*_IR_IN ... does not parse / verify`, roundtrip FAIL at the re-entry build): `struct(params)` with an `ArrayRefParameter` | mlirattrarrayroundtrip |
 | Adding/reading tiling or per-tensor DMA info in routing IR (halo, shim_dma, pp_depth, kernel rounds); "where did `tensor_N.halo` / `routing.spatial_out_rounds` go"; value reads 0 inside a conversion pattern | routingirtilingcarriers |

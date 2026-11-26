@@ -56,7 +56,7 @@ namespace {
 
 struct Operand {
     int arg = -1;
-    DictionaryAttr df;
+    routing::DataflowAttr df; // the tensor's #routing.dataflow
     routing::KernelBlockAttr kb;
     int elemBytes = 1;
     int depth = 0; // pp_depth: the kernel's {.depth} (buffers per channel on the host core)
@@ -74,16 +74,8 @@ int traceToArg(Value v) {
     return -1;
 }
 
-std::string dstr(DictionaryAttr d, StringRef k, StringRef dflt = "") {
-    if (auto s = d ? d.getAs<StringAttr>(k) : StringAttr())
-        return s.getValue().str();
-    return dflt.str();
-}
-int64_t dint(DictionaryAttr d, StringRef k, int64_t dflt) {
-    if (auto i = d ? d.getAs<IntegerAttr>(k) : IntegerAttr())
-        return i.getInt();
-    return dflt;
-}
+// {.ring = N} or, when the kernel gave none (0), the default of the caller's staging
+int64_t ringOr(routing::DataflowAttr d, int64_t dflt) { return d && d.getRing() ? d.getRing() : dflt; }
 
 // Per-column host-tile matching for the neighbour-shared streams: stream s is read by the mesh rows in
 // consumers[s]; its host row must be within one row of every one of them, one stream per host.
@@ -188,8 +180,8 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
         return fail("A has " + std::to_string(SA) + " strips: the mesh needs at least as many columns");
     // ---- the two streams' groups, readers and hosts
     SynthStream sa, sb;
-    sa.op = &A, sa.role = "a", sa.stage = "memtile_ring", sa.ring = (int)dint(A.df, "ring", 0);
-    sb.op = &B, sb.role = "b", sb.stage = "memtile", sb.keep = dstr(B.df, "resident") == "launches";
+    sa.op = &A, sa.role = "a", sa.stage = "memtile_ring", sa.ring = (int)ringOr(A.df, 0);
+    sb.op = &B, sb.role = "b", sb.stage = "memtile", sb.keep = B.df.getKeep();
     if (sa.ring <= 0)
         return fail("stage = \"memtile_ring\" needs ring = N (MemTile FIFO buffers)");
     for (int pm = 0; pm < R; pm++)
@@ -237,7 +229,7 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
         const int64_t aBytes = kA == 1 ? ring * 2 * chunk : ring * kA * chunk;
         const int64_t bChunk = g.TN * g.KC * B.elemBytes, bWhole = (int64_t)sb.groups * NK * bChunk;
         const int64_t room = T.memBytes - (mtA == mtB ? aBytes : 0);
-        const std::string want = dstr(B.df, "stage");
+        const std::string want = B.df.getStage().str();
         // held whole, the column's strips are ONE S2MM BD: its length field bounds it too
         const bool bdFits = bWhole / T.bdWordBytes <= T.memBdMaxLenWords;
         if (want == "memtile_ring" || bWhole > room || !bdFits) {
@@ -245,7 +237,7 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
             // the shallowest ring (from .ring, default 2) whose MemTile channels start at most chMaxRepeat
             // times and that divides the column's chunk stream (rounds x groups x K chunks)
             const int64_t stream = R2 * (int64_t)sb.groups * NK, k = (int64_t)sb.groups * channels;
-            sb.ring = (int)dint(B.df, "ring", 2);
+            sb.ring = (int)ringOr(B.df, 2);
             // (a channel's walk may span chStartQueue queued starts of <= chMaxRepeat each: plandma splits it)
             auto startsOk = [&](int64_t rep) {
                 for (int n = 1; n <= T.chStartQueue; n++)
@@ -323,7 +315,7 @@ bool synthText(const Geometry &g, const Operand &A, const Operand &B, bool persi
             }
     }
     // ---- the streams: what the DMA program (derived in dfschedule, plandma.cpp) realizes
-    const int parts = (int)dint(A.df, "parts", 1);
+    const int parts = (int)A.df.getParts();
     for (SynthStream *st : {&sa, &sb}) {
         const bool isA = st == &sa;
         os << "dmaphop.plan_stream {arg = " << st->op->arg << ", role = \"" << st->role
@@ -368,10 +360,10 @@ Walk walkOf(const Operand &op, ArrayRef<int64_t> si, ArrayRef<int64_t> sj, int64
     w.rowStep = si.size() ? si[0] : 0, w.colStepI = (si.size() > 1 ? si[1] : 0) * inner;
     w.rowStepJ = sj.size() ? sj[0] : 0, w.colStep = (sj.size() > 1 ? sj[1] : 0) * inner;
     w.rounds = op.kb.getRoundsI(), w.chunks = op.kb.getRoundsJ();
-    for (const char *k : {"base_p0", "base_p1"})
-        if (auto a = op.df.getAs<ArrayAttr>(k))
-            for (Attribute x : a)
-                (k[6] == '0' ? w.b0 : w.b1).push_back(cast<IntegerAttr>(x).getInt());
+    for (int64_t x : op.df.getBaseP0().asArrayRef())
+        w.b0.push_back(x);
+    for (int64_t x : op.df.getBaseP1().asArrayRef())
+        w.b1.push_back(x);
     return w;
 }
 std::string walkAttrs(const Walk &w, const std::vector<int64_t> &rowBase, const std::vector<int64_t> &colBase) {
@@ -401,11 +393,11 @@ bool synthPerCore(const Geometry &g, const Operand &op, int o, ArrayRef<int64_t>
     for (size_t d = 2; d < ts.size(); d++)
         if (b0[d] || b1[d])
             return fail(A + "a core's blocks must start at the tensor's dims 2.. origin");
-    if (dstr(op.df, "stage") != "memtile_ring")
+    if (op.df.getStage() != "memtile_ring")
         return fail(A + "implemented with stage = memtile_ring");
     const int64_t M = ts[0], N = ts[1] * inner, cr = bs[0], cc = bs[1] * inner;
     const int64_t rounds = w.rounds, chunks = w.chunks;
-    const int ring = (int)dint(op.df, "ring", 2), mt = g.memRows - o, shim = T.shimMm2sChannels - 1 - o;
+    const int ring = (int)ringOr(op.df, 2), mt = g.memRows - o, shim = T.shimMm2sChannels - 1 - o;
     if ((rounds * chunks) % ring)
         return fail(A + "a ring of " + std::to_string(ring) + " does not divide a core's " +
                     std::to_string(rounds * chunks) + " chunks");
@@ -445,7 +437,7 @@ bool synthPerCore(const Geometry &g, const Operand &op, int o, ArrayRef<int64_t>
        << ", resident = \"launch\", chunk = " << list({cr, cc}) << ", chunks = " << chunks << ", rounds = " << rounds
        << ", tensor = " << list({M, N}) << ", host_rows = " << list(rows) << ", first_rows = " << list(rows)
        << ", row_groups = " << list(rows) << ", strips = " << list(strips)
-       << ", channels = 1, slots = " << std::max(op.depth, 1) << ", readers = 1, parts = " << dint(op.df, "parts", 1)
+       << ", channels = 1, slots = " << std::max(op.depth, 1) << ", readers = 1, parts = " << op.df.getParts()
        << ", elem_bytes = " << op.elemBytes << ", channel = " << o << walkAttrs(w, rowBase, colBase) << "}\n";
     return true;
 }
@@ -493,10 +485,10 @@ bool synthCopyText(const Geometry &g, const std::vector<const Operand *> &ops, b
         const int64_t M = ts[0], N = ts[1] * inner, cr = bs[0], cc = bs[1] * inner;
         const Walk w = walkOf(op, si, sj, inner);
         const int64_t ri = w.rounds, rj = w.chunks;
-        const bool perCore = dstr(op.df, "share") == "none"; // its own stream per core
-        const bool byRow = perCore || dstr(op.df, "axis", "row") == "row";
-        const std::string stage = dstr(op.df, "stage");
-        const bool keep = dstr(op.df, "resident") == "launches";
+        const bool perCore = op.df.getShare() == "none"; // its own stream per core
+        const bool byRow = perCore || op.df.getAxis() != "column";
+        const std::string stage = op.df.getStage().str();
+        const bool keep = op.df.getKeep();
         if (perCore) {
             if (!synthPerCore(g, op, (int)o, ts, bs, si, sj, inner, mtCh, os))
                 return false;
@@ -519,7 +511,7 @@ bool synthCopyText(const Geometry &g, const std::vector<const Operand *> &ops, b
         const bool ring = stage == "memtile_ring";
         if (!ring && stage != "memtile")
             return fail(A + "implemented with stage = memtile_ring or memtile");
-        const int nring = ring ? (int)dint(op.df, "ring", 2) : 0, mt = g.memRows - (int)o,
+        const int nring = ring ? (int)ringOr(op.df, 2) : 0, mt = g.memRows - (int)o,
                   shim = T.shimMm2sChannels - 1 - (int)o;
         for (int s = 0; s < nStrips; s++) {
             MemtileChannels &mc = mtCh[mt * 1000 + s];
@@ -553,9 +545,8 @@ bool synthCopyText(const Geometry &g, const std::vector<const Operand *> &ops, b
            << ", chunks = " << rj << ", rounds = " << ri << ", tensor = " << list({M, N})
            << ", host_rows = " << list(hostRows) << ", first_rows = " << list(hostRows)
            << ", row_groups = " << list(rowGroups) << ", strips = " << list(strips)
-           << ", channels = 1, slots = " << std::max(op.depth, 1)
-           << ", readers = 1, parts = " << dint(op.df, "parts", 1) << ", elem_bytes = " << op.elemBytes
-           << ", channel = " << o << walkAttrs(w, rowBase, colBase) << "}\n";
+           << ", channels = 1, slots = " << std::max(op.depth, 1) << ", readers = 1, parts = " << op.df.getParts()
+           << ", elem_bytes = " << op.elemBytes << ", channel = " << o << walkAttrs(w, rowBase, colBase) << "}\n";
     }
     llvm::outs() << "[DataflowPlan] synthesized per-core copies: " << R << " x " << C << " mesh, " << ops.size()
                  << " broadcast operand(s), one multicast stream per mesh row / column\n";
@@ -619,7 +610,7 @@ bool synthesizeDataflowPlan(ModuleOp module, std::string &why) {
         auto decl = dyn_cast<routing::createscheduletensor>(op);
         if (!decl)
             return;
-        auto df = op->getAttrOfType<DictionaryAttr>("dataflow");
+        auto df = decl.getDataflowAttr();
         if (!df)
             return;
         Operand o;
@@ -642,7 +633,7 @@ bool synthesizeDataflowPlan(ModuleOp module, std::string &why) {
     }
     size_t nBroadcast = 0;
     for (auto &[arg, o] : shared) {
-        const std::string sh = dstr(o.df, "share");
+        const std::string sh = o.df.getShare().str();
         if (sh != "neighbor" && sh != "broadcast" && sh != "none") {
             why = "dataflow on arg " + std::to_string(arg) + ": share = \"" + sh + "\" is not implemented";
             return false;

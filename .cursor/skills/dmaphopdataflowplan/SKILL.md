@@ -1,6 +1,6 @@
 ---
 name: dmaphopdataflowplan
-description: Explicit dataflow plans -- replacing hand edits of generated host.cc / kernel.cc / routing.cc with IR the compiler lowers. Use for `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, a `dataflow = {...}` attribute in the routing IR, `dmaphop.plan*` ops, `[DataflowPlan]` log lines / errors, `aiehlc_plan.h` not found, a plan build that hangs or mismatches, or "flowcheck ... replaced by the dataflow plan".
+description: Explicit dataflow plans -- replacing hand edits of generated host.cc / kernel.cc / routing.cc with IR the compiler lowers. Use for `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, a `#routing.dataflow<...>` attribute in the routing IR, `dmaphop.plan*` ops, `[DataflowPlan]` log lines / errors, `aiehlc_plan.h` not found, a plan build that hangs or mismatches, or "flowcheck ... replaced by the dataflow plan".
 ---
 <!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
      SPDX-License-Identifier: Apache-2.0 -->
@@ -15,7 +15,7 @@ GOLDEN PASS).
 | level | write | compiler entry |
 |---|---|---|
 | C | `load_buffer(..., {.share = aie::share::neighbor, .stage = aie::stage::memtile_ring, .ring = 10})`, `{.keep = true}`, `#pragma persistent_kernel` | trace harness -> `KernelBlock` -> `dataflow` dict |
-| routing IR | `dataflow = {...}` on `routingcreatescheduletensor`, `routing.persistent_kernel` | `plansynth.cpp` (dump `4_DataflowPlan.mlir`) |
+| routing IR | `#routing.dataflow<...>` on `routingcreatescheduletensor`, `routing.persistent_kernel` | `plansynth.cpp` (dump `4_DataflowPlan.mlir`) |
 | dmaphop IR | `dmaphop.plan` / `plan_route` / `plan_stream` (dataflow decisions) | `collectDataflowPlan` (`dataflowplan.cpp`) |
 | dfschedule IR (derived) | `config.tile_bd` / `lock_set` / `channel_enable` / `channel_start`, shim `config.dma_bd` + `start_io` | `plandma.cpp` derive + materialize; lowered by DfscheduleToApi / DfscheduleToKernelApi |
 
