@@ -339,6 +339,45 @@ static void gemm_ka_run(int8_t *A, int8_t *B, int8_t *C) {
     aieMesh mesh = device.partition({2, 2 + GP_HW_COLS, 0, 6}, GP_HW_ROWS, GP_HW_COLS);
     gemm_ka<<<mesh>>>(A, B, C);
 }
+#if defined(AIEHLC_PROFILING) && AIEHLC_PROFILING
+// PROFILING=1 (aiehlc.sh --profiling -> -DAIEHLC_PROFILING=1), the 71129420 pattern of gemm_plan_tbody.cc: the
+// runtime arms the 4 core perf counters (ACTIVE, INSTR_VECTOR, STREAM_STALL, LOCK_STALL) of the 16 cores at the
+// first call when g_runtime_debug_level has AIE_DEBUG_FLAG_CORE_PERF_COUNTER (0x100); the persistent kernel is not
+// re-armed later, so the host zeroes them before the last launch's first call and prints one [PERF] tag=<last launch
+// index> line per core after its last call. One launch = GP_N_SLICES calls (gemm_plan_slices.cc) or 1; the main()s
+// call gemm_ka_run through this wrapper, so the hook lives here and the slices / 1-slice drivers stay unchanged.
+extern int g_runtime_debug_level;
+void __Runtime_core_perf_report(int tag);
+#ifdef GP_N_SLICES
+#define GP_PL_CALLS ((long)GP_N_SLICES)
+#else
+#define GP_PL_CALLS 1L
+#endif
+#define GP_PL_COL0 1 // the kernel group's cores: partition cols 1 .. GP_HW_COLS, rows 3 .. 2 + GP_HW_ROWS (host.cc)
+#define GP_PL_ROW0 3
+static void gp_pl_perf_zero(void) {
+#if defined(__aarch64__) && !defined(__AIESIM__) && !defined(__linux__)
+    for (int ti = 0; ti < GP_HW_ROWS * GP_HW_COLS; ti++)
+        for (uint8_t c = 0; c < 4; c++)
+            XAie_PerfCounterSet(__Runtime_get_partition_dev(0),
+                                XAie_TileLoc(GP_PL_COL0 + ti % GP_HW_COLS, GP_PL_ROW0 + ti / GP_HW_COLS), XAIE_CORE_MOD,
+                                c, 0);
+#endif
+}
+static void gemm_ka_run_pl(int8_t *A, int8_t *B, int8_t *C) {
+    static long calls = 0;
+    const long last0 = (long)(GP_LAUNCHES - 1) * GP_PL_CALLS; // first call of the last launch
+    if (calls == 0)
+        g_runtime_debug_level |= 0x100; // AIE_DEBUG_FLAG_CORE_PERF_COUNTER: armed by the first kernel start
+    if (calls == last0)
+        gp_pl_perf_zero();
+    gemm_ka_run(A, B, C);
+    if (calls == last0 + GP_PL_CALLS - 1)
+        __Runtime_core_perf_report(GP_LAUNCHES - 1);
+    calls++;
+}
+#define gemm_ka_run gemm_ka_run_pl
+#endif
 
 // Host element type: int8, or the bf16 bit pattern (gplan_ref.h: data, sampling, reference, crc32).
 #include "gplan_ref.h"
