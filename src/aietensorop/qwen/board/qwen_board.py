@@ -122,7 +122,7 @@ def main():
     a3.add_argument("--obj", action="append", default=[], help="extra object / archive (e.g. libqwen_gemv_lib.a)")
     a3.add_argument("-L", dest="libdirs", action="append", default=[])
     a3.add_argument("-l", dest="libs", action="append", default=[])
-    a3.add_argument("--ld", action="append", default=[], help="extra link flag, e.g. -Wl,--undefined=SYM")
+    a3.add_argument("--ld", action="append", default=[], help="extra link flag, e.g. -Wl,--defsym=SYM=ADDR")
     a = ap.parse_args()
     if a.cmd == "loaders":
         loaders(a.blob, a.outdir, [int(x, 0) for x in a.bases.split(",")] if a.bases else None)

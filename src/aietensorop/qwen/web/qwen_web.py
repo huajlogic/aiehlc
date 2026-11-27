@@ -47,8 +47,7 @@ class Board:
             f.write(f'extern "C" const int qw_prompt_ngen = {ngen};\n')
         out = os.path.join(d, "qwen.elf")
         qwen_board.build_elf(out, [src], objs=self.objs + [os.path.join(self.a.lib, "libqwen_gemv_lib.a")],
-                             heap=0x20000000, opt="-O2", extra_ld=["-L" + self.a.lib,
-                                                                    "-Wl,--undefined=_Z7routingP12XAie_DevInst"],
+                             heap=0x20000000, opt="-O2", extra_ld=["-L" + self.a.lib],
                              libs=["xaienginea78"])
         return out
 

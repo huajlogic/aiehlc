@@ -327,16 +327,66 @@ void qw_matmul_cpu(void *ctx, const qw_mat *w, const float *x, int n, float *y) 
 }
 
 /* ---- pieces ---- */
+static float dot(const float *a, const float *b, int n);
 static void rmsnorm(float *o, const float *x, const float *w, int n, float eps, int one_plus) {
-    double ss = 0;
-    for (int i = 0; i < n; i++)
-        ss += (double)x[i] * x[i];
-    const float r = 1.0f / sqrtf((float)(ss / n) + eps);
+    const float r = 1.0f / sqrtf(dot(x, x, n) / n + eps);
     for (int i = 0; i < n; i++)
         o[i] = x[i] * r * (one_plus ? 1.0f + w[i] : w[i]);
 }
-static float silu(float v) { return v / (1.0f + expf(-v)); } /* libm expf: a polynomial was slower on the A78 */
+static float silu(float v) { return v / (1.0f + expf(-v)); }
 static float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
+
+/* ---- vector helpers: NEON on the A78 (the compiler does not vectorize libm calls or fp reductions), scalar elsewhere
+ */
+#ifdef __aarch64__
+#include <arm_neon.h>
+/* exp(x), 4 lanes: x = n ln2 + r, |r| <= ln2 / 2, degree-6 polynomial, 2^n through the exponent field */
+static inline float32x4_t exp4(float32x4_t x) {
+    x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
+    const int32x4_t ni = vcvtnq_s32_f32(vmulq_n_f32(x, 1.44269504f));
+    const float32x4_t n = vcvtq_f32_s32(ni);
+    float32x4_t r = vfmsq_f32(x, n, vdupq_n_f32(0.693145752f));
+    r = vfmsq_f32(r, n, vdupq_n_f32(1.42860677e-6f));
+    float32x4_t p = vdupq_n_f32(0.00138888892f);
+    p = vfmaq_f32(vdupq_n_f32(0.00833330024f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.0416666679f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.166666672f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+    return vmulq_f32(p, vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23)));
+}
+static inline float32x4_t silu4(float32x4_t x) {
+    return vdivq_f32(x, vaddq_f32(vdupq_n_f32(1.0f), exp4(vnegq_f32(x))));
+}
+#endif
+/* y[i] = silu(x[i]) * (m ? m[i] : 1) */
+static void silu_vec(float *y, const float *x, const float *m, int n) {
+    int i = 0;
+#ifdef __aarch64__
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t s = silu4(vld1q_f32(x + i));
+        vst1q_f32(y + i, m ? vmulq_f32(s, vld1q_f32(m + i)) : s);
+    }
+#endif
+    for (; i < n; i++)
+        y[i] = silu(x[i]) * (m ? m[i] : 1.0f);
+}
+static float dot(const float *a, const float *b, int n) {
+    int i = 0;
+    float s = 0;
+#ifdef __aarch64__
+    float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
+    for (; i + 8 <= n; i += 8) {
+        s0 = vfmaq_f32(s0, vld1q_f32(a + i), vld1q_f32(b + i));
+        s1 = vfmaq_f32(s1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    }
+    s = vaddvq_f32(vaddq_f32(s0, s1));
+#endif
+    for (; i < n; i++)
+        s += a[i] * b[i];
+    return s;
+}
 static float softplus(float v) { return v > 20.0f ? v : log1pf(expf(v)); }
 
 static void embed_row(const qw_model *m, int tok, float *o) {
@@ -394,8 +444,9 @@ static void linear_attn(qw_model *m, int li, int n) {
             for (int j = 0; j < K - 2; j++)
                 st[j] = st[j + 1];
             st[K - 2] = in[c];
-            conv[c] = silu(acc);
+            conv[c] = acc;
         }
+        silu_vec(conv, conv, NULL, convc);
         for (int h = 0; h < kh; h++) { /* l2norm q, k per head; q / sqrt(kd) */
             double sq = 0, sk = 0;
             for (int i = 0; i < kd; i++)
@@ -448,8 +499,9 @@ static void linear_attn(qw_model *m, int li, int n) {
             }
             G_out[h] = sig;
             rmsnorm(out, out, nw, vd, m->eps, 0);
-            for (int j = 0; j < vd; j++)
-                out[j] *= silu(z[h * vd + j]);
+            float zg[256];
+            silu_vec(zg, z + h * vd, out, vd); /* silu(z) * out */
+            memcpy(out, zg, sizeof(float) * vd);
         }
         if (m->now)
             m->prof[QW_P_DN_HEADS] += m->now() - tc1;
@@ -502,11 +554,7 @@ static void full_attn(qw_model *m, const qw_layer *L, float *kc, float *vc, int 
             const int j = h / (H / KV);
             float mx = -1e30f, sum = 0;
             for (int s = 0; s <= p; s++) {
-                const float *kp = kc + (size_t)s * kvd + j * D;
-                float d = 0;
-                for (int i = 0; i < D; i++)
-                    d += q[i] * kp[i];
-                sc[s] = d / sqrtf((float)D);
+                sc[s] = dot(q, kc + (size_t)s * kvd + j * D, D) / sqrtf((float)D);
                 mx = sc[s] > mx ? sc[s] : mx;
             }
             for (int s = 0; s <= p; s++)
@@ -540,8 +588,7 @@ static void mlp(qw_model *m, const qw_layer *L, int n) {
     {
         PROF_T0(m);
         for (int t = 0; t < n; t++)
-            for (int i = 0; i < F; i++)
-                h[(size_t)t * F + i] = silu(gu[(size_t)t * 2 * F + i]) * gu[(size_t)t * 2 * F + F + i];
+            silu_vec(h + (size_t)t * F, gu + (size_t)t * 2 * F, gu + (size_t)t * 2 * F + F, F);
         PROF_ADD(m, QW_P_MLPACT);
     }
     PROF_T0(m);

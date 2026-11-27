@@ -845,7 +845,7 @@ if [ -n "${_HCA_DIR}" ] && [ "${HOST_ENTRY_KIND}" = "library" ] && [ "${REBUILD}
     _hca_kobj="$(printf '%s\n' ${KERNEL_OBJ_LIST} | xargs -r -P 8 -n 8 sha1sum | sed -e 's#  .*/#  #' | LC_ALL=C sort -k2 | sha1sum)"
     wait
     if ! ls "${_hca_t}"/*.fail >/dev/null 2>&1; then
-        _HCA_KEY="$( { echo hca1; echo "${HOST_LIB_NAME} ${HAS_ROUTING}"; ${TOOL_PREFIX}g++ --version; ${TOOL_PREFIX}ar --version
+        _HCA_KEY="$( { echo hca2; echo "${HOST_LIB_NAME} ${HAS_ROUTING}"; ${TOOL_PREFIX}g++ --version; ${TOOL_PREFIX}ar --version
                        sha1sum < "${BASH_SOURCE[0]}"; echo "${_hca_kobj}"
                        for _n in "${_hca_names[@]}"; do echo "${_n} $(cat "${_hca_t}/${_n}")"; done; } | sha1sum | cut -c1-40)"
     fi
@@ -1091,9 +1091,25 @@ if [ "${HOST_ENTRY_KIND}" = "library" ]; then
     # with the library; the final executable still needs the BSP/XAie libs that
     # the link branch below passes, since an archive records no dependencies.
     echo "Archiving host static library (no main() in host.cc)..."
+    # Fold routing.o into the host.o member. The generated host.cc names routing()
+    # only through a WEAK declaration (a host-only build has no routing.cc), and a
+    # weak undefined reference never pulls an archive member: a consumer linking
+    # lib<app>.a got host.o without routing.o, so the partition came up with no
+    # stream-switch routes and the first launch hung (skill aiehlclibraryrouting).
+    # `ld -r` resolves the weak reference inside one object, so pulling host.o now
+    # brings routing() with it -- no --undefined=routing at the consumer's link.
+    _lib_objs="${HOST_OBJS}"
+    if [ -n "${ROUTING_OBJ}" ]; then
+        rm -rf .libmerge && mkdir -p .libmerge
+        if ! ${TOOL_PREFIX}ld -r -o .libmerge/host.o host.o "${ROUTING_OBJ}"; then
+            echo "Error: failed to merge ${ROUTING_OBJ} into host.o for ${HOST_LIB_NAME}"
+            exit 1
+        fi
+        _lib_objs="$(echo " ${HOST_OBJS} " | sed -e 's| host\.o | .libmerge/host.o |' -e "s| ${ROUTING_OBJ} | |")"
+    fi
     set -x
     rm -f "${HOST_LIB_NAME}"
-    ${TOOL_PREFIX}ar rcs "${HOST_LIB_NAME}" ${HOST_OBJS}
+    ${TOOL_PREFIX}ar rcs "${HOST_LIB_NAME}" ${_lib_objs}
     _ar_rc=$?
     set +x
     if [ ${_ar_rc} -ne 0 ]; then

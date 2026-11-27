@@ -10,6 +10,6 @@
 // 32 K groups each: int8 tiles [32 groups][4][M][16] (8192 B), then the scales [32 groups][M] fp32 (512 B).
 // y per row block: [M][16] fp32. The math is qw_matmul_cpu's: per group int32 sum, times w_scale x x_scale.
 // The qwen_gemv kernel and its launch function, no main(): aiehlc archives it as libqwen_gemv_lib.a, which the
-// qwen board app links (src/aietensorop/qwen/board/build_aie.sh).
+// qwen board app links (build steps: src/aietensorop/qwen/README.md).
 #include "qwen_gemv_host.h"
 #include "qwen_gemv_kernel.cc"

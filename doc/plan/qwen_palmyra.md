@@ -87,3 +87,18 @@ qwen_ref.py: torch reference      AIE (persistent kernel): small-M GEMM -- int4 
   MemTile BD holds 524,284 B -> the plan streamed B (re-read per output tile). Fix: a held B loads through a
   chain of BDs (`plandma.cpp` `deriveResident`, runtime `__Runtime_tile_bd_config` one-sided locks).
   M = 12288 in one launch exceeds the 64 output tiles per core (6-bit OOO counter): a layer is 2 launches.
+* 2026-11-26: G1 done -- with the BD chain the weights-streamed GEMM reaches 86.55 % (6144 x 512 x 4096),
+  86.15 % (5120), 85.41 % (4096) on palmyra; 36.20 % before the fix. GEMMOP chapter 12.
+* 2026-11-26: M0 -- DDR_LOW1 (`0x8_0000_0000`) is 6 GB of real DDR on the 2026-11-25 PDI, readable and
+  writable by the AIE; the blob goes there in 3 segments of <= 1.75 GB via loader ELFs (checksummed).
+  VEK385 ruled out: its A78 hangs on the 0x500_/0x600_/0x700_ windows and AIE accesses there are ~25 % wrong.
+* 2026-11-26: M1-M3 -- the C engine matches the torch reference's greedy tokens on x86; on the board every
+  weight matmul runs as qwen_gemv launches (4096 rows x K 4096 x M <= 4, persistent kernel 0.355 ms).
+* 2026-11-26: M4 -- MTP speculative decoding (post-norm hidden, two-bank DeltaNet state with commit /
+  rollback, 16 K draft vocabulary from frequency-ordered lm_head rows). Lazy decay (3 FMA per state element),
+  NEON x quantization (x prep 1.24 -> 0.20 s), NEON exp / SiLU / dot. Decode 6.49 / 5.90 / 5.28 tok/s on the
+  en / zh / poem prompts (palmyra-14); output identical to plain greedy. Did not help: fp16 state, a scalar
+  polynomial exp, MTP gap fill.
+* 2026-11-27: library-mode routing fix (`hostcompile.sh` merges routing.o into host.o; no more
+  `--undefined`), verified on palmyra-14: 17,462 launches, 6.52 tok/s.
+  Next: the other A78 cores for the CPU part (DeltaNet), an M = 8 prefill kernel for the time to first token.

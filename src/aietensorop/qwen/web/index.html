@@ -14,6 +14,16 @@ header b{font-size:16px}header .tag{font-size:12px;color:var(--mut);border:1px s
 .msg .who{width:28px;height:28px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
 .msg.user .who{background:#5436da}.msg.bot .who{background:var(--acc)}
 .msg .body{white-space:pre-wrap;word-wrap:break-word;flex:1}
+.msg .body.md{white-space:normal;line-height:1.55}
+.md p{margin:.35em 0}.md h1,.md h2,.md h3,.md h4{margin:.6em 0 .3em;line-height:1.25}.md h1{font-size:1.35em}.md h2{font-size:1.2em}.md h3,.md h4{font-size:1.05em}
+.md ul,.md ol{margin:.3em 0;padding-left:1.5em}.md li{margin:.15em 0}
+.md code{background:rgba(127,127,127,.18);border-radius:4px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}
+.md pre{background:#0d1117;color:#e6edf3;border-radius:8px;padding:10px 12px;overflow-x:auto;margin:.5em 0}
+.md pre code{background:none;padding:0;font-size:.9em;white-space:pre}
+.md blockquote{border-left:3px solid var(--acc);margin:.4em 0;padding:.1em .8em;opacity:.85}
+.md table{border-collapse:collapse;margin:.5em 0}.md th,.md td{border:1px solid rgba(127,127,127,.4);padding:3px 8px}
+.md th{background:rgba(127,127,127,.15)}.md hr{border:none;border-top:1px solid rgba(127,127,127,.4);margin:.6em 0}
+.md a{color:var(--acc)}
 .msg.user .body{background:var(--bub);border-radius:14px;padding:8px 14px}
 .msg .meta{color:var(--mut);font-size:12px;margin-top:6px}
 .cursor::after{content:"\25CF";animation:blink 1s infinite;margin-left:2px;color:var(--acc)}@keyframes blink{50%{opacity:0}}
@@ -46,8 +56,10 @@ table{width:100%;border-collapse:collapse;margin-top:6px}td{padding:3px 4px;bord
 </div>
 <div id="hw">
  <h3>Hardware <span class="sub" id="phase">idle</span></h3>
- <div class="sub">AIE partition: control column + 4 x 4 compute mesh. Color = utilization over the run, from the board's measured
- launch / CPU times (not per-core counters).</div>
+ <div class="sub">AIE partition: control column + 4 x 4 compute mesh. While an answer runs the tiles show what is active
+ (AIE weight streaming vs A78 compute); when it ends the board is idle. Utilization comes from the board's measured launch / CPU
+ times (not per-core counters).</div>
+ <label class="sub"><input type="checkbox" id="avg"> show last-run average on the tiles</label>
  <div id="grid"></div>
  <div class="legend">0%<div class="bar"></div>100%</div>
  <div class="box"><div class="tile" id="cpu">A78 core<br><span>-</span></div><div class="tile" id="ddr">DDR read<br><span>-</span></div></div>
@@ -73,28 +85,62 @@ function paint(aieOn,cpuOn,txt){
     const u=ctrl?Math.min(.15,aieOn*.15):aieOn*(t.dataset.k==="core"?1:t.dataset.k==="mem"?.9:.95);
     t.style.background=color(u);t.textContent=txt?(ctrl?"":Math.round(u*100)+"%"):""});
   $("cpu").style.background=color(cpuOn);$("ddr").style.background=color(util.ddr*aieOn/(util.aie||1))}
-function idle(){clearInterval(anim);anim=null;paint(0,0,false);$("phase").textContent="idle"}
+function idle(){clearInterval(anim);anim=null;paint(0,0,false);$("phase").textContent="idle";
+  $("cpu").querySelector("span").textContent="idle";$("ddr").querySelector("span").textContent="idle"}
 function live(phase){clearInterval(anim);$("phase").textContent=phase;let k=0;
   anim=setInterval(()=>{k++;if(phase==="prefill"){paint(.95,.25,false);return}
     // decode: per weight pass the AIE streams (~last.aie of the time), then the A78 runs its parts
     const onAie=(k%10)/10<last.aie;paint(onAie?1:.05,onAie?.08:1,false)},120)}
+let lastHw=null;
+function showAvg(){if($("avg").checked&&lastHw){paint(lastHw.aie,lastHw.cpu,true);$("phase").textContent="last-run average"}else idle()}
 function showStats(ev){const p=ev.perf,h=ev.hw;last={aie:h.aie,cpu:h.cpu};util={aie:h.aie,cpu:h.cpu,ddr:h.ddr_gbs/h.ddr_peak_gbs*h.aie};
-  clearInterval(anim);anim=null;paint(h.aie,h.cpu,true);$("phase").textContent="last run";
+  lastHw=h;clearInterval(anim);anim=null;showAvg();
   $("cpu").querySelector("span").textContent=Math.round(h.cpu*100)+"% busy";
   $("ddr").querySelector("span").textContent=h.ddr_gbs.toFixed(1)+" GB/s in launches";
   const acc=p.drafted?`${p.accepted}/${p.drafted} (${Math.round(100*p.accepted/p.drafted)}%)`:"-";
   const rows=[["decode",`<b>${p.tok_s.toFixed(2)} tok/s</b>`],["tokens",`${p.gen} in ${p.steps} steps`],
     ["prefill (time to first token)",`${p.prefill.toFixed(2)} s for ${p.prompt} tokens`],["MTP draft accepted",acc],
-    ["AIE launches",`${ev.aie.launches} (${ev.aie.aie_s.toFixed(2)} s)`],["AIE busy / A78 busy",`${Math.round(h.aie*100)}% / ${Math.round(h.cpu*100)}%`],
+    ["AIE launches",`${ev.aie.launches} (${ev.aie.aie_s.toFixed(2)} s)`],["AIE busy / A78 busy (run average)",`${Math.round(h.aie*100)}% / ${Math.round(h.cpu*100)}%`],
     ["host round trip",`${ev.host_s.toFixed(1)} s (build + load + run)`]];
   $("stats").innerHTML=rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("");
   const parts=Object.entries(h.cpu_parts).concat([["x/y glue",h.glue_s]]);const mx=Math.max(...parts.map(q=>q[1]),1e-9);
   $("parts").innerHTML=parts.map(([k,v])=>`<tr><td>${k}<div class="pbar"><i style="width:${100*v/mx}%"></i></div></td><td>${v.toFixed(2)} s</td></tr>`).join("")}
 idle();
 const hist=[];
+/* minimal Markdown -> HTML for the answers (no external library). Everything is HTML-escaped first,
+ * so model output can never inject markup; an unclosed ``` while streaming renders as an open code block. */
+function esc(t){return t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function inl(t){const c=[];t=esc(t).replace(/`([^`]+)`/g,(m,x)=>{c.push(x);return"\u0000"+(c.length-1)+"\u0000"});
+  t=t.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>").replace(/__(.+?)__/g,"<b>$1</b>")
+     .replace(/(^|[^*])\*([^*\s][^*]*?)\*/g,"$1<i>$2</i>").replace(/~~(.+?)~~/g,"<s>$1</s>")
+     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return t.replace(/\u0000(\d+)\u0000/g,(m,i)=>"<code>"+c[+i]+"</code>")}
+function cells(l){return l.trim().replace(/^\||\|$/g,"").split("|").map(x=>x.trim())}
+function mdBlocks(src){const L=src.split("\n"),o=[];let i=0;
+  while(i<L.length){const l=L[i];
+    if(!l.trim()){i++;continue}
+    let m;
+    if((m=l.match(/^(#{1,6})\s+(.*)/))){const n=Math.min(m[1].length+0,4);o.push(`<h${n}>${inl(m[2])}</h${n}>`);i++;continue}
+    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)){o.push("<hr>");i++;continue}
+    if(/^\s*\|.*\|\s*$/.test(l)&&i+1<L.length&&/^\s*\|?\s*:?-{2,}/.test(L[i+1])){
+      const h=cells(l);i+=2;const rows=[];while(i<L.length&&/^\s*\|.*\|\s*$/.test(L[i]))rows.push(cells(L[i++]));
+      o.push("<table><tr>"+h.map(x=>`<th>${inl(x)}</th>`).join("")+"</tr>"+rows.map(r=>"<tr>"+r.map(x=>`<td>${inl(x)}</td>`).join("")+"</tr>").join("")+"</table>");continue}
+    if(/^\s*>/.test(l)){const q=[];while(i<L.length&&/^\s*>/.test(L[i]))q.push(L[i++].replace(/^\s*>\s?/,""));o.push("<blockquote>"+mdBlocks(q.join("\n"))+"</blockquote>");continue}
+    if(/^\s*([-*+]|\d+[.)])\s+/.test(l)){const ord=/^\s*\d/.test(l),it=[];
+      while(i<L.length&&((/^\s*([-*+]|\d+[.)])\s+/.test(L[i])&&/^\s*\d/.test(L[i])===ord)||(/^\s{2,}\S/.test(L[i])&&it.length))){
+        if(/^\s*([-*+]|\d+[.)])\s+/.test(L[i]))it.push(L[i].replace(/^\s*([-*+]|\d+[.)])\s+/,""));else it[it.length-1]+=" "+L[i].trim();i++}
+      o.push((ord?"<ol>":"<ul>")+it.map(x=>`<li>${inl(x)}</li>`).join("")+(ord?"</ol>":"</ul>"));continue}
+    const p=[];while(i<L.length&&L[i].trim()&&!/^(#{1,6}\s|\s*>|\s*([-*+]|\d+[.)])\s+|\s*\|.*\|\s*$)/.test(L[i]))p.push(inl(L[i++]));
+    if(!p.length)p.push(inl(L[i++]));o.push("<p>"+p.join("<br>")+"</p>")}
+  return o.join("")}
+function md(src){const parts=src.split(/^```/m);let h="";
+  parts.forEach((part,k)=>{if(k%2===0){h+=mdBlocks(part);return}
+    const nl=part.indexOf("\n"),code=nl<0?"":part.slice(nl+1);h+="<pre><code>"+esc(code.replace(/\n$/,""))+"</code></pre>"});
+  return h}
 function add(role,text){const d=document.createElement("div");d.className="msg "+role;
   d.innerHTML=`<div class="who">${role==="user"?"U":"Q"}</div><div style="flex:1;min-width:0"><div class="body"></div><div class="meta"></div></div>`;
-  d.querySelector(".body").textContent=text;$("msgs").appendChild(d);$("msgs").scrollTop=1e9;return d}
+  const b=d.querySelector(".body");if(role==="user")b.textContent=text;else{b.classList.add("md");b.innerHTML=md(text)}
+  $("msgs").appendChild(d);$("msgs").scrollTop=1e9;return d}
 async function send(){const q=$("in").value.trim();if(!q)return;$("in").value="";$("send").disabled=true;
   add("user",q);const b=add("bot","");const body=b.querySelector(".body"),meta=b.querySelector(".meta");body.classList.add("cursor");
   const msgs=($("multi").checked?hist:[]).concat([{role:"user",content:q}]);let answer="";
@@ -106,12 +152,12 @@ async function send(){const q=$("in").value.trim();if(!q)return;$("in").value=""
         const ev=JSON.parse(line.slice(6));
         if(ev.type==="status"){meta.textContent=ev.text;$("st").textContent=ev.text}
         else if(ev.type==="phase"){live(ev.phase);meta.textContent=ev.phase==="prefill"?"prefill on the board...":"generating...";$("st").textContent=ev.phase}
-        else if(ev.type==="token"){answer+=ev.text;body.textContent=answer;$("msgs").scrollTop=1e9}
+        else if(ev.type==="token"){answer+=ev.text;body.innerHTML=md(answer);$("msgs").scrollTop=1e9}
         else if(ev.type==="stats"){showStats(ev);const p=ev.perf;meta.textContent=`${p.tok_s.toFixed(2)} tok/s · ${p.gen} tokens · first token after ${p.prefill.toFixed(2)} s prefill`}
         else if(ev.type==="error"){meta.textContent="error: "+ev.text;meta.style.color="#e4572e"}
         else if(ev.type==="done"){$("st").textContent="idle"}}}
   }catch(e){meta.textContent="error: "+e}
-  body.classList.remove("cursor");if(anim)idle();$("send").disabled=false;
+  body.classList.remove("cursor");showAvg();$("send").disabled=false;
   if(answer){hist.push({role:"user",content:q},{role:"assistant",content:answer})}}
-$("send").onclick=send;$("in").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}});
+$("avg").onchange=showAvg;$("send").onclick=send;$("in").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}});
 </script></body></html>
