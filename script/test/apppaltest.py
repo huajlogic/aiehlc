@@ -126,6 +126,11 @@ PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
 # hw_server, so xsdb attaches with `connect -url` (HW_SERVER_URL) in both modes.
 # -board-rev b (or VEK385_REV=b) programs rev B's boot + PLD PDI pair, as appvek385.py.
 IS_VEK385 = boardname.lower().startswith("vek385")
+# A palmyra in the board farm ("palmyra-N" on its farm host, -board palmyra-14 -host gomphus12): the farm flow of
+# the VEK385 (systest-client bound to the host's board, no `become`, connect -url, PMC reset, the farm hws backend)
+# with palmyra's boot image, console and netboot supervisor.
+IS_FARM_PALMYRA = bool(re.match(r"palmyra-\d+$", boardname.lower()))
+IS_FARM = IS_VEK385 or IS_FARM_PALMYRA
 BOARD_REV = (_cli.board_rev or os.environ.get("VEK385_REV") or "a").lower()
 if os.environ.get("BOOT_IMAGE"):
     BOOT_IMAGES = [os.environ["BOOT_IMAGE"]]
@@ -485,7 +490,7 @@ def setup_first_connection(nonreboot=False):
 
     # Use systest-client in nonreboot mode so the session doesn't hold the
     # systest server lock, allowing other users/tools to connect.
-    if nonreboot or IS_VEK385:  # a VEK385 farm host: systest-client only
+    if nonreboot or IS_FARM:  # a farm host (VEK385 / palmyra-N): systest-client only
         print("[Connection 1] Connected, starting systest-client"
               f"{' (nonreboot mode)' if nonreboot else ''}...")
         log.debug("setup_first_connection: sending systest-client")
@@ -496,7 +501,7 @@ def setup_first_connection(nonreboot=False):
         child.sendline("/bin/systest")
     child.expect(r'Systest[#>]', timeout=60)
     log.debug("setup_first_connection: systest prompt received")
-    if IS_VEK385:
+    if IS_FARM:
         # systest-client lands on the farm host's own board ("[vek385-3] Systest#");
         # refuse to power-cycle anything else (no `become` off palmyra).
         m = re.search(r'\[([^\]\s]+)\]\s*$', child.before or "")
@@ -509,7 +514,7 @@ def setup_first_connection(nonreboot=False):
     # Step 3: Become palboard - wait for Systest# prompt after board info.
     # In nonreboot mode the board is already up and owned by an existing
     # session, so skip 'become' to avoid taking over/holding the board.
-    if IS_VEK385:
+    if IS_FARM:
         print("[Connection 1] Farm board: no 'become', powering off first...")
     elif not nonreboot:
         print("[Connection 1] In systest, becoming palboard...")
@@ -549,8 +554,8 @@ def setup_first_connection(nonreboot=False):
     print("[Connection 1] In xsdb, connecting...")
     
     # Steps 7-11, each waited on by its own completion token (xsdb_run).
-    xsdb_run(child, f"connect -url {HW_SERVER_URL}" if nonreboot or IS_VEK385 else "conn", 60, "connect")
-    if IS_VEK385:
+    xsdb_run(child, f"connect -url {HW_SERVER_URL}" if nonreboot or IS_FARM else "conn", 60, "connect")
+    if IS_FARM:
         vek385_reset_system(child)
     print("[Connection 1] Connected, targeting device 1...")
     xsdb_run(child, "tar 1", 60)
@@ -563,7 +568,7 @@ def setup_first_connection(nonreboot=False):
                                "run 'plm log' for details.") from e
     print("[Connection 1] Device programmed (100%), letting the PLM settle...")
     time.sleep(PLM_SETTLE_S)  # now measured from the END of programming
-    if IS_VEK385:
+    if IS_FARM:
         # Reset A78 #0.0 only, as palmyra does. Not appvek385.py's APU `rst -cores`:
         # that suspends EVERY core of the group, so #0.1 sits in the debugger's Reset
         # Catch and the netboot supervisor's RequestWakeUp of it fails (PM 0x7D2) or
@@ -1011,7 +1016,7 @@ def netboot_park_app_core(park_addr):
         xsdb_run(child, "catch {stop}", 30)
         # VEK385: the PLM denies the core power request behind rst -proc; stop + pc +
         # con alone parks the core (jane, 2026-11-05: park_core1.tcl -> exited).
-        xsdb_run(child, "catch {rst -proc}" if IS_VEK385 else "rst -proc", 30, "rst -proc (app core)")
+        xsdb_run(child, "catch {rst -proc}" if IS_FARM else "rst -proc", 30, "rst -proc (app core)")
         xsdb_run(child, f"rwr pc 0x{park_addr:x}", 30, "pc = nb_park")
         xsdb_run(child, "con", 30, "continue (app core)")
         xsdb_run(child, "disconnect", 30)
@@ -1190,7 +1195,7 @@ def netboot_bootstrap(why, ip, load_argv, collected):
         if not download_elf_and_continue(conn1, netboot_stage_supervisor()):
             return conn1, conn2, th, False
         if drain_until("[netboot] ready", NETBOOT_READY_TIMEOUT_S, collected):
-            if IS_VEK385 and not vek385_park_app_core(conn1, ip):
+            if IS_FARM and not vek385_park_app_core(conn1, ip):
                 return conn1, conn2, th, False
             rc, out = netload_remote(load_argv, live=True)
             if rc != 2:
@@ -1395,7 +1400,7 @@ def main():
 # hws preflight (plan-1109-b1597a s5): hw_server healthy before every run, under
 # this run's board lock. Logic and tests: hwspreflight.py / test_hwspreflight.py.
 # --------------------------------------------------------------------------
-HWS_TYPE = "vek385" if IS_VEK385 else "palmyra"
+HWS_TYPE = "vek385" if IS_FARM else "palmyra"  # "vek385": the farm-host backend (hws_vek385.py)
 SMOKE_MAX_RUN_MS = 30000
 SMOKE_DONE_S = 60
 _preflight = None  # the running Preflight; setup_first_connection calls after_power_cycle()
@@ -1420,7 +1425,7 @@ def hws_passthrough(args):
 def preflight_mode(args):
     if args.netload:
         return hwspreflight.NETLOAD
-    if not IS_VEK385 and args.nonreboot:  # systest-client + connect -url to the resident hw_server
+    if not IS_FARM and args.nonreboot:  # systest-client + connect -url to the resident hw_server
         return hwspreflight.ATTACH
     return hwspreflight.FULL
 

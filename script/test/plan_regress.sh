@@ -20,7 +20,7 @@ shift 2
 R=$(cd "$(dirname "$0")/../.." && pwd)
 C=$R/example/tileprogram/ccode
 NONPLAN="simplematmul2 simplegemm_kernel_port simplegemm_dataflow simpleconv2d simpleconv2dkernel_port_less"
-PLAN="simpleeltwise_add_none gemm_plan/gemm_plan gemm_plan/gemm_plan_4x2 gemm_plan/gemm_plan_bring simpleeltwise_add_plan simpleconv2dkernel_port_plan"
+PLAN="simpleeltwise_add_none gemm_plan/gemm_plan gemm_plan/gemm_plan_4x2 gemm_plan/gemm_plan_bring simpleeltwise_add_plan simpleconv2dkernel_port_plan ../../../src/APP/qwen/aie/qwen_gemv_lib"
 SRCS=${*:-$NONPLAN $PLAN}
 FILES="host.cc kernel.cc routing.cc aiehlc_plan.h"
 mkdir -p "$REF"
@@ -35,12 +35,15 @@ for s in $SRCS; do
     (cd "$R" && bash -c "source script/aiehlc.sh --aie-version 5 --runtime-source-file $C/$s.cc") >"$out/build.log" 2>&1
     brc=$?
     fc=$(grep -a 'flowcheck' "$out/build.log" | tail -1)
-    if [ $brc -ne 0 ] || [ ! -f "$R/aout/worklocal/build/host" ] || [ "$R/aout/worklocal/build/host" -ot "$out/.start" ]; then
+    # the artifact: the host ELF, or lib<app>.a for a library source (no main(), skill hostlibrarymode)
+    art="$R/aout/worklocal/build/host"
+    [ -f "$art" ] && [ ! "$art" -ot "$out/.start" ] || art=$(ls -t "$R"/aout/worklocal/build/lib*.a 2>/dev/null | head -1)
+    if [ $brc -ne 0 ] || [ -z "$art" ] || [ ! -f "$art" ] || [ "$art" -ot "$out/.start" ]; then
         echo "$tag: FAIL build rc=$brc ($(grep -a -m1 -E 'ERROR|error:' "$out/build.log" | cut -c1-160))"
         rc=1
     else
         for f in $FILES; do cp "$R/aout/worklocal/$f" "$out/" 2>/dev/null; done
-        cp "$R/aout/worklocal/build/host" "$out/host"
+        cp "$art" "$out/"
     fi
     # the build rewrites tracked IR dumps and generated .inc files: put them back
     (cd "$R" && git checkout -- ir/ src/mlir/mlirfront/*.inc src/mlir/mlirfront/mlirlinkrelocate/*.inc 2>/dev/null)

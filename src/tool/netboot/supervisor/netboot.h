@@ -12,8 +12,9 @@
 #include "netboot_proto.h"
 
 /* Memory map, doc/design/lwip_elf_bootloader.md section 3 (as measured on the
- * board): the design's "unused DDR_LOW1" at 0x8_0000_0000 is a MIRROR of the 2 GB
- * DDR_LOW0 on this board, so the supervisor lives at the top of DDR_LOW0 and apps
+ * board): on the PDI the supervisor was built for, the design's "unused DDR_LOW1" at
+ * 0x8_0000_0000 mirrored the 2 GB DDR_LOW0 (the PDI of 2026-11-25 has 6 GB of real
+ * DDR_LOW1, see the doc), so the supervisor lives at the top of DDR_LOW0 and apps
  * must stay below NB_APP_LIMIT. */
 #define NB_APP_BASE 0x0ULL
 #define NB_APP_LIMIT 0x78000000ULL    /* supervisor image starts here (build.sh) */

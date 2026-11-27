@@ -291,8 +291,8 @@ static AnyPtr block(Port &p, std::initializer_list<int> off, std::initializer_li
     if (!st && p.out) AIEHLC_E(p, "aie::load_buffer on an output port");
     if (st && (opt.share != aie::share::none || opt.stage != aie::stage::none || opt.ring || opt.keep))
         AIEHLC_E(p, "aie::store_buffer takes no dataflow options (.share / .stage / .ring / .keep)");
-    if (!st && opt.stage == aie::stage::memtile_ring && opt.ring <= 0)
-        AIEHLC_E(p, "{.stage = aie::stage::memtile_ring} needs {.ring = N} (MemTile ring buffers)");
+    if (!st && opt.ring < 0)
+        AIEHLC_E(p, "{.ring = %d}: a MemTile ring has >= 1 buffers (omit it to let the compiler pick)", opt.ring);
     if (st && (opt.reuse || pad || opt.resident || opt.tile[0] || opt.tile[1]))
         AIEHLC_E(p, "aie::store_buffer takes only {.depth}; .reuse / .pad / .resident / .tile are load options");
     if (ro != p.rank || rs != p.rank)
@@ -888,6 +888,50 @@ static bool remapSharedGrid(const TracePort &port, std::map<std::pair<int, int>,
     return true;
 }
 
+} // namespace
+bool viewLinearSplit(std::vector<int> &shape, PortFit &f, int rows, int cols, std::string &note) {
+    const int rank = f.rank;
+    if (rank < 2 || (int)shape.size() != rank || f.remap_cols || f.linear_view || rows < 2 || cols < 2)
+        return false;
+    const int s1 = f.base_p1[0], s0 = f.base_p0[0];
+    if (s1 <= 0 || s0 != cols * s1 || shape[0] != rows * s0)
+        return false;
+    long rowElems = 1; // elements of one dim-0 row: the block must take every later dim whole
+    for (int d = 1; d < rank; d++) {
+        if (f.base_p0[d] || f.base_p1[d] || f.step_i[d] || f.step_j[d] || f.shape[d] != shape[d])
+            return false;
+        rowElems *= shape[d];
+    }
+    // the core's loops walk dim 0 inside its own slice of s1 rows
+    const long reach = (long)(f.rounds_i - 1) * f.step_i[0] + (long)(f.rounds_j - 1) * f.step_j[0] + f.shape[0];
+    if (f.step_i[0] < 0 || f.step_j[0] < 0 || reach > s1)
+        return false;
+    const long wide = (long)s0 * rowElems;
+    if (wide > 0x7fffffff)
+        return false;
+    f.q_base0 = f.base_p0;
+    f.q_base1 = f.base_p1;
+    f.q_step_i = f.step_i;
+    f.q_step_j = f.step_j;
+    f.q_rounds_i = f.rounds_i;
+    f.q_rounds_j = f.rounds_j;
+    f.logical_tensor = shape;
+    f.q_shape = f.shape;
+    f.linear_view = true;
+    const int blk = (int)(f.shape[0] * rowElems);
+    f.rank = 2;
+    f.shape = {1, blk};
+    f.base_p0 = {1, 0};
+    f.base_p1 = {0, (int)(s1 * rowElems)};
+    f.step_i = {0, (int)(f.q_step_i[0] * rowElems)};
+    f.step_j = {0, (int)(f.q_step_j[0] * rowElems)};
+    shape = {rows, (int)wide};
+    note = "dim 0 is split over the core index p0 * " + std::to_string(cols) + " + p1 (" + std::to_string(s1) +
+           " rows per core): routed as the same memory viewed " + vecStr(shape) + ", block " + vecStr(f.shape);
+    return true;
+}
+
+namespace {
 bool fitPort(const TracePort &port, const std::vector<Event> &events, int rows, int cols, PortFit &f,
              std::vector<int> &origin, std::string &err, bool allowRemap = false) {
     std::map<std::pair<int, int>, std::vector<const Event *>> seq;
@@ -1613,6 +1657,27 @@ KernelOnlyResult inferKernelOnly(std::string &src, const std::string &srcDir, co
         rep << "[KernelAnalysis] " << k.name << ": traced on the " << mesh.first << "x" << mesh.second << " mesh\n";
         KernelTraceResult tr = traceKernel(src, k, mesh.first, mesh.second, sourceDefines(src), srcName);
         inferRoles(k.ports, tr.fits);
+        for (auto &p : k.ports) { // a dim split over the linear core index: route the equivalent 2-D view
+            std::string note;
+            if (tr.fits.count(p.var) && viewLinearSplit(p.shape, tr.fits[p.var], mesh.first, mesh.second, note)) {
+                p.extent.clear();
+                tr.notes.push_back(p.var + ": " + note);
+            }
+            // an input whose blocks differ per core (depend on both program ids) can only be fed by the
+            // dataflow plan (one stream per core): stage it through a MemTile ring unless the kernel chose
+            if (p.output || !tr.fits.count(p.var) || mesh.first < 2 || mesh.second < 2)
+                continue;
+            const PortFit &f = tr.fits[p.var];
+            auto nz = [](const std::vector<int> &v) {
+                return std::any_of(v.begin(), v.end(), [](int x) { return x; });
+            };
+            BlockOpts &o = tr.opts[p.var];
+            if (nz(f.base_p0) && nz(f.base_p1) && !o.stage && !o.share && !o.resident) {
+                o.stage = 2; // aie::stage::memtile_ring, ring picked by the plan synthesis
+                tr.notes.push_back(p.var + ": its blocks differ per core: fed by the dataflow plan, one stream per "
+                                           "core through a MemTile ring (write {.stage = ...} to choose otherwise)");
+            }
+        }
         for (auto &n : tr.notes)
             res.notes.push_back(n);
         for (auto &p : k.ports)

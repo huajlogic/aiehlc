@@ -7372,6 +7372,9 @@ void __Runtime_tile_bd_config(XAie_DevInst *dev, XAie_LocType t, int bd, int add
         XAie_DmaSetBdIteration(&d, (u32)(iter_step / 4), (u16)iter_wrap, 0);
     if (acq >= 0 && rel >= 0)
         XAie_DmaSetLock(&d, XAie_LockInit((u8)acq, (s8)acqv), XAie_LockInit((u8)rel, (s8)relv));
+    else if (acq >= 0 || rel >= 0) /* one side only (e.g. the first / last BD of a chained load) */
+        XAie_DmaLockControl(&d, XAie_LockInit((u8)(acq >= 0 ? acq : 0), (s8)(acq >= 0 ? acqv : 0)),
+                            XAie_LockInit((u8)(rel >= 0 ? rel : 0), (s8)(rel >= 0 ? relv : 0)), acq >= 0, rel >= 0);
     if (next >= 0)
         XAie_DmaSetNextBd(&d, (u16)next, XAIE_ENABLE);
     XAie_DmaEnableBd(&d);

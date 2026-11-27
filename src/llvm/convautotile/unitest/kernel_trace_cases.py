@@ -194,9 +194,10 @@ GEMM_CASES = [
      [("const int8_t *x = aie::load_buffer(a, {pm * 16, j * 64}, {16, 64});",
        "const int8_t *x = aie::load_buffer(a, {pm * 16, j * 64}, {16, 64}, {.tile = {8, 8}});")],
      "need blocks that are whole rows of the tensor"),
-    ("gemm: input block unique per core",
+    # an input unique per core used to be rejected; it is now fed by the dataflow plan (one stream per core)
+    ("gemm: input block unique per core -> dataflow plan",
      [(LOAD_B, "aie::load_buffer(b, {pn * 16, pm * 64}, {16, 64})")],
-     "unique per core"),
+     "PASS:fed by the dataflow plan, one stream per core"),
     # example/other/aiehlcpm_gemm1.cc: the mesh macros come from an <angle>
     # include, which used to be skipped -> "no device.partition(...) found".
     ("gemm: mesh ROWS/COLS from an #include <header> macro",

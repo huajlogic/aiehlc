@@ -163,7 +163,7 @@ def board_type(board, explicit=None):
     host = host_of(board)
     if host.startswith("10.23.224."):
         return "palmyra"
-    if re.match(r"^(vek385|crimini|gomphus)", host):
+    if re.match(r"^(vek385|palmyra-|crimini|gomphus|hydnum|parasol)", host):  # farm hosts: hws_vek385.py
         return "vek385"
     raise HwsError(RC_USAGE, f"cannot tell the board type of {board!r}: pass --type palmyra|vek385")
 

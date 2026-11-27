@@ -302,6 +302,65 @@ static void testRejects() {
     CHECK(!p3.ok);
 }
 
+// A dim split over the linear core index c = p0 C + p1 (qwen_gemv's weights and output): routed as the
+// same memory viewed (R, C s rowElems); the descriptor keeps the kernel's own blocks.
+static void testLinearView() {
+    std::string note;
+    std::vector<int> w = {1024, 8704};
+    PortFit fw = fit({1, 8704}, {256, 0}, {64, 0}, 1, {0, 0}, 64, {1, 0});
+    CHECK(viewLinearSplit(w, fw, 4, 4, note));
+    CHECK(!note.empty());
+    CHECK_EQ(w.size(), 2);
+    CHECK_EQ(w[0], 4);
+    CHECK_EQ(w[1], 64 * 4 * 8704);
+    CHECK(fw.linear_view);
+    CHECK_EQ(fw.shape[0], 1);
+    CHECK_EQ(fw.shape[1], 8704);
+    CHECK_EQ(fw.base_p0[0], 1);
+    CHECK_EQ(fw.base_p0[1], 0);
+    CHECK_EQ(fw.base_p1[0], 0);
+    CHECK_EQ(fw.base_p1[1], 64 * 8704);
+    CHECK_EQ(fw.step_j[1], 8704);
+    CHECK_EQ(fw.rounds_j, 64);
+    CHECK_EQ(fw.q_base0[0], 256);
+    CHECK_EQ(fw.q_base1[0], 64);
+    CHECK_EQ(fw.q_step_j[0], 1);
+    CHECK_EQ(fw.logical_tensor[0], 1024);
+    // a block of several rows: the view block is those rows, flat; the descriptor keeps (2, 32)
+    std::vector<int> t2 = {256, 32};
+    PortFit f2 = fit({2, 32}, {64, 0}, {16, 0}, 1, {0, 0}, 8, {2, 0});
+    CHECK(viewLinearSplit(t2, f2, 4, 4, note));
+    CHECK_EQ(f2.shape[1], 64);
+    CHECK_EQ(f2.step_j[1], 64);
+    CHECK_EQ(f2.q_shape[0], 2);
+    CHECK_EQ(f2.q_shape[1], 32);
+    // the view routes: w per core (plan-staged), y gathered
+    std::vector<int> y = {256, 256};
+    PortFit fy = fit({1, 256}, {64, 0}, {16, 0}, 1, {0, 0}, 16, {1, 0});
+    CHECK(viewLinearSplit(y, fy, 4, 4, note));
+    CHECK_EQ(y[1], 16384);
+    CHECK_EQ(fy.base_p1[1], 4096);
+    std::vector<TracePort> ports = {port("w", "IFM", w, false), port("y", "OFM", y, true)};
+    std::map<std::string, PortFit> fits = {{"w", fw}, {"y", fy}};
+    std::map<std::string, BlockOpts> opts;
+    opts["w"].stage = 2;
+    RoutingPlan plan = planRouting(ports, fits, 4, 4, opts);
+    CHECK(plan.ok);
+    std::vector<std::string> decls = routedTUDecls("k", plan, fits);
+    CHECK(decls.size() == 5 &&
+          decls[1].find("{2, {1, 8704, 0, 0}, {256, 0, 0, 0}, {64, 0, 0, 0}") != std::string::npos);
+    // not that form: left alone
+    std::vector<int> n1 = {1024, 8704};
+    PortFit g1 = fit({1, 8704}, {128, 0}, {64, 0}, 1, {0, 0}, 64, {1, 0}); // p0 step != C x p1 step
+    CHECK(!viewLinearSplit(n1, g1, 4, 4, note));
+    CHECK_EQ(n1[0], 1024);
+    PortFit g2 = fit({1, 4352}, {256, 0}, {64, 0}, 1, {0, 0}, 64, {1, 0}); // block not the whole row
+    CHECK(!viewLinearSplit(n1, g2, 4, 4, note));
+    PortFit g3 = fit({1, 8704}, {256, 0}, {64, 0}, 1, {0, 0}, 65, {1, 0}); // walks past the core's slice
+    CHECK(!viewLinearSplit(n1, g3, 4, 4, note));
+    CHECK(!g3.linear_view);
+}
+
 // The launch mesh, from each declaration form kernel analysis accepts:
 // device.partition({..}, R, C) / partition(R, C) / aieArray device(R, C) / aieDim mesh(R, C).
 static void testLaunchMeshForms() {
@@ -521,6 +580,7 @@ int main(int argc, char **argv) {
     testGemmStripsOptions();
     testEltwise();
     testRejects();
+    testLinearView();
     testTraceExample(repo);
     testLaunchMeshForms();
     testSpaceParse();

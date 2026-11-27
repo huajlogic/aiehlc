@@ -89,7 +89,18 @@ struct PortFit {
     int remap_cols = 0;
     std::vector<int> q_base0, q_base1, q_step_i, q_step_j;
     int q_rounds_i = 1, q_rounds_j = 1;
+    // Linear core split (viewLinearSplit): the kernel splits dim 0 over the core index c = p0 C + p1 (it
+    // moves with both program ids, p0's step = C x p1's). The fields above then describe the same memory
+    // as a 2-D view (R, C s0) -- p0 on dim 0, p1 on dim 1 -- the routing derivation consumes; the q_*
+    // fields keep the kernel's own blocks (its load_buffer coordinates), `logical_tensor` its aie::shape.
+    bool linear_view = false;
+    std::vector<int> logical_tensor, q_shape;
 };
+
+// A port whose dim 0 is split over the linear core index gets the 2-D view described at
+// PortFit::linear_view: `shape` (the tensor) and `f` are rewritten in place, `note` says what was
+// done. False (nothing changed) when the blocks do not have that form.
+bool viewLinearSplit(std::vector<int> &shape, PortFit &f, int rows, int cols, std::string &note);
 
 // Dataflow options of one port, from its load_buffer / store_buffer calls
 // (every block of a port must pass the same). All optional; 0 / false = the

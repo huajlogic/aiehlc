@@ -513,6 +513,25 @@ eager (kernel reloaded per layer), eager layer-major (B images per layer). Kerne
 reverted to the 2026-10-20 engine (~1.61 ms/image at B=32): the faster kernels
 (1.364 ms) hang ~1 run in 3 in residual layers (skill **shimctrlpushloss**).
 
+**Qwen3.5-9B on palmyra** (`src/APP/qwen/`, README there; plan + log
+`doc/plan/qwen_palmyra.md`): a 9B LLM answering on one board, baremetal, no llama.cpp. **5.3–6.5 tok/s
+decode** (prompt-dependent MTP acceptance), ~5 tok/s end to end on palmyra-14. Weight matrices on the AIE:
+`aie/qwen_gemv_kernel.cc`, y[4096][M≤4] = W·x, int4 x int8 `mmul<4,16,16>`, written as the data is laid out
+(w = `[row block][k chunk][8704 B]` by the linear core index, x whole; skill **naturalkernelplan**) -- the compiler
+derives the per-core MemTile-ring streams and x broadcast; persistent kernel, 0.352 ms / 25.3 GB/s per 4096² launch; built as an aiehlc library
+(`libqwen_gemv_lib.a`, `qwen_gemv_launch`). The rest is a C engine on one A78 (`engine/`: Gated DeltaNet with a
+two-bank state for MTP rollback, lazy decay, gated attention, MTP drafts on a 16 K frequency-ordered vocabulary,
+NEON helpers). Weights: `tools/qwen_convert.py --plan-header <lib build>/aiehlc_plan.h` → a 4.98 GB v7 blob, every
+launch put in the plan's DDR order by the compiler's generated `aiehlc_plan_arrange` (rebuild the blob when the plan
+changes; the engine refuses another version), put into
+**DDR_LOW1** (`0x8_0000_0000`, 6 GB on the 2026-11-25 PDI) by loader ELFs (`board/qwen_board.py loaders/load`,
+since netboot places segments in DDR_LOW0 only). Chat page `web/qwen_web.py` (port 8101), Markdown answers +
+AIE/A78/DDR panel. Farm palmyras (`-board palmyra-N -host <farm host>` in `apppaltest.py`); **VEK385 cannot
+hold the 9B** (A78 sees 2 + 2 GB). Goal 1 (the GEMM weights-streamed / activations-resident on Qwen shapes)
+reached 85–87 % of peak after `plandma.cpp` learned to load a held B > one MemTile BD as a BD chain.
+Traps: x/y cached + explicit flush (uncached A78 stores ~0.5 GB/s); a library from before the routing fix
+needs a rebuild (skill **aiehlclibraryrouting**).
+
 ### Dataflow options on kernel-only kernels (`.depth` / `.resident` / `.tile`)
 
 `aie::load_buffer(p, off, shape, {.depth = 1|2, .resident = true, .tile = {tr, tc}})`
@@ -590,6 +609,12 @@ flows (`[DataflowPlan] resources (aie2ps): ...`), channels from the `plan_route`
 `__Runtime_plan_setup`: BD write-once, persistent kernel (go lock), `restored` MemTile locks written once. A build without a plan is byte-identical; round trips stay identical;
 flowcheck simulates the plan routes. Design **[doc/design/dmaphop_dataflow_plan.md](doc/design/dmaphop_dataflow_plan.md)**;
 skill **dmaphopdataflowplan**.
+**Natural kernels (2026-11-27):** a dim split over the linear core index `p0 * C + p1` is routed as a 2-D
+view (`viewLinearSplit`), a per-core input is promoted to the plan, `.ring` is optional (auto 2 / 1, one-chunk
+ring buffers when needed), a shim chunk row over the BD wrap is split, and plan-fed core buffers are sized from
+the plan when the stand-in windows are too small -- each only where a build used to fail (`plan_regress.sh`
+byte-identical). The Qwen GEMV written without workarounds runs bit-exact at the same 0.345 ms; skill
+**naturalkernelplan**.
 
 ### bfloat16 ports (`input_window_bfloat16`)
 
@@ -1059,6 +1084,7 @@ Read the matching skill when the task fits:
 | A hand-written GemmSpace GEMM (simplematmul2) hangs in `wait_io TIMEOUT ... dir=1` / watchdog after a compiler update; `startio(..., 4)` became `(..., 1)`; `3D K BD is already the whole walk ... repeat 4 -> 1` | kwalkrepeatcollapse |
 | A launch slower after merging main with identical kernel / routing / DMA program: `__aie_launch` now invalidates every output (`__Runtime_sync_for_cpu`) -- allocate outputs uncached | postlaunchoutputinval |
 | A non-square mesh (4 x 2) places core groups on columns it does not have; `No free shim DMA slot` before a dataflow plan replaces the flows; a `#ifndef` / `#define` default missing in the trace harness or the kernel TU | nonsquaremeshplan |
+| Kernel-only kernel written naturally fails analysis / plan: `dim 0 moves with both program_id`, input `unique per core`, `.ring` needed / does not divide, chunk over a BD wrap, `cannot hold its copy`; tempted to hand-arrange a tensor (strided views, halves, converter interleave) | naturalkernelplan |
 | Dataflow plans: `load_buffer {.share / .stage / .ring / .keep}`, `#pragma persistent_kernel`, routing `#routing.dataflow<...>`, `dmaphop.plan*` ops, `[DataflowPlan]` errors, `aiehlc_plan.h` not found, replacing hand edits of host.cc / kernel.cc / routing.cc | dmaphopdataflowplan |
 | Kernel-only kernel without options hangs in `wait_io TIMEOUT ... dir=0` (output) but works with `{.depth = 2}`; output `pp_depth=1`, one output MM2S BD with `next_bd=-1` vs ping/pong `window_init`; `{.depth = 1} on aie::store_buffer` error | outputpingponghang |
 | A dialect attribute's dumped IR does not parse back (`expected integer value`, `failed to parse ...Attr parameter ... ArrayRef<int64_t>`, `AIEHLC_*_IR_IN ... does not parse / verify`, roundtrip FAIL at the re-entry build): `struct(params)` with an `ArrayRefParameter` | mlirattrarrayroundtrip |
@@ -1067,6 +1093,7 @@ Read the matching skill when the task fits:
 | Gen2-only build break: missing `xpseudo_asm_armclang.h`, or `XPAR_CPU_TIMESTAMP_CLK_FREQ` undeclared | bspheadergen2 |
 | hostcompile / missing compile_kernel.sh | hostcompile-entrypoint |
 | App source with no `main()` → static lib; "return-statement with a value, in function returning 'void'" | hostlibrarymode |
+| An aiehlc `lib<app>.a` linked into your own ELF hangs on the first launch; `w _Z7routingP12XAie_DevInst` in host.o, no `routing` in the ELF; old `-Wl,--undefined=...routing...` link flags | aiehlclibraryrouting |
 | aiehlc stuck after `[KernelAnalysis]` with a `/tmp/aiehlc_trace_*/h` at 100% CPU (endless loop in the kernel body); `did not finish within N s` / `AIEHLC_TRACE_TIMEOUT`; `int main(int argc, char *argv[])` built `lib<app>.a` instead of the host ELF | kerneltracehang |
 | Entry file `#include`s a kernel `.cc`; `unknown type name '__global__'` or `acquire_input_window` errors pointing at an INCLUDED file | aiehlcincludekernel |
 | Pipeline "succeeds" but emits an EMPTY module (0 routing connections, no BCF/PRX → `Couldn't open aie2ps.prx`): `__global__` in a comment, or a prototype above the kernel | aiesourcetextrewrite |
@@ -1132,7 +1159,7 @@ to reload the MCP server.
 ### Build notes
 
 - **[script/verify_env.sh](script/verify_env.sh)** — validate Vitis, LLVM, toolchain, board vars before build
-- **[script/hostcompile.sh](script/hostcompile.sh)** — kernel build via `compile_one_kernel()` → `kc.sh`; do not restore deleted `compile_kernel.sh` (skill: hostcompile-entrypoint). `compile_one_kernel` reuses `build/kernel.o` when `build/kernel.stamp` (sha256 of `kernel.cc`, `aieml.bcf`, `aieml.prx`, `kc.sh` + func/version/platform/llvm/debug knobs) matches -- aiekernel's install re-runs this script after editing only `host.cc` and used to recompile the identical kernel (~30 s per `offload`); `HOSTCOMPILE_KERNEL_REBUILD=1` forces it. Picks `HOST_ENTRY_KIND` from the generated `host.cc`: `int main()` / `void main()` link an ELF, **no main() archives `lib<app>.a`** instead (skill: hostlibrarymode). The `return;`→`return 0;` fixup is main-only — it rewrites the *first* `return;` in the file and corrupts `host_canonicalized` if applied without a main.
+- **[script/hostcompile.sh](script/hostcompile.sh)** — kernel build via `compile_one_kernel()` → `kc.sh`; do not restore deleted `compile_kernel.sh` (skill: hostcompile-entrypoint). `compile_one_kernel` reuses `build/kernel.o` when `build/kernel.stamp` (sha256 of `kernel.cc`, `aieml.bcf`, `aieml.prx`, `kc.sh` + func/version/platform/llvm/debug knobs) matches -- aiekernel's install re-runs this script after editing only `host.cc` and used to recompile the identical kernel (~30 s per `offload`); `HOSTCOMPILE_KERNEL_REBUILD=1` forces it. Picks `HOST_ENTRY_KIND` from the generated `host.cc`: `int main()` / `void main()` link an ELF, **no main() archives `lib<app>.a`** instead (skill: hostlibrarymode). That archive's `host.o` member has `routing.o` merged in (`ld -r`): the generated host.cc references `routing` only weakly, and a weak reference never pulls an archive member, so the consumer used to link without routes and hang (skill: aiehlclibraryrouting). The `return;`→`return 0;` fixup is main-only — it rewrites the *first* `return;` in the file and corrupts `host_canonicalized` if applied without a main.
 - **`script/hooks/pre-push`** (install: `bash script/install_git_hooks.sh`, also run by `source script/setup.sh`) — blocks `git push` unless `script/ci/check_opensource.py --all` (license headers + English-only text) passes on each pushed commit tip, checked in a throw-away detached worktree (so uncommitted fixes neither hide nor cause a violation; ~12 s). `--no-verify` bypasses it; the server-side gate is `.github/workflows/opensource-check.yml` as a required check.
 - **Rebuild caches (default ON; skill aiehlcbuildcache)** — a plain rerun of `aiehlc.sh` on an unchanged source went 94 s → 5.5 s (simplematmul2, `main.elf` byte-identical). Three layers, each keyed on content: **alib** (`aiehlc_alib_ensure`: skips `build_hw_lib` when `alib/.aiehlc_libcache_key` matches -- aie-rt tree, BSP, toolchain, flags, `AIE_GEN`, the recipe; flock SHARED to use, exclusive to rebuild; `--rebuild-alib`); **kernel .o** (`hostcompile.sh` KOBJ cache, `~/.cache/aiehlc/kobj`, key includes every file `kernel.cc` `#include`s via host `g++ -M -MG` -- the user kernel body `matmul.cc`/`conv2d.cc` can change while `kernel.cc` stays byte-identical; `AIEHLC_KOBJ_CACHE=off`); **host objects** (ccache-style `-E -P` key, `~/.cache/aiehlc/hobj`, off for `-g`; `HOSTCOMPILE_OBJ_CACHE=off`). A miss rebuilds alib with `-j` and without the unused x86 aie-rt build (~23 s → ~3 s).
 - **[script/aiehlc.sh](script/aiehlc.sh)** — `--platform sim` is build-only; launch sim separately via `runsim.sh` or debug UI **Run** (skills: sim-build-run-separation, raw-xaie-sim-debug-bundle)
