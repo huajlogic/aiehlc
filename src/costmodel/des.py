@@ -260,17 +260,34 @@ def _unit_exp(tile: tuple, n: int) -> list:
 
 
 def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, gran: int,
-            a_depth: Optional[int] = None, t_a: float = 0.0) -> Dict[str, Any]:
+            a_depth: Optional[int] = None, t_a: float = 0.0, b_ch: int = 2, share: str = "neighbor",
+            core_in_bpc: Optional[float] = None) -> Dict[str, Any]:
     """gran = K sub-chunks per KC=128 chunk (1: KC=128, 2: KC=64).  Returns per-tile B wait / end (cycles).
 
     depth = B slot ring depth.  a_depth (phase PQ): A slot ring depth per core; None = A not modelled (the A wait
     stays inside W, phase PM behaviour, byte-identical).  With a_depth, A is a per-core stream (one MemTile MM2S per
     core, no broadcast): A chunk j arrives at max(arrival j-1, release of chunk j - a_depth) + t_a, and the core
     acquires A before B (lock order a2/b2 ACQ, pb.txt:6), so a chunk starts at max(end j-1, A arrival, B arrival);
-    the A part of that wait is returned in 'await'."""
+    the A part of that wait is returned in 'await'.
+
+    Generic data-movement knobs (phase PR, sprint-1126161435); the defaults reproduce every older output:
+      b_ch  = core S2MM channels that carry B (2 on the board); t_b scales by 2/b_ch.
+      share = 'neighbor': one B stream per column fans out to the column's cores (column coupling, above).
+              'mt_bcast': every core takes A and B on its OWN MemTile channel (no column coupling: core i's B chunk
+              j waits only for core i's own release of j - depth and its own slice end).  The core's input port
+              carries A then B of each chunk serially at core_in_bpc bytes/cycle total (default stream_b_per_cyc,
+              8 B/cyc = 8 GB/s at 1000 MHz, ASSUMED until measured), so B chunk j starts after A chunk j."""
     N = P["chunks_per_launch"] * gran
     per_slice = N // P["slices"]
-    t_b = P["b_chunk_bytes"] / gran / P["stream_b_per_cyc"]
+    if share not in ("neighbor", "mt_bcast"):
+        raise ValueError(f"g90_sim: unknown share {share!r}")
+    if b_ch < 1:
+        raise ValueError(f"g90_sim: b_ch must be >= 1, got {b_ch}")
+    bpc = P["stream_b_per_cyc"] if (share == "neighbor" or core_in_bpc is None) else core_in_bpc
+    t_b = P["b_chunk_bytes"] / gran / bpc
+    if b_ch != 2:
+        t_b = t_b * 2.0 / b_ch
+    own = share == "mt_bcast"
     reload = P["breload_us"] * P["clk_mhz"] / P["slices"]
     bwait, end, await_ = {}, {}, {}
     for c in (1, 2, 3, 4):
@@ -286,18 +303,21 @@ def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, 
         ta_g = t_a / gran
         arr = 0.0
         slice_ready = 0.0
+        b_arr = [0.0] * 4
         for j in range(N):
-            if j % per_slice == 0:
-                if j:
-                    slice_ready = max(t_end) + reload
-                a = max(arr + t_b, slice_ready)
-            else:
-                a = arr + t_b
-            if j >= depth:
-                a = max(a, max(f[j - depth] for f in fin) + t_b)
-            arr = a
+            if not own:
+                if j % per_slice == 0:
+                    if j:
+                        slice_ready = max(t_end) + reload
+                    a = max(arr + t_b, slice_ready)
+                else:
+                    a = arr + t_b
+                if j >= depth:
+                    a = max(a, max(f[j - depth] for f in fin) + t_b)
+                arr = a
             for i in range(4):
                 st = t_end[i]
+                xa = 0.0
                 if a_depth is not None:
                     xa = a_arr[i] + ta_g
                     if j >= a_depth:
@@ -306,6 +326,13 @@ def g90_sim(P: Dict[str, Any], W: Dict[tuple, float], sigma: float, depth: int, 
                     if xa > st:
                         aw[i] += xa - st
                         st = xa
+                if own:
+                    a = max(b_arr[i], xa) + t_b
+                    if j % per_slice == 0 and j:
+                        a = max(a, t_end[i] + reload)
+                    if j >= depth:
+                        a = max(a, fin[i][j - depth] + t_b)
+                    b_arr[i] = a
                 if a > st:
                     bw[i] += a - st
                     st = a
@@ -465,6 +492,35 @@ def g90_price_ab(P: Dict[str, Any], pairs: list) -> list:
     return out, dict(sigma=sigma, t_a=t_a, base_wall_us=base["wall"] / clk)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Retile variants (phase PR, sprint-1126161435): ``python3 -m costmodel.des --gemm90-price-v V`` prints ONE line.
+# Same calibrated model as --gemm90-price-ab (sigma, t_a fitted on A2/B2 = 782.1/152.0 us, pb.txt:12; not retuned);
+# the variant only sets the generic g90_sim knobs.  gain_us = DES wall(A2,B2 base) - DES wall(variant);
+# pred_lo_us = gain - |gain| * 3.6 % (pq.txt calibration band).
+# ---------------------------------------------------------------------------------------------------------------------
+G90_VARIANTS = {
+    "b1d3": dict(b_ch=1, b_depth=3, a_depth=2, kc=128, share="neighbor"),
+    "kc64b3": dict(b_ch=2, b_depth=3, a_depth=2, kc=64, share="neighbor"),
+    "mtb3": dict(b_ch=1, b_depth=3, a_depth=2, kc=64, share="mt_bcast"),
+}
+G90_PRED_BAND = 0.036
+
+
+def g90_price_v(P: Dict[str, Any], name: str) -> str:
+    v = G90_VARIANTS[name]
+    clk = P["clk_mhz"]
+    gran = 128 // v["kc"]
+    W = g90_work_ab(P)
+    sigma, t_a = g90_fit_ab(P, W)
+    base = g90_sim(P, W, sigma, 2, 1, 2, t_a)
+    r = g90_sim(P, W, sigma, v["b_depth"], gran, v["a_depth"], t_a, b_ch=v["b_ch"], share=v["share"])
+    gain = (base["wall"] - r["wall"]) / clk
+    lo = gain - abs(gain) * G90_PRED_BAND
+    return (f"DESV v={name} b_ch={v['b_ch']} b_depth={v['b_depth']} a_depth={v['a_depth']} kc={v['kc']} "
+            f"share={v['share']} b_chunk_B={P['b_chunk_bytes'] // gran} gain_us={_f1(gain)} pred_lo_us={_f1(lo)} "
+            f"b_us={_f1(r['bwait'][(4, 3)] / clk)} a_us={_f1(r['await'][(4, 3)] / clk)}")
+
+
 if __name__ == "__main__":
     import sys as _sys
     _a = _sys.argv[1:]
@@ -479,6 +535,12 @@ if __name__ == "__main__":
         print(f"DESABFIT sigma_cyc={_f1(_f['sigma'])} t_a_cyc={_f1(_f['t_a'])} base_wall_us={_f1(_f['base_wall_us'])}")
         for _l in _o:
             print(_l)
+    elif len(_a) == 2 and _a[0] == "--gemm90-price-v":
+        if _a[1] not in G90_VARIANTS:
+            _sys.stderr.write(f"des.py: unknown variant {_a[1]!r} (known: {' '.join(G90_VARIANTS)})\n")
+            _sys.exit(2)
+        print(g90_price_v(g90_load(), _a[1]))
     else:
-        _sys.stderr.write("usage: des.py --gemm90-price | --gemm90-price-ab A B | --gemm90-price-ab-fit\n")
+        _sys.stderr.write("usage: des.py --gemm90-price | --gemm90-price-ab A B | --gemm90-price-ab-fit"
+                          " | --gemm90-price-v V\n")
         _sys.exit(2)
