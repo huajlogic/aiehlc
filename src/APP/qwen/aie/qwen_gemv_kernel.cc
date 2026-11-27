@@ -4,7 +4,7 @@
  ******************************************************************************/
 // qwen_gemv_kernel.cc -- included by qwen_gemv.cc (self test ELF) and qwen_gemv_lib.cc (library for the engine).
 // qwen small-M int4 GEMM on the 4 x 4 mesh: one launch is y[4096 rows][M] = W[4096 x 4096] . x[M x 4096]
-// with W in the qwen blob's Q4G64 layout (src/aietensorop/qwen/engine/qwen_blob.h): per row block of 16 rows,
+// with W in the qwen blob's Q4G64 layout (src/APP/qwen/engine/qwen_blob.h): per row block of 16 rows,
 // 4 chunks of 16 K-groups (64 K each), a chunk = 16 x 512 B int4 tiles then 16 x 32 B bf16 row scales.
 // Core c (mesh row-major) owns row blocks c * QG_U .. c * QG_U + QG_U - 1: its weights are one contiguous
 // range, streamed once. x (M tokens, int8 per 64 with a float scale) is held by every core, in two halves of
@@ -123,7 +123,7 @@ __global__ void qwen_gemv(aie::port<input_window_int8 *, aie::shape<QG_WR, QG_WC
     }
 }
 
-/* one launch; the qwen engine calls it through qa_ctx.launch (src/aietensorop/qwen/engine/qwen_aie.h) */
+/* one launch; the qwen engine calls it through qa_ctx.launch (src/APP/qwen/engine/qwen_aie.h) */
 extern "C" void qwen_gemv_launch(int8_t *w, int8_t *x, int8_t *y) {
     __Runtime_ctrl_high_throughput_enable(1);
     __Runtime_ctrl_pmap_enable(0);

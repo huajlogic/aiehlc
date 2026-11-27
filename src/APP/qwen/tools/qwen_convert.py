@@ -16,7 +16,7 @@ Types:
             groups' tiles, then their scales. Rows are zero-padded to a multiple of 4096 (the entry's `reserved` field
             holds the padded count) and K is cut in 4096-wide slices, slice-major. A slice's 4096-row launches
             (rows / 4096 of them) are contiguous, each 1024 chunks in the qwen_gemv plan's stream order
-            [pn][jj][pm] (src/aietensorop/qwen/aie/qwen_gemv.cc), so the AIE reads the blob as it is.
+            [pn][jj][pm] (src/APP/qwen/aie/qwen_gemv.cc), so the AIE reads the blob as it is.
   QW_I32    int32 (lm_perm: lm_head row -> token id, when lm_head's rows are in frequency order)
   QW_Q4R64  int4 rows (the embedding: one row looked up per token): per row, per 64 columns 32 B of nibbles
             (element j of the group in byte j / 2, the even one low) then a bf16 scale.

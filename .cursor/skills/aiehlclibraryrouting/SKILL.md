@@ -23,7 +23,7 @@ The generated `host.cc` declares the library's stream-switch setup **weak**:
 `__Runtime_init_mesh_partition_with`. A **weak undefined reference never pulls an archive member**,
 so `ld` took `host.o` from `lib<app>.a` but not `routing.o`; `routing` resolved to NULL and the
 partition came up with no routes. `aiekernel`'s isolate step (`ld -r` of the own objects) happened to
-hide this for TVM offloads; an archive linked directly (Qwen: `src/aietensorop/qwen/`) hit it.
+hide this for TVM offloads; an archive linked directly (Qwen: `src/APP/qwen/`) hit it.
 
 ## Fix (in the tree)
 `script/hostcompile.sh`, library branch: when routing.cc exists, `ld -r host.o routing.o ->

@@ -80,17 +80,24 @@ function buildGrid(){const g=$("grid");g.innerHTML='<div></div>'+COLS.map(c=>`<d
     COLS.forEach((c,ci)=>g.insertAdjacentHTML("beforeend",`<div class="tile" data-k="${kind}" data-c="${ci}" id="t${row}_${ci}"></div>`))}}
 buildGrid();
 let util={aie:0,cpu:0,ddr:0},anim=null,last={aie:.78,cpu:.22};
-function paint(aieOn,cpuOn,txt){
+function paint(aieOn,cpuOn,txt,ddrOn){
   document.querySelectorAll("#grid .tile").forEach(t=>{const ctrl=t.dataset.c==="0";
     const u=ctrl?Math.min(.15,aieOn*.15):aieOn*(t.dataset.k==="core"?1:t.dataset.k==="mem"?.9:.95);
     t.style.background=color(u);t.textContent=txt?(ctrl?"":Math.round(u*100)+"%"):""});
-  $("cpu").style.background=color(cpuOn);$("ddr").style.background=color(util.ddr*aieOn/(util.aie||1))}
+  $("cpu").style.background=color(cpuOn);$("ddr").style.background=color(ddrOn!==undefined?ddrOn:util.ddr*aieOn/(util.aie||1))}
 function idle(){clearInterval(anim);anim=null;paint(0,0,false);$("phase").textContent="idle";
   $("cpu").querySelector("span").textContent="idle";$("ddr").querySelector("span").textContent="idle"}
+/* While an answer runs: every weight pass is the AIE streaming the weights out of DDR (DDR busy exactly
+ * when the AIE is), then the A78 runs its parts (DeltaNet, attention, MTP, sampling) while the AIE waits.
+ * The two alternate; the labels give each block's share, from the last measured run (or typical values). */
+const DDR_STREAM=.85; /* ~25 GB/s of the ~30 GB/s DDR peak while a launch streams weights */
 function live(phase){clearInterval(anim);$("phase").textContent=phase;let k=0;
-  anim=setInterval(()=>{k++;if(phase==="prefill"){paint(.95,.25,false);return}
-    // decode: per weight pass the AIE streams (~last.aie of the time), then the A78 runs its parts
-    const onAie=(k%10)/10<last.aie;paint(onAie?1:.05,onAie?.08:1,false)},120)}
+  const a=last.aie,c=last.cpu;
+  $("cpu").querySelector("span").textContent=phase==="prefill"?"busy (prompt)":`busy ~${Math.round(c*100)}% (DeltaNet, attn, sampling)`;
+  $("ddr").querySelector("span").textContent=`busy ~${Math.round(a*100)}% (weights to the AIE)`;
+  anim=setInterval(()=>{k++;
+    if(phase==="prefill"){const on=k%4!==0;paint(on?.95:.1,on?.15:1,false,on?DDR_STREAM:.05);return}
+    const onAie=(k%10)/10<a;paint(onAie?1:.05,onAie?.08:1,false,onAie?DDR_STREAM:.05)},120)}
 let lastHw=null;
 function showAvg(){if($("avg").checked&&lastHw){paint(lastHw.aie,lastHw.cpu,true);$("phase").textContent="last-run average"}else idle()}
 function showStats(ev){const p=ev.perf,h=ev.hw;last={aie:h.aie,cpu:h.cpu};util={aie:h.aie,cpu:h.cpu,ddr:h.ddr_gbs/h.ddr_peak_gbs*h.aie};

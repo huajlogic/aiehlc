@@ -67,7 +67,7 @@ supervisor. **`0x8_0000_0000` ("DDR_LOW1")**: on the PDI this design was first b
 `DDR_LOW0` (section 12, item 1). On the PDI of 2026-11-25 it is **6 GB of real DDR**
 (`0x8_0000_0000 .. 0x9_7FFF_FFFF`, as `xparameters.h` says; `0x9_8000_0000 ..` aliases `DDR_LOW0`), the
 AIE shim DMA reaches it, and its contents survive between runs -- the qwen weight loader puts a model
-there (`src/aietensorop/qwen/board/qwen_board.py`). The supervisor still loads `PT_LOAD`s into `DDR_LOW0` only.
+there (`src/APP/qwen/board/qwen_board.py`). The supervisor still loads `PT_LOAD`s into `DDR_LOW0` only.
 
 ## 4. Components
 

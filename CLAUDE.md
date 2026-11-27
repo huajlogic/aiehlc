@@ -513,7 +513,7 @@ eager (kernel reloaded per layer), eager layer-major (B images per layer). Kerne
 reverted to the 2026-10-20 engine (~1.61 ms/image at B=32): the faster kernels
 (1.364 ms) hang ~1 run in 3 in residual layers (skill **shimctrlpushloss**).
 
-**Qwen3.5-9B on palmyra** (`src/aietensorop/qwen/`, README there; plan + log
+**Qwen3.5-9B on palmyra** (`src/APP/qwen/`, README there; plan + log
 `doc/plan/qwen_palmyra.md`): a 9B LLM answering on one board, baremetal, no llama.cpp. **5.3–6.5 tok/s
 decode** (prompt-dependent MTP acceptance), ~5 tok/s end to end on palmyra-14. Weight matrices on the AIE:
 `aie/qwen_gemv_kernel.cc`, y[4096][M≤4] = W·x, int4 x int8 `mmul<4,16,16>`, W streamed once per core through a

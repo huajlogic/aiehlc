@@ -46,21 +46,21 @@ Boards: farm palmyras, held with `python3 script/test/hws.py --board <farm host>
 
 ```bash
 # 1. weights -> blob (host; the model and the blob stay out of the repo)
-python3 src/aietensorop/qwen/tools/qwen_draftvocab.py $MODEL lm_order.npy corpus_en.txt corpus_zh.txt
-python3 src/aietensorop/qwen/tools/qwen_convert.py $MODEL qwen35_9b.qwb --lm-order lm_order.npy
+python3 src/APP/qwen/tools/qwen_draftvocab.py $MODEL lm_order.npy corpus_en.txt corpus_zh.txt
+python3 src/APP/qwen/tools/qwen_convert.py $MODEL qwen35_9b.qwb --lm-order lm_order.npy
 
 # 2. blob -> the board's DDR_LOW1 (0x8_0000_0000; DDR keeps it until the board is power cycled)
-python3 src/aietensorop/qwen/board/qwen_board.py loaders qwen35_9b.qwb loaders/ \
+python3 src/APP/qwen/board/qwen_board.py loaders qwen35_9b.qwb loaders/ \
         --bases 0x800000000,0x870000000,0x8E0000000
-python3 src/aietensorop/qwen/board/qwen_board.py load loaders/ --board palmyra-14 --host gomphus12
+python3 src/APP/qwen/board/qwen_board.py load loaders/ --board palmyra-14 --host gomphus12
 
 # 3. the AIE library (aiehlc library mode, persistent kernel)
 AIEHLC_DEFINES="QG_PERSISTENT=1" source script/aiehlc.sh --aie-version 5 \
-        --runtime-source-file $PWD/src/aietensorop/qwen/aie/qwen_gemv_lib.cc
+        --runtime-source-file $PWD/src/APP/qwen/aie/qwen_gemv_lib.cc
 mkdir -p $LIB && cp aout/worklocal/build/libqwen_gemv_lib.a thirdparty/alib/lib/libxaienginea78.a $LIB/
 
 # 4. the chat page (builds the engine objects once, then one ELF per question)
-python3 src/aietensorop/qwen/web/qwen_web.py --model $MODEL --lib $LIB \
+python3 src/APP/qwen/web/qwen_web.py --model $MODEL --lib $LIB \
         --board palmyra-14 --host gomphus12 --port 8101
 ```
 
