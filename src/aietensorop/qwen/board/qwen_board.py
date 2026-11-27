@@ -39,17 +39,31 @@ def build_elf(out, srcs, defs=(), objs=(), heap=0x0100_0000, extra_ld=(), opt="-
     sh([CROSS + "g++" if libs or objs else CROSS + "gcc", *cflags, "-o", out, *srcs, *objs, *ld])
 
 
+def compile_objs(outdir, srcs, defs=(), incs=(), opt="-O3"):
+    """cross-compile C / C++ sources (as C++, like build_elf with archives) to objects in outdir"""
+    os.makedirs(outdir, exist_ok=True)
+    objs = []
+    for src in srcs:
+        o = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + ".o")
+        sh([CROSS + "g++", "-x", "c++", opt, "-mcpu=cortex-a78", "-I" + os.path.join(BSP, "include"),
+            "-ffunction-sections", "-fdata-sections", *["-I" + i for i in incs], *["-D" + d for d in defs],
+            "-c", "-o", o, src])
+        objs.append(o)
+    return objs
+
+
 def qw_sum(b):
     w = np.frombuffer(b, dtype="<u8")
     return int(np.bitwise_xor(w, np.arange(len(w), dtype=np.uint64)).sum(dtype=np.uint64))
 
 
-def loaders(blob, outdir):
+def loaders(blob, outdir, bases=None):
     os.makedirs(outdir, exist_ok=True)
     size = os.path.getsize(blob)
     manifest = []
     with open(blob, "rb") as f:
         for i, off in enumerate(range(0, size, CHUNK)):
+            dst = bases[i] if bases else QW_BASE + off
             data = f.read(min(CHUNK, size - off))
             data += b"\0" * (-len(data) % 8)
             d = os.path.join(outdir, f"chunk{i}")
@@ -62,23 +76,24 @@ def loaders(blob, outdir):
             os.remove(os.path.join(d, "payload.bin"))
             elf = os.path.join(d, "qwen_load.elf")
             build_elf(elf, [os.path.join(HERE, "qwen_load.c")],
-                      defs=[f"QW_DST=0x{QW_BASE + off:x}ULL", f"QW_BYTES={len(data)}ULL"],
+                      defs=[f"QW_DST=0x{dst:x}ULL", f"QW_BYTES={len(data)}ULL"],
                       objs=[os.path.join(d, "payload.o")],
                       extra_ld=[f"-Wl,--section-start=.qwpayload=0x{QW_STAGE:x}"])
             os.remove(os.path.join(d, "payload.o"))
-            manifest.append((elf, QW_BASE + off, len(data), qw_sum(data)))
-            print(f"chunk {i}: 0x{QW_BASE + off:x} {len(data)} B sum 0x{manifest[-1][3]:016x}", flush=True)
+            manifest.append((elf, dst, len(data), qw_sum(data)))
+            print(f"chunk {i}: 0x{dst:x} {len(data)} B sum 0x{manifest[-1][3]:016x}", flush=True)
     with open(os.path.join(outdir, "manifest.txt"), "w") as m:
         for e in manifest:
             m.write(f"{e[0]} 0x{e[1]:x} {e[2]} 0x{e[3]:016x}\n")
 
 
-def load(outdir):
+def load(outdir, board="palmyra", host=None):
     ok = True
     for line in open(os.path.join(outdir, "manifest.txt")):
         elf, dst, n, want = line.split()
-        r = subprocess.run([sys.executable, os.path.join(REPO, "script/test/apppaltest.py"), "-board", "palmyra", "-y",
-                            "--netload", "--lock-wait", "7200", elf], capture_output=True, text=True, cwd=REPO)
+        cmd = [sys.executable, os.path.join(REPO, "script/test/apppaltest.py"), "-board", board, "-y", "--netload",
+               "--netload-max-run-ms", "120000", "--lock-wait", "7200"] + (["-host", host] if host else []) + [elf]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
         log = r.stdout + r.stderr
         open(elf + ".applog", "w").write(log)
         m = re.search(r"QWLOAD dst=(0x[0-9a-f]+) bytes=(\d+) sum=(0x[0-9a-f]+)", log)
@@ -96,7 +111,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sp = ap.add_subparsers(dest="cmd", required=True)
     a1 = sp.add_parser("loaders"); a1.add_argument("blob"); a1.add_argument("outdir")
+    a1.add_argument("--bases", help="comma list: segment i's DDR address (default: consecutive from 0x8_0000_0000)")
     a2 = sp.add_parser("load"); a2.add_argument("outdir")
+    a2.add_argument("--board", default="palmyra"); a2.add_argument("--host")
     a3 = sp.add_parser("elf"); a3.add_argument("out"); a3.add_argument("srcs", nargs="+")
     a3.add_argument("-D", dest="defs", action="append", default=[])
     a3.add_argument("-I", dest="incs", action="append", default=[])
@@ -108,9 +125,9 @@ def main():
     a3.add_argument("--ld", action="append", default=[], help="extra link flag, e.g. -Wl,--undefined=SYM")
     a = ap.parse_args()
     if a.cmd == "loaders":
-        loaders(a.blob, a.outdir)
+        loaders(a.blob, a.outdir, [int(x, 0) for x in a.bases.split(",")] if a.bases else None)
     elif a.cmd == "load":
-        sys.exit(0 if load(a.outdir) else 1)
+        sys.exit(0 if load(a.outdir, a.board, a.host) else 1)
     else:
         build_elf(a.out, a.srcs, defs=a.defs, heap=a.heap, opt=a.opt, incs=a.incs, objs=a.obj,
                   extra_ld=["-L" + d for d in a.libdirs] + a.ld, libs=a.libs)

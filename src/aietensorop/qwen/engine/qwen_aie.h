@@ -28,13 +28,15 @@ typedef struct {
     int8_t *xbuf; /* QA_XCOPIES x QA_XB, written by the CPU, read by the AIE (uncached) */
     float *ybuf;  /* QA_YB, written by the AIE */
     int ycached;  /* invalidate ybuf before reading it */
+    int xcached;  /* xbuf is cached memory: clean it (qw_dcache_flush) before each launch set */
     long launches;
     double aie_s, cpu_s; /* time in launches / in the x prep + y scatter (when timers are set) */
+    double prep_s;       /* of cpu_s: the x prep */
     double (*now)(void);
 } qa_ctx;
 
-/* quantize QA_M tokens' K slice s into the kernel's x layout (tokens >= n are zero) */
-void qa_prep_x(const float *x, int K, int n, int s, int8_t *xbuf);
+/* quantize n (<= QA_M) tokens' K slice s into the kernel's x layout, `copies` times (other token slots untouched) */
+void qa_prep_x(const float *x, int K, int n, int s, int8_t *xbuf, int copies);
 void qw_matmul_aie(void *ctx, const qw_mat *w, const float *x, int n, float *y);
 
 #ifdef __cplusplus

@@ -40,7 +40,7 @@ TARGETS_MIN = {"Cortex-A78AE": 1, "Cortex-R52": 1}
 # Same silicon as palmyra; informational, the pass bar stays TARGETS_MIN.
 EXPECTED_SEEN = {"Cortex-A78AE": 8, "Cortex-R52": 10}
 
-PROMPT_RE = r"\[(vek385-\d+)\] Systest#"
+PROMPT_RE = r"\[((?:vek385|palmyra)-\d+)\] Systest#"  # also farm palmyras (same silicon, same flow)
 DEAD_RE = r"Systest server exiting|Script done|AUTOLOGOUT!"
 STARTED_RE = r"Starting Vivado hardware server|hardware server is running"
 SESSION_SECS = 900      # LSF dispatch + system controller boot
@@ -64,7 +64,7 @@ def parse_cluster_ping(text):
     """{farmhost: (vboard, holder, job)}; holder is 'ok' (free), 'closed' or a user."""
     out = {}
     for line in text.splitlines():
-        m = re.match(r"\s*(vek385-\d+)\s+(\S+)\s+\[[^\]]*\]\s+(\S+)(?:\s+(\d+))?", line)
+        m = re.match(r"\s*((?:vek385|palmyra)-\d+)\s+(\S+)\s+(?:\[[^\]]*\]\s+)?(\S+)(?:\s+(\d+))?", line)
         if m:
             out[m.group(2)] = (m.group(1), m.group(3), m.group(4))
     return out

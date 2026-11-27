@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Convert a Qwen3.5 text checkpoint (safetensors, bf16) into the qwen engine's weight blob.
 
-Blob layout (little endian):
+Blob layout (little endian; cut in SEG-byte segments, each placed in its own DDR region on the board -- no
+tensor crosses a segment boundary, the header records SEG in MiB):
   header   struct qw_header (qwen_blob.h): magic, version, config, tensor count, table offset
   table    struct qw_tensor[n]: name[64], type, rows, cols, offset, bytes
   data     every tensor 64-byte aligned
@@ -16,6 +17,7 @@ Types:
             holds the padded count) and K is cut in 4096-wide slices, slice-major. A slice's 4096-row launches
             (rows / 4096 of them) are contiguous, each 1024 chunks in the qwen_gemv plan's stream order
             [pn][jj][pm] (src/aietensorop/qwen/aie/qwen_gemv.cc), so the AIE reads the blob as it is.
+  QW_I32    int32 (lm_perm: lm_head row -> token id, when lm_head's rows are in frequency order)
   QW_Q4R64  int4 rows (the embedding: one row looked up per token): per row, per 64 columns 32 B of nibbles
             (element j of the group in byte j / 2, the even one low) then a bf16 scale.
 
@@ -34,10 +36,11 @@ import torch
 from safetensors import safe_open
 
 QW_MAGIC = 0x35335751  # 'QW35'
-QW_VERSION = 5
-QW_F32, QW_Q4G64, QW_Q4R64 = 1, 2, 3
+QW_VERSION = 6
+QW_F32, QW_Q4G64, QW_Q4R64, QW_I32 = 1, 2, 3, 4
 ALIGN = 64
 SLICE_K = 4096   # one AIE launch: 4096 rows x SLICE_K
+SEG = 0x7000_0000  # a segment: one DDR region on the board (a loader ELF's chunk); no tensor crosses one
 PAD_ROWS = 4096
 GRID = torch.tensor([0.80, 0.85, 0.90, 0.95, 1.00, 1.05])
 
@@ -109,6 +112,10 @@ def s32(v):
     return v - (1 << 32) if v >= 1 << 31 else v
 
 
+def to_i32(w):
+    return w.to(torch.int32).contiguous().numpy().astype("<i4").tobytes()
+
+
 def to_f32(w):
     return w.float().contiguous().numpy().astype("<f4").tobytes()
 
@@ -147,6 +154,8 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--layers", type=int, default=0, help="convert only the first N layers (testing)")
     ap.add_argument("--no-mtp", action="store_true")
+    ap.add_argument("--lm-order", help="token ids by frequency (qwen_draftvocab.py): lm_head rows in that order, "
+                                       "lm_perm maps a row back to its token id")
     a = ap.parse_args()
     cfg = json.load(open(os.path.join(a.model_dir, "config.json")))
     tc = cfg.get("text_config", cfg)
@@ -193,7 +202,15 @@ def main():
         add(f"l{i}.mlp.down", QW_Q4G64, g(mp + "down_proj.weight"), to_q4g64)
     add("final_norm", QW_F32, g(P + "norm.weight"), to_f32)
     lm = "lm_head.weight" if src.has("lm_head.weight") else P + "embed_tokens.weight"
-    add("lm_head", QW_Q4G64, g(lm), to_q4g64)
+    W = g(lm)
+    if a.lm_order:
+        order = [int(t) for t in np.load(a.lm_order) if 0 <= t < W.shape[0]]
+        seen = set(order)
+        perm = torch.tensor(list(dict.fromkeys(order)) + [t for t in range(W.shape[0]) if t not in seen])
+        assert perm.numel() == W.shape[0]
+        W = W[perm]
+        add("lm_perm", QW_I32, perm, to_i32)
+    add("lm_head", QW_Q4G64, W, to_q4g64)
     mtp = not a.no_mtp and src.has("mtp.fc.weight")
     if mtp:
         add("mtp.fc", QW_Q4G64, g("mtp.fc.weight"), to_q4g64)
@@ -217,7 +234,7 @@ def main():
     ints = [L, tc["hidden_size"], tc["intermediate_size"], tc["num_attention_heads"], tc["num_key_value_heads"],
             tc["head_dim"], tc["vocab_size"], tc["linear_num_key_heads"], tc["linear_num_value_heads"],
             tc["linear_key_head_dim"], tc["linear_value_head_dim"], tc["linear_conv_kernel_dim"], int(mtp),
-            s32(full_mask & 0xFFFFFFFF), s32(full_mask >> 32)]
+            s32(full_mask & 0xFFFFFFFF), s32(full_mask >> 32), SEG >> 20]
     flts = [tc["rms_norm_eps"], theta, prf]
     # header: magic, version, n_ints, n_flts, ints[16], flts[4], n_tensors, pad, table_off (u64)
     ints16 = ints + [0] * (16 - len(ints))
@@ -230,6 +247,8 @@ def main():
     off = (table_off + ent_size * len(tensors) + ALIGN - 1) // ALIGN * ALIGN
     ents = []
     for name, t, r, c, b, prow in tensors:
+        if off % SEG + len(b) > SEG:  # starts the next segment
+            off = (off // SEG + 1) * SEG
         ents.append(struct.pack(ent_fmt, name.encode(), t, r, c, prow, off, len(b)))
         off = (off + len(b) + ALIGN - 1) // ALIGN * ALIGN
     with open(a.out, "wb") as f:

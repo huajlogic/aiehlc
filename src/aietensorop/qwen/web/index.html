@@ -1,0 +1,117 @@
+<!doctype html>
+<!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en"><head><meta charset="utf-8"><title>Qwen3.5-9B on palmyra (AIE)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#212121;--panel:#171717;--fg:#ececec;--mut:#9b9b9b;--acc:#10a37f;--bub:#2f2f2f}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI",Roboto,"Noto Sans CJK SC","PingFang SC",sans-serif;display:flex;height:100vh}
+#chat{flex:1;display:flex;flex-direction:column;min-width:0}
+header{padding:10px 18px;border-bottom:1px solid #333;display:flex;gap:12px;align-items:center}
+header b{font-size:16px}header .tag{font-size:12px;color:var(--mut);border:1px solid #444;border-radius:10px;padding:1px 8px}
+#msgs{flex:1;overflow-y:auto;padding:18px 0}
+.msg{max-width:780px;margin:0 auto 18px;padding:0 18px;display:flex;gap:12px}
+.msg .who{width:28px;height:28px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
+.msg.user .who{background:#5436da}.msg.bot .who{background:var(--acc)}
+.msg .body{white-space:pre-wrap;word-wrap:break-word;flex:1}
+.msg.user .body{background:var(--bub);border-radius:14px;padding:8px 14px}
+.msg .meta{color:var(--mut);font-size:12px;margin-top:6px}
+.cursor::after{content:"\25CF";animation:blink 1s infinite;margin-left:2px;color:var(--acc)}@keyframes blink{50%{opacity:0}}
+#form{max-width:780px;width:100%;margin:0 auto;padding:12px 18px 18px}
+#box{display:flex;background:var(--bub);border-radius:16px;padding:8px 10px;gap:8px;align-items:flex-end}
+textarea{flex:1;background:none;border:none;color:var(--fg);font:inherit;resize:none;outline:none;max-height:180px}
+button{background:var(--fg);color:#000;border:none;border-radius:10px;padding:6px 14px;font-weight:600;cursor:pointer}
+button:disabled{opacity:.4;cursor:default}
+.opts{display:flex;gap:14px;color:var(--mut);font-size:12px;margin-top:6px}.opts input[type=number]{width:60px;background:#2a2a2a;color:var(--fg);border:1px solid #444;border-radius:6px}
+#hw{width:420px;background:var(--panel);border-left:1px solid #333;padding:14px 16px;overflow-y:auto;font-size:13px}
+#hw h3{margin:4px 0 8px;font-size:14px}.sub{color:var(--mut);font-size:12px}
+#grid{display:grid;grid-template-columns:54px repeat(5,1fr);gap:4px;margin:10px 0}
+.lbl{color:var(--mut);font-size:11px;display:flex;align-items:center}
+.tile{height:38px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;
+  transition:background .25s;border:1px solid rgba(255,255,255,.08);text-shadow:0 1px 1px rgba(0,0,0,.6)}
+.colh{text-align:center;color:var(--mut);font-size:11px}
+.box{display:flex;gap:8px;margin:8px 0}.box .tile{flex:1;height:46px;flex-direction:column}
+.legend{display:flex;align-items:center;gap:6px;color:var(--mut);font-size:11px;margin:6px 0 12px}
+.legend .bar{flex:1;height:8px;border-radius:4px;background:linear-gradient(90deg,#1b2a44,#1f6f8b,#2ca25f,#e6c229,#e4572e)}
+table{width:100%;border-collapse:collapse;margin-top:6px}td{padding:3px 4px;border-bottom:1px solid #2a2a2a}td:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.pbar{height:7px;background:#2a2a2a;border-radius:4px;overflow:hidden}.pbar i{display:block;height:100%;background:var(--acc)}
+#phase{font-weight:600}
+</style></head><body>
+<div id="chat">
+ <header><b>Qwen3.5-9B</b><span class="tag">int4 · palmyra · 16 AIE cores + A78 baremetal</span><span class="tag" id="st">idle</span></header>
+ <div id="msgs"></div>
+ <div id="form"><div id="box"><textarea id="in" rows="1" placeholder="Message Qwen (on the board)..."></textarea><button id="send">Send</button></div>
+  <div class="opts"><label><input type="checkbox" id="think"> thinking</label><label>max tokens <input type="number" id="maxt" value="256" min="16" max="1500"></label>
+  <label><input type="checkbox" id="multi" checked> keep history</label></div></div>
+</div>
+<div id="hw">
+ <h3>Hardware <span class="sub" id="phase">idle</span></h3>
+ <div class="sub">AIE partition: control column + 4 x 4 compute mesh. Color = utilization over the run, from the board's measured
+ launch / CPU times (not per-core counters).</div>
+ <div id="grid"></div>
+ <div class="legend">0%<div class="bar"></div>100%</div>
+ <div class="box"><div class="tile" id="cpu">A78 core<br><span>-</span></div><div class="tile" id="ddr">DDR read<br><span>-</span></div></div>
+ <h3>Last answer</h3>
+ <table id="stats"><tr><td class="sub" colspan="2">no run yet</td></tr></table>
+ <h3>CPU time by part</h3>
+ <table id="parts"><tr><td class="sub" colspan="2">-</td></tr></table>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const ROWS=[["core",6],["core",5],["core",4],["core",3],["mem",2],["mem",1],["shim",0]];
+const COLS=["ctrl","c0","c1","c2","c3"];
+function color(u){ // 0..1 -> blue, teal, green, yellow, red
+  const s=[[27,42,68],[31,111,139],[44,162,95],[230,194,41],[228,87,46]];u=Math.max(0,Math.min(1,u))*(s.length-1);
+  const i=Math.min(Math.floor(u),s.length-2),f=u-i,c=s[i].map((v,k)=>Math.round(v+(s[i+1][k]-v)*f));return `rgb(${c})`}
+function buildGrid(){const g=$("grid");g.innerHTML='<div></div>'+COLS.map(c=>`<div class="colh">${c}</div>`).join("");
+  for(const [kind,row] of ROWS){g.insertAdjacentHTML("beforeend",`<div class="lbl">${kind} r${row}</div>`);
+    COLS.forEach((c,ci)=>g.insertAdjacentHTML("beforeend",`<div class="tile" data-k="${kind}" data-c="${ci}" id="t${row}_${ci}"></div>`))}}
+buildGrid();
+let util={aie:0,cpu:0,ddr:0},anim=null,last={aie:.78,cpu:.22};
+function paint(aieOn,cpuOn,txt){
+  document.querySelectorAll("#grid .tile").forEach(t=>{const ctrl=t.dataset.c==="0";
+    const u=ctrl?Math.min(.15,aieOn*.15):aieOn*(t.dataset.k==="core"?1:t.dataset.k==="mem"?.9:.95);
+    t.style.background=color(u);t.textContent=txt?(ctrl?"":Math.round(u*100)+"%"):""});
+  $("cpu").style.background=color(cpuOn);$("ddr").style.background=color(util.ddr*aieOn/(util.aie||1))}
+function idle(){clearInterval(anim);anim=null;paint(0,0,false);$("phase").textContent="idle"}
+function live(phase){clearInterval(anim);$("phase").textContent=phase;let k=0;
+  anim=setInterval(()=>{k++;if(phase==="prefill"){paint(.95,.25,false);return}
+    // decode: per weight pass the AIE streams (~last.aie of the time), then the A78 runs its parts
+    const onAie=(k%10)/10<last.aie;paint(onAie?1:.05,onAie?.08:1,false)},120)}
+function showStats(ev){const p=ev.perf,h=ev.hw;last={aie:h.aie,cpu:h.cpu};util={aie:h.aie,cpu:h.cpu,ddr:h.ddr_gbs/h.ddr_peak_gbs*h.aie};
+  clearInterval(anim);anim=null;paint(h.aie,h.cpu,true);$("phase").textContent="last run";
+  $("cpu").querySelector("span").textContent=Math.round(h.cpu*100)+"% busy";
+  $("ddr").querySelector("span").textContent=h.ddr_gbs.toFixed(1)+" GB/s in launches";
+  const acc=p.drafted?`${p.accepted}/${p.drafted} (${Math.round(100*p.accepted/p.drafted)}%)`:"-";
+  const rows=[["decode",`<b>${p.tok_s.toFixed(2)} tok/s</b>`],["tokens",`${p.gen} in ${p.steps} steps`],
+    ["prefill (time to first token)",`${p.prefill.toFixed(2)} s for ${p.prompt} tokens`],["MTP draft accepted",acc],
+    ["AIE launches",`${ev.aie.launches} (${ev.aie.aie_s.toFixed(2)} s)`],["AIE busy / A78 busy",`${Math.round(h.aie*100)}% / ${Math.round(h.cpu*100)}%`],
+    ["host round trip",`${ev.host_s.toFixed(1)} s (build + load + run)`]];
+  $("stats").innerHTML=rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("");
+  const parts=Object.entries(h.cpu_parts).concat([["x/y glue",h.glue_s]]);const mx=Math.max(...parts.map(q=>q[1]),1e-9);
+  $("parts").innerHTML=parts.map(([k,v])=>`<tr><td>${k}<div class="pbar"><i style="width:${100*v/mx}%"></i></div></td><td>${v.toFixed(2)} s</td></tr>`).join("")}
+idle();
+const hist=[];
+function add(role,text){const d=document.createElement("div");d.className="msg "+role;
+  d.innerHTML=`<div class="who">${role==="user"?"U":"Q"}</div><div style="flex:1;min-width:0"><div class="body"></div><div class="meta"></div></div>`;
+  d.querySelector(".body").textContent=text;$("msgs").appendChild(d);$("msgs").scrollTop=1e9;return d}
+async function send(){const q=$("in").value.trim();if(!q)return;$("in").value="";$("send").disabled=true;
+  add("user",q);const b=add("bot","");const body=b.querySelector(".body"),meta=b.querySelector(".meta");body.classList.add("cursor");
+  const msgs=($("multi").checked?hist:[]).concat([{role:"user",content:q}]);let answer="";
+  try{const r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({messages:msgs,think:$("think").checked,max_tokens:+$("maxt").value})});
+    const rd=r.body.getReader(),dec=new TextDecoder();let buf="";
+    for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
+      while((i=buf.indexOf("\n\n"))>=0){const line=buf.slice(0,i);buf=buf.slice(i+2);if(!line.startsWith("data: "))continue;
+        const ev=JSON.parse(line.slice(6));
+        if(ev.type==="status"){meta.textContent=ev.text;$("st").textContent=ev.text}
+        else if(ev.type==="phase"){live(ev.phase);meta.textContent=ev.phase==="prefill"?"prefill on the board...":"generating...";$("st").textContent=ev.phase}
+        else if(ev.type==="token"){answer+=ev.text;body.textContent=answer;$("msgs").scrollTop=1e9}
+        else if(ev.type==="stats"){showStats(ev);const p=ev.perf;meta.textContent=`${p.tok_s.toFixed(2)} tok/s · ${p.gen} tokens · first token after ${p.prefill.toFixed(2)} s prefill`}
+        else if(ev.type==="error"){meta.textContent="error: "+ev.text;meta.style.color="#e4572e"}
+        else if(ev.type==="done"){$("st").textContent="idle"}}}
+  }catch(e){meta.textContent="error: "+e}
+  body.classList.remove("cursor");if(anim)idle();$("send").disabled=false;
+  if(answer){hist.push({role:"user",content:q},{role:"assistant",content:answer})}}
+$("send").onclick=send;$("in").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}});
+</script></body></html>

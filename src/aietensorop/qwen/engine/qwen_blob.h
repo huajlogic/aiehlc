@@ -15,10 +15,10 @@
 #endif
 
 #define QW_MAGIC 0x35335751U /* 'QW35' */
-#define QW_VERSION 5
+#define QW_VERSION 6
 #define QW_SLICE_K 4096 /* Q4G64: K stored in 4096-wide slices, slice-major */
 
-enum qw_type { QW_F32 = 1, QW_Q4G64 = 2, QW_Q4R64 = 3 };
+enum qw_type { QW_F32 = 1, QW_Q4G64 = 2, QW_Q4R64 = 3, QW_I32 = 4 };
 
 /* QW_Q4G64: a group is 16 rows x 64 K = four 16(K) x 16(N) int4 tiles (512 B) + 16 bf16 scales (32 B);
  * a chunk is 16 groups of one row block: [16 x 512 B tiles][16 x 32 B scales] = 8704 B */
@@ -46,7 +46,8 @@ enum qw_cfg {
     QWC_CONV_K,
     QWC_MTP,
     QWC_FULL_MASK_LO,
-    QWC_FULL_MASK_HI
+    QWC_FULL_MASK_HI,
+    QWC_SEG_MB /* the blob's segment size (MiB): segment i may live anywhere, no tensor crosses one */
 };
 enum qw_cfgf { QWF_EPS, QWF_THETA, QWF_ROPE_FRAC };
 

@@ -46,6 +46,7 @@ __global__ void eltwise_add(aie::port<input_window_int8 *, aie::shape<OPS_R, OPS
 void __Runtime_ctrl_high_throughput_enable(int on);
 void __Runtime_ctrl_pmap_enable(int on);
 void *__Runtime_alloc_uncached(size_t bytes);
+void *__Runtime_alloc_zone(uint64_t zone_base, uint64_t zone_size, size_t bytes);
 // x / y laid out in DDR in the order the plan's shim BDs stream them (generated into aiehlc_plan.h)
 #if __has_include("aiehlc_plan.h")
 #include "aiehlc_plan.h"
@@ -67,6 +68,11 @@ int main() {
     int8_t *x = (int8_t *)malloc(n), *y = (int8_t *)malloc(n), *z = (int8_t *)malloc(n), *ref = (int8_t *)malloc(n);
 #ifdef OPS_HIDDR /* the AIE reads and writes DDR_LOW1 (0x8_0000_0000 + 6 GB on palmyra), cached on the A78 */
     int8_t *x2 = (int8_t *)(uintptr_t)(OPS_HIDDR), *y2 = x2 + n, *zt = y2 + n;
+#elif defined(OPS_HIDDR_AIE) /* a window only the AIE may touch: launch 1 writes z there, launch 2 reads it back */
+    int8_t *x2 = (int8_t *)__Runtime_alloc_uncached(n), *y2 = (int8_t *)__Runtime_alloc_uncached(n);
+    /* mapped Normal non-cacheable by the runtime, so no CPU cache maintenance ever touches the window */
+    int8_t *zt = (int8_t *)__Runtime_alloc_uncached(n),
+           *zhi = (int8_t *)__Runtime_alloc_zone(OPS_HIDDR_AIE, 0x40000000ULL, (size_t)n);
 #else
     int8_t *x2 = (int8_t *)__Runtime_alloc_uncached(n), *y2 = (int8_t *)__Runtime_alloc_uncached(n);
     int8_t *zt = (int8_t *)__Runtime_alloc_uncached(n); // tile-major: [mesh row][mesh col][round][16 x 256]
@@ -81,6 +87,28 @@ int main() {
 #endif
     const int launches = 6;
     double first = 0, best = 1e9, sum = 0;
+#ifdef OPS_HIDDR_AIE
+    { /* the same two launches twice: (x + y) -> the AIE-only window -> + 0 -> zt, and through DDR_LOW0 -> zref */
+        int8_t *zero = (int8_t *)__Runtime_alloc_uncached(n), *zlo = (int8_t *)__Runtime_alloc_uncached(n);
+        int8_t *zref = (int8_t *)__Runtime_alloc_uncached(n);
+        memset(zero, 0, n);
+        printf("[eltwise_plan] AIE-only window %p (zone at 0x%llx)\n", (void *)zhi,
+               (unsigned long long)(OPS_HIDDR_AIE));
+        if (!zhi)
+            return 1;
+        eltwise_run(x2, y2, zhi);
+        eltwise_run(zhi, zero, zt);
+        eltwise_run(x2, y2, zlo);
+        eltwise_run(zlo, zero, zref);
+        long diff = 0;
+        for (long e = 0; e < n; e++)
+            diff += zt[e] != zref[e];
+        printf("[eltwise_plan] AIE-only window %p: z written and read back by the AIE, %ld of %ld bytes differ\n",
+               (void *)zhi, diff, n);
+        printf("GOLDEN %s: eltwise_plan AIE-only window\n", diff ? "FAIL" : "PASS");
+        return diff ? 1 : 0;
+    }
+#endif
     for (int it = 0; it < launches; it++) {
         XTime t0, t1;
         XTime_GetTime(&t0);

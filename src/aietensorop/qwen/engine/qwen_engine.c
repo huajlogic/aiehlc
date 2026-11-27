@@ -17,6 +17,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(QW_STATE_F16) && !defined(__aarch64__)
+float qw_round_f16(float v) { /* round to the nearest fp16 value (normal range; tiny values flush to 0) */
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    const uint32_t e = (u >> 23) & 0xFF;
+    if (e < 127 - 14)
+        return 0.0f;
+    u = (u + 0x0FFF + ((u >> 13) & 1)) & ~0x1FFFu;
+    memcpy(&v, &u, 4);
+    return v;
+}
+#endif
+
 float qw_bf16(uint16_t h) {
     uint32_t u = (uint32_t)h << 16;
     float r;
@@ -44,17 +57,30 @@ float qw_f16(uint16_t h) {
     return r;
 }
 
+#define PROF_T0(m) double pt0_ = (m)->now ? (m)->now() : 0
+#define PROF_RE(m) pt0_ = (m)->now ? (m)->now() : 0
+#define PROF_ADD(m, k)                                                                                                 \
+    do {                                                                                                               \
+        if ((m)->now)                                                                                                  \
+            (m)->prof[k] += (m)->now() - pt0_;                                                                         \
+    } while (0)
+
 /* ---- the blob ---- */
+static const qw_model *g_bind; /* the model being bound: its segment table */
+
 static int find(const void *blob, size_t size, const char *name, qw_mat *out) {
+    (void)size;
+    const qw_model *m = g_bind;
     const struct qw_header *h = (const struct qw_header *)blob;
     const struct qw_tensor_ent *e = (const struct qw_tensor_ent *)((const uint8_t *)blob + h->table_off);
     for (uint32_t i = 0; i < h->n_tensors; i++)
         if (!strncmp(e[i].name, name, sizeof(e[i].name))) {
-            if (e[i].offset + e[i].bytes > size)
+            const size_t sg = (size_t)(e[i].offset / m->seg_bytes), in = (size_t)(e[i].offset % m->seg_bytes);
+            if (sg >= (size_t)m->nseg || in + e[i].bytes > m->seg_bytes)
                 return -1;
             out->name = e[i].name, out->type = (int)e[i].type, out->rows = (int)e[i].rows, out->cols = (int)e[i].cols;
             out->prow = e[i].reserved ? (int)e[i].reserved : out->rows;
-            out->data = (const uint8_t *)blob + e[i].offset;
+            out->data = m->seg[sg] + in;
             return 0;
         }
     return -1;
@@ -97,11 +123,31 @@ missing:
 
 int qw_open(qw_model *m, const void *blob, size_t size, int max_ctx, int max_batch, char *err, size_t errn) {
     const struct qw_header *h = (const struct qw_header *)blob;
-    memset(m, 0, sizeof *m);
-    if (size < sizeof *h || h->magic != QW_MAGIC || h->version != QW_VERSION) {
-        snprintf(err, errn, "not a qwen blob (magic %08x)", size >= 4 ? h->magic : 0);
+    if (size < sizeof *h || h->magic != QW_MAGIC) {
+        snprintf(err, errn, "not a qwen blob");
         return -1;
     }
+    const size_t sb = (size_t)h->ints[QWC_SEG_MB] << 20;
+    const void *seg[QW_MAX_SEG];
+    int n = 0;
+    for (size_t o = 0; o < size && n < QW_MAX_SEG; o += sb)
+        seg[n++] = (const uint8_t *)blob + o;
+    return qw_open_seg(m, seg, n, max_ctx, max_batch, err, errn);
+}
+
+int qw_open_seg(qw_model *m, const void *const *segs, int nseg, int max_ctx, int max_batch, char *err, size_t errn) {
+    const struct qw_header *h = (const struct qw_header *)segs[0];
+    const void *blob = segs[0];
+    memset(m, 0, sizeof *m);
+    if (h->magic != QW_MAGIC || h->version != QW_VERSION || nseg < 1 || nseg > QW_MAX_SEG) {
+        snprintf(err, errn, "not a qwen blob v%d (magic %08x version %u)", QW_VERSION, h->magic, h->version);
+        return -1;
+    }
+    m->nseg = nseg, m->seg_bytes = (size_t)h->ints[QWC_SEG_MB] << 20;
+    for (int i = 0; i < nseg; i++)
+        m->seg[i] = (const uint8_t *)segs[i];
+    g_bind = m;
+    const size_t size = 0; /* find() checks segment bounds */
     int32_t c[16];
     memcpy(c, (const uint8_t *)blob + offsetof(struct qw_header, ints), sizeof c);
     m->layers = c[QWC_LAYERS], m->hidden = c[QWC_HIDDEN], m->ffn = c[QWC_FFN], m->heads = c[QWC_HEADS];
@@ -113,6 +159,10 @@ int qw_open(qw_model *m, const void *blob, size_t size, int max_ctx, int max_bat
     NEED("embed", &m->embed);
     NEED("final_norm", &m->final_norm);
     NEED("lm_head", &m->lm_head);
+    {
+        qw_mat pm;
+        m->lm_perm = find(blob, size, "lm_perm", &pm) ? NULL : (const int32_t *)pm.data;
+    }
     if (m->mtp) {
         qw_layer *L = &m->mtp_layer;
         L->full = 1;
@@ -138,7 +188,7 @@ int qw_open(qw_model *m, const void *blob, size_t size, int max_ctx, int max_bat
                  convc = (size_t)2 * m->la_kh * m->la_kd + (size_t)m->la_vh * m->la_vd;
     m->kcache = (float *)calloc((size_t)m->n_full * max_ctx * kvd, sizeof(float));
     m->vcache = (float *)calloc((size_t)m->n_full * max_ctx * kvd, sizeof(float));
-    m->la_state = (float *)calloc((size_t)2 * m->n_la * m->la_vh * m->la_kd * m->la_vd, sizeof(float));
+    m->la_state = (qw_state_t *)calloc((size_t)2 * m->n_la * m->la_vh * m->la_kd * m->la_vd, sizeof(qw_state_t));
     m->la_cur = (unsigned char *)calloc((size_t)m->n_la + 1, 1);
     m->conv_state = (float *)calloc((size_t)m->n_la * convc * (m->conv_k - 1), sizeof(float));
     /* widest activation: the fused MLP gate + up (2 x ffn) or the linear attention qkvz */
@@ -184,7 +234,7 @@ void qw_close(qw_model *m) {
 
 void qw_reset(qw_model *m) {
     const size_t convc = (size_t)2 * m->la_kh * m->la_kd + (size_t)m->la_vh * m->la_vd;
-    memset(m->la_state, 0, (size_t)2 * m->n_la * m->la_vh * m->la_kd * m->la_vd * sizeof(float));
+    memset(m->la_state, 0, (size_t)2 * m->n_la * m->la_vh * m->la_kd * m->la_vd * sizeof(qw_state_t));
     memset(m->la_cur, 0, (size_t)m->n_la);
     memset(m->conv_state, 0, (size_t)m->n_la * convc * (m->conv_k - 1) * sizeof(float));
 }
@@ -256,10 +306,15 @@ void qw_matmul_cpu(void *ctx, const qw_mat *w, const float *x, int n, float *y) 
         const float *W = (const float *)w->data;
         for (int i = 0; i < n; i++)
             for (int r = 0; r < w->rows; r++) {
-                double s = 0;
-                for (int k = 0; k < K; k++)
-                    s += (double)W[(size_t)r * K + k] * x[(size_t)i * K + k];
-                y[(size_t)i * w->rows + r] = (float)s;
+                const float *wr = W + (size_t)r * K, *xi = x + (size_t)i * K;
+                float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                int k = 0;
+                for (; k + 8 <= K; k += 8)
+                    for (int j = 0; j < 8; j++)
+                        a[j] += wr[k + j] * xi[k + j];
+                for (; k < K; k++)
+                    a[0] += wr[k] * xi[k];
+                y[(size_t)i * w->rows + r] = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
             }
         return;
     }
@@ -305,17 +360,62 @@ static void embed_row(const qw_model *m, int tok, float *o) {
     }
 }
 
+#if defined(__aarch64__) && defined(QW_STATE_F16)
+#include <arm_neon.h>
+/* one DeltaNet head on an fp16 state, 8 lanes at a time (fp32 math): pass 1 kv = S^T k, pass 2
+ * S' = decay S + k kv^T, out = S'^T q (the generic loops below, vectorized; vd % 8 == 0) */
+static void qw_dnet_neon(const qw_state_t *Si, qw_state_t *So, const float *k, const float *q, const float *v,
+                         float decay, float beta, int kd, int vd, float *kv, float *out) {
+    for (int j = 0; j < vd; j++)
+        kv[j] = 0, out[j] = 0;
+    for (int i = 0; i < kd; i++) {
+        const float16_t *row = (const float16_t *)(Si + (size_t)i * vd);
+        const float ki = k[i];
+        for (int j = 0; j < vd; j += 8) {
+            const float16x8_t h = vld1q_f16(row + j);
+            vst1q_f32(kv + j, vfmaq_n_f32(vld1q_f32(kv + j), vcvt_f32_f16(vget_low_f16(h)), ki));
+            vst1q_f32(kv + j + 4, vfmaq_n_f32(vld1q_f32(kv + j + 4), vcvt_high_f32_f16(h), ki));
+        }
+    }
+    for (int j = 0; j < vd; j++)
+        kv[j] = (v[j] - decay * kv[j]) * beta;
+    for (int i = 0; i < kd; i++) {
+        const float16_t *row = (const float16_t *)(Si + (size_t)i * vd);
+        float16_t *orow = (float16_t *)(So + (size_t)i * vd);
+        const float ki = k[i], qi = q[i];
+        for (int j = 0; j < vd; j += 8) {
+            const float16x8_t h = vld1q_f16(row + j);
+            const float32x4_t s0 =
+                vfmaq_n_f32(vmulq_n_f32(vcvt_f32_f16(vget_low_f16(h)), decay), vld1q_f32(kv + j), ki);
+            const float32x4_t s1 = vfmaq_n_f32(vmulq_n_f32(vcvt_high_f32_f16(h), decay), vld1q_f32(kv + j + 4), ki);
+            vst1q_f16(orow + j, vcombine_f16(vcvt_f16_f32(s0), vcvt_f16_f32(s1)));
+            vst1q_f32(out + j, vfmaq_n_f32(vld1q_f32(out + j), s0, qi));
+            vst1q_f32(out + j + 4, vfmaq_n_f32(vld1q_f32(out + j + 4), s1, qi));
+        }
+    }
+}
+#endif
+
 /* linear attention for n tokens: m->xn (normed) -> m->buf2 (out_proj input -> output via matmul) */
 static void linear_attn(qw_model *m, int li, int n) {
     const qw_layer *L = &m->layer[li];
     const int kd = m->la_kd, vd = m->la_vd, kh = m->la_kh, vh = m->la_vh, K = m->conv_k;
     const int keyd = kh * kd, vald = vh * vd, convc = 2 * keyd + vald, wq = convc + vald;
     float *qkvz = m->buf0, *ab = m->buf1;
-    m->matmul(m->matmul_ctx, &L->qkvz, m->xn, n, qkvz);
-    qw_matmul_cpu(NULL, &L->ab, m->xn, n, ab); /* 2 x vh rows: CPU */
+    {
+        PROF_T0(m);
+        m->matmul(m->matmul_ctx, &L->qkvz, m->xn, n, qkvz);
+        PROF_ADD(m, QW_P_MATMUL);
+    }
+    {
+        PROF_T0(m);
+        qw_matmul_cpu(NULL, &L->ab, m->xn, n, ab); /* 2 x vh rows: CPU */
+        PROF_ADD(m, QW_P_AB);
+    }
+    PROF_T0(m);
     const size_t ssz = (size_t)vh * kd * vd, bank = (size_t)m->n_la * ssz;
-    float *Slive = m->la_state + m->la_cur[m->slot[li]] * bank + (size_t)m->slot[li] * ssz;
-    float *Sspec = m->la_state + (1 - m->la_cur[m->slot[li]]) * bank + (size_t)m->slot[li] * ssz;
+    qw_state_t *Slive = m->la_state + m->la_cur[m->slot[li]] * bank + (size_t)m->slot[li] * ssz;
+    qw_state_t *Sspec = m->la_state + (1 - m->la_cur[m->slot[li]]) * bank + (size_t)m->slot[li] * ssz;
     float *cs = m->conv_state + (size_t)m->slot[li] * convc * (K - 1);
     const float *cw = (const float *)L->conv.data, *Alog = (const float *)L->A_log.data;
     const float *dtb = (const float *)L->dt_bias.data, *nw = (const float *)L->la_norm.data;
@@ -325,7 +425,8 @@ static void linear_attn(qw_model *m, int li, int n) {
         const float *in = qkvz + (size_t)t * wq, *z = in + convc, *a = ab + (size_t)t * 2 * vh, *b = a + vh;
         /* tokens after the checkpoint read the live bank (first one) and write the speculative bank */
         const int spec = m->ckpt_t >= 0 && t > m->ckpt_t;
-        float *S_in = spec && t > m->ckpt_t + 1 ? Sspec : Slive, *S_out = spec ? Sspec : Slive;
+        qw_state_t *S_in = spec && t > m->ckpt_t + 1 ? Sspec : Slive, *S_out = spec ? Sspec : Slive;
+        const double tc0 = m->now ? m->now() : 0;
         for (int c = 0; c < convc; c++) { /* causal conv1d over [state, x] + SiLU, shift the state */
             float *st = cs + (size_t)c * (K - 1), acc = cw[c * K + K - 1] * in[c];
             for (int j = 0; j < K - 1; j++)
@@ -344,20 +445,27 @@ static void linear_attn(qw_model *m, int li, int n) {
             for (int i = 0; i < kd; i++)
                 qn[h * kd + i] = conv[h * kd + i] * rq, kn[h * kd + i] = conv[keyd + h * kd + i] * rk;
         }
+        const double tc1 = m->now ? m->now() : 0;
+        if (m->now)
+            m->prof[QW_P_DN_CONV] += tc1 - tc0;
         for (int h = 0; h < vh; h++) {
             const int hk = h / (vh / kh);
             const float *q = qn + hk * kd, *k = kn + hk * kd, *v = conv + 2 * keyd + h * vd;
             const float beta = sigm(b[h]), decay = expf(-expf(Alog[h]) * softplus(a[h] + dtb[h]));
-            const float *Si = S_in + (size_t)h * kd * vd;
-            float *So = S_out + (size_t)h * kd * vd, kv[256], *out = core + h * vd;
+            const qw_state_t *Si = S_in + (size_t)h * kd * vd;
+            qw_state_t *So = S_out + (size_t)h * kd * vd;
+            float kv[256], *out = core + h * vd;
+#if defined(__aarch64__) && defined(QW_STATE_F16)
+            qw_dnet_neon(Si, So, k, q, v, decay, beta, kd, vd, kv, out);
+#else
             /* pass 1 (read): kv = (decay S)^T k = decay (S^T k) */
             for (int j = 0; j < vd; j++)
                 kv[j] = 0;
             for (int i = 0; i < kd; i++) {
                 const float ki = k[i];
-                const float *row = Si + (size_t)i * vd;
+                const qw_state_t *row = Si + (size_t)i * vd;
                 for (int j = 0; j < vd; j++)
-                    kv[j] += row[j] * ki;
+                    kv[j] += (float)row[j] * ki;
             }
             for (int j = 0; j < vd; j++)
                 kv[j] = (v[j] - decay * kv[j]) * beta;
@@ -366,24 +474,30 @@ static void linear_attn(qw_model *m, int li, int n) {
                 out[j] = 0;
             for (int i = 0; i < kd; i++) {
                 const float ki = k[i], qi = q[i];
-                const float *row = Si + (size_t)i * vd;
-                float *orow = So + (size_t)i * vd;
+                const qw_state_t *row = Si + (size_t)i * vd;
+                qw_state_t *orow = So + (size_t)i * vd;
                 for (int j = 0; j < vd; j++) {
-                    const float sv = decay * row[j] + ki * kv[j];
-                    orow[j] = sv;
+                    const float sv = decay * (float)row[j] + ki * kv[j];
+                    orow[j] = QW_SSTORE(sv);
                     out[j] += sv * qi;
                 }
             }
+#endif
             rmsnorm(out, out, nw, vd, m->eps, 0);
             for (int j = 0; j < vd; j++)
                 out[j] *= silu(z[h * vd + j]);
         }
+        if (m->now)
+            m->prof[QW_P_DN_HEADS] += m->now() - tc1;
         memcpy(o + (size_t)t * vald, core, sizeof(float) * vald);
         if (t == m->ckpt_t) /* speculative decoding: the conv state after the last token known to be kept */
             memcpy(m->conv_ckpt + (size_t)m->slot[li] * convc * (K - 1), cs, sizeof(float) * convc * (K - 1));
     }
     memcpy(m->buf1, o, sizeof(float) * (size_t)n * vald);
+    PROF_ADD(m, QW_P_DELTANET);
+    PROF_RE(m);
     m->matmul(m->matmul_ctx, &L->la_out, m->buf1, n, m->buf2);
+    PROF_ADD(m, QW_P_MATMUL);
 }
 
 static void rope(float *v, int pos, int rot, float theta) {
@@ -399,7 +513,12 @@ static void full_attn(qw_model *m, const qw_layer *L, float *kc, float *vc, int 
     const int H = m->heads, KV = m->kv_heads, D = m->head_dim, qd = H * D * 2, kvd = KV * D;
     const int rot = (int)(D * m->rope_frac), wq = qd + 2 * kvd;
     float *qkv = m->buf0, *att = m->buf1;
-    m->matmul(m->matmul_ctx, &L->qkv, m->xn, n, qkv);
+    {
+        PROF_T0(m);
+        m->matmul(m->matmul_ctx, &L->qkv, m->xn, n, qkv);
+        PROF_ADD(m, QW_P_MATMUL);
+    }
+    PROF_T0(m);
     const float *qnw = (const float *)L->q_norm.data, *knw = (const float *)L->k_norm.data;
     static float sc[1 << 16], q[256];
     for (int t = 0; t < n; t++) {
@@ -440,17 +559,30 @@ static void full_attn(qw_model *m, const qw_layer *L, float *kc, float *vc, int 
                 oh[i] *= sigm(gate[i]);
         }
     }
+    PROF_ADD(m, QW_P_ATTN);
+    PROF_RE(m);
     m->matmul(m->matmul_ctx, &L->o, att, n, m->buf2);
+    PROF_ADD(m, QW_P_MATMUL);
 }
 
 static void mlp(qw_model *m, const qw_layer *L, int n) {
     const int F = m->ffn;
     float *gu = m->buf0, *h = m->buf1;
-    m->matmul(m->matmul_ctx, &L->mlp_gu, m->xn, n, gu);
-    for (int t = 0; t < n; t++)
-        for (int i = 0; i < F; i++)
-            h[(size_t)t * F + i] = silu(gu[(size_t)t * 2 * F + i]) * gu[(size_t)t * 2 * F + F + i];
+    {
+        PROF_T0(m);
+        m->matmul(m->matmul_ctx, &L->mlp_gu, m->xn, n, gu);
+        PROF_ADD(m, QW_P_MATMUL);
+    }
+    {
+        PROF_T0(m);
+        for (int t = 0; t < n; t++)
+            for (int i = 0; i < F; i++)
+                h[(size_t)t * F + i] = silu(gu[(size_t)t * 2 * F + i]) * gu[(size_t)t * 2 * F + F + i];
+        PROF_ADD(m, QW_P_MLPACT);
+    }
+    PROF_T0(m);
     m->matmul(m->matmul_ctx, &L->mlp_down, h, n, m->buf2);
+    PROF_ADD(m, QW_P_MATMUL);
 }
 
 /* one decoder layer on m->x (n tokens): attention (full or linear) and the MLP, each with its residual */
@@ -487,7 +619,11 @@ int qw_forward_ex(qw_model *m, const int *tok, int n, int pos, int nlog, int ckp
     memcpy(m->hid_pre, m->x, sizeof(float) * (size_t)n * Hd);
     for (int t = 0; t < n; t++)
         rmsnorm(m->hid + (size_t)t * Hd, m->x + (size_t)t * Hd, (const float *)m->final_norm.data, Hd, m->eps, 1);
-    m->matmul(m->matmul_ctx, &m->lm_head, m->hid + (size_t)(n - nlog) * Hd, nlog, m->logits);
+    {
+        PROF_T0(m);
+        m->matmul(m->matmul_ctx, &m->lm_head, m->hid + (size_t)(n - nlog) * Hd, nlog, m->logits);
+        PROF_ADD(m, QW_P_LM);
+    }
     return 0;
 }
 
@@ -520,8 +656,18 @@ int qw_mtp(qw_model *m, const int *tok, const float *hid, int n, int pos, int wa
     if (!want)
         return 0;
     rmsnorm(m->xn, m->x + (size_t)(n - 1) * Hd, (const float *)m->mtp_norm.data, Hd, m->eps, 1);
-    m->matmul(m->matmul_ctx, &m->lm_head, m->xn, 1, m->mlogits);
-    return qw_argmax(m->mlogits, m->vocab);
+    qw_mat lm = m->lm_head; /* a draft vocabulary: the first rows (whole 4096-row launches) of lm_head */
+    if (m->mtp_vocab > 0 && m->mtp_vocab < lm.rows) {
+        lm.rows = (m->mtp_vocab + 4095) / 4096 * 4096;
+        lm.prow = lm.rows;
+    }
+    m->matmul(m->matmul_ctx, &lm, m->xn, 1, m->mlogits);
+    return qw_token(m, m->mlogits, lm.rows);
+}
+
+int qw_token(const qw_model *m, const float *logits, int rows) {
+    const int i = qw_argmax(logits, rows);
+    return m->lm_perm ? m->lm_perm[i] : i;
 }
 
 int qw_argmax(const float *v, int n) {
@@ -560,14 +706,14 @@ int qw_generate(qw_model *m, const int *prompt, int n, int ngen, int spec, const
     pos = n;
     double t1 = now ? now() : 0;
     st->prefill_s = t1 - t0;
-    int t = qw_argmax(m->logits, m->vocab);
+    int t = qw_token(m, m->logits, m->vocab);
     emit(ctx, t), st->emitted++;
     while (st->emitted < ngen && !is_stop(t, stop, nstop)) {
         st->steps++;
         if (!spec) {
             if (qw_forward_ex(m, &t, 1, pos++, 1, -1))
                 break;
-            t = qw_argmax(m->logits, m->vocab);
+            t = qw_token(m, m->logits, m->vocab);
             emit(ctx, t), st->emitted++;
             continue;
         }
@@ -576,7 +722,7 @@ int qw_generate(qw_model *m, const int *prompt, int n, int ngen, int spec, const
         st->drafted++;
         if (pos + 2 > m->max_ctx || qw_forward_ex(m, toks, 2, pos, 2, 0))
             break;
-        const int a0 = qw_argmax(m->logits, m->vocab);
+        const int a0 = qw_token(m, m->logits, m->vocab);
         const float *hsrc = m->mtp_hid_pre ? m->hid_pre : m->hid;
         if (a0 == d) { /* the draft holds: two tokens for one weight pass */
             qw_commit(m);
@@ -584,7 +730,7 @@ int qw_generate(qw_model *m, const int *prompt, int n, int ngen, int spec, const
             emit(ctx, d), st->emitted++;
             if (is_stop(d, stop, nstop) || st->emitted >= ngen)
                 break;
-            t = qw_argmax(m->logits + m->vocab, m->vocab);
+            t = qw_token(m, m->logits + m->vocab, m->vocab);
             memcpy(last, hsrc + Hd, sizeof(float) * Hd);
             pos += 2;
         } else { /* drop the draft: back to the state after t */

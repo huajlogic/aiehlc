@@ -102,7 +102,9 @@ int main(int argc, char **argv) {
     }
     static int8_t xbuf[QA_XCOPIES * QA_XB];
     static float ybuf[QA_YB / 4];
-    qa_ctx actx = {fake_gemv, xbuf, ybuf, 0, 0, 0, 0, NULL};
+    qa_ctx actx;
+    memset(&actx, 0, sizeof actx);
+    actx.launch = fake_gemv, actx.xbuf = xbuf, actx.ybuf = ybuf;
     if (argc > 5 && !strcmp(argv[5], "null")) { /* time everything but the weight matmuls */
         m.matmul = null_matmul;
         printf("matmul: none (CPU-side cost only)\n");
@@ -116,6 +118,7 @@ int main(int argc, char **argv) {
     const int spec = argc > 6 ? atoi(argv[6]) : 0;
     m.mtp_hid_pre = getenv("QW_MTP_PRE") ? atoi(getenv("QW_MTP_PRE")) : 0;
     m.mtp_pos_off = getenv("QW_MTP_POS") ? atoi(getenv("QW_MTP_POS")) : 1;
+    m.mtp_vocab = getenv("QW_MTP_VOCAB") ? atoi(getenv("QW_MTP_VOCAB")) : 0;
     const int stop[] = {248046, 248044};
     qw_gen_stats gs;
     printf("GEN");
