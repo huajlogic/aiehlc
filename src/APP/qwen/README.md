@@ -24,11 +24,11 @@ The plan, the budget and the log are in [`doc/plan/qwen_palmyra.md`](../../../do
 
 | dir | file | what |
 |---|---|---|
-| `tools/` | `qwen_convert.py` | safetensors (bf16) → weight blob `.qwb` (v6): Q4G64 int4 in the AIE launch order, bf16 scales, 1.75 GB segments, lm_head rows by token frequency (`--lm-order`) |
+| `tools/` | `qwen_convert.py` | safetensors (bf16) → weight blob `.qwb` (v7): Q4G64 int4, each launch put in the plan's DDR order by the compiler's `aiehlc_plan_arrange` (`--plan-header`), bf16 scales, 1.75 GB segments, lm_head rows by token frequency (`--lm-order`) |
 | | `qwen_draftvocab.py` | token frequency order from text corpora → the MTP draft's 16 K vocabulary |
 | | `qwen_tok.py` | chat template + tokenizer: a prompt → token ids / header; board log → text |
 | | `qwen_ref.py` | transformers reference; `--engine` compares the C engine against it |
-| `aie/` | `qwen_gemv_kernel.cc` | the AIE kernel: y[4096][M≤4] = W[4096x4096]·x, `mmul<4,16,16,int8,int4>`, 4 x 4 mesh, W streamed through a MemTile ring per core, x broadcast; `QG_PERSISTENT` = persistent kernel |
+| `aie/` | `qwen_gemv_kernel.cc` | the AIE kernel, written as the data is laid out: w = `[row block][k chunk][8704 B]` read by the linear core index `4·pm + pn`, x loaded whole, y = row blocks; the compiler derives the per-core MemTile-ring streams, x broadcast, rings and BD dims (skill **naturalkernelplan**); y[4096][M≤4] = W[4096x4096]·x, `mmul<4,16,16,int8,int4>`; `QG_PERSISTENT` = persistent kernel |
 | | `qwen_gemv_lib.cc` | library entry (no `main()`) → `libqwen_gemv_lib.a`, exports `qwen_gemv_launch(w, x, y)` |
 | | `qwen_gemv.cc`, `qwen_gemv_host.h` | standalone self-test ELF (golden check) |
 | `engine/` | `qwen_engine.c/.h` | the C engine: Gated DeltaNet (two-bank state, commit / rollback, lazy decay) + gated attention, MTP drafts, NEON helpers |
@@ -45,19 +45,22 @@ Boards: farm palmyras, held with `python3 script/test/hws.py --board <farm host>
 (e.g. palmyra-14 @ gomphus12). Every board command below takes `-board palmyra-N -host <farm host>`.
 
 ```bash
-# 1. weights -> blob (host; the model and the blob stay out of the repo)
-python3 src/APP/qwen/tools/qwen_draftvocab.py $MODEL lm_order.npy corpus_en.txt corpus_zh.txt
-python3 src/APP/qwen/tools/qwen_convert.py $MODEL qwen35_9b.qwb --lm-order lm_order.npy
+# 1. the AIE library (aiehlc library mode, persistent kernel); its aiehlc_plan.h fixes the weights' DDR order
+AIEHLC_DEFINES="-DQG_PERSISTENT=1" source script/aiehlc.sh --aie-version 5 \
+        --runtime-source-file $PWD/src/APP/qwen/aie/qwen_gemv_lib.cc
+mkdir -p $LIB && cp aout/worklocal/build/libqwen_gemv_lib.a aout/worklocal/aiehlc_plan.h \
+        thirdparty/alib/lib/libxaienginea78.a $LIB/
 
-# 2. blob -> the board's DDR_LOW1 (0x8_0000_0000; DDR keeps it until the board is power cycled)
+# 2. weights -> blob (host; the model and the blob stay out of the repo). Every launch is put in the order
+#    the plan's shim BDs read, by the generated aiehlc_plan_arrange -- rebuild the blob when the plan changes
+python3 src/APP/qwen/tools/qwen_draftvocab.py $MODEL lm_order.npy corpus_en.txt corpus_zh.txt
+python3 src/APP/qwen/tools/qwen_convert.py $MODEL qwen35_9b.qwb --lm-order lm_order.npy \
+        --plan-header $LIB/aiehlc_plan.h
+
+# 3. blob -> the board's DDR_LOW1 (0x8_0000_0000; DDR keeps it until the board is power cycled)
 python3 src/APP/qwen/board/qwen_board.py loaders qwen35_9b.qwb loaders/ \
         --bases 0x800000000,0x870000000,0x8E0000000
 python3 src/APP/qwen/board/qwen_board.py load loaders/ --board palmyra-14 --host gomphus12
-
-# 3. the AIE library (aiehlc library mode, persistent kernel)
-AIEHLC_DEFINES="QG_PERSISTENT=1" source script/aiehlc.sh --aie-version 5 \
-        --runtime-source-file $PWD/src/APP/qwen/aie/qwen_gemv_lib.cc
-mkdir -p $LIB && cp aout/worklocal/build/libqwen_gemv_lib.a thirdparty/alib/lib/libxaienginea78.a $LIB/
 
 # 4. the chat page (builds the engine objects once, then one ELF per question)
 python3 src/APP/qwen/web/qwen_web.py --model $MODEL --lib $LIB \

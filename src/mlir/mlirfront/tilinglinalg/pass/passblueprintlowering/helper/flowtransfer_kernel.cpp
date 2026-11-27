@@ -11,6 +11,7 @@
 // per-core-tile locals in CoreTileCtx (`t`).
 
 #include "flowtransfer_internal.h"
+#include "dataflowplan/dataflowplan.h"
 
 namespace blueprint_sched {
 
@@ -752,6 +753,26 @@ void emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitD
         }
         if (kernelBufElements < t.pingPongBufferSize)
             kernelBufElements = t.pingPongBufferSize;
+        // A port the dataflow plan feeds keeps the plan's copy (`slots` traced blocks) in these buffers
+        // (planresource.cpp assignCopyCores). The generated stand-in flow may slice it far finer (a whole-row
+        // x cut into 68 B windows by the GEMM tiling): when its windows cannot hold the copy, size them from
+        // the plan instead -- one traced block per buffer, as many buffers as slots (one: no pong, as with
+        // depth 1). Windows that already hold it keep their layout.
+        int bufCount = t.ppDepth == 1 ? 1 : 2;
+        if (c.isInput && t.elementSizeBytes > 0 && d.passState && dfplan::activePlan().present &&
+            dfplan::activePlan().replaces(c.funcArgIdx)) {
+            const int64_t block = routing::lookupWindowBytes(d.passState->tensorInfo, c.funcArgIdx);
+            int slots = 0;
+            for (const dfplan::PlanStream &ps : dfplan::activePlan().streams)
+                if (ps.arg == c.funcArgIdx)
+                    slots = std::max(slots, ps.slots);
+            const int64_t have = (int64_t)bufCount * ((kernelBufElements * t.elementSizeBytes + 31) / 32 * 32);
+            const int64_t need = slots > 0 ? (int64_t)(slots - 1) * ((block + 31) / 32 * 32) + block : 0;
+            if (block > 0 && have < need) {
+                kernelBufElements = std::max<int64_t>(kernelBufElements, block / t.elementSizeBytes);
+                bufCount = slots == 1 ? 1 : bufCount;
+            }
+        }
         uint32_t bufSizeBytes = ((kernelBufElements * t.elementSizeBytes) + 3) & ~3;
         try {
             auto &allocator = ResourceMgr::instance()->coreMemAllocator();
@@ -760,7 +781,7 @@ void emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitD
                 d.passState ? routing::lookupBlockAlign(d.passState->tensorInfo, c.funcArgIdx) : 0;
             const uint32_t align = blockAlign > 32 ? (uint32_t)blockAlign : 32u;
             auto pingAddr = allocator.allocate(pingName, bufSizeBytes, align, c.funcArgIdx);
-            if (t.ppDepth == 1) {
+            if (bufCount == 1) {
                 // Single buffer mode: only allocate ping buffer, no pong
                 if (pingAddr) {
                     c.flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;

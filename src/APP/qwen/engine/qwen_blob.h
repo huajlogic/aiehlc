@@ -15,7 +15,7 @@
 #endif
 
 #define QW_MAGIC 0x35335751U /* 'QW35' */
-#define QW_VERSION 6
+#define QW_VERSION 7         /* 7: launches in the natural-kernel plan order */
 #define QW_SLICE_K 4096 /* Q4G64: K stored in 4096-wide slices, slice-major */
 
 enum qw_type { QW_F32 = 1, QW_Q4G64 = 2, QW_Q4R64 = 3, QW_I32 = 4 };

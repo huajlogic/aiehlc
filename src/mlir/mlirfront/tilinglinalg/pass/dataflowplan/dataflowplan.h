@@ -258,6 +258,7 @@ struct MemtileUse {
     const PlanRoute *shimRoute = nullptr;
     std::vector<const PlanRoute *> out;
     std::vector<int> parities; // ring: the chunk parities (core S2MM channels) the MemTile serves
+    int unit = 1;              // ring, one parity: chunks per ring buffer (2, or 1 when 2 x ring does not divide)
     int s2mmBds = 0, locks = 0;
     std::vector<int> mm2sBds; // per out route
     int64_t bytes = 0;        // MemTile memory

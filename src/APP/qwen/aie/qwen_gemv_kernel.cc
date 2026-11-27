@@ -10,12 +10,16 @@
 // range, streamed once. x (M tokens, int8 per 64 with a float scale) is held by every core, in two halves of
 // 32 K groups each: int8 tiles [32 groups][4][M][16] (8192 B), then the scales [32 groups][M] fp32 (512 B).
 // y per row block: [M][16] fp32. The math is qw_matmul_cpu's: per group int32 sum, times w_scale x x_scale.
+// Written as the data is laid out -- w = the launch's chunks [row block][k chunk][8704 B], x whole, y = row
+// blocks -- and the compiler derives the DMA: w's dim 0 follows the linear core index 4 pm + pn (routed as a
+// 2-D view), w is fed one stream per core through a MemTile ring, rings and BD dims are picked by the plan
+// (skill naturalkernelplan). The DDR order of w is the plan's: qwen_convert.py applies the generated
+// aiehlc_plan_arrange to every launch; y lands row-block order as declared (no output_tile_major).
 #include "qwen_gemv_host.h"
 #pragma aie_debug_level(AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
 #pragma control_plan_op_control_packet
 #pragma control_packet_mode(aot)
 #pragma KERNELCONFIGOFFLOAD
-#pragma output_tile_major
 #ifdef QG_PERSISTENT
 #pragma persistent_kernel
 #endif
@@ -27,20 +31,12 @@
 #define QG_CB 8704
 #define QG_XB 17408
 #define QG_YB 256
-#define QG_PR 16 /* a chunk is viewed as QG_PR rows of QG_PB bytes (BD wrap limits) */
-#define QG_PB 544
-#define QG_WR 4096 /* 4 mesh rows x QG_U x QG_CH x QG_PR */
-#define QG_WC 2176 /* 4 mesh cols x QG_PB */
-#define QG_XR 68   /* x viewed as 68 rows of 256 B */
-#define QG_XC 256
-#define QG_YR 64   /* 4 mesh rows x QG_U */
-#define QG_YC 1024 /* 4 mesh cols x QG_YB */
+#define QG_NCH 1024 /* chunks per launch: 256 row blocks x QG_CH */
+#define QG_NRB 256  /* row blocks per launch */
 
-// w: one stream per core (the dataflow plan), through a MemTile FIFO
-#define QG_OPTS_W {.depth = 2, .stage = aie::stage::memtile_ring, .ring = 2, .align = 64}
-// x: the same two halves for every core, multicast per mesh column, one held at a time
-#define QG_OPTS_X                                                                                                      \
-    {.depth = 1, .share = aie::share::broadcast, .stage = aie::stage::memtile_ring, .ring = 1, .align = 64}
+// w: one stream per core through a MemTile FIFO; x: the same block for every core, multicast, held once
+#define QG_OPTS_W {.depth = 2, .stage = aie::stage::memtile_ring, .align = 64}
+#define QG_OPTS_X {.depth = 1, .share = aie::share::broadcast, .stage = aie::stage::memtile_ring, .align = 64}
 
 #if defined(__chess__)
 // one 64-K group: 4 x mmul<4,16,16> int8 x int4, then acc += float(c) * (x_scale[m] * w_scale[n])
@@ -86,38 +82,34 @@
 #define QG_COPY_OUT(o, p) memcpy((o), (p), QG_YB)
 #endif
 
-// The core walks x half h = 0, 1 and, under it, its row blocks u and their K chunks 2h, 2h + 1, keeping the
-// QG_U accumulators in core memory. w viewed [(((pm * 2 + h) * QG_U + u) * 2 + kh) * QG_PR + r][pn * QG_PB + byte]:
-// in DDR a launch's chunks are cut in 16 pieces of 544 B ordered [pm][h][u][kh][r][pn] (the converter writes them
-// so); the core receives each chunk contiguous. Core c = 4 pm + pn computes row block c * QG_U + u.
-// y is written tile-major ([pm][pn][u][QG_YB]), i.e. row-block order.
-__global__ void qwen_gemv(aie::port<input_window_int8 *, aie::shape<QG_WR, QG_WC>> w,
-                          aie::port<input_window_int8 *, aie::shape<QG_XR, QG_XC>> x,
-                          aie::port<output_window_int8 *, aie::shape<QG_YR, QG_YC>> y) {
+// Core c = 4 pm + pn computes row blocks c * QG_U + u, u < QG_U, each over its QG_CH K chunks; the QG_U
+// accumulators stay in core memory. x holds the K groups g = 0..63 in two halves of 32 (tiles, then scales).
+__global__ void qwen_gemv(aie::port<input_window_int8 *, aie::shape<QG_NCH, QG_CB>> w,
+                          aie::port<input_window_int8 *, aie::shape<1, QG_XB>> x,
+                          aie::port<output_window_int8 *, aie::shape<QG_NRB, QG_YB>> y) {
     const int pm = aie::program_id(0), pn = aie::program_id(1);
+    const int c = pm * 4 + pn;
     alignas(64) static float accs[QG_U * 64];
     for (int i = 0; i < QG_U * 64; i++)
         accs[i] = 0;
-    for (int h = 0; h < 2; h++) {
-        const int8_t *xh = aie::load_buffer(x, {h * (QG_XR / 2), 0}, {QG_XR / 2, QG_XC}, QG_OPTS_X);
-        for (int u = 0; u < QG_U; u++) {
-            QG_ACC_LOAD(acc, accs + u * 64);
-            for (int kh = 0; kh < 2; kh++) {
-                const int8_t *wb = aie::load_buffer(w, {(((pm * 2 + h) * QG_U + u) * 2 + kh) * QG_PR, pn * QG_PB},
-                                                    {QG_PR, QG_PB}, QG_OPTS_W);
-                for (int gg = 0; gg < 16; gg++) { /* group g = 32 h + 16 kh + gg of the row block */
-                    const int gh = kh * 16 + gg;
-                    QG_GROUP(acc, wb + gg * 512, wb + 8192 + gg * 32, xh + gh * 256,
-                             (const float *)(xh + 8192) + gh * QG_M);
-                }
-                aie::release(w);
-            }
-            QG_ACC_SAVE(accs + u * 64, acc);
-        }
-        aie::release(x);
-    }
+    const int8_t *xb = aie::load_buffer(x, {0, 0}, {1, QG_XB}, QG_OPTS_X);
     for (int u = 0; u < QG_U; u++) {
-        int8_t *o = aie::store_buffer(y, {pm * QG_U + u, pn * QG_YB}, {1, QG_YB}, {.depth = 2});
+        QG_ACC_LOAD(acc, accs + u * 64);
+        for (int kc = 0; kc < QG_CH; kc++) {
+            const int8_t *wb = aie::load_buffer(w, {(c * QG_U + u) * QG_CH + kc, 0}, {1, QG_CB}, QG_OPTS_W);
+            for (int gg = 0; gg < 16; gg++) { /* group g = 16 kc + gg of the row block */
+                const int g = kc * 16 + gg;
+                const int8_t *xh = xb + (g / 32) * (QG_XB / 2);
+                QG_GROUP(acc, wb + gg * 512, wb + 8192 + gg * 32, xh + (g % 32) * 256,
+                         (const float *)(xh + 8192) + (g % 32) * QG_M);
+            }
+            aie::release(w);
+        }
+        QG_ACC_SAVE(accs + u * 64, acc);
+    }
+    aie::release(x);
+    for (int u = 0; u < QG_U; u++) {
+        int8_t *o = aie::store_buffer(y, {c * QG_U + u, 0}, {1, QG_YB}, {.depth = 2});
         QG_COPY_OUT(o, accs + u * 64);
         aie::commit(y);
     }

@@ -366,6 +366,27 @@ operands on a 4-row mesh need 8 and the router refuses (`no free path`); a spati
 (the same kernel on the generated path: 57 ms and wrong), x per core + y per column 0.213 ms, conv 7x7 s2
 224 x 224 0.098 ms (54.2 ms on the generated path).
 
+### Kernels written naturally: what the compiler now derives (2026-11-27)
+
+Writing the Qwen int4 GEMV (`src/APP/qwen/aie/`) needed four workarounds in the kernel and the weight
+converter. Each is now the compiler's job; the natural kernel (`w` = `[1024 chunks][8704 B]` read by the
+linear core index `c = 4 pm + pn`, `x` loaded whole once, `y` = `[256 row blocks][256 B]`, no `.ring`, no
+`output_tile_major`) builds as written and runs bit-exact at the hand-arranged kernel's speed (VEK385:
+0.345 ms per launch, 25.9 GB/s of weights, GOLDEN PASS; the hand-arranged kernel 0.348 ms).
+
+| limit | where | now |
+|---|---|---|
+| a tensor dim may move with only one program id | kernel analysis (`trace_routing.cpp planPort`) | `viewLinearSplit` (`kernel_trace.cpp`): dim 0 split over `c = p0 C + p1` (p0's step = C x p1's, blocks spanning the later dims, loops inside the core's slice) is routed as the same memory viewed `(R, C s rowElems)` -- p0 on dim 0, p1 on dim 1. The routing, `#routing.kernel_block` and the plan see the view; the on-core descriptor keeps the kernel's own blocks (`PortFit::linear_view`, `q_*`). An output gathered this way lands row-major `[pm][pn][u]` without `output_tile_major`. |
+| an input unique per core needs `.stage` | kernel analysis (`planRouting`) | such an input with no `.stage` / `.share` / `.resident` gets `.stage = memtile_ring` (note in the report) -- one stream per core |
+| `.stage = memtile_ring` needs `.ring`; a single-parity ring needs a multiple of `2 x ring` chunks | analysis; `plandma.cpp` `memtileUse` / `deriveRing` | `.ring` optional: `autoRing` (`plansynth.cpp`) = 2 when a core's chunk count is even, else 1; a single-parity ring whose stream is not a multiple of `2 x ring` uses one-chunk buffers (`MemtileUse::unit`) -- a broadcast x of one chunk per launch works |
+| a chunk row wider than a BD wrap | `plandma.cpp` `shimChunkDims` (core / MemTile already split) | the shim walks the arranged (contiguous) chunk as `{1, in} {in, out}` words (`splitWords`) when the row form does not fit |
+| the plan's copy must fit the replaced windows | `planresource.cpp assignCopyCores` | the stand-in flow may slice a plan-fed input far finer than its block (x cut into 68 B windows); `flowtransfer_kernel.cpp` then sizes its core buffers from the plan (traced block per buffer, one buffer for one slot) -- only when the windows cannot hold the copy, so existing builds keep their layout |
+
+Each rule fires only where a build used to fail: `script/test/plan_regress.sh` (5 non-plan + 6 plan
+examples + the current Qwen library) is byte-identical before / after, `flowcheck: OK` everywhere. Not done:
+the shim reading a natural layout in place -- a per-core stream is still laid out by `aiehlc_plan_arrange`
+(each column's shim interleaves its cores' chunks), so static weights are arranged once, offline.
+
 ### Device facts: one table per target
 
 `plantarget.h` holds every device fact the plan and the flow-transfer helpers use, per target: `aie2ps`

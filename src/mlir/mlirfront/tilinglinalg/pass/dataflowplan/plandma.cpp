@@ -60,8 +60,9 @@ MemtileUse memtileUse(const DataflowPlan &p, const PlanStream &s, int col) {
             u.parities.push_back(r->dsts[0].second - s.channel);
         const int k = (int)u.parities.size();
         u.chunksPerTile = (int64_t)s.chunks * k / s.channels;
-        if (k == 1) { // one parity: buffers of 2 chunks, one chain each way
-            u.s2mmBds = s.ring, u.mm2sBds = {s.ring}, u.locks = 2, u.bytes = (int64_t)s.ring * 2 * chunk;
+        if (k == 1) { // one parity: buffers of 2 chunks (1 when the stream is not a multiple of 2 x ring)
+            u.unit = s.ring > 0 && (s.rounds * u.chunksPerTile) % (2 * s.ring) == 0 ? 2 : 1;
+            u.s2mmBds = s.ring, u.mm2sBds = {s.ring}, u.locks = 2, u.bytes = (int64_t)s.ring * u.unit * chunk;
         } else { // k parities: per parity `ring` one-chunk buffers and an (empty, full) lock pair
             u.s2mmBds = s.ring * k, u.mm2sBds.assign(k, s.ring), u.locks = 2 * k;
             u.bytes = (int64_t)s.ring * k * chunk;
@@ -97,10 +98,16 @@ std::pair<int64_t, int64_t> splitWords(int64_t words, int64_t maxW) {
 // The chunk stream a shim BD reads from DDR, chunk by chunk (bytes): rows of chunkCols elements,
 // chunkRows rows, then n chunks. The host lays the stream out contiguously in this order
 // (aiehlc_plan_arrange in aiehlc_plan.h).
+// A chunk row wider than the shim's BD wrap (e.g. one 8704 B row = 2176 words > 1023) is walked as the
+// contiguous run it is in the arranged stream: {1, in} {in, out} words, both wraps within the limit.
 Dims shimChunkDims(const PlanStream &s, int64_t n) {
-    const int w = planTarget().bdWordBytes;
+    const PlanTarget &T = planTarget();
+    const int w = T.bdWordBytes;
     const int64_t row = (int64_t)s.chunkCols * s.elemBytes;
-    return {{w, row / w}, {row, s.chunkRows}, {s.chunkBytes(), n}};
+    if (row / w <= T.shimBdMaxWrap && s.chunkRows <= T.shimBdMaxWrap)
+        return {{w, row / w}, {row, s.chunkRows}, {s.chunkBytes(), n}};
+    const auto [in, out] = splitWords(s.chunkBytes() / w, T.shimBdMaxWrap);
+    return {{w, in}, {in * w, out}, {s.chunkBytes(), n}};
 }
 
 // MemTile side of a memtile_ring stream, per column: the shim's chunks enter a FIFO ring and leave on
@@ -124,14 +131,14 @@ void deriveRing(DataflowPlan &p, size_t si) {
             p.locks.back().tag = mtag(si, c, "lock", 2 * j + 1);
         }
         if (k == 1) {
-            const int rounds = (int)(A.rounds * u.chunksPerTile / (2 * ring));
+            const int rounds = (int)(A.rounds * u.chunksPerTile / (u.unit * ring));
             for (int b = 0; b < ring; b++) {
                 const bool last = b == ring - 1;
-                const int64_t addr = m.addr + b * 2 * chunk;
+                const int64_t addr = m.addr + b * u.unit * chunk;
                 p.bds.push_back({t,
                                  m.bdIn + b,
                                  addr,
-                                 2 * chunk,
+                                 u.unit * chunk,
                                  {},
                                  0,
                                  0,
@@ -144,7 +151,7 @@ void deriveRing(DataflowPlan &p, size_t si) {
                 p.bds.push_back({t,
                                  m.bdOut[0] + b,
                                  addr,
-                                 2 * chunk,
+                                 u.unit * chunk,
                                  {},
                                  0,
                                  0,
@@ -454,7 +461,8 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
     }
     if (splitWords(s.chunkBytes() / s.parts / T.bdWordBytes, T.coreBdMaxWrap).first == 0 ||
         splitWords(s.chunkBytes() / T.bdWordBytes, T.memBdMaxWrap).first == 0 ||
-        (int64_t)s.chunkCols * s.elemBytes / T.bdWordBytes > T.shimBdMaxWrap || s.chunkRows > T.shimBdMaxWrap) {
+        (((int64_t)s.chunkCols * s.elemBytes / T.bdWordBytes > T.shimBdMaxWrap || s.chunkRows > T.shimBdMaxWrap) &&
+         splitWords(s.chunkBytes() / T.bdWordBytes, T.shimBdMaxWrap).first == 0)) {
         why = S + "a chunk does not fit the core / MemTile / shim BD wrap limits";
         return false;
     }
@@ -479,7 +487,7 @@ bool checkStream(const DataflowPlan &p, const PlanStream &s, std::string &why) {
                 served.insert({s.strips[c * groups + g], r->dsts[0].second - s.channel});
             }
             const int64_t perTile = u.chunksPerTile;
-            if (k == 1 ? (s.rounds * perTile) % (2 * s.ring) : (s.rounds * perTile) % (s.ring * k)) {
+            if (k == 1 ? (s.rounds * perTile) % (u.unit * s.ring) : (s.rounds * perTile) % (s.ring * k)) {
                 why = S + "the ring does not divide column " + str(c) + "'s chunk stream";
                 return false;
             }

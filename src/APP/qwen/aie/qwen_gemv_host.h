@@ -49,13 +49,6 @@ static float qgh_bf16(const uint8_t *p) {
 static int8_t *qgh_xt(int8_t *xb, int g) { return xb + (g / 32) * 8704 + (g % 32) * 256; }
 static float *qgh_xs(int8_t *xb, int g) { return (float *)(xb + (g / 32) * 8704 + 8192) + (g % 32) * QGH_M; }
 
-/* DDR offset of piece r (544 B) of chunk kc of launch row block rb: the kernel views w as
- * [(((pm * 2 + h) * 16 + u) * 2 + kh) * 16 + r][pn * 544 + byte], row-major, 2176 B per row */
-static size_t qgh_piece(int rb, int kc, int r) {
-    const int c = rb / 16, u = rb % 16, pm = c / 4, pn = c % 4, h = kc / 2, kh = kc % 2;
-    return (((((size_t)pm * 2 + h) * 16 + u) * 2 + kh) * 16 + r) * 2176 + (size_t)pn * 544;
-}
-
 /* reference: y[m][row] for M tokens (w as logical chunks [rb][kc][8704]), the kernel's math in the same order */
 static void qgh_ref(const uint8_t *w, int8_t *xb, float *y) {
     for (int rb = 0; rb < QGH_ROWS / 16; rb++)
@@ -91,10 +84,7 @@ static int qg_selftest(void (*run)(int8_t *, int8_t *, int8_t *)) {
             wl[c * QGH_CB + 8192 + 2 * j] = (uint8_t)m7;
             wl[c * QGH_CB + 8192 + 2 * j + 1] = (uint8_t)(0x3C); /* exponent 120: 2^-7 x (1 + m/128) */
         }
-    for (int rb = 0; rb < QGH_ROWS / 16; rb++) /* scatter into the kernel's view: pieces [pm][h][u][kh][r][pn] */
-        for (int kc = 0; kc < 4; kc++)
-            for (int r = 0; r < 16; r++)
-                memcpy(w + qgh_piece(rb, kc, r), wl + ((size_t)rb * 4 + kc) * QGH_CB + r * 544, 544);
+    memcpy(w, wl, QGH_WBYTES); /* the kernel takes the chunks as they are: w[row block][k chunk][8704] */
     for (int g = 0; g < QGH_K / 64; g++) {
         for (int i = 0; i < 4 * QGH_M * 16; i++)
             qgh_xt(x, g)[i] = (int8_t)(qgh_rng(&s) % 255 - 127);

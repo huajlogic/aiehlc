@@ -15,8 +15,10 @@ Types:
             16 rows' bf16 scales (32 B). 16 consecutive K groups of a row block form a chunk of 8704 B: the 16
             groups' tiles, then their scales. Rows are zero-padded to a multiple of 4096 (the entry's `reserved` field
             holds the padded count) and K is cut in 4096-wide slices, slice-major. A slice's 4096-row launches
-            (rows / 4096 of them) are contiguous, each 1024 chunks in the qwen_gemv plan's stream order
-            [pn][jj][pm] (src/APP/qwen/aie/qwen_gemv.cc), so the AIE reads the blob as it is.
+            (rows / 4096 of them) are contiguous. A launch is the kernel's w = [256 row blocks][4 k chunks][8704 B]
+            (src/APP/qwen/aie/qwen_gemv_kernel.cc), put into the DDR order the dataflow plan's shim BDs read by
+            the compiler's own aiehlc_plan_arrange (--plan-header: the aiehlc_plan.h of the qwen_gemv library
+            build), so the AIE reads the blob as it is and no order is written down here.
   QW_I32    int32 (lm_perm: lm_head row -> token id, when lm_head's rows are in frequency order)
   QW_Q4R64  int4 rows (the embedding: one row looked up per token): per row, per 64 columns 32 B of nibbles
             (element j of the group in byte j / 2, the even one low) then a bf16 scale.
@@ -29,14 +31,14 @@ Fused matrices (one weight pass on the AIE per group of outputs that share an in
   fa.qkv  = q_proj ++ k_proj ++ v_proj  (10240 x 4096, full-attention layers)
   mlp.gu  = gate_proj ++ up_proj        (24576 x 4096)
 """
-import argparse, json, os, struct, sys, time
+import argparse, ctypes, json, os, struct, subprocess, sys, tempfile, time
 
 import numpy as np
 import torch
 from safetensors import safe_open
 
 QW_MAGIC = 0x35335751  # 'QW35'
-QW_VERSION = 6
+QW_VERSION = 7  # 7: launches in the natural-kernel plan order (aiehlc_plan_arrange)
 QW_F32, QW_Q4G64, QW_Q4R64, QW_I32 = 1, 2, 3, 4
 ALIGN = 64
 SLICE_K = 4096   # one AIE launch: 4096 rows x SLICE_K
@@ -73,6 +75,37 @@ def pack_nibbles(q):
     return u[..., 0::2] | (u[..., 1::2] << 4)
 
 
+LAUNCH_CHUNKS, CHUNK_BYTES = 1024, 8704  # one AIE launch: 256 row blocks x 4 k chunks
+ARRANGE = None  # aiehlc_plan_arrange of the qwen_gemv build (plan_arranger)
+
+
+def plan_arranger(header):
+    """The compiler's aiehlc_plan_arrange(0, ...) from `header`, as bytes -> bytes for one launch. Checked to
+    be a permutation of the launch's chunks (every chunk once, none lost)."""
+    d = tempfile.mkdtemp(prefix="qw_arrange_")
+    stub = os.path.join(d, "arrange.c")
+    with open(stub, "w") as f:
+        f.write('#include "%s"\nvoid qw_arrange(int a, const void *s, void *d) { aiehlc_plan_arrange(a, s, d); }\n'
+                % os.path.abspath(header))
+    so = os.path.join(d, "arrange.so")
+    subprocess.run(["gcc", "-O2", "-shared", "-fPIC", "-o", so, stub], check=True)
+    fn = ctypes.CDLL(so).qw_arrange
+    fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+    n = LAUNCH_CHUNKS * CHUNK_BYTES
+
+    def arrange(src):
+        assert len(src) == n, len(src)
+        sbuf, dbuf = ctypes.create_string_buffer(bytes(src), n), ctypes.create_string_buffer(n)
+        fn(0, sbuf, dbuf)
+        return dbuf.raw
+    probe = np.repeat(np.arange(LAUNCH_CHUNKS, dtype=np.int32), CHUNK_BYTES // 4).tobytes()
+    ids = np.frombuffer(arrange(probe), dtype=np.int32).reshape(LAUNCH_CHUNKS, CHUNK_BYTES // 4)
+    if not (ids == ids[:, :1]).all() or sorted(ids[:, 0].tolist()) != list(range(LAUNCH_CHUNKS)):
+        sys.exit(f"{header}: aiehlc_plan_arrange(0) is not a permutation of {LAUNCH_CHUNKS} chunks of "
+                 f"{CHUNK_BYTES} B -- not the qwen_gemv plan")
+    return arrange
+
+
 def to_q4g64(w):
     """rows padded with zeros to a multiple of PAD_ROWS; K > SLICE_K stored as SLICE_K slices, slice-major
     ([K / SLICE_K][rows / 16][SLICE_K / 64] blocks): one AIE launch streams one contiguous slice range."""
@@ -91,12 +124,10 @@ def to_q4g64(w):
     tiles = tiles.reshape(R // 16, S, C, 16 * 512)
     sc = sc.reshape(R // 16, S, C, 16 * 32)
     blk = torch.cat([tiles, sc], -1).permute(1, 0, 2, 3).contiguous()  # [S, rb, C, 8704]
-    # one AIE launch = 256 row blocks of a slice, in the qwen_gemv plan's stream order [pn][jj][pm]: core
-    # c = 4 pm + pn owns row blocks 16 c + u and loads chunk kc = 2 h + kh as its jj = (16 h + u) 2 + kh-th
+    # one AIE launch = 256 row blocks of a slice = the kernel's w [row block][k chunk][8704], arranged by the plan
     L = R // 4096
-    blk = blk.reshape(S, L, 4, 4, 16, 2, 2, 8704)                     # [S, L, pm, pn, u, h, kh, 8704]
-    blk = blk.permute(0, 1, 3, 5, 4, 6, 2, 7).contiguous()            # [S, L, pn, h, u, kh, pm, 8704]
-    return blk.numpy().tobytes(), R
+    blk = blk.reshape(S * L, LAUNCH_CHUNKS * CHUNK_BYTES).numpy()
+    return b"".join(ARRANGE(blk[i].tobytes()) for i in range(S * L)), R
 
 
 def to_q4r64(w):
@@ -154,9 +185,13 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--layers", type=int, default=0, help="convert only the first N layers (testing)")
     ap.add_argument("--no-mtp", action="store_true")
+    ap.add_argument("--plan-header", required=True,
+                    help="aiehlc_plan.h of the qwen_gemv library build (aout/worklocal/): the launch DDR order")
     ap.add_argument("--lm-order", help="token ids by frequency (qwen_draftvocab.py): lm_head rows in that order, "
                                        "lm_perm maps a row back to its token id")
     a = ap.parse_args()
+    global ARRANGE
+    ARRANGE = plan_arranger(a.plan_header)
     cfg = json.load(open(os.path.join(a.model_dir, "config.json")))
     tc = cfg.get("text_config", cfg)
     src = Src(a.model_dir)

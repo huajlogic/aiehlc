@@ -76,6 +76,9 @@ int traceToArg(Value v) {
 
 // {.ring = N} or, when the kernel gave none (0), the default of the caller's staging
 int64_t ringOr(routing::DataflowAttr d, int64_t dflt) { return d && d.getRing() ? d.getRing() : dflt; }
+// {.ring} omitted on a per-core / copy stream: 2 buffers when a core's chunk stream has an even length (the
+// ring of 2-chunk buffers needs it), else 1 -- any ring divides the stream then (plandma one-chunk buffers).
+int64_t autoRing(routing::DataflowAttr d, int64_t chunksPerCore) { return ringOr(d, chunksPerCore % 2 == 0 ? 2 : 1); }
 
 // Per-column host-tile matching for the neighbour-shared streams: stream s is read by the mesh rows in
 // consumers[s]; its host row must be within one row of every one of them, one stream per host.
@@ -396,7 +399,7 @@ bool synthPerCore(const Geometry &g, const Operand &op, int o, ArrayRef<int64_t>
         return fail(A + "implemented with stage = memtile_ring");
     const int64_t M = ts[0], N = ts[1] * inner, cr = bs[0], cc = bs[1] * inner;
     const int64_t rounds = w.rounds, chunks = w.chunks;
-    const int ring = (int)ringOr(op.df, 2), mt = g.memRows - o, shim = T.shimMm2sChannels - 1 - o;
+    const int ring = (int)autoRing(op.df, w.rounds * w.chunks), mt = g.memRows - o, shim = T.shimMm2sChannels - 1 - o;
     if ((rounds * chunks) % ring)
         return fail(A + "a ring of " + std::to_string(ring) + " does not divide a core's " +
                     std::to_string(rounds * chunks) + " chunks");
@@ -510,7 +513,7 @@ bool synthCopyText(const Geometry &g, const std::vector<const Operand *> &ops, b
         const bool ring = stage == "memtile_ring";
         if (!ring && stage != "memtile")
             return fail(A + "implemented with stage = memtile_ring or memtile");
-        const int nring = ring ? (int)ringOr(op.df, 2) : 0, mt = g.memRows - (int)o,
+        const int nring = ring ? (int)autoRing(op.df, (int64_t)ri * rj) : 0, mt = g.memRows - (int)o,
                   shim = T.shimMm2sChannels - 1 - (int)o;
         for (int s = 0; s < nStrips; s++) {
             MemtileChannels &mc = mtCh[mt * 1000 + s];

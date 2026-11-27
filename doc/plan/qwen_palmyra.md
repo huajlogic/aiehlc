@@ -102,3 +102,12 @@ qwen_ref.py: torch reference      AIE (persistent kernel): small-M GEMM -- int4 
 * 2026-11-27: library-mode routing fix (`hostcompile.sh` merges routing.o into host.o; no more
   `--undefined`), verified on palmyra-14: 17,462 launches, 6.52 tok/s.
   Next: the other A78 cores for the CPU part (DeltaNet), an M = 8 prefill kernel for the time to first token.
+* 2026-11-27: the qwen_gemv kernel is written naturally (w = [row block][k chunk][8704 B] by the linear core
+  index, x whole, y = row blocks; no hand view, no x halves, no output_tile_major) -- four framework limits
+  lifted (skill naturalkernelplan). The converter no longer writes the shim order by hand: every launch goes
+  through the generated aiehlc_plan_arrange (--plan-header), blob v7. palmyra-14: self-test GOLDEN PASS 0.352 ms
+  / 25.3 GB/s (was 0.355 / 25.1); en / zh / poem tokens identical to the old kernel, 6.53 / 5.93 / 5.32 tok/s
+  (was 6.48 / 5.89 / 5.28). palmyra-22 (web) reloaded with v7 and the new library: 7.28 tok/s.
+* 2026-11-27: PDI sweep on palmyra-14 (2MC, LPDDR5 6400 / 8533, 128 B / 4 KB interleave): 128 B beats 4 KB by
+  4-7 % (a core's weights are one contiguous range, which 128 B spreads over the 4 DRAM channels); 8533 = 6400
+  (the NoC limits, not DRAM). The default BOOT.BIN (md5 ef1d417e) is already 2MC 8533 / 128 B -- the best of them.
