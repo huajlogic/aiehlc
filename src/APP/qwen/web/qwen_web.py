@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A chat web page in front of the qwen engine on a palmyra board (baremetal A78 + AIE).
 
-  qwen_web.py --model /content/models/Qwen3.5-9B --lib <dir with libqwen_gemv_lib.a, libxaienginea78.a>
+  qwen_web.py --model <Qwen3.5-9B dir> --lib <dir with libqwen_gemv_lib.a, libxaienginea78.a>
               --board palmyra-14 --host gomphus12 [--port 8101]
 
 Per question: the chat template on the host tokenizer, a tiny object with the token ids linked against the
