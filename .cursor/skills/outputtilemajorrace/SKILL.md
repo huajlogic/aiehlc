@@ -40,7 +40,7 @@ send the next slab while BDs are rewritten -> data lands at stale addresses.
 
 ## Kernel-only kernels hit it too (2026-11-14)
 `example/tileprogram/ccode/simpleconv2dkernel_port.cc` (aie::mmul<8,8,8>, dense
-HWC output) with a golden-checking host: **FAIL 483,593 / 802,816** on palmyra,
+HWC output) with a golden-checking host: **FAIL 483,593 / 802,816** on VEK385_2,
 while `emu_conv2d_spatial.sh` on the same build says 0 mismatches (x86 has no DMA
 timing). Every wrong output equals the right value of the same position in
 another round (core (0,3) round (0,0) held round (1,0)'s block): the generated

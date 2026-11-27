@@ -7,7 +7,7 @@ directory, runs offline on archived data; **[proposed]** = not built.
 
 ## Goal
 
-Board time is the scarce resource (one palmyra213 run of the three nets takes minutes per cfg, the
+Board time is the scarce resource (one VEK385_2 run of the three nets takes minutes per cfg, the
 17-kernel K calibration ~7 min plus 1338 s of builds — M7 REPORT §4). Use `estimate()` to discard bad build
 candidates *before* the board, send only the best few, and feed the board results back into the parameters.
 
@@ -75,8 +75,8 @@ Runtime ~19 s on x86.
   locks, `glue`, `l` in `unpriced` and leaves them out of `total_ms` (`estimate.py:119-171`, `:480`). A ranking
   across candidates that differ in an unpriced term is meaningless; the loop must refuse such comparisons
   (`tune_loop.py` prints `unpriced=` per candidate; net mode returns `[]`).
-* **L3 One board** (#4). Full parameter sets exist only for palmyra213 (`estimate.py:186`, `:344`); VEK385 has a
-  kernel-level diff only (M7.2.2). The loop as written tunes for palmyra213.
+* **L3 One board** (#4). Full parameter sets exist only for VEK385_2 (`estimate.py:186`, `:344`); VEK385 has a
+  kernel-level diff only (M7.2.2). The loop as written tunes for VEK385_2.
 * **L4 Resolution** (#2, #5). The candidates ranked so far differ 1.1–2×. Per-site maxrel is 0.177 (UNet) and
   per-site board jitter ~2–4 %; ranking candidates a few percent apart is unvalidated — hence the `--margin`
   rule (send all candidates within the model error to the board).

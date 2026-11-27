@@ -269,7 +269,7 @@ print(r.ok, r.top1, r.inference_ms)
 ```
 
 `run` rebuilds `main.elf` if it is older than its inputs, loads it on the board
-(palmyra uses netboot), and parses the console. The proof that layer 1 ran on
+(VEK385_2 uses netboot), and parses the console. The proof that layer 1 ran on
 the array is one `ENTER` / `EXIT rc=0` pair from the AIE adapter in the log
 (`r.log`).
 

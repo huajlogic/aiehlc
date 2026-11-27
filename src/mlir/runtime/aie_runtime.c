@@ -651,7 +651,7 @@ int __Runtime_core_perf_last_launch_ovl(unsigned long long *compute_cyc, unsigne
  * XAie_LoadElf -> _XAie_EccOnPM/_XAie_EccOnDM -> _XAie_EccPerfCntConfig (aie-rt pm/xaie_ecc.c:58) programs core
  * counter 0 as the ECC-scrub period timer: Counter0_Event_Value = 1000000, Performance_Control2.Cnt0_Reset_Event =
  * PERF_CNT_0 (event 5), start/stop = TRUE. Re-arming only start/stop (ACTIVE_CORE) leaves the self-reset in place,
- * so counter 0 counted ACTIVE modulo 1e6 (palmyra213 resident: perfctl2=0x00000005, every read < 1e6, non-monotonic
+ * so counter 0 counted ACTIVE modulo 1e6 (VEK385_2 resident: perfctl2=0x00000005, every read < 1e6, non-monotonic
  * across launches; GAP-aie_runtime-core-perf-co-2da35c). Arming counter 0 for profiling therefore takes full
  * ownership: reset event -> NONE (no self-reset; the scrub trigger then fires once at 1e6 instead of every 1e6
  * cycles for the rest of the profiled run) before the counter is zeroed. */

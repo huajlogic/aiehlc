@@ -179,7 +179,7 @@ def main(log, out, name, section="aie"):
         es = (int(bs["elapsed0"]) + int(bs["elapsed1"])) / 2.0
         ed = (int(bdf["elapsed0"]) + int(bdf["elapsed1"])) / 2.0
         # DMA-vs-DMA: the arbiter conflicts (CONFLICT_DM_BANK_0, level count) but the 8 B/cyc streams absorb them, so
-        # the elapsed penalty is reported separately (dm_bank_conflict_dma_elapsed_cyc_per_kib, 0 on palmyra213).
+        # the elapsed penalty is reported separately (dm_bank_conflict_dma_elapsed_cyc_per_kib, 0 on VEK385_2).
         # dm_bank_conflict_cyc = bank-0 conflict cycles (same - diff) per KiB of same-bank traffic (4 streams).
         p["dm_bank_conflict_dma_elapsed_cyc_per_kib"] = round((es - ed) / kib, 2)
         p["dm_bank_conflict_cyc"] = round((int(bs["conflict_bank0"]) - int(bdf["conflict_bank0"])) / (4 * kib), 2)

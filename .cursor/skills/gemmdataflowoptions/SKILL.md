@@ -64,7 +64,7 @@ any option on a conv gave `the routed carrier differs from the spatial-halo
 conv derivation ... (internal error)` (pp_depth was compared).
 
 ## Board
-palmyra 213 (2026-11-11): `simplegemm_dataflow.cc` GOLDEN PASS (524,288), 79.55 ms
+VEK385_2 (2026-11-11): `simplegemm_dataflow.cc` GOLDEN PASS (524,288), 79.55 ms
 per launch; `--profiling`: kload 96.5 %, bdcfg 2.3 %, wait_io 1.2 % -- the
 launch is the per-call kernel ELF reload (26.6 KB of buffer BSS per core over
 MMIO), not the DMA. Board runs need the sandbox off (devlock file, ssh).

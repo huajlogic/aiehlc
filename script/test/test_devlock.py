@@ -8,6 +8,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 import devlock
 
+# The AIE2PS local test board; a TEST-NET-1 placeholder when unset (tests never reach it).
+BOX_IP = os.environ.get("AIE2PS_LOCAL_TEST_BOX_IP", "").strip() or "192.0.2.213"
+
 HOLDER = textwrap.dedent("""
     import sys, time; sys.path.insert(0, {here!r})
     import devlock
@@ -15,7 +18,7 @@ HOLDER = textwrap.dedent("""
         print("HELD", flush=True); time.sleep(60)
 """)
 
-def spawn_holder(tmp_path, dev="huaj@10.23.224.213"):
+def spawn_holder(tmp_path, dev=f"huaj@{BOX_IP}"):
     code = HOLDER.format(here=os.path.dirname(os.path.abspath(__file__)), dev=dev, d=str(tmp_path))
     p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
     for line in p.stdout:
@@ -26,13 +29,13 @@ def spawn_holder(tmp_path, dev="huaj@10.23.224.213"):
     return p
 
 def test_same_file_as_board_py(tmp_path):
-    assert devlock.lock_path("huaj@10.23.224.213", str(tmp_path)).endswith("10.23.224.213_3121.lock")
+    assert devlock.lock_path(f"huaj@{BOX_IP}", str(tmp_path)).endswith(f"{BOX_IP}_3121.lock")
 
 def test_second_run_is_refused_while_first_holds(tmp_path):
     p = spawn_holder(tmp_path)
     try:
         with pytest.raises(SystemExit) as e:
-            with devlock.DeviceLock("huaj@10.23.224.213", lock_dir=str(tmp_path), wait_secs=0):
+            with devlock.DeviceLock(f"huaj@{BOX_IP}", lock_dir=str(tmp_path), wait_secs=0):
                 pass
         assert "BOARD BUSY" in str(e.value) and str(p.pid) in str(e.value)
     finally:
@@ -42,19 +45,19 @@ def test_sigkilled_holder_releases_lock_immediately(tmp_path):
     p = spawn_holder(tmp_path)
     p.send_signal(signal.SIGKILL); p.wait()
     t = time.time()
-    with devlock.DeviceLock("huaj@10.23.224.213", lock_dir=str(tmp_path), wait_secs=0):
+    with devlock.DeviceLock(f"huaj@{BOX_IP}", lock_dir=str(tmp_path), wait_secs=0):
         assert time.time() - t < 1
 
 def test_waiter_gets_lock_when_holder_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(devlock, "POLL_SECS", 0.2)
     p = spawn_holder(tmp_path)
     subprocess.Popen(["sh", "-c", f"sleep 1; kill {p.pid}"])
-    with devlock.DeviceLock("huaj@10.23.224.213", lock_dir=str(tmp_path), wait_secs=20):
+    with devlock.DeviceLock(f"huaj@{BOX_IP}", lock_dir=str(tmp_path), wait_secs=20):
         pass
     p.wait()
 
 def test_different_devices_do_not_block(tmp_path):
-    p = spawn_holder(tmp_path, dev="huaj@10.23.224.213")
+    p = spawn_holder(tmp_path, dev=f"huaj@{BOX_IP}")
     try:
         with devlock.DeviceLock("huaj@10.23.224.214", lock_dir=str(tmp_path), wait_secs=0):
             pass
@@ -63,10 +66,10 @@ def test_different_devices_do_not_block(tmp_path):
 
 def test_lock_break_kills_hung_local_holder(tmp_path):
     p = spawn_holder(tmp_path)
-    msg = devlock.break_lock("huaj@10.23.224.213", lock_dir=str(tmp_path))
+    msg = devlock.break_lock(f"huaj@{BOX_IP}", lock_dir=str(tmp_path))
     assert str(p.pid) in msg
     p.wait(timeout=10)
-    with devlock.DeviceLock("huaj@10.23.224.213", lock_dir=str(tmp_path), wait_secs=0):
+    with devlock.DeviceLock(f"huaj@{BOX_IP}", lock_dir=str(tmp_path), wait_secs=0):
         pass
 
 
@@ -85,10 +88,10 @@ def test_lock_break_frees_a_frozen_sigstopped_holder(tmp_path):
     p = spawn_holder(tmp_path)
     os.kill(p.pid, signal.SIGSTOP)
     try:
-        msg = devlock.break_lock("huaj@10.23.224.213", lock_dir=str(tmp_path))
+        msg = devlock.break_lock(f"huaj@{BOX_IP}", lock_dir=str(tmp_path))
         assert "gone, lock released" in msg and "SIGKILL" in msg
         p.wait(timeout=10)
-        with devlock.DeviceLock("huaj@10.23.224.213", lock_dir=str(tmp_path), wait_secs=0):
+        with devlock.DeviceLock(f"huaj@{BOX_IP}", lock_dir=str(tmp_path), wait_secs=0):
             pass
     finally:
         if p.poll() is None:

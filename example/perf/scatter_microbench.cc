@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
-/* Host scatter microbench (costmodel SCMB), bare-metal A78 (palmyra213), no AIE work.
+/* Host scatter microbench (costmodel SCMB), bare-metal A78 (VEK385_2), no AIE work.
  * Driven by script/perf/run_microbench.sh --section scatter; script/perf/scmb_fit.py reads the log (writes nothing
  * to script/perf/params/).
  * Function under test: uc_scatter16 (src/aiednn/conv2d/kacc_conv_host.cc:107, NEON), body copied verbatim below,

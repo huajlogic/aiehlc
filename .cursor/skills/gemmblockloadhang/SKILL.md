@@ -7,7 +7,7 @@ description: A GEMM (or other non-conv) block-load kernel -- kernel-only `aie::s
 
 Reference: `example/tileprogram/ccode/simplegemm_kernel_port.cc` (kernel-only) and
 `simplegemm_kernel_space.cc` (hand-written), C[64,64] = A[64,256] x B[64,256]^T on 4x4,
-PASS on palmyra 213 since 2026-11-10. History: `doc/design/trace_to_routing.md` step 3.
+PASS on VEK385_2 since 2026-11-10. History: `doc/design/trace_to_routing.md` step 3.
 
 ## Where to look, in order
 

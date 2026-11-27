@@ -1,7 +1,7 @@
 <!doctype html>
 <!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
      SPDX-License-Identifier: Apache-2.0 -->
-<html lang="en"><head><meta charset="utf-8"><title>Qwen3.5-9B on palmyra (AIE)</title>
+<html lang="en"><head><meta charset="utf-8"><title>Qwen3.5-9B on vek385_2 (AIE)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 :root{--bg:#212121;--panel:#171717;--fg:#ececec;--mut:#9b9b9b;--acc:#10a37f;--bub:#2f2f2f}
@@ -48,7 +48,7 @@ table{width:100%;border-collapse:collapse;margin-top:6px}td{padding:3px 4px;bord
 #phase{font-weight:600}
 </style></head><body>
 <div id="chat">
- <header><b>Qwen3.5-9B</b><span class="tag">int4 · palmyra · 16 AIE cores + A78 baremetal</span><span class="tag" id="st">idle</span></header>
+ <header><b>Qwen3.5-9B</b><span class="tag">int4 · vek385_2 · 16 AIE cores + A78 baremetal</span><span class="tag" id="st">idle</span></header>
  <div id="msgs"></div>
  <div id="form"><div id="box"><textarea id="in" rows="1" placeholder="Message Qwen (on the board)..."></textarea><button id="send">Send</button></div>
   <div class="opts"><label><input type="checkbox" id="think"> thinking</label><label>max tokens <input type="number" id="maxt" value="256" min="16" max="1500"></label>
@@ -92,7 +92,7 @@ function idle(){clearInterval(anim);anim=null;paint(0,0,false,0);$("phase").text
  * when the AIE is), then the A78 runs its parts (DeltaNet, attention, MTP, sampling) while the AIE waits.
  * The two alternate; the labels give each block's share, from the last measured run (or typical values). */
 const DDR_STREAM=.85; /* ~25 GB/s of the ~30 GB/s DDR peak while a launch streams weights */
-let lastGbs=25.1,ddrPeak=26.0; /* weight GB/s during a launch: the last run's measurement (palmyra default) */
+let lastGbs=25.1,ddrPeak=26.0; /* weight GB/s during a launch: the last run's measurement (vek385_2 default) */
 function ddrText(now,avg){$("ddr").querySelector("span").textContent=`${now.toFixed(1)} GB/s now · avg ${avg.toFixed(1)} GB/s`}
 function live(phase){clearInterval(anim);$("phase").textContent=phase;let k=0;
   const a=last.aie,c=last.cpu;

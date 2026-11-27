@@ -63,7 +63,7 @@ Every example checks its own result (`PASS` / `GOLDEN PASS`). Only the kernel
 analysis, in about a second and without a board:
 `./build/aiehlc-convtile trace <file.cc>`.
 
-## Measured on the board (palmyra, AIE2PS)
+## Measured on the board (VEK385_2, AIE2PS)
 
 | Example | Result | Launch |
 |---|---|---|

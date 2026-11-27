@@ -445,7 +445,7 @@ threads it per request, and `retarget()` (Connect) sets `st.device` so the
 aiegdb subprocess, the MCP config and `backend_status.json` all follow.
 
 Two fallthroughs had to close with it, both of which used to treat *anything not
-`vek385`* as palmyra: `start_run()` would have deployed the palmyra test to a
+`vek385`* as VEK385_2: `start_run()` would have deployed the VEK385_2 test to a
 vek280 selection (it now refuses with "no run script for …"), and the hw_server
 recovery path would have ssh'd to `$PALIP` instead of the chosen board.
 

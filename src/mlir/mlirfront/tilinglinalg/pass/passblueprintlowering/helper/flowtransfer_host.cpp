@@ -953,7 +953,7 @@ void FlowTransferConversion::computeMultipleInputShimBd(FlowLoweringCtx &c, Mult
     // legal for k_rounds <= 64 (aie2ps BD iteration wrap; start-queue repeat <= 256), and
     // the M-round strip BD was started k_rounds times with an element-count len.
     // P4bk c013: k_rounds 360 -> "Iteration parameters exceed ... Wrap:360" / "Invalid Repeat
-    // Count: 360" on palmyra213, inputs never started.
+    // Count: 360" on VEK385_2, inputs never started.
     p.loopLen = c.perTileShimLen;
     p.loopIterStep = c.shimIterStepSize;
     p.loopIterWrap = c.shimIterWrap;

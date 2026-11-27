@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
-/* AIE-side cost-model microbench (segment K, costmodel K1a), bare-metal A78 + AIE2PS (palmyra / vek385).
+/* AIE-side cost-model microbench (segment K, costmodel K1a), bare-metal A78 + AIE2PS (VEK385_2 / vek385).
  * Built on the example/perf probes (aieml_perf.cc init + routing style) and the board probes
  * amit/tasks/2026-11-14_palmyra-ddr-cap/ddrbw.cpp (DDR) and 2026-11-11_vek385-s2mm-bw (tile DMA, HW counters).
  * Driven by script/perf/run_microbench.sh, which fits the raw "MB ..." lines into params/<board>.json.

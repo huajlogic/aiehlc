@@ -352,7 +352,7 @@ visibly more accuracy than with a single rounding at the end.
 **The trade-off, measured.** A bigger TK means fewer chunks, so fewer lock
 round trips and DMA handshakes. But the window buffers are part of the kernel's
 BSS, and a cold launch re-writes the BSS of all 16 cores over the config bus.
-The same 256×64×2304 GEMM on palmyra:
+The same 256×64×2304 GEMM on VEK385_2:
 
 | TK | kernel BSS per core | launch | kload | bdcfg | wait_io (DMA + compute) |
 |---|---|---|---|---|---|
@@ -697,7 +697,7 @@ python3 example/aiednn/gen_variants.py --out /tmp/variants
 build/aiehlc-convtile trace /tmp/variants/gemm_kacc_variants.cc
 ```
 
-Results on palmyra (AIE2PS, 4×4 mesh), 2026-11-14, of the former stand-alone compact example (`gemm_kacc<M, N, K, TK, RELU>`, git `da30c4d`):
+Results on VEK385_2 (AIE2PS, 4×4 mesh), 2026-11-14, of the former stand-alone compact example (`gemm_kacc<M, N, K, TK, RELU>`, git `da30c4d`):
 
 | Instance | Shape (M×N×K), TK | Result | Launch |
 |---|---|---|---|

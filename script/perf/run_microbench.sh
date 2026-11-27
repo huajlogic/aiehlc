@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
 # Cost-model segment K microbench, one command (costmodel K1a).
-#   run_microbench.sh --board <ip> [--name palmyra213|vek385] [--section aie|ddr|launch|all] [--rebuild] [--out <dir>]
+#   run_microbench.sh --board <ip> [--name VEK385_2|vek385] [--section aie|ddr|launch|all] [--rebuild] [--out <dir>]
 # section aie: builds example/perf/aie_microbench.cc (aiehlc.sh, bare-metal A78 host, AIE2PS), runs it on the board with
 # script/test/apppaltest.py --netload (bare-metal xsdb/netboot, the same path as LAUNCH split -> path="baremetal"),
 # prints the console (CR stripped; the BOARD marker gets " board=<name>"), fits the raw "MB ..." lines and writes
@@ -36,7 +36,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$BOARD" ] || { echo "run_microbench: --board <ip> required" >&2; exit 2; }
-case "$BOARD" in 10.23.224.213) NAME="${NAME:-palmyra213}"; BKIND=palmyra ;; *) NAME="${NAME:-$BOARD}"; BKIND="${BOARD_KIND:-palmyra}" ;; esac
+case "$BOARD" in "${AIE2PS_LOCAL_TEST_BOX_IP:-<unset>}") NAME="${NAME:-palmyra213}"; BKIND=palmyra ;; *) NAME="${NAME:-$BOARD}"; BKIND="${BOARD_KIND:-palmyra}" ;; esac
 case "$SECTION" in
 aie|ddr|all|scatter) ;;
 launch) echo "run_microbench: --section launch is a stub (L sprint: MMIO / ctrlpkt / PM-load), nothing measured" >&2; exit 3 ;;

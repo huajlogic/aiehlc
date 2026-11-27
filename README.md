@@ -201,7 +201,7 @@ a conv2d configured over the control-packet plane runs one launch in 185 us
 [`src/costmodel`](src/costmodel/README.md) predicts, without a board, how long one AIE launch, one
 site or a whole network takes on a calibrated board, split into AIE time (K), launch overhead (L) and
 host glue (N): `T = K + L + N - overlap`. It reads a finished build (it does not change the compiler),
-and its per-board parameters are frozen in `src/costmodel/params/` (calibrated on palmyra213).
+and its per-board parameters are frozen in `src/costmodel/params/` (calibrated on VEK385_2).
 
 ```bash
 cd src

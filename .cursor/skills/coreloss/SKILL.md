@@ -48,7 +48,7 @@ Only the stall rows need the counters.
 
 Per core, median of 16 cores, launches 3-6:
 
-| item | palmyra (1000 MHz, 1.435 ms) | VEK385 (1250 MHz, 1.150 ms) |
+| item | VEK385_2 (1000 MHz, 1.435 ms) | VEK385 (1250 MHz, 1.150 ms) |
 |---|---|---|
 | VMAC (1,228,860 vector instr vs 1,228,800 MAC instr) | 85.6 % | 85.5 % |
 | other instructions | 6.1 % | 6.1 % |
@@ -69,4 +69,4 @@ banks 0-3 < 2 k. Same on both boards: the design is core-bound. `doc/performance
 | all counters 0 / garbage with `--profiling` | the `--profiling` core-perf window uses the same core counters: do not combine |
 | moving buffers between banks "fixes" memory stall but the launch is not faster | the loss moves to lock stall (DMA loses the bank arbitration). Judge by launch time, then re-run the table |
 | VEK385: more cores than the mesh, a bank at 300 k conflicts | the farm com port echoes and splices lines; losstable.py keeps the first well-formed line per (launch, tile), drops cores with vec = 0 and takes medians over cores |
-| comparing boards | VEK385 runs at 1.25 GHz, palmyra 1.0 GHz: compare shares, not cycles |
+| comparing boards | VEK385 runs at 1.25 GHz, VEK385_2 1.0 GHz: compare shares, not cycles |

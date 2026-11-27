@@ -2185,7 +2185,7 @@ class DebugState:
 
             else:
                 # No runner for this board. Falling through to apppaltest would
-                # have quietly deployed the palmyra test to whatever was picked.
+                # have quietly deployed the VEK385_2 test to whatever was picked.
                 return {"error": f"no run script for {device}; add one via "
                                  f"debug_ui_config.json (hw_run_script)"}
 
@@ -5678,16 +5678,12 @@ def _hwsrv_drain(child):
         pass
 
 
-# The PAL board's JTAG host. Fixed, because the "pal" device selection names one
-# specific board — unlike vek385, whose hostname the user types into the UI.
-#
-# This used to fall back to the literal string "xx.xx.xx.213" when $PALIP was
-# unset, which is a placeholder, not an address: the browser's Connect probe
-# emitted `connect -url TCP:xx.xx.xx.213:3121` and failed at DNS before opening a
-# socket. $PALIP still wins when it is set (script/test/envlocal.sh exports it,
-# as do apppaltest.py / aiedbg's connecttest.py), so a farm move only needs the
-# env var — but with it unset, Connect now works out of the box.
-PAL_DEFAULT_IP = "10.23.224.213"
+# The PAL board's JTAG host: $PALIP when set (script/test/envlocal.sh exports it,
+# as do apppaltest.py / aiedbg's connecttest.py), else $AIE2PS_LOCAL_TEST_BOX_IP.
+# The address is never written in the source. Never fall back to a placeholder
+# such as "xx.xx.xx.213": the browser's Connect probe emitted
+# `connect -url TCP:xx.xx.xx.213:3121` and failed at DNS before opening a socket.
+PAL_DEFAULT_IP = os.environ.get("AIE2PS_LOCAL_TEST_BOX_IP", "").strip()
 
 
 def _pal_ip():

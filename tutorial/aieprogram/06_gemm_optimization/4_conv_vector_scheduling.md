@@ -407,7 +407,7 @@ the block, 16 channels each.
 
 ## 6. Results
 
-All on the board (palmyra), same data, golden-checked against `scalar_conv2d`:
+All on the board (VEK385_2), same data, golden-checked against `scalar_conv2d`:
 
 | Build | Launch | Result |
 |---|---|---|

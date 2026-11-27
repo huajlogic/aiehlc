@@ -3,7 +3,7 @@
 `aiegraph` turns an ONNX or PyTorch image classifier into int8 C for the
 Cortex-A78 (one C file per layer, plus a driver and Makefile), and moves the
 layers you choose onto your own AIE kernels after proving them on x86. It
-hands you `main.elf`, and `emod.run()` runs it on a lab board (palmyra by
+hands you `main.elf`, and `emod.run()` runs it on a lab board (VEK385_2 by
 default, or `emod.run(ag.VEK385, "hostname")`) -- nothing else touches a board.
 
 Design and rationale: [doc/design/aiegraph_python_api.md](design/aiegraph_python_api.md).
@@ -32,7 +32,7 @@ What pip cannot install, and how it is handled:
 |---|---|
 | TVM 0.16 (no wheel exists) | **automatic**: aiegraph attaches the build in `thirdparty/tvm-0.16`. If there is none, `aiegraph setup` builds it once (10–25 min) — or the first conversion does. |
 | Vitis (AIE compiler `xchesscc`, aarch64 cross gcc) | licensed, install it yourself and `source <Vitis>/settings64.sh`. Needed only for `offload` (the aiehlc build) and `build` (linking `main.elf`). Everything else works without it. |
-| a board | only for `emod.run()`: `script/test/apppaltest.py` (palmyra: `USERNAME`/`PALIP`/`BOARDNAME`) or `appvek385.py` (VEK385: `USERNAME`/`VEK385IP`), from the env or `script/test/envlocal.sh`; `pexpect` |
+| a board | only for `emod.run()`: `script/test/apppaltest.py` (VEK385_2: `USERNAME`/`PALIP`/`BOARDNAME`) or `appvek385.py` (VEK385: `USERNAME`/`VEK385IP`), from the env or `script/test/envlocal.sh`; `pexpect` |
 
 `aiegraph doctor` on a working machine:
 
@@ -364,7 +364,7 @@ any kernel; it does not prove that aiehlc compiles it for AIE2PS -- `offload()`
 | `emod.prototype_check(layer, dir, build=False)` | gates `todo` / `kemu` (kernel + host on x86 vs TVM) / `trace` / `check` [/ `build`] (section 4c) |
 | `emod.offload_AI_proto(layers, kernel, rounds=3, model=None)` | NOT READY → `claude -p` ports a copy until `offload_check` is READY (section 4a) |
 | `emod.run_local()` | build and run `main_local.elf` on x86 |
-| `emod.run(board="palmyra", host=None, *, elf=None, build=True, profile=False, netload=None, reboot=None, timeout=1800)` | run `main.elf` on a lab board, (re)building it if missing or older than the driver / `partition.json` / AIE archives; returns a `RunReport` (`.ok`, `.top1`, `.top5`, `.inference_ms`, AIE `ENTER`/`EXIT` counts, `.log`). `emod.run(ag.VEK385, "crimini2")` for a VEK385; `host` overrides `$PALIP` / `$VEK385IP`. Palmyra defaults to `--netload` (a 12–16 MB ELF fails JTAG `dow`); VEK385 powers off afterwards (its `-nonreboot` holds the board until killed). Refuses while another run of the same board script of yours is active. CLI: `aiegraph run [palmyra\|vek385] [HOST]` |
+| `emod.run(board="palmyra", host=None, *, elf=None, build=True, profile=False, netload=None, reboot=None, timeout=1800)` | run `main.elf` on a lab board, (re)building it if missing or older than the driver / `partition.json` / AIE archives; returns a `RunReport` (`.ok`, `.top1`, `.top5`, `.inference_ms`, AIE `ENTER`/`EXIT` counts, `.log`). `emod.run(ag.VEK385, "crimini2")` for a VEK385; `host` overrides `$PALIP` / `$VEK385IP`. VEK385_2 defaults to `--netload` (a 12–16 MB ELF fails JTAG `dow`); VEK385 powers off afterwards (its `-nonreboot` holds the board until killed). Refuses while another run of the same board script of yours is active. CLI: `aiegraph run [palmyra\|vek385] [HOST]` |
 | `emod.profile(ag.ALL, *, by="call", top=None)` | each layer's time on the board from the last `run()`: one row per call (`by="layer"`: per layer, its calls summed), layer name, op, `cpu`/`aie`, mean ms per `graph_run()`, % of the total; `emod.profile("layer1")` / `top=5` filter. Needs `emod.run(profile=True)` (a `make PROFILE=1` ELF, two timer reads per call; the default `profile=False` builds a plain one, switching rebuilds); otherwise it prints `profiling not enabled` and returns `None`. Reads `last_run`, else the newest `arm_build/run_*.log`. CLI: `aiegraph profile [LAYER ...] [--by-layer] [--top N]` |
 | `report = emod.AI_perf_analysis("layer1", ai=True)` | why an offloaded layer is slow (skill **kernelperfcheck**): deterministic facts (measured ms of the last `run(profile=True)`, EXIT rc, pragmas, generated host.cc call counts, kernel ELF text/data/BSS, kernel.lst vector ops, aiehlc.log), a cost model (372 ns per config-bus word, 2.9 ns over control packets), the skill's rules, then `claude -p` read-only returns bottlenecks + ranked suggestions with predicted savings. `ai=False`: no AI. Saved to `<workdir>/aiperf/<layer>/report.{md,json}` |
 | `result = emod.AI_kernel_accelerate("layer1", report, rounds=2, board=None)` | `claude -p` applies the suggestions to a COPY of the kernel the layer runs NOW (`<workdir>/aiopt/layer<N>_<kernel>/`, `..._r2` when that kernel is itself an aiopt copy; an earlier copy is moved to `<dir>.prev-<time>`, never deleted; the original is never edited); every round is gated by our own `offload_check` + an aiehlc build of the copy (failures go back via `--resume`); the result compares facts/model of the old and NEW build: `result.saved_ms`, `result.predicted_ms`. `board=` also offloads the copy and measures it (`measured_after`). Path-like: `emod.offload(("layer1", result))` |

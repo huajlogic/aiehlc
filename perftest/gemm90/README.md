@@ -4,24 +4,24 @@
 # GEMM toward 90 % of peak: measurement patches (not in the main tree)
 
 The int8 dataflow-plan GEMM (`example/tileprogram/ccode/gemm_plan/gemm_plan.cc`, 7680 x 512 x 2560, 4 x 4)
-runs at **85.65 %** of peak end to end on palmyra (1.435 ms, PDI of 2026-11-25) and **86.4 %** on the
+runs at **85.65 %** of peak end to end on VEK385_2 (1.435 ms, PDI of 2026-11-25) and **86.4 %** on the
 array-only basis (host time in `wait_io`, 1.422 ms; the basis RSN-XNN reports), 85.5-85.7 % on VEK385.
 The work that tried to push it toward 90-95 % produced the changes below. Each one has a limitation that
 keeps it out of the main tree, so it is kept here as a patch on top of `main` (`git apply <patch>` from the
 repository root; all apply cleanly to the tree they were cut from). What they measured is recorded in
-`doc/performance/gemm_e2e_progress.md` (sections from "palmyra on the PDI of 2026-11-25" on).
+`doc/performance/gemm_e2e_progress.md` (sections from "VEK385_2 on the PDI of 2026-11-25" on).
 
 | file | what it adds | why it is not in the main tree |
 |---|---|---|
 | `runtime_coreloss.patch` | `__Runtime_core_loss_arm(meshId, bank_a, bank_b)` / `__Runtime_core_loss_read(out, n)` in `aie_runtime.c/.h`: per core ACTIVE, MEMORY_STALL, LOCK_STALL, INSTR_VECTOR + DM bank conflicts of two banks | uses the same core performance counters as `--profiling`'s core-perf window (the two cannot be combined); the other runtime users (eltwise / conv plans, `simplematmul2`, ...) were not re-run on a board after it |
 | `gemm_plan_loss.patch` (needs `runtime_coreloss.patch`) | `gemm_plan_body.cc --define GP_LOSS=1`: arms the counters on launches 3..6, one DM bank pair each, prints `LOSS ...` lines | depends on the runtime patch |
 | `losstable.py` | turns the `LOSS` lines of a board log into the per-core loss table | only useful with the two patches |
-| `gemm_autotile_palmyra_pdi2.patch` | `#pragma gemm_autotile` board facts for palmyra on the new PDI (1000 MHz, DDR reads 26 / writes 25 GB/s, overlapped, shim channel 7.6 GB/s) | changes the tilings the autotiler picks for palmyra; not validated on the board (`gemm_plan_auto.cc` was not rebuilt and run). VEK385, the default board, is unaffected |
+| `gemm_autotile_palmyra_pdi2.patch` | `#pragma gemm_autotile` board facts for VEK385_2 on the new PDI (1000 MHz, DDR reads 26 / writes 25 GB/s, overlapped, shim channel 7.6 GB/s) | changes the tilings the autotiler picks for VEK385_2; not validated on the board (`gemm_plan_auto.cc` was not rebuilt and run). VEK385, the default board, is unaffected |
 | `simplegemm_peak_2x4.patch` | `simplegemm_peak.cc`: shape knobs `GP_M/N/K/BN` (`#ifndef`), 2 x 4 register blocking (`GP_BN 4`, all 8 accumulators); default 64 x 128 x 1152 = 16 x 32 x 1152 per core | changes the example's default shape and blocking: numbers quoted elsewhere for the old default (128 x 128 x 384, 2 x 2) no longer come out of a plain build |
 
 ## Results (all GOLDEN PASS)
 
-Core MAC loop alone (`simplegemm_peak_2x4.patch`, operands resident, klog CYC per core, palmyra):
+Core MAC loop alone (`simplegemm_peak_2x4.patch`, operands resident, klog CYC per core, VEK385_2):
 
 | per core | blocking | MAC instr | cycles | of peak |
 |---|---|---|---|---|
@@ -34,14 +34,14 @@ Core MAC loop alone (`simplegemm_peak_2x4.patch`, operands resident, klog CYC pe
 Loss table of gemm_plan (`runtime_coreloss.patch` + `gemm_plan_loss.patch` + `losstable.py`), per core,
 median of 16 cores, launches 3..6, one ELF:
 
-| item | palmyra (1000 MHz, 1.435 ms) | VEK385 (1250 MHz, 1.150 ms) |
+| item | VEK385_2 (1000 MHz, 1.435 ms) | VEK385 (1250 MHz, 1.150 ms) |
 |---|---|---|
 | VMAC (1,228,860 vector instr; 1,228,800 MAC instr expected) | 85.6 % | 85.5 % |
 | other instructions | 6.1 % | 6.1 % |
 | memory stall (DM bank conflicts, banks 4-7 ~42-45 k each) | 4.6 % | 4.7 % |
 | lock stall (incl. host launch 1.1 % / 0.8 %) | 3.7 % | 3.7 % |
 
-Chunk-boundary experiments (built on the loss patches, palmyra steady, then removed):
+Chunk-boundary experiments (built on the loss patches, VEK385_2 steady, then removed):
 
 | attempt | middle boundary bundles per 128 MACs | steady |
 |---|---|---|

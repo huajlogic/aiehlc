@@ -1,14 +1,14 @@
 <!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
      SPDX-License-Identifier: Apache-2.0 -->
 
-# qwen — Qwen3.5-9B on palmyra (baremetal A78 + AIE)
+# qwen — Qwen3.5-9B on vek385_2 (baremetal A78 + AIE)
 
-A 9B language model answering on one palmyra board, with no OS and no llama.cpp. The weight matrices run on
+A 9B language model answering on one vek385_2 board, with no OS and no llama.cpp. The weight matrices run on
 the AIE array as int4 x int8 GEMVs. Everything else runs on one A78 core: embedding, RMSNorm, the Gated
 DeltaNet recurrence, attention, MTP speculative decoding and sampling. The whole thing is a C engine linked
 with an aiehlc library.
 
-Measured on a farm palmyra (palmyra-14, 2026-11-26/27, 1 GHz AIE, weights int4 group 64):
+Measured on a farm vek385_2 (palmyra-14, 2026-11-26/27, 1 GHz AIE, weights int4 group 64):
 
 | | |
 |---|---|
@@ -41,7 +41,7 @@ The plan, the budget and the log are in [`doc/plan/qwen_palmyra.md`](../../../do
 
 ## Run it
 
-Boards: farm palmyras, held with `python3 script/test/hws.py --board <farm host> up`
+Boards: farm vek385_2 boards, held with `python3 script/test/hws.py --board <farm host> up`
 (e.g. palmyra-14 @ gomphus12). Every board command below takes `-board palmyra-N -host <farm host>`.
 
 ```bash
@@ -78,8 +78,8 @@ first), linked with `--obj $LIB/libqwen_gemv_lib.a -L $LIB -l xaienginea78`, and
 - **Rebuild the library with a current `hostcompile.sh`.** The generated host.cc references `routing` only
   weakly, and an archive built before the fix did not bring `routing.o` along: the first launch hung unless
   the link carried `-Wl,--undefined=_Z7routingP12XAie_DevInst`. Skill **aiehlclibraryrouting**.
-- **palmyra, not VEK385.** VEK385's A78 sees 2 + 2 GB (the other DDR windows hang it, and AIE reads there
-  are ~25 % wrong), so the 4.98 GB blob does not fit. On palmyra DDR_LOW1 is 6 GB on the 2026-11-25 PDI.
+- **vek385_2, not VEK385.** VEK385's A78 sees 2 + 2 GB (the other DDR windows hang it, and AIE reads there
+  are ~25 % wrong), so the 4.98 GB blob does not fit. On vek385_2 DDR_LOW1 is 6 GB on the 2026-11-25 PDI.
 - **netboot places segments in DDR_LOW0 only**, so a loader carries its chunk there and copies it up.
 - **x / y buffers are cached** with an explicit flush / invalidate around each launch. Uncached A78 stores
   run at ~0.5 GB/s. Forgetting the flush gives stale x (MTP acceptance drops to 0 %).

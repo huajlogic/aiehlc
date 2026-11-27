@@ -350,7 +350,7 @@ board -> host   netboot_rep (48 B + msg) unchanged
 | `OK` | app core free or parked; or a forced run terminated an app past its max | send the ELF (0) |
 | `BUSY` | an app runs within its `max_run_ms` | retry after `retry_after_ms`; `--wait N` polls every <= 2 s (3) |
 | `OVERTIME` | the app ran past its `max_run_ms`, request not forced | resend with `--force` (4) |
-| `STUCK` | forced, but the PLM refuses to stop the app core (palmyra, section 12 item 4) | re-bootstrap; `apppaltest --netload` does it (5) |
+| `STUCK` | forced, but the PLM refuses to stop the app core (VEK385_2, section 12 item 4) | re-bootstrap; `apppaltest --netload` does it (5) |
 | `SERVING` | another client's request is in progress (one at a time) | retry after 0.5 s (3) |
 | `REJECT` | malformed header | fix the request (1) |
 
@@ -363,7 +363,7 @@ console wait on `exited`, `killed` or `watchdog-timeout`.
 
 **Forced run.** `FORCE` only preempts an app *past* its limit; an app within its
 limit is never preempted (`BUSY`). The supervisor stops the old app through the
-PLM kill chain (power-down, warm reset, cold reset). On palmyra the PLM refuses
+PLM kill chain (power-down, warm reset, cold reset). On VEK385_2 the PLM refuses
 all three, so the verdict is `STUCK` and the client terminates the app by
 re-bootstrapping (power cycle + `device program`). `can_stop` in the ack says
 which case the board is in (1 yes, 0 refused, 2 not tried yet).
@@ -388,7 +388,7 @@ median 839 ms (810-863) vs 837 ms (828-932); client send median 1.52 s vs
 client talking to a v1 supervisor gets the v1 error reply, detects it and says
 to re-bootstrap, which `apppaltest --netload` does on its own.
 
-Measured on palmyra with `src/tool/netboot/test/nbspin.c` (busy-waits N s):
+Measured on VEK385_2 with `src/tool/netboot/test/nbspin.c` (busy-waits N s):
 `BUSY` with the exact time left; `OVERTIME` at 11.4 s of an 8 s max; `STUCK` with
 `--force`; `exited` detected after the timeout; `SERVING` for a second client
 while one connection is held mid-header; a v1 client still served;
@@ -411,7 +411,7 @@ was down and had to be brought up. A resident supervisor needs none of it, so
 netload now defers the check: `Preflight.need_jtag(why)` runs `ensure_service`
 once, right before the first JTAG use in `netload_start` -- the park of a busy or
 stuck app core, or the supervisor bootstrap -- and a failure is remembered for the
-run, not retried. The run's own `load` is the smoke test. Measured on palmyra:
+run, not retried. The run's own `load` is the smoke test. Measured on VEK385_2:
 preflight 10.3 s -> 0 s, `load rc=0` 0.35 s after start. `--hws-eager`
 restores the up-front check (status + smoke test); full and attach modes are
 unchanged.
@@ -435,11 +435,11 @@ link up, 1000 Mb/s` and load.
 VEK385 farm board (README "VEK385"). Verified on vek385-3: full JTAG boot,
 netload bootstrap (power cycle, `vek385_netboot.BIN`, supervisor, 2.8 MB app in
 ~0.1 s on core 1, `Kernel test passed!`), fast path with a parked core, and
-palmyra unchanged. Board facts, each of which silently breaks a run:
+VEK385_2 unchanged. Board facts, each of which silently breaks a run:
 
 1. **GEM DMA cannot reach DDR_LOW0.** The GEM is an LPD master; on the vek385 base
    platform LPD_AXI_NOC0 decodes only DDR_CH1 (0xA_0000_0000) and DDR_CH2. With the
-   palmyra layout TX reports HRESP, RX resource errors, the PLM logs NOCTYPE1_NCR and
+   VEK385_2 layout TX reports HRESP, RX resource errors, the PLM logs NOCTYPE1_NCR and
    ARP never answers. `NETBOOT_DMA_BASE=0xA00000000` links lwIP's heap/pools there,
    the BD ring 1 GB above, maps the block at boot (`dma_map`) and builds
    `-mcmodel=large` (Jane).

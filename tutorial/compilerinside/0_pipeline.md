@@ -68,7 +68,7 @@ Three things to keep in mind while reading:
 
 ## The performance levels of this series
 
-The GEMM is int8, `C = A . B^T` on the 4 x 4 mesh of palmyra (AIE2PS, 1.0 GHz, 16 x 512 MAC / cycle). The
+The GEMM is int8, `C = A . B^T` on the 4 x 4 mesh of VEK385_2 (AIE2PS, 1.0 GHz, 16 x 512 MAC / cycle). The
 sources are `example/tileprogram/ccode/gemm_plan/step*.cc`; what each step changes in the C source and why is
 told in `tutorial/perfoptmize/` -- this series tells what the compiler does with it. See `README.md` for the
 measured levels and which step reaches each.

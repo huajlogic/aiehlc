@@ -513,7 +513,7 @@ eager (kernel reloaded per layer), eager layer-major (B images per layer). Kerne
 reverted to the 2026-10-20 engine (~1.61 ms/image at B=32): the faster kernels
 (1.364 ms) hang ~1 run in 3 in residual layers (skill **shimctrlpushloss**).
 
-**Qwen3.5-9B on palmyra** (`src/APP/qwen/`, README there; plan + log
+**Qwen3.5-9B on VEK385_2** (`src/APP/qwen/`, README there; plan + log
 `doc/plan/qwen_palmyra.md`): a 9B LLM answering on one board, baremetal, no llama.cpp. **5.3–6.5 tok/s
 decode** (prompt-dependent MTP acceptance), ~5 tok/s end to end on palmyra-14. Weight matrices on the AIE:
 `aie/qwen_gemv_kernel.cc`, y[4096][M≤4] = W·x, int4 x int8 `mmul<4,16,16>`, written as the data is laid out
@@ -560,7 +560,7 @@ AIE2PS (`__AIE_ARCH__` 22) uses the aie2p mmul backend, where `mmul<8,8,8,int8,i
 is ONE `mac_8x8_8x8` = **512 MAC/cycle per core** (not the 256 older docs assume).
 Both operands `{.resident}`, host-packed in mmul order (aligned 64-byte loads),
 2x2 register blocking, C written tile-major; the in-tree default is 32x32x384 per core (768 MAC
-instructions; 839 cycles = 91.5 % on an older toolchain, 891 = 86.2 % on palmyra 2026-11-25). Every
+instructions; 839 cycles = 91.5 % on an older toolchain, 891 = 86.2 % on VEK385_2 2026-11-25). Every
 accumulator group pays ~20-30 cycles outside its K loop, so K steps per group set it: with the patch,
 2x4 blocking (all 8 `dm` accumulators) and 16x32x1152 per core = 1152 MAC instructions in **1180 cycles**
 (97.6 %). Measured per core by klog `CYC` around the compute; the launch around it is kernel load.
@@ -569,7 +569,7 @@ accumulator group pays ~20-30 cycles outside its K loop, so K steps per group se
 
 The 2 x 8 shared-operand GEMM that `share2x8.py` reached by rewriting the generated files now
 comes from the compiler: **85.5 % of the VEK385 peak from `example/tileprogram/ccode/gemm_plan/gemm_plan.cc`
-alone** (1.147-1.153 ms per 10.07 G MAC, every launch, GOLDEN PASS). palmyra on the PDI of 2026-11-25: **85.7 %** (1.435 ms
+alone** (1.147-1.153 ms per 10.07 G MAC, every launch, GOLDEN PASS). VEK385_2 on the PDI of 2026-11-25: **85.7 %** (1.435 ms
 at 1000 MHz, GOLDEN PASS), core-bound like VEK385 -- that PDI's DDR is no longer the limit
 (`example/perf/ddr_microbench.cc`, now with `kind=rdwr`: one shim channel ~7.6 GB/s, reads ~26 / writes ~25 GB/s,
 read + write overlapped 33-36 GB/s; the PDI before it gave 16.1 / 3.58 GB/s serialized and 47 %). Three ways in, each lowering to the next:
@@ -626,7 +626,7 @@ only the kernel body sees `bfloat16` (chess native; RNE type in
 `const bfloat16 *`. Element size is decided in two front ends (`aiehlc.cc` bit
 width, `kernel_trace.cpp elemBytesOf`) plus the conv cross-check's
 `Target.elem_bytes`. Limits: one element type per kernel, scalar only (no bf16
-mmul in the x86 emulation yet), blocks twice the bytes (7x14 tile). palmyra:
+mmul in the x86 emulation yet), blocks twice the bytes (7x14 tile). VEK385_2:
 802,816 bit-exact, 12/12 runs. Design `doc/design/bf16_support.md`; skill
 **bf16kernel**.
 
@@ -650,7 +650,7 @@ analysis / port parser / kernel extraction (they all read shapes as text):
 keeps the name, several become `k__a_b_c` kernels in one host ELF (board:
 two instances, both bit-exact). Never-launched / argument-count / no-default
 are errors; a source without a template kernel is returned untouched.
-palmyra: 4 instances bit-exact; a cold launch is 98-99 % kload, so TK 64 (33 ms)
+VEK385_2: 4 instances bit-exact; a cold launch is 98-99 % kload, so TK 64 (33 ms)
 beats TK 128 (53.6 ms) -- the buffers are BSS reloaded per launch. Needed two
 GEMM lowering fixes (B's window divided by m_rounds; the 3-D K BD started
 k_rounds times -- the latter only where its len is not already the walk, or
@@ -754,7 +754,7 @@ needs the BSP's `libxil.a` de-duplicated against `libxaienginea78.a`.
 `arm_build.build_arm_elf(run_make=False)` into `worklocal/aiegraph/<model>/`, cached by a
 model-hash stamp `aiegraph.json`) → `emod.detect / offload_check / offload / build /
 run_local` (all `aiekernel.flow` + `arm_build`), one-call `ag.compile(m, target, offload)`,
-`ag.open(workdir)` adopts any deploy tree, `emod.run()` / `emod.run(ag.VEK385, "host")` runs `main.elf` on a lab board (`board.py` over `script/test/apppaltest.py` / `appvek385.py`; palmyra defaults to `--netload`, VEK385 powers off after; refuses a second concurrent run; `emod.run(profile=True)` builds a `make PROFILE=1` ELF (default off; `emod.profile` otherwise prints `profiling not enabled`), so `emod.profile(ag.ALL)` then prints each call/layer's board time; `emod.AI_perf_analysis("layer1")` explains it (facts + cost model + rules + read-only `claude -p`, skill **kernelperfcheck**) and `emod.AI_kernel_accelerate("layer1", report)` lets Claude optimize a copy, gated by `offload_check` + aiehlc build, re-predicted from the new build (`aiperf.py`), `by="layer"`, `top=N` -- `arm_build.sync_make_vars` deletes `graph_driver.o`/`main.o`/`main.elf` when the make vars change, since objects don't depend on CFLAGS), CLI `aiegraph …`, plus an `aiehlc` command
+`ag.open(workdir)` adopts any deploy tree, `emod.run()` / `emod.run(ag.VEK385, "host")` runs `main.elf` on a lab board (`board.py` over `script/test/apppaltest.py` / `appvek385.py`; VEK385_2 defaults to `--netload`, VEK385 powers off after; refuses a second concurrent run; `emod.run(profile=True)` builds a `make PROFILE=1` ELF (default off; `emod.profile` otherwise prints `profiling not enabled`), so `emod.profile(ag.ALL)` then prints each call/layer's board time; `emod.AI_perf_analysis("layer1")` explains it (facts + cost model + rules + read-only `claude -p`, skill **kernelperfcheck**) and `emod.AI_kernel_accelerate("layer1", report)` lets Claude optimize a copy, gated by `offload_check` + aiehlc build, re-predicted from the new build (`aiperf.py`), `by="layer"`, `top=N` -- `arm_build.sync_make_vars` deletes `graph_driver.o`/`main.o`/`main.elf` when the make vars change, since objects don't depend on CFLAGS), CLI `aiegraph …`, plus an `aiehlc` command
 (`bash -c 'source script/aiehlc.sh "$@"'` in the caller's cwd). **One install command:**
 `pip install -e .` — verified in a fresh venv: no `PYTHONPATH`, no setup step, `doctor`
 green, quickstart converts/checks/offloads/links. Traps: **editable only** — the flow
@@ -981,6 +981,12 @@ source script/aiehlc.sh --aie-version 5 --runtime-source-file ./example/tileprog
 3. Verify      script/test/verify_host.sh → pass: "device_teardown done", fail: "AIE ERROR"
 ```
 
+The local AIE2PS test board's address is never written in the repo: export
+`AIE2PS_LOCAL_TEST_BOX_IP=<board ip>`. `script/test/envlocal.sh` turns it into
+`PALIP` (and fails naming the variable when it is unset); `aiedump.py palmyra_local`,
+the debug server's `pal` device and `script/perf/*` read it too. Tests fall back to
+the never-routable `192.0.2.213`.
+
 ### Per-Dialect Unit Tests
 
 Each dialect has its own `unitest/` directory with independent CMake build:
@@ -1009,11 +1015,11 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/tutorial_aiegraph.md](doc/tutorial_aiegraph.md)** — `aiegraph` user guide: `pip install -e .`, `aiegraph doctor`, ONNX/PyTorch steps, `ag.compile`, API + CLI reference, limits
 - **[doc/design/aiegraph_python_api.md](doc/design/aiegraph_python_api.md)** — Design (M0–M3 implemented in `src/aiegraph/`): user-facing `import aiegraph as ag` facade — `ag.load` (ONNX/PyTorch) → `ag.convert(m, "a78")` (int8 + per-layer C) → `register_kernel` → `check_offload(region=, kernel=)` → `assign` → `partition` → `build(target=, output=)` (§4.8; the older `offload_check("layer1", k.cc)` → `offload(...)` remains), one-call `ag.compile(m, "aie", "layer1=k.cc")`; prior art (PyTorch/ExecuTorch, TVM BYOC, MLIR/IREE, Triton, ORT); maps onto `deploy_flow` + `aiekernel`; milestones M0–M5
 - **[doc/tutorial_userkernel.md](doc/tutorial_userkernel.md)** — Bring your own AIE kernel: `aie_user_kernel.h` contract (`AIEK_ENTRY/SPEC/REFERENCE`), lint → detect → calibrate → emulate → build → link, stem + 3×3 "bunch of layers" walkthroughs, one-library-per-ELF limit
-- **[doc/design/lwip_elf_bootloader.md](doc/design/lwip_elf_bootloader.md)** — netboot, **implemented** (`src/tool/netboot/`, `apppaltest.py --netload`): lwIP TCP supervisor resident on A78 core 0 at `0x7800_0000` runs each ELF on core 1 via xilpm; 15 MB ELF in ~0.2 s vs ~150 s JTAG; the target ELF is streamed from the dev box through `netboot_proxy.py` on PALIP over ssh (no scp), and a finished app parks core 1 (patched `_exit`) so the next run needs no bootstrap. Section 12 = board facts: `0x8_0000_0000` mirrors `0x0`; `Xil_SetTlbAttributes` >4 GB rewrites a 1 GB block; `p_memsz` includes the 1 GB heap; this PDI denies stopping core 1 (auto re-bootstrap). Section 13 = protocol v2: the board acks each request's header before the ELF is sent (`ok` / `busy` + time left / `overtime` / `stuck` / `serving`), per-run `max_run_ms` (default 60 s), `--force` preempts only an app past its max (on palmyra: `apppaltest` frees core 1 over JTAG -- `stop; rst -proc; pc=park_addr; con` -- ~17 s instead of a ~60 s re-bootstrap; the supervisor is polled, because that reset disables the GIC); `netload.py --wait/--force/--max-run-ms`, `apppaltest --netload-wait/--netload-max-run-ms/--netload-no-force`; `apppaltest --netload-force-now` takes over a run still within its max (JTAG park, re-bootstrap fallback; kills any running app). Section 14 = VEK385: `apppaltest.py -board vek385 -host gomphus3 [--netload]` (farm board: systest-client, the host's hw_server, `vek385_netboot.BIN`, com3; supervisor built with `NETBOOT_DMA_BASE=0xA00000000` because the LPD GEM cannot reach DDR_LOW0; apppaltest starts the A78 system counter, which is off after the PDI boot, and resets only A78 #0.0 since `rst -cores` leaves #0.1 in Reset Catch)
+- **[doc/design/lwip_elf_bootloader.md](doc/design/lwip_elf_bootloader.md)** — netboot, **implemented** (`src/tool/netboot/`, `apppaltest.py --netload`): lwIP TCP supervisor resident on A78 core 0 at `0x7800_0000` runs each ELF on core 1 via xilpm; 15 MB ELF in ~0.2 s vs ~150 s JTAG; the target ELF is streamed from the dev box through `netboot_proxy.py` on PALIP over ssh (no scp), and a finished app parks core 1 (patched `_exit`) so the next run needs no bootstrap. Section 12 = board facts: `0x8_0000_0000` mirrors `0x0`; `Xil_SetTlbAttributes` >4 GB rewrites a 1 GB block; `p_memsz` includes the 1 GB heap; this PDI denies stopping core 1 (auto re-bootstrap). Section 13 = protocol v2: the board acks each request's header before the ELF is sent (`ok` / `busy` + time left / `overtime` / `stuck` / `serving`), per-run `max_run_ms` (default 60 s), `--force` preempts only an app past its max (on VEK385_2: `apppaltest` frees core 1 over JTAG -- `stop; rst -proc; pc=park_addr; con` -- ~17 s instead of a ~60 s re-bootstrap; the supervisor is polled, because that reset disables the GIC); `netload.py --wait/--force/--max-run-ms`, `apppaltest --netload-wait/--netload-max-run-ms/--netload-no-force`; `apppaltest --netload-force-now` takes over a run still within its max (JTAG park, re-bootstrap fallback; kills any running app). Section 14 = VEK385: `apppaltest.py -board vek385 -host gomphus3 [--netload]` (farm board: systest-client, the host's hw_server, `vek385_netboot.BIN`, com3; supervisor built with `NETBOOT_DMA_BASE=0xA00000000` because the LPD GEM cannot reach DDR_LOW0; apppaltest starts the A78 system counter, which is off after the PDI boot, and resets only A78 #0.0 since `rst -cores` leaves #0.1 in Reset Catch)
 - **[doc/resnetlaye1timeoutdebug.md](doc/resnetlaye1timeoutdebug.md)** — Step-by-step summary of the ResNet-18 layer-01 `--aie-offload` timeout debug: symptom, allconv review, source/pragma bisection, KCO absolute-column root cause + fix, `-O3` (2232 → 1282 ms), lessons
 - **[doc/debug/troubleshoot_aie_offload_timeout.md](doc/debug/troubleshoot_aie_offload_timeout.md)** — `--aie-offload` main.elf hangs (`ENTER` without `EXIT`, `wait_io TIMEOUT`): reading the deadlock, allconv review, HW bisection (committed stem passes, control-plane WIP hangs standalone too), `AIE_DEBUG_LOG`-gated timeout dump
 - **[doc/design/op_mapping_programming_model.md](doc/design/op_mapping_programming_model.md)** — Op + mapping model on top of convautotile: native-support plan (op/mapping in routing IR, `OpMappingToTilingPass`, more ops), evaluation, and §4 the Triton block-load kernel style (`aie::program_id`, `aie::load_buffer/store_buffer` in tensor coordinates, checked against the derived DMA by `aie_block_io.h`), its x86 emulator `simpleconv2ddebug/emu_conv2d_spatial.sh`, and why a load is an assertion, not a request, on a DMA-streamed array; §5 kernel analysis: kernel-only sources (`aie::shape` ports, no `conv`/`map`, `simpleconv2dkernel_port.cc`) whose DMA is inferred from the traced `load_buffer` calls and verified (too big/small, out of tensor, data used without load, use after release, never committed, loop order, data-dependent schedule, coverage), plus static bounds (`kernel_static.cpp`: names the constant behind an out-of-block access, e.g. `oc_t = 15` -> fits with 16); `aiehlc-convtile trace`; §6 tensor form (`simpleconv2dkernel.cc`: `aie::in<aie::tensor>`, `.pad` / `.reuse`, block views, `aie::autotune`; `kernel_front.cpp` lowers it via a logical trace + staged layout, `emu_conv2d_tensor.sh`); §7 vector kernels: `simpleconv2dkernel_port.cc` on `aie::mmul<8,8,8>`, traced via the AIE API x86 emulation `src/mlir/runtime/aie_api_x86emu.h` (ASan + vector alignment checks)
-- **[tutorial/compilerinside/README.md](tutorial/compilerinside/README.md)** — the compiler inside, per performance level (0.01 / ~14 / ~50 / ~80 / 85 % on palmyra, `gemm_plan/step0..7`): how the IR lowers at each level and what each one-word source change moves at routing (`#routing.dataflow`), dmaphop (plan paths: `create_hop` / `create_path` + `#dmaphop.stream`), dfscheblueprint (the plan typed on `declare_data` / module) and dfschedule; excerpts from real dumps, measured 2026-11-26
+- **[tutorial/compilerinside/README.md](tutorial/compilerinside/README.md)** — the compiler inside, per performance level (0.01 / ~14 / ~50 / ~80 / 85 % on VEK385_2, `gemm_plan/step0..7`): how the IR lowers at each level and what each one-word source change moves at routing (`#routing.dataflow`), dmaphop (plan paths: `create_hop` / `create_path` + `#dmaphop.stream`), dfscheblueprint (the plan typed on `declare_data` / module) and dfschedule; excerpts from real dumps, measured 2026-11-26
 - **[tutorial/aieprogram/README.md](tutorial/aieprogram/README.md)** — kernel-only programming tutorials by operator family, then GEMM optimization: `01_contraction/` (GEMM: every host/kernel line, pid -> tile figures, trace -> DMA -> routing / dmap / dmaphop / dfschedule / routinghw pipeline figure; conv2d), `02_elementwise/` .. `05_indexing/` (4x4 by redundant broadcast -- a mesh row's data broadcast, work split by `pn`; reduction in two levels; model + limits; their kernels pass the kernel analysis but the lowering still derives windows from the GEMM model -- pending), `06_gemm_optimization/` (step 0 baseline 90.6 ms -> `.depth`/`.resident` 101.1 ms (slower: compute-bound) -> `aie::mmul` + `.tile` 79.6 ms; conv scheduling + vector with `output_tile_major`); listings synced by `sync_code.py`, figures from `img/make_figures.py`
 - **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` for `aie::SpatialPolicy`
 - **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based spatial op spaces (GemmSpace, Conv2dSpace)
@@ -1043,8 +1049,8 @@ Read the matching skill when the task fits:
 | Core register write succeeds on-core but host reads 0 / DMA never starts (`ST` vs `ST.TM`) | coretmregisterwrite |
 | Shim BD stuck on wrong/locked BD (index overflow into channel-control regs) | shimbdindexoverflow |
 | Vector kernel (aie_api SRS/requantize) off by +1 / data-dependent rounding on HW but exact on host; `control_rnd`/`sync_buffer` at DMb 0x0 in kernel.map | bcfglobalplacement |
-| netboot (`src/tool/netboot`, `apppaltest --netload`): `[netboot] ready` but `No route to host` / `Auto negotiation timeout` (PHY link down after bootstrap); supervisor dies on LOAD_RUN, uploads crawl, "app core busy" / PLM 0x7DB 0x7D2, watchdog fires at launch; board busy / how long to wait / max run time / forcing an overdue app (netload exit 3/4/5); `0x8_0000_0000` mirrors `0x0` on palmyra | netbootsupervisor |
-| palmyra hws (hw_server service) gone again: `[hws] status DOWN` / `3121 closed` every hour, hws session ends with no `hws_down` log, hw_server killed when another systest exits; does hws detect "service up but board gone" | hwsservicedrops |
+| netboot (`src/tool/netboot`, `apppaltest --netload`): `[netboot] ready` but `No route to host` / `Auto negotiation timeout` (PHY link down after bootstrap); supervisor dies on LOAD_RUN, uploads crawl, "app core busy" / PLM 0x7DB 0x7D2, watchdog fires at launch; board busy / how long to wait / max run time / forcing an overdue app (netload exit 3/4/5); `0x8_0000_0000` mirrors `0x0` on VEK385_2 | netbootsupervisor |
+| VEK385_2 hws (hw_server service) gone again: `[hws] status DOWN` / `3121 closed` every hour, hws session ends with no `hws_down` log, hw_server killed when another systest exits; does hws detect "service up but board gone" | hwsservicedrops |
 | VEK385 run via `apppaltest -board vek385 -host <farm host>` (JTAG or `--netload`): no output / nbspin never ends (system counter off), supervisor never answers ARP (GEM DMA in DDR_LOW0), `wake of app core FAILED` / #0.1 in Reset Catch (`rst -cores`), `APU core power request denied`, systest-client `User signal 1` | vek385netboot |
 | `KERNELCONFIGOFFLOAD` + partition start col ≠ 0 hangs; high core columns' MM2S never armed (`get_coreid()` absolute vs plan relative) | kcocoreidpartition |
 | Print values from an AIE kernel (`klog`); klog output never appears (`no log (write_index=0)`, e.g. a build run outside the repo root); `aie::print_log` (does not exist) | kernelklog |

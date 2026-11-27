@@ -83,7 +83,7 @@ int apu_busy(void) { return s_powered; }
 
 /* Stop the app core whatever it is doing. Each PLM path is tried in turn and
  * logged, because which one is permitted is a property of the PDI's subsystem
- * definition. On the palmyra BOOT.BIN NONE is: ForcePowerDown -> 0x2, both core
+ * definition. On the VEK385_2 BOOT.BIN NONE is: ForcePowerDown -> 0x2, both core
  * resets -> XPM_PM_NO_ACCESS. (XPm_ReleaseNode is deliberately not used: it
  * returns success but leaves the core running.) */
 int apu_kill(void) {

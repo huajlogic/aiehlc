@@ -16,7 +16,7 @@
  * Both operands are resident here ({.resident}), host-packed in mmul order (simplegemm_peak.h), so the
  * CYC each core klogs is the loop alone. Efficiency = (cm * cn * GP_K) / (CYC * 512).
  *
- * Measured on palmyra, 2026-11-25 (16 x 96 x 384 per core, all 16 cores, GOLDEN PASS): 1152 MAC instructions
+ * Measured on VEK385_2, 2026-11-25 (16 x 96 x 384 per core, all 16 cores, GOLDEN PASS): 1152 MAC instructions
  * in 1365 cycles = 84.4 %. Inside a block the schedule is one VMAC per bundle; each 16 x 16 block pays ~35
  * cycles at its start (load latency) and end (MAC / SRS latency before the int8 stores), and the compiler does
  * not overlap one block's end with the next block's start. Compare simplegemm_peak.cc with

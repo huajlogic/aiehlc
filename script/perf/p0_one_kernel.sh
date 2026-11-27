@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
 # Cost-model P0 / K1a: one gemm_kacc kernel from kernels.tsv on the board, with per-launch AIE core perf counters.
-#   p0_one_kernel.sh --board <ip> [--kernel <name>] [--kernels <kernels.tsv>] [--name palmyra213] [--out <dir>]
+#   p0_one_kernel.sh --board <ip> [--kernel <name>] [--kernels <kernels.tsv>] [--name VEK385_2] [--out <dir>]
 #                    [--reps 8] [--aie-clk-mhz 1000] [--rebuild] [--ctrlpkt off|aot|aot-kco] [--build-only]
 #                    [--launch warm|reload|cold] [--alt <k2>]
 #   p0_one_kernel.sh --parse-log <run.log> --kernel <k> --ctrlpkt <m> --launch <l>   (offline replay of a board run.log)
@@ -144,7 +144,7 @@ if [ -n "$PARSE_LOG" ]; then
     exit $?
 fi
 [ -n "$BOARD" ] || [ "$BUILD_ONLY" = 1 ] || { echo "p0_one_kernel: --board <ip> required (or --build-only)" >&2; exit 2; }
-case "$BOARD" in 10.23.224.213) NAME="${NAME:-palmyra213}"; BKIND=palmyra ;; *) NAME="${NAME:-$BOARD}"; BKIND="${BOARD_KIND:-palmyra}" ;; esac
+case "$BOARD" in "${AIE2PS_LOCAL_TEST_BOX_IP:-<unset>}") NAME="${NAME:-palmyra213}"; BKIND=palmyra ;; *) NAME="${NAME:-$BOARD}"; BKIND="${BOARD_KIND:-palmyra}" ;; esac
 read -r M K N RECIPE < <(awk -F'\t' -v k="$KERNEL" 'NR>1 && $1==k {print $3, $4, $5, $2}' "$KTSV")
 [ -n "${M:-}" ] || { echo "p0_one_kernel: kernel $KERNEL not in $KTSV" >&2; exit 2; }
 if [ "$RECIPE" = kacc_chunk_conv_bf16 ]; then

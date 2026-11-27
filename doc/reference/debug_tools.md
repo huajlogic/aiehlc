@@ -250,7 +250,7 @@ stops the server.
 
 ```bash
 # Live reads (grid overlay + per-tile /cmd) need a JTAG target. Set it once:
-export AIEDBG_TARGET=xsdb://10.23.224.213:3121   # or pass --target below
+export AIEDBG_TARGET=xsdb://$AIE2PS_LOCAL_TEST_BOX_IP:3121   # or pass --target below
 
 # Serve an existing worklocal (must contain host_schedule.html + provenance JSONs)
 python3 src/tool/debug/schedule_debug_server.py aout/worklocal --open
@@ -269,7 +269,7 @@ python3 src/tool/debug/schedule_debug_server.py aout/worklocal \
 | `--port` | HTTP port (default `8091`) |
 | `--aie-version` | Register offset set: `5` (AIEML, default) or `2ps` |
 | `--device` | `aiedbg --device` (default `pal`) |
-| `--target` | `aiedbg --target` (e.g. `xsdb://10.23.224.213:3121`); resolution order: `--target` → `$AIEDBG_TARGET` → `~/.aiedbg_env` (the file `aiedbg-setup` writes). Without any, live grid/`/cmd` reads fail with "timed out" / "connection closed" |
+| `--target` | `aiedbg --target` (e.g. `xsdb://$AIE2PS_LOCAL_TEST_BOX_IP:3121`); resolution order: `--target` → `$AIEDBG_TARGET` → `~/.aiedbg_env` (the file `aiedbg-setup` writes). Without any, live grid/`/cmd` reads fail with "timed out" / "connection closed" |
 | `--startcol` | Physical column offset: `phys_col = col + startcol` |
 | `--apppaltest` | Path to `apppaltest.py` (default `script/test/apppaltest.py`) |
 | `--open` | Open the served URL in a browser after binding |

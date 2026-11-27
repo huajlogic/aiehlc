@@ -50,7 +50,7 @@ regression script.
       paths + header) re-entered -> identical files; `gen_plan.py` ops -> plan-path dump re-entered -> identical.
       The `dmaphop.plan` header stays next to the paths until `erasePlanPaths`, so the plan-step dump is a complete,
       re-enterable plan; the paths' streams are ordered by `replace_args` on reading (IR order follows the flows).
-- [x] **Board, with the unified compiler** (2026-11-26, palmyra, every run GOLDEN PASS): `gemm_plan/step0..7` =
+- [x] **Board, with the unified compiler** (2026-11-26, VEK385_2, every run GOLDEN PASS): `gemm_plan/step0..7` =
       0.012 / 0.389 / 19.6 / 66.1 / 68.3 / 76.4 / 85.67 / 85.68 % of peak; `gemm_plan.cc` (= step 7) 85.68 % >= 85 %.
       The blueprint dump of its own stage (`6_DmaphopTodfscheblueprintPass.mlir`) now shows the plan it carries.
       Tutorial `tutorial/compilerinside/` walks these levels through the IR.
@@ -89,7 +89,7 @@ regression script.
   1. non-plan sources: every generated file byte-identical to the stage-0 snapshot;
   2. plan sources: flowcheck OK; generated files identical unless the stage says which may change and why;
   3. `routing_ir_roundtrip.sh` (routing and dmaphop stage) OK on one plan and one non-plan source;
-  4. board: `gemm_plan.cc` palmyra GOLDEN PASS and steady >= 85.4 % (stage 0: 85.63 %); `gemm_plan_4x2.cc`,
+  4. board: `gemm_plan.cc` VEK385_2 GOLDEN PASS and steady >= 85.4 % (stage 0: 85.63 %); `gemm_plan_4x2.cc`,
      `simpleeltwise_add_plan.cc`, `simpleconv2dkernel_port_plan.cc` GOLDEN PASS; non-plan sources need a board
      run only if any generated file changed.
 - Close a stage with: design doc `doc/design/dmaphop_dataflow_plan.md` + CLAUDE.md + skill
@@ -118,7 +118,7 @@ English-only rules (CLAUDE.md "Working rules"). `perftest/gemm90/*.patch` are ou
 **Step 2:** commit the open work on `gemm-dmaphop-ir` (message: "gemm 90 % study: loss tables, wait_io basis,
 kcyc_lst for gemm_plan, perftest/gemm90").
 **Step 3:** `git merge main` (13 commits: docker / LLVM / setup; one runtime `#error` guard in `aie_runtime.c`).
-**Step 4:** build `gemm_plan.cc`, run on palmyra. Expected: `GOLDEN PASS ... | PERF SUMMARY gemm_plan steady
+**Step 4:** build `gemm_plan.cc`, run on VEK385_2. Expected: `GOLDEN PASS ... | PERF SUMMARY gemm_plan steady
 1.43x ms median (85.6x % ...)`.
 **Step 5:** commit the merge.
 

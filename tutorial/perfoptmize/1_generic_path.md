@@ -57,7 +57,7 @@ The operands are already **host-packed in `mmul` order** (`ka_pack`: [mi][kb][8 
 the baseline that layout costs nothing extra; the core simply cannot do more than a few MACs per cycle
 with scalar code, against 512 for one `mac_8x8_8x8`.
 
-History: the first compiler-generated GEMM ran at 0.09 % (293 ms on palmyra, 998 MHz, a smaller
+History: the first compiler-generated GEMM ran at 0.09 % (293 ms on VEK385_2, 998 MHz, a smaller
 problem) -- a scalar kernel *and* a
 host loop that re-programmed the shim BDs for every strip. Today's compiler already removes the host
 loop (one shim BD walks every round, back-pressured by the core's locked ring), so step 0 is the
@@ -129,7 +129,7 @@ int8_t *Ct = (int8_t *)__Runtime_alloc_uncached(M * N);           //   no cache 
 Partition `{2, 6}`: five columns for a four-column mesh -- the control plane needs a column of its own;
 the data plane stays on columns 3..6.
 
-History: this is the 14.6 % milestone ("the compiler alone", 0.897 ms per 1.07 G MAC on palmyra). Today it
+History: this is the 14.6 % milestone ("the compiler alone", 0.897 ms per 1.07 G MAC on VEK385_2). Today it
 lands higher, because warm reload, the plan cache and uncached buffers did not exist then. It is now
 bound by the generic data path: every core pulls its A and B chunks from DDR through its own shim
 channel, so DDR and the per-core input streams, not the MACs, set the pace.

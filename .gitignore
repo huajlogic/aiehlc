@@ -26,7 +26,6 @@ thirdparty/llvm-project/
 
 # thirdparty dependencies
 thirdparty/alib/
-thirdparty/cardano/
 thirdparty/aiedbg/
 
 # debug UI bootstrap (ensure_aiedbg.py)

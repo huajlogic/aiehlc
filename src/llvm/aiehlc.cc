@@ -4224,7 +4224,7 @@ public:
         // AutoTVM tuner (script/convtune) uses. A rejected configuration aborts.
         // #pragma gemm_autotile (convautotile/gemm_autotile.h): the mesh and A ring of a 2 x 8 shared-operand
         // GEMM chosen by the cost model from GP_M / GP_N / GP_K / GP_DTYPE, written as #defines before the
-        // kernel is traced. Board: #pragma gemm_autotile(palmyra) or AIEHLC_GEMM_BOARD (default vek385).
+        // kernel is traced. Board: #pragma gemm_autotile(VEK385_2) or AIEHLC_GEMM_BOARD (default vek385).
         void applyGemmAutoTiling(std::string &src) {
             std::string log, err;
             if (!gemmtile::applyGemmAutoTile(src, log, err)) {

@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""A chat web page in front of the qwen engine on a palmyra board (baremetal A78 + AIE).
+"""A chat web page in front of the qwen engine on a vek385_2 board (baremetal A78 + AIE).
 
   qwen_web.py --model <Qwen3.5-9B dir> --lib <dir with libqwen_gemv_lib.a, libxaienginea78.a>
               --board palmyra-14 --host gomphus12 [--port 8101]
@@ -74,7 +74,7 @@ def hw_model(perf, prof, aie):
         "aie": min(1.0, aie_s / wall),           # the 16 cores, their MemTile rings and shims stream weights
         "cpu": min(1.0, cpu / wall),             # the A78: DeltaNet, attention, norms, x/y glue
         "ddr_gbs": gbs,                          # int4 weight bytes per second of launch time
-        "ddr_peak_gbs": 26.0,                    # measured AIE read bandwidth on palmyra
+        "ddr_peak_gbs": 26.0,                    # measured AIE read bandwidth on vek385_2
         "cpu_parts": {k: v for k, v in prof.items() if k not in ("matmul", "lm_head")},
         "glue_s": aie.get("glue_s", 0),
         "wall_s": wall,

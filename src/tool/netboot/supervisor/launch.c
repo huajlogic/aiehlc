@@ -128,7 +128,7 @@ void nb_fill_ack(struct netboot_ack *ack) {
  *   app within its max_run_ms      -> BUSY, retry after the time it has left
  *   app past it, no FORCE          -> OVERTIME (resend with FORCE to preempt it)
  *   app past it, FORCE             -> terminate it (PLM) and OK, or STUCK when
- *                                     the PDI refuses (palmyra: design section 12,
+ *                                     the PDI refuses (VEK385_2: design section 12,
  *                                     item 4) -- only a re-bootstrap frees the core
  * KILL and STATUS are always admitted. */
 int nb_admit(uint32_t cmd, uint32_t flags, struct netboot_ack *ack, char *msg, size_t msglen) {

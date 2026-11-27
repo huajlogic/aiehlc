@@ -22,7 +22,7 @@ namespace gemmtile {
 
 namespace {
 
-// Measured boards (script/perf/gemm_plan.py BOARDS): palmyra one controller, reads and writes do not
+// Measured boards (script/perf/gemm_plan.py BOARDS): VEK385_2 one controller, reads and writes do not
 // overlap. VEK385 three interleaved controllers: one shim MM2S channel ~5.2 GB/s, and the aggregate DDR
 // read rate when B is re-read per output tile fitted on the stage-4 runs (84 MB / 3.14 ms, 168 MB / 6.21
 // ms, 147 MB / 6.77 ms -> 26.7 / 27.0 / 21.7 GB/s): 24 GB/s, within +-12 % of all three. Its write

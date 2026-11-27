@@ -30,7 +30,7 @@ __all__ = ["MC", "ConvPlan", "kacc_geom", "kacc_name", "kernel_text", "plan_conv
 
 _STAGE = "cnn"
 MC = 256            # output pixels per launch (4 mesh columns x 64; board-proven non-transposed walk)
-# palmyra213 self-check (UC_SELFCHECK, 2026-11-18): gemm_kacc instances with a K walk of <= 64 words
+# VEK385_2 self-check (UC_SELFCHECK, 2026-11-18): gemm_kacc instances with a K walk of <= 64 words
 # (64x64x256, 128x64x256, 128x128x256, 256x128x512) and 64x2304x256 run but return wrong sums (rel err
 # 0.2-0.5) while their x86 model is exact; the kernel K is >= KK_MIN and a K > KK_BIG gets >= NP_MIN_BIGK rows
 KK_MIN = 192

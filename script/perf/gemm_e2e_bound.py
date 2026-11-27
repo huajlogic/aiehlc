@@ -7,7 +7,7 @@
 PEAK=16*512*0.998e9
 best={}
 import sys, os
-# Per-channel core input in B/cycle: 4 = the 32-bit stream; 2.7 = measured on palmyra
+# Per-channel core input in B/cycle: 4 = the 32-bit stream; 2.7 = measured on VEK385_2
 # (memtile -> core, DMA-only slope, 2026-11-20). AIEHLC_BOUND_CH=2.7 to use it.
 CH = float(os.environ.get("AIEHLC_BOUND_CH", "4"))
 for BW in [float(x)*1e9 for x in (sys.argv[1:] or ["7.4","11"])]:

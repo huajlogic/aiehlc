@@ -39,7 +39,7 @@ round trip: `#routing.kernel_block` (kernel-only ports) first printed its arrays
 unbracketed and re-entry failed to parse it (skill **mlirattrarrayroundtrip**);
 `simplegemm_dataflow.cc` exercises it with `.resident` / `.tile`.
 
-Edits that take effect, board-verified (palmyra 213): output C `pp_depth` 2 -> 1
+Edits that take effect, board-verified (VEK385_2): output C `pp_depth` 2 -> 1
 (host.cc + aieml.bcf change, `PASS: all 4096 output elements match`).
 
 ## Step 2: Python API (`aiebackend.routing_ir`)

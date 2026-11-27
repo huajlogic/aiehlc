@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
-/* DDR-side cost-model microbench (segment K, costmodel K2d), bare-metal A78 + AIE2PS (palmyra213).
+/* DDR-side cost-model microbench (segment K, costmodel K2d), bare-metal A78 + AIE2PS (VEK385_2).
  * Driven by script/perf/run_microbench.sh --section ddr; script/perf/mb_fit.py (section=ddr) merges the fitted keys
  * into the existing params/<board>.json (keeps every section=aie key).
  * Self-contained (aiehlc.sh rewrites only the runtime source file), DDR path copied from aie_microbench.cc bench_ddr

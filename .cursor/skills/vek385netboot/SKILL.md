@@ -42,7 +42,7 @@ rejects `vek385_netboot.BIN` with `PLM Error Major 0x326 Minor 0x14`, even right
 power cycle. Use another board.
 
 **The array clock on these boards is 1.25 GHz** (core/shim timer 0x340F8 vs host time, xsdb),
-not palmyra's 998 MHz. Any test that hard-codes 998 MHz overstates its % of peak by 1.25x.
+not VEK385_2's 998 MHz. Any test that hard-codes 998 MHz overstates its % of peak by 1.25x.
 
 ## Procedure (verified on vek385-11 @ crimini1, HEAD ccfcaa2, 2026-11-05)
 
@@ -58,7 +58,7 @@ need `BOARDNAME/PALIP` or `--netload-bootstrap`: `--netload` bootstraps by itsel
   shows `huaj`. Pairs: vek385-11 = crimini1 (hw_server `crimini1:3121`), vek385-3 = gomphus3.
   Both hosts have eth1 = 10.10.70.101/24, and the supervisor is at 10.10.70.50.
 - `BOARD_OWNER=huaj board.py probe vek385-11` must show `[vek385-11] Systest#`. Never use `become`
-  (palmyra only). apppaltest uses the host's systest-client by itself.
+  (VEK385_2 only). apppaltest uses the host's systest-client by itself.
 - `source <aiengineers>/skills/vitis-2026.2/vitis_env.sh` (xsdb, A78 gcc).
   The supervisor was verified on the board with gcc 13.4 (2026.1). gcc 15.3 is not verified on the board.
 

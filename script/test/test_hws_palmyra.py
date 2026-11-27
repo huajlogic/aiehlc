@@ -14,7 +14,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 import hws  # noqa: E402
 import hws_palmyra as hp  # noqa: E402
 
-BOARD = "10.23.224.213"
+# The AIE2PS local test board; a TEST-NET-1 placeholder when unset (tests never reach it).
+BOX_IP = os.environ.get("AIE2PS_LOCAL_TEST_BOX_IP", "").strip() or "192.0.2.213"
+os.environ.setdefault("AIE2PS_LOCAL_TEST_BOX_IP", BOX_IP)  # hws.board_type: this host is palmyra
+
+BOARD = BOX_IP
 GOOD_TARGETS = "\n".join(
     ["  1  Versal Gen2 xc2ve3858", "     2  PMC", "     3  PSM"]
     + [f"        {10 + i}  Cortex-A78AE #{i // 2}.{i % 2} (Running)" for i in range(8)]
@@ -74,7 +78,7 @@ class Fake213(hws.Io):
         self._tick_reboot()
         self.cmds.append(cmd)
         if not self.reachable:
-            return 255, "ssh: connect to host 10.23.224.213 port 22: Connection refused"
+            return 255, f"ssh: connect to host {BOX_IP} port 22: Connection refused"
         if cmd == "true":
             return 0, ""
         if cmd == "hostname":
@@ -177,7 +181,7 @@ def make_up(fake):
 
 # ---- type / usage ------------------------------------------------------------
 def test_board_type_detection():
-    assert hws.board_type("huaj@10.23.224.213") == "palmyra"
+    assert hws.board_type(f"huaj@{BOX_IP}") == "palmyra"
     assert hws.board_type("crimini1") == "vek385"
     with pytest.raises(hws.HwsError) as e:
         hws.board_type("example.com")
@@ -459,7 +463,7 @@ def test_cli_script_maps_backend_errors_to_rc(tmp_path):
     code = ("import sys, hws, hws_palmyra\n"
             "def boom(self): raise hws.HwsError(hws.RC_DEGRADED, 'HWS FAIL x')\n"
             "hws_palmyra.Backend.up = boom\n")
-    p = subprocess.run([sys.executable, "-c", code + "import runpy; sys.argv=['hws.py','--board','10.23.224.213',"
+    p = subprocess.run([sys.executable, "-c", code + f"import runpy; sys.argv=['hws.py','--board','{BOX_IP}',"
                         "'--wait-lock','0','up']; runpy.run_path('hws.py', run_name='__main__')"],
                        cwd=os.path.dirname(os.path.abspath(__file__)), capture_output=True, text=True,
                        env={**os.environ, "BOARD_LOCK_DIR": str(tmp_path), "HWS_LOG_DIR": str(tmp_path)})

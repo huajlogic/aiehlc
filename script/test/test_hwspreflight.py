@@ -18,7 +18,11 @@ sys.path.insert(0, HERE)
 import hws  # noqa: E402
 import hwspreflight as hp  # noqa: E402
 
-PAL, VEK = ("10.23.224.213", "palmyra"), ("crimini1", "vek385")
+# The AIE2PS local test board; a TEST-NET-1 placeholder when unset (tests never reach it).
+BOX_IP = os.environ.get("AIE2PS_LOCAL_TEST_BOX_IP", "").strip() or "192.0.2.213"
+os.environ.setdefault("AIE2PS_LOCAL_TEST_BOX_IP", BOX_IP)  # hws.board_type: this host is palmyra
+
+PAL, VEK = (BOX_IP, "palmyra"), ("crimini1", "vek385")
 BOTH = pytest.mark.parametrize("board,btype", [PAL, VEK], ids=["palmyra", "vek385"])
 
 
@@ -227,7 +231,7 @@ def test_palmyra_full_mode_failed_up_after_run_is_a_warning_only():
     pf, _, lines = make(*PAL, down=[hws.DOWN], up=[err])
     pf.before_run(hp.FULL)
     assert pf.after_run() == hws.RC_DEGRADED  # returned, never raised
-    assert any(s.startswith("HWS WARN 10.23.224.213") and "rc=3" in s for s in lines)
+    assert any(s.startswith(f"HWS WARN {BOX_IP}") and "rc=3" in s for s in lines)
 
 
 def test_palmyra_full_mode_down_failure_stops_the_run():

@@ -311,7 +311,7 @@ def test_given_a_32b_run_shim_read_on_palmyra213_then_ddr_runb_uses_the_board_fi
 
 
 def test_given_a_dma_bound_32b_launch_then_the_run_penalty_sets_launch_ms():
-    # palmyra213, measured at 32 B runs: u_conv_1024x2880x320 10.174 ms, u_lin_1024x5760x320 17.972 ms (both floor > issue)
+    # VEK385_2, measured at 32 B runs: u_conv_1024x2880x320 10.174 ms, u_lin_1024x5760x320 17.972 ms (both floor > issue)
     ddr = {"mm2s": 1, "s2mm": 0, "channels": [dict(_ch(0, "MM2S", 1), run_b=32)]}
     for floor, issue, meas in ((3.81, 2.73, 10.174), (7.61, 2.733, 17.972)):
         r = bdgraph.ddr_runb({"ms": floor}, ddr, bdgraph.RUN_B_FACTOR_FIT_P4I["palmyra213"], issue_ms=issue)
@@ -319,7 +319,7 @@ def test_given_a_dma_bound_32b_launch_then_the_run_penalty_sets_launch_ms():
 
 
 def test_given_an_issue_bound_32b_launch_then_run_size_is_hidden_under_issue():
-    # palmyra213 issue-bound 32 B kernels (floor < issue): u_lin_1024x{1280x320, 320x2560, 320x320, 320x960}
+    # VEK385_2 issue-bound 32 B kernels (floor < issue): u_lin_1024x{1280x320, 320x2560, 320x320, 320x960}
     ddr = {"mm2s": 1, "s2mm": 0, "channels": [dict(_ch(0, "MM2S", 1), run_b=32)]}
     for floor, issue, meas in ((1.69, 2.73, 5.259), (1.59, 6.00, 8.310), (0.42, 2.73, 3.295), (0.59, 2.60, 3.413)):
         r = bdgraph.ddr_runb({"ms": floor}, ddr, bdgraph.RUN_B_FACTOR_FIT_P4I["palmyra213"], issue_ms=issue)
@@ -327,7 +327,7 @@ def test_given_an_issue_bound_32b_launch_then_run_size_is_hidden_under_issue():
 
 
 def test_given_a_32b_launch_between_the_old_and_new_switch_then_it_is_dma_bound():
-    # P4i: palmyra213 u_lin_1024x{1600,1920,2560}x320 (r = floor/issue .77/.93/1.24) measured 6.879/7.719/9.711 ms;
+    # P4i: VEK385_2 u_lin_1024x{1600,1920,2560}x320 (r = floor/issue .77/.93/1.24) measured 6.879/7.719/9.711 ms;
     # P4h (switch at r 1) put r .77 and .93 in the issue regime and missed u_lin_1024x1920x320 by -18%
     ddr = {"mm2s": 1, "s2mm": 0, "channels": [dict(_ch(0, "MM2S", 1), run_b=32)]}
     for floor, meas in ((2.114, 6.879), (2.537, 7.719), (3.382, 9.711)):
@@ -417,7 +417,7 @@ def test_given_palmyra213_32b_builds_then_p4j_launch_ms_is_within_3pct(build, me
     assert op["ddr_runb"]["launch_ms"] == pytest.approx(meas, rel=0.03)    # P4i: -11.5% on u_lin_2048x960x320
 
 
-# --- P4k: at 32 B runs the factor follows the DDR row stride (empirical, palmyra213) ---
+# --- P4k: at 32 B runs the factor follows the DDR row stride (empirical, VEK385_2) ---
 
 def test_given_a_strided_bd_then_row_stride_is_its_second_dim_stride_and_a_plain_bd_has_none():
     assert bdgraph.row_stride({"len": 40960, "dim_strides": [4, 2560, 32], "dim_wraps": [8, 16, 80]}) == 2560
@@ -460,7 +460,7 @@ def test_given_palmyra213_fast_and_slow_stride_builds_then_p4k_launch_ms_is_with
     assert op["ddr_runb"]["launch_ms"] == pytest.approx(meas, rel=0.07)
 
 
-# ---- the board fit only prices the BD write path it was measured on (jit_ctrlpkt on palmyra213)
+# ---- the board fit only prices the BD write path it was measured on (jit_ctrlpkt on VEK385_2)
 
 @pytest.mark.parametrize("path", ["jit_mmio", "aot_window", "uart_degraded"])
 def test_given_another_bd_write_path_and_no_bd_us_then_the_board_fit_does_not_price_issue(tmp_path, cycles_file, path):

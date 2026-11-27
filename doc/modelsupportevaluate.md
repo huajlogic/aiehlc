@@ -547,6 +547,6 @@ Total ≈ 54 ew. Critical path to the first new model (ResNet-50): M0→M3 ≈ 1
 1. M0.2: write a micro-benchmark for ctrl-pkt ELF load and per-window setup (extends
    `doc/performance/register_write_cost.md`).
 2. M1.1: prototype a stream-switch ctrl-pkt encoder on one tile, verify the register
-   image against MMIO `XAie_StrmConn*` on palmyra.
+   image against MMIO `XAie_StrmConn*` on VEK385_2.
 3. Draft `aiecfg` TableGen (`state`, `switch_route`, `pkt_route`, `bd`, `lock_init`,
    `rtp`, `core_elf`, `delta`, `encode`) under `src/mlir/mlirfront/tilinglinalg/aiecfg/`.

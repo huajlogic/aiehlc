@@ -22,7 +22,7 @@ void __Runtime_core_perf_report(int tag);
 void __Runtime_launch_words(unsigned long long *mmio_w, unsigned long long *cp_w, unsigned long long *ph_w,
                             unsigned int *bd_n, unsigned int *rst_n, unsigned long long *miss);
 /* pmu_hz fallback when XTime does not advance (VEK385 A78: CNTPCT frozen unless the SCNTRS is started): the A78
- * PMCCNTR rate measured against XTime on vek385-12 (1.8675 GHz). Palmyra always takes the xtime branch. */
+ * PMCCNTR rate measured against XTime on vek385-12 (1.8675 GHz). VEK385_2 always takes the xtime branch. */
 #ifndef P0_A78_FALLBACK_HZ
 #define P0_A78_FALLBACK_HZ 1867500000ULL
 #endif

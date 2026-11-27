@@ -17,10 +17,14 @@ sys.path.insert(0, os.path.dirname(HERE))
 import aiedump as ad  # noqa: E402
 import hws  # noqa: E402
 
+# The AIE2PS local test board; a TEST-NET-1 placeholder when unset (tests never reach it).
+BOX_IP = os.environ.get("AIE2PS_LOCAL_TEST_BOX_IP", "").strip() or "192.0.2.213"
+os.environ.setdefault("AIE2PS_LOCAL_TEST_BOX_IP", BOX_IP)  # what palmyra_local resolves to
+
 
 def test_palmyra_local_alias():
     b = ad.resolve_board("palmyra_local")
-    assert (b.host, b.type) == ("10.23.224.213", "palmyra")
+    assert (b.host, b.type) == (BOX_IP, "palmyra")
 
 
 def test_vek385_name_via_cluster_ping(monkeypatch):
@@ -37,7 +41,7 @@ def test_vek385_host_override_skips_cluster_ping(monkeypatch):
 
 
 def test_raw_host_needs_type():
-    assert ad.resolve_board("10.23.224.213").type == "palmyra"
+    assert ad.resolve_board(BOX_IP).type == "palmyra"
     with pytest.raises(ad.DumpError, match="unknown board"):
         ad.resolve_board("somehost")
     assert ad.resolve_board("somehost", btype="vek385").type == "vek385"
@@ -46,7 +50,7 @@ def test_raw_host_needs_type():
 def test_hw_server_up_does_not_call_hws(monkeypatch):
     monkeypatch.setattr(ad, "port_open", lambda host, *a, **k: True)
     monkeypatch.setattr(hws, "ensure", lambda *a, **k: pytest.fail("hws.ensure called"))
-    ad.ensure_hw_server(ad.Board("palmyra_local", "10.23.224.213", "palmyra"))
+    ad.ensure_hw_server(ad.Board("palmyra_local", BOX_IP, "palmyra"))
 
 
 def test_hw_server_down_is_started_through_hws(monkeypatch):
@@ -60,7 +64,7 @@ def test_hw_server_down_is_started_through_hws(monkeypatch):
 
 def test_hw_server_down_no_start_and_start_failure(monkeypatch):
     monkeypatch.setattr(ad, "port_open", lambda host, *a, **k: False)
-    b = ad.Board("palmyra_local", "10.23.224.213", "palmyra")
+    b = ad.Board("palmyra_local", BOX_IP, "palmyra")
     with pytest.raises(ad.DumpError, match="--no-start"):
         ad.ensure_hw_server(b, start=False)
 

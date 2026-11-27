@@ -296,7 +296,6 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 }");
                 */
                 // AIEML Gen-2 lock protocol (acquire_greater_equal / release with value).
-                // Reference: cardano/src/windowfunctions/window.h lines 1232-1286.
                 // Input window: DMA S2MM writes data then releases lockids[1].
                 //   Kernel acquire: acquire_greater_equal(lockids[1], 1)  -- wait for "data ready"
                 //   Kernel release: release(lockids[0], 1)               -- signal "buffer free"

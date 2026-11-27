@@ -14,7 +14,7 @@ compiler's current, hard-code-free logic.
 
 | step | source (`example/tileprogram/ccode/gemm_plan/`) | what changes | VEK385 (per launch, % of peak) | history (first reached, by hand) |
 |---|---|---|---|---|
-| 0 | `step0_baseline.cc` | scalar MACs, no options | 3194.4 ms, 0.015 % | 0.09 % (palmyra, 293 ms) |
+| 0 | `step0_baseline.cc` | scalar MACs, no options | 3194.4 ms, 0.015 % | 0.09 % (VEK385_2, 293 ms) |
 | 1 | `step1_vector.cc` | `aie::mmul<8,8,8>` 2 x 2 register block | 99.25 ms, 0.50 % | -- |
 | 2 | `step2_launch.cc` | launch off the MMIO path: control-packet ELF, KCO, tile-major output, no teardown, uncached buffers | 2.042 ms, 24.1 % | 14.6 % (compiler alone) |
 | 3 | `step3_memtile.cc` | dataflow plan: 2 x 8 shared operands, MemTile staging (A ring 2, B per launch) | 1.497 ms, 65.7 % | 26-57 % (MemTile staging, hand-edited) |

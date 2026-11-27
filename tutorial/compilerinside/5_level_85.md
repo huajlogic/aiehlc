@@ -55,9 +55,9 @@ dfschedule.config.tile_bd(%27) {bd_id = 10 : i32, ..., dfplan.tag = "mem/0/0/out
 The empty-buffer lock counts the ring's free buffers (10), the S2MM chain has 10 BDs and the MM2S chains start
 after them (BD 10); `planresource.cpp` checked the MemTile's BD count and memory (`A ring 10, 163840 B per
 MemTile`). With a 2-deep ring the MemTile could run at most one buffer ahead of the cores; with 10 the shim's
-bursts are absorbed. On palmyra's DDR this is within noise (85.67 % -> 85.68 %): the design is core-bound here.
+bursts are absorbed. On VEK385_2's DDR this is within noise (85.67 % -> 85.68 %): the design is core-bound here.
 
-## Measured (palmyra, GOLDEN PASS every run)
+## Measured (VEK385_2, GOLDEN PASS every run)
 
 | step | per launch | % of peak |
 |---|---|---|

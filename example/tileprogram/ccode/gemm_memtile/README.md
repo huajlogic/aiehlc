@@ -12,7 +12,7 @@ replay them (B resident per column, A double-buffered per mesh row).
     WORKLOCAL_DIR=$PWD/aout/worklocal AIE_VERSION=5 PLATFORM=baremetal bash script/hostcompile.sh
     python3 script/test/apppaltest.py aout/worklocal/build/host -y --netload
 
-palmyra: **2.20 ms per 4.83 G MAC = 26.8 % of peak end to end**, GOLDEN PASS (two 16x16 blocks per step; 2.24 ms / 26.3 % with one)
+VEK385_2: **2.20 ms per 4.83 G MAC = 26.8 % of peak end to end**, GOLDEN PASS (two 16x16 blocks per step; 2.24 ms / 26.3 % with one)
 (MemTile BDs written once and only re-armed per launch: 2.51 -> 2.25 ms; B received in
 NT parts so replay starts on part 0: 2.25 -> 2.24 ms; uncached C instead of the
 invalidate contract: slower, 2.43 ms).

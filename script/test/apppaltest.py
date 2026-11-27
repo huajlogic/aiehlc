@@ -100,6 +100,7 @@ if not username or not palip or not boardname:
 if not username or not palip or not boardname:
     print("Error: Please set USERNAME, PALIP, and BOARDNAME environment variables, or pass -board/-host")
     print("Example: export USERNAME=aaaaa && export PALIP=10.23.***.*** && export BOARDNAME=pal***")
+    print("envlocal.sh takes PALIP from AIE2PS_LOCAL_TEST_BOX_IP: export AIE2PS_LOCAL_TEST_BOX_IP=<board ip>")
     print("Example: apppaltest.py -board vek385 -host gomphus3 -y main.elf")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     print(f"Or create {os.path.join(script_dir, 'envlocal.sh')} with these exports")
@@ -114,7 +115,7 @@ PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
 # vek385_pld.pdi packed by bootgen (vek385_netboot.BIN), the A78 console is com3
 # (as in appvek385.py), and after `device program` the APU cluster is reset with
 # `rst -cores` (as appvek385.py does). The netboot supervisor's IP 10.10.70.50 and
-# gateway 10.10.70.101 on the farm host's eth1 are shared with palmyra. One
+# gateway 10.10.70.101 on the farm host's eth1 are shared with VEK385_2. One
 # difference: on the vek385 base platform the GEM (an LPD master, LPD_AXI_NOC0)
 # reaches only DDR_CH1/DDR_CH2, not DDR_LOW0, so its supervisor is a separate
 # build with the lwIP heap/pools and BD ring at NETBOOT_DMA_BASE (DDR_CH1).
@@ -126,9 +127,9 @@ PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
 # hw_server, so xsdb attaches with `connect -url` (HW_SERVER_URL) in both modes.
 # -board-rev b (or VEK385_REV=b) programs rev B's boot + PLD PDI pair, as appvek385.py.
 IS_VEK385 = boardname.lower().startswith("vek385")
-# A palmyra in the board farm ("palmyra-N" on its farm host, -board palmyra-14 -host gomphus12): the farm flow of
+# A VEK385_2 in the board farm ("palmyra-N" on its farm host, -board palmyra-14 -host gomphus12): the farm flow of
 # the VEK385 (systest-client bound to the host's board, no `become`, connect -url, PMC reset, the farm hws backend)
-# with palmyra's boot image, console and netboot supervisor.
+# with VEK385_2's boot image, console and netboot supervisor.
 IS_FARM_PALMYRA = bool(re.match(r"palmyra-\d+$", boardname.lower()))
 IS_FARM = IS_VEK385 or IS_FARM_PALMYRA
 BOARD_REV = (_cli.board_rev or os.environ.get("VEK385_REV") or "a").lower()
@@ -503,7 +504,7 @@ def setup_first_connection(nonreboot=False):
     log.debug("setup_first_connection: systest prompt received")
     if IS_FARM:
         # systest-client lands on the farm host's own board ("[vek385-3] Systest#");
-        # refuse to power-cycle anything else (no `become` off palmyra).
+        # refuse to power-cycle anything else (no `become` off VEK385_2).
         m = re.search(r'\[([^\]\s]+)\]\s*$', child.before or "")
         if not m or not board_matches(m.group(1)):
             child.close(force=True)
@@ -569,7 +570,7 @@ def setup_first_connection(nonreboot=False):
     print("[Connection 1] Device programmed (100%), letting the PLM settle...")
     time.sleep(PLM_SETTLE_S)  # now measured from the END of programming
     if IS_FARM:
-        # Reset A78 #0.0 only, as palmyra does. Not appvek385.py's APU `rst -cores`:
+        # Reset A78 #0.0 only, as VEK385_2 does. Not appvek385.py's APU `rst -cores`:
         # that suspends EVERY core of the group, so #0.1 sits in the debugger's Reset
         # Catch and the netboot supervisor's RequestWakeUp of it fails (PM 0x7D2) or
         # the woken core never runs. After `device program` both cores are in Power

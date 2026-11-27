@@ -2026,7 +2026,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                     os << indent << "__Runtime_dsync_drain();\n";
                     // The pre-launch clean+invalidate is NOT enough for outputs: while the
                     // array runs, the A78 may speculatively (pre)fetch output lines back
-                    // into the cache, and the CPU would then read the old bytes (palmyra
+                    // into the cache, and the CPU would then read the old bytes (VEK385_2
                     // 2026-11-15: FA D40 read 64 B lines of its 0xff memset; the same
                     // lines were correct in DDR after a fresh invalidate). Invalidate every
                     // output after the launch has completed, before control returns.

@@ -8,7 +8,7 @@ Related: `tutorial/model/03_tiny-sdm-unet.md` (the current approach, which produ
 
 ## 1. Goal
 
-Given a network, a user calls only aiegraph functions and gets an ELF that generates the orange on VEK385 (palmyra):
+Given a network, a user calls only aiegraph functions and gets an ELF that generates the orange on VEK385 (VEK385_2):
 
 ```
 ONNX → ag.load → convert("a78") → [kernels generated from Python templates] → emod.offload_group(...) → emod.build → main.elf

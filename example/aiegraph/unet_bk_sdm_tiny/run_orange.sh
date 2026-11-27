@@ -18,7 +18,7 @@
 #   ZOO_SRC   bk-sdm-tiny ONNX model zoo                     (/scratch/staff/huaj/aiehlc/model_zoo/bk-sdm-tiny)
 #   IMAGEGEN  dir holding the aie_imagegen package (palmyra_stage_runner)
 #             (/scratch/staff/huaj/aiehlc/aiehlc-sdxl-wt/palmyra-runner/script)
-#   BOARD     palmyra board ip                               (10.23.224.213)
+#   BOARD     VEK385_2 board ip                               ($AIE2PS_LOCAL_TEST_BOX_IP)
 #   PROMPT / NEG / GUIDANCE
 #   REF       optional host-generated PNG to compare against (PSNR / cos)
 set -eu
@@ -28,7 +28,7 @@ HERE=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$HERE/../../.." && pwd)
 PY=${PY:-/scratch/staff/huaj/aiehlc/.venv/bin/python3}
 ZOO_SRC=${ZOO_SRC:-/scratch/staff/huaj/aiehlc/model_zoo/bk-sdm-tiny}
 IMAGEGEN=${IMAGEGEN:-/scratch/staff/huaj/aiehlc/aiehlc-sdxl-wt/palmyra-runner/script}
-BOARD=${BOARD:-10.23.224.213}
+BOARD=${BOARD:-${AIE2PS_LOCAL_TEST_BOX_IP:?set AIE2PS_LOCAL_TEST_BOX_IP or BOARD to the board IP}}
 PROMPT=${PROMPT:-"a photo of an orange, citrus fruit, high quality"}
 NEG=${NEG:-"blurry, deformed, low quality"}
 GUIDANCE=${GUIDANCE:-7.5}

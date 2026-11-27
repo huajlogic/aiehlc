@@ -32,7 +32,7 @@ NETBOOT_MASK="${NETBOOT_MASK:-255.255.255.0}"
 NETBOOT_GW="${NETBOOT_GW:-10.10.70.101}"
 # VEK385: GEM (LPD) cannot reach DDR_LOW0 there; put its DMA memory in DDR_CH1.
 #   NETBOOT_DMA_BASE=0xA00000000 src/tool/netboot/build.sh
-# lwIP heap+pools go at NETBOOT_DMA_BASE, the BD ring 1 GB above it. Empty = palmyra layout.
+# lwIP heap+pools go at NETBOOT_DMA_BASE, the BD ring 1 GB above it. Empty = VEK385_2 layout.
 NETBOOT_DMA_BASE="${NETBOOT_DMA_BASE:-}"
 
 die() { echo "[netboot] ERROR: $*" >&2; exit 1; }

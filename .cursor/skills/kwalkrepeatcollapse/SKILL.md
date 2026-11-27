@@ -34,16 +34,16 @@ trace can prove.
 Collapse only for a traced kernel-only port (`c.kb.attr`, a `#routing.kernel_block`): there the trace
 says how many times the core takes the walk. Other inputs keep the repeat the GEMM model derived.
 Not `c.kb.follow`: simplegemm_kacc's B is traced but does not follow its blocks (not row-contiguous),
-and gating on `follow` brought its hang back (palmyra `wait_io TIMEOUT ... ch=1`).
+and gating on `follow` brought its hang back (VEK385_2 `wait_io TIMEOUT ... ch=1`).
 
 ## Check
 
 - simplematmul2: `host.cc` / `kernel.cc` / `routing.cc` byte-identical to a 3ff40966 build, and the
   board run ends (`aie matmul time: ... ms`, no `wait_io TIMEOUT`).
 - simplegemm_kacc: the `repeat 16 -> 1` line is still printed (4 times), `host.cc` identical to a
-  12109fc7 build, and the palmyra run is `GOLDEN PASS: 112384 / 112384`.
+  12109fc7 build, and the VEK385_2 run is `GOLDEN PASS: 112384 / 112384`.
 - Build a plan-less baseline to compare against: `git worktree add --detach <dir> 3ff40966`, copy
-  `thirdparty/alib`, `rsync thirdparty/arch`, symlink `thirdparty/{cardano,tvm-0.16}`, cmake + `make
+  `thirdparty/alib`, `rsync thirdparty/arch`, symlink `thirdparty/tvm-0.16`, cmake + `make
   aiehlc`, run `aiehlc.sh` from that worktree (it writes `aout/` in the cwd).
 
 ## Lesson

@@ -63,7 +63,7 @@ struct PlanTarget {
 };
 
 // The devices a plan can target (xaie2psgbl_* / xaiemlgbl_* params and reginit, aie_device_map.h): AIE2PS
-// (--aie-version 5: VEK385, palmyra) and AIE-ML (--aie-version 2). Their DMA, lock and memory facts agree;
+// (--aie-version 5: VEK385, VEK385_2) and AIE-ML (--aie-version 2). Their DMA, lock and memory facts agree;
 // the array differs (36 x 4 vs 38 x 8 core rows). The pipeline selects one per build (selectPlanTarget,
 // from the build's AIE generation); aie2ps unless told otherwise.
 inline const PlanTarget *planTargets() {

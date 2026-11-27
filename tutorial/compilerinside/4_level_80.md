@@ -58,7 +58,7 @@ dfschedule.config.lock_set(%0) {dfplan.tag = "core/sync", lock_id = 13 : i32, va
 `main` becomes `for (;;) { acquire(go); kernel(); }` and the host's later launches only release the go lock
 (`__Runtime_plan_setup(1, 12)`): no ELF reload, no core reset, the BDs written once (`bd_once`).
 
-## Measured (palmyra)
+## Measured (VEK385_2)
 
 | step | per launch | % of peak |
 |---|---|---|

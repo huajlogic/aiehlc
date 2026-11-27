@@ -1,6 +1,6 @@
 # ResNet-18 on the AIE: the persistent conv engine
 
-**Result (board, VEK385 / palmyra, 2026-10-15): 2.81 ms per image**, float image
+**Result (board, VEK385 / VEK385_2, 2026-10-15): 2.81 ms per image**, float image
 → 1000 logits, **bit-identical to TVM's int8 graph** (logits compared as raw
 float bits, 10/10 runs, top-5 258 279 259 257 270). Every conv runs on the AIE: the stem, all
 16 3×3 convs and all 3 1×1 downsamples. Only input quantize and avgpool + fc stay on the A78.

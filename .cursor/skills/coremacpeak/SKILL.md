@@ -22,7 +22,7 @@ drain and int8 write-back outside the K loop. So:
 - **fewer groups**: 2x4 blocking uses all 8 `dm` accumulators (6 loads feed 8 MACs, still MAC-bound),
   half the groups of 2x2.
 
-palmyra, 2026-11-25, all 16 cores identical, GOLDEN PASS:
+VEK385_2, 2026-11-25, all 16 cores identical, GOLDEN PASS:
 
 | per core | blocking | MAC instr | cycles | of peak |
 |---|---|---|---|---|

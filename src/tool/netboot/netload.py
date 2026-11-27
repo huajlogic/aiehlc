@@ -13,7 +13,7 @@ Standard library only. Two ways to reach the board:
     never scp'd and nothing lands on PALIP's disk.
 
     python3 netload.py load  main.elf [--max-run-ms N]   # send, place, start on the app core
-    python3 netload.py load  main.elf --via huaj@10.23.224.213   # same, from the dev box
+    python3 netload.py load  main.elf --via huaj@$AIE2PS_LOCAL_TEST_BOX_IP   # same, from the dev box
     python3 netload.py rerun          [--max-run-ms N]   # start the staged ELF again, no transfer
     python3 netload.py kill                              # power the app core down
     python3 netload.py status

@@ -9,7 +9,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import devlock, devwatch
 
-DEV = "huaj@10.23.224.213"
+# The AIE2PS local test board; a TEST-NET-1 placeholder when unset (tests never reach it).
+BOX_IP = os.environ.get("AIE2PS_LOCAL_TEST_BOX_IP", "").strip() or "192.0.2.213"
+os.environ.setdefault("AIE2PS_LOCAL_TEST_BOX_IP", BOX_IP)  # hws.board_type: this host is palmyra
+
+DEV = f"huaj@{BOX_IP}"
 
 # A holder that takes the lock, starts the watchdog, spawns a child (like xsdb),
 # then either goes silent or keeps reporting progress.

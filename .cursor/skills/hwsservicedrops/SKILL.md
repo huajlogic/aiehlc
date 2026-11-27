@@ -1,6 +1,6 @@
 ---
 name: hwsservicedrops
-description: The palmyra hw_server service (hws, `script/test/hws*.py`, tmux session `hws` on 213) is gone or DEGRADED again -- apppaltest prints `[hws] status DOWN` / `3121 open but ...` / `session alive but 3121 closed` and spends ~40 s on `hws up`, the hws session vanished ~60 min after it started with no `hws_down` log, or hw_server died when some other systest session ended. Also: can hws tell "service up but board gone" (213 reboot, board taken, powered off) and what it does then.
+description: The VEK385_2 hw_server service (hws, `script/test/hws*.py`, tmux session `hws` on 213) is gone or DEGRADED again -- apppaltest prints `[hws] status DOWN` / `3121 open but ...` / `session alive but 3121 closed` and spends ~40 s on `hws up`, the hws session vanished ~60 min after it started with no `hws_down` log, or hw_server died when some other systest session ended. Also: can hws tell "service up but board gone" (213 reboot, board taken, powered off) and what it does then.
 ---
 
 # hws keeps disappearing on 213

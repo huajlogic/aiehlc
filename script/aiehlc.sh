@@ -558,7 +558,6 @@ rm -rf $KERNEL_DIR
 # Also clean build/aout/ if it exists (stale from previous runs with different CWD)
 [ -d "$(pwd)/build/aout" ] && rm -rf "$(pwd)/build/aout"
 export XILINX_VITIS_AIETOOLS=$XILINX_VITIS/aietools
-CARDANO_AIE_ARCH_MODEL_DIR="$XILINX_VITIS_AIETOOLS/data/versal_prod/lib"
 
 # Check if local thirdparty/alib/include has xaiengine headers
 LOCAL_ALIB_INCLUDE="${AIEHLC_DIR}/thirdparty/alib/include"

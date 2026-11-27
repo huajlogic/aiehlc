@@ -9,7 +9,7 @@ optionally with every core tile's program memory (PM) and data memory (DM).
     script/aiedump.py vek385-12 --pm --dm            # + core-tile PM/DM binaries
     script/aiedump.py palmyra_local --cols 3-6 --rows 3-6 --core-mem -o /tmp/d
 
-Board names: ``palmyra_local`` (the palmyra on 10.23.224.213) or ``vek385-N`` (a
+Board names: ``palmyra_local`` (the palmyra on ``$AIE2PS_LOCAL_TEST_BOX_IP``) or ``vek385-N`` (a
 VEK385 farm board, resolved to its farm host with ``cluster-ping``). Any other
 name is taken as a host/IP; pass ``--type palmyra|vek385``.
 
@@ -62,7 +62,9 @@ XSDB = (os.environ.get("AIEDUMP_XSDB") or os.environ.get("HWS_XSDB")
         or "/proj/custbuilds/2026.2_daily_latest/installs/lin64/2026.2/Vitis/bin/xsdb")
 CLUSTER_PING = "/proj/systest/bin/cluster-ping"
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "aiedump_boards.json")
-BOARD_ALIASES = {"palmyra_local": ("10.23.224.213", "palmyra")}
+#: ``palmyra_local`` -> the AIE2PS local test board; its address comes from the environment.
+LOCAL_BOX_ENV = "AIE2PS_LOCAL_TEST_BOX_IP"
+BOARD_ALIASES = {"palmyra_local": (None, "palmyra")}  # host: $AIE2PS_LOCAL_TEST_BOX_IP
 
 # AIE2PS (Gen5) array: include/aie_device_map.h -- 36 x 7, shim row 0, memtiles 1-2.
 BASE, COL_SHIFT, ROW_SHIFT = 0x20000000000, 25, 20
@@ -146,7 +148,10 @@ def resolve_board(name, host=None, btype=None):
     key = name.lower()
     if key in BOARD_ALIASES:
         h, t = BOARD_ALIASES[key]
-        return Board(name, host or h, btype or t)
+        h = host or h or os.environ.get(LOCAL_BOX_ENV, "").strip()
+        if not h:
+            raise DumpError(f"{name}: set {LOCAL_BOX_ENV} to the board's IP (or pass --host)")
+        return Board(name, h, btype or t)
     if re.fullmatch(r"vek385-\d+", key):
         if host:
             return Board(name, host, "vek385")

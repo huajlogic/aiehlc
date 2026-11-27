@@ -105,7 +105,7 @@ scheme. AIEML is selected by `"1"`/`"2"`.
 2. **Integration** (daemon resolution against real workdir):
    - `aie_version_from_jsons(load_jsons("aout/worklocal"))` → `"2ps"`.
    - Simulate explicit flag `5` → normalized → `"2ps"`.
-3. **End-to-end** (on board, HW at 10.23.224.213):
+3. **End-to-end** (on board, HW at $AIE2PS_LOCAL_TEST_BOX_IP):
    - `aiegdb --aie-version 5 --json-dir aout/worklocal` reading shim(3,0)
      mm2s1 (`target tile 0 0; target channel mm2s1; dma status`) → must return
      `raw=0x02080012` (not `0x00000000`).

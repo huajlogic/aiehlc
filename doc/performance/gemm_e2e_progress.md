@@ -1,7 +1,7 @@
 # int8 GEMM on the 4x4 mesh: end-to-end progress (aiehlchj-90)
 
 Source session: **aiehlchj-90** (Claude Code, aiehlc repo). Branch `gemm-e2e-opt`
-(worktree `.worktrees/gemm_e2e`). Board: palmyra (`apppaltest.py --netload`).
+(worktree `.worktrees/gemm_e2e`). Board: VEK385_2 (`apppaltest.py --netload`).
 Every number below is a board run with a host golden check. The golden check is
 bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 
@@ -16,7 +16,7 @@ bit-exact on a subsample of C (e.g. 200,241 outputs), not on all of C.
 
 Peak = 16 cores x 512 int8 MAC/cycle x 0.998 GHz = 8.18 TMAC/s. On AIE2PS,
 `aie::mmul<8,8,8,int8,int8>` is one `mac_8x8_8x8` (512 MACs) per VLIW word; bf16 is
-`mac_8x8_8x4_bf16` (256). The 0.998 GHz is the clock measured on VEK385; palmyra's
+`mac_8x8_8x4_bf16` (256). The 0.998 GHz is the clock measured on VEK385; VEK385_2's
 was not measured.
 
 End to end went 293 ms -> 0.897 ms (0.09 % -> 14.6 %). The goal (60-70 % end to
@@ -96,7 +96,7 @@ simplegemm_kernel_port / simplematmul2 is byte-identical before/after):
 ### Retracted
 Earlier "reads alone ~37 GB/s, writes alone 20.5 GB/s" were bytes / `wait_io` of
 whole launches, **not** DMA probes. 37 GB/s is not physical (4 streams x 4 B/cycle).
-Use Amit's palmyra213 probes (read 9.9, write 8.0, r+w 7.4 GB/s) as the reference.
+Use Amit's VEK385_2 probes (read 9.9, write 8.0, r+w 7.4 GB/s) as the reference.
 Ceiling projections built on 37/20.5 are unverified.
 
 ## 5. Bound: why this architecture cannot reach 60 %
@@ -156,7 +156,7 @@ implementation would sit below these numbers.
 These are DMA-only probes: the best build (`gs18`) with every MAC removed, at 16,
 32 and 64 rounds per launch. Each round moves 96 KB (A 32 KB in, C 64 KB out).
 The time is host XTime around the whole launch, so no phase accounting is
-involved. Steady-state calls on palmyra:
+involved. Steady-state calls on VEK385_2:
 
 | rounds | bytes | end to end |
 |---|---|---|
@@ -229,7 +229,7 @@ Compiler fix that made it run: a whole-K-walk shim BD was started k_rounds times
 (hang). With `output_tile_major`, the M rounds now use one BD iteration instead of a
 host loop (`flowtransfer_host.cpp`, `computeMultipleInputShimBd`).
 
-| build (palmyra, GOLDEN PASS unless noted) | end to end | % peak |
+| build (VEK385_2, GOLDEN PASS unless noted) | end to end | % peak |
 |---|---|---|
 | K-acc, A and B from DDR (B re-read per m tile) | 3.50 ms / 2.42 G MAC | 8.4 % |
 | + B in MemTile, replayed | 1.85 ms / 2.42 G MAC | 16.0 % |
@@ -244,7 +244,7 @@ host loop (`flowtransfer_host.cpp`, `computeMultipleInputShimBd`).
 | tm 96 x tn 80, kc 32 | 6.96 ms / 8.92 G MAC | 14.9 % (compute-bound: accumulator reload per 32-B chunk) |
 
 Measured limits:
-- **AIE clock on palmyra is 1000 MHz** (core timer vs XTime).
+- **AIE clock on VEK385_2 is 1000 MHz** (core timer vs XTime).
 - **The on-chip DMA sets the pace.** The DMA-only probe is 2.29 ms vs 2.51 ms with the MACs.
 - **Per-core input is 5.4 GB/s = 2.7 B/cycle per S2MM channel** (67 % of the 32-bit
   stream). This is the slope of DMA-only 8 vs 16 rounds: 1.41 vs 2.29 ms.
@@ -473,7 +473,7 @@ Launch cost is 0 and compute efficiency 100 %, including at kc = 32 (measured: 1
 **No stream-fed design reaches 60 %**, even granting a full-width stream, 11 GB/s,
 zero launch cost and perfect compute. That covers any tiling, with or without MemTile
 staging. The bound does not cover cores reading operands directly from neighbour tile
-memory. That design is not expressible in aiehlc today, and its rate on palmyra is
+memory. That design is not expressible in aiehlc today, and its rate on VEK385_2 is
 unmeasured.
 
 ## 7. Files
@@ -487,7 +487,7 @@ unmeasured.
 
 The same ELFs ran unchanged (netload), GOLDEN PASS 196,608/196,608 each:
 
-| build | palmyra (998 MHz array) | VEK385 time | VEK385 % of own peak |
+| build | VEK385_2 (998 MHz array) | VEK385 time | VEK385 % of own peak |
 |---|---|---|---|
 | gs79, A+B from DDR | 2.33 ms, 57.0 %, 9.3 TOPS | 1.643 ms, 12.9 TOPS | **62.8 %** |
 | gs90, weight-resident B | 64.7 % | 1.576 ms, 13.4 TOPS | **65.5 %** |
@@ -535,14 +535,14 @@ buffers and stamps the cycles per chunk (ideal: 1,024):
   rotation) and about 90 cycles of chunk prologue/epilogue.
 - **Do not unroll the block loop to 4 blocks:** chess was still scheduling it after 30 min.
 
-End to end (palmyra at 998 MHz, VEK385 at its real 1.25 GHz), GOLDEN PASS 196,608 everywhere:
+End to end (VEK385_2 at 998 MHz, VEK385 at its real 1.25 GHz), GOLDEN PASS 196,608 everywhere:
 
-| build | palmyra | VEK385 |
+| build | VEK385_2 | VEK385 |
 |---|---|---|
 | A + B from DDR: gs79 -> **v2** | 57.0 -> **58.4 %** | 62.8 -> **67.9 %** (1.521 ms) |
 | weight-resident B: gs90 -> **v2r** | 64.7 -> **64.5-64.9 %** | 65.5 -> **71.5 %** (1.446 ms) |
 
-Palmyra is DDR-bound, so the faster kernel barely moves it.
+VEK385_2 is DDR-bound, so the faster kernel barely moves it.
 
 ### Why the current layout cannot reach 95 % (VEK385 measurements)
 
@@ -642,8 +642,8 @@ launch. Build: `share2x8.py ... --r2 42 --nt2 1 --k 2560 --bres --single --persi
     maintenance with the BASE build's sizes, so the 13.8 MB A range ran past the target's
     6.9 MB non-cacheable buffer and the host cleaned 13.8 MB of cache on every launch.
   - The generator now passes the target sizes.
-- **palmyra: the shared layout loses** (52-57 % vs 64.7 % for the 4 x 4 + weight-resident
-  design). Palmyra is DDR-bound and the 4 x 4 design moves fewer bytes per MAC.
+- **VEK385_2: the shared layout loses** (52-57 % vs 64.7 % for the 4 x 4 + weight-resident
+  design). VEK385_2 is DDR-bound and the 4 x 4 design moves fewer bytes per MAC.
 - **DDR zones on VEK385 (probed from the A78).** `DDR_LOW1` (0x8_0000_0000) is real, separate
   memory. `DDR_CH_1` (0x500_0000_0000) hangs on the first read: not populated with this PDI,
   although the BSP maps it. So the 3 MCs are interleaved behind LOW0 / LOW1.
@@ -661,13 +661,13 @@ launch. Build: `share2x8.py ... --r2 42 --nt2 1 --k 2560 --bres --single --persi
 - **What it does:** ranks the feasible tilings, adds A / B / C zone placement when there are
   separate controllers, and prints the build commands.
 - **Calibration:** `--check` compares it with the 8 measured runs, worst error **3.0 points**.
-  - palmyra fits `reads / 16.1 GB/s + writes / 3.58 GB/s`. Reads and writes do not overlap on
+  - VEK385_2 fits `reads / 16.1 GB/s + writes / 3.58 GB/s`. Reads and writes do not overlap on
     the one controller, and writes are slow. That is why the 4 x 4 design, with fewer writes
     per MAC, wins there.
 
 | board | memory system | chosen | model (measured) |
 |---|---|---|---|
-| palmyra | 1 MC, DDR-bound | 4 x 4 MemTile-staged, weight-resident, R 21 NT 3 K 2560 | 62.4 % (64.7 %) |
+| VEK385_2 | 1 MC, DDR-bound | 4 x 4 MemTile-staged, weight-resident, R 21 NT 3 K 2560 | 62.4 % (64.7 %) |
 | VEK385 | 3 MC interleaved, DDR not binding | 2 x 8 shared, persistent, tile pipeline, R2 60 NT2 1 K 2560 | 76.9 % (78.9 %) |
 | a board with 3 separate MC zones | separate controllers | 2 x 8 with `--zones` (A, C, B on different controllers) | -- (not measured) |
 
@@ -890,7 +890,7 @@ stack, accumulators and output already occupy banks 0-3).
 - The code for both was not kept.
 
 
-## palmyra on the PDI of 2026-11-25: DDR no longer binds; the 95 % question (2026-11-25)
+## VEK385_2 on the PDI of 2026-11-25: DDR no longer binds; the 95 % question (2026-11-25)
 
 **DDR re-measured** (`example/perf/ddr_microbench.cc`, new `kind=rdwr`: read and write on every column at
 once; shim <-> MemTile, 4 MiB per column, median of 9 reps). One shim channel ~7.6 GB/s each way (a stream
@@ -927,7 +927,7 @@ VCK190 (AIE1, FP32, 384 of 400 tiles), 6.78 TFLOPS with operands generated in th
 6144^3 GEMM through DRAM: ~88 % of the 384 tiles' peak. Its duration includes neither the host copy into DDR
 nor the kernel start. gemm_plan now prints, per launch, the host time in `wait_io`
 (`__Runtime_host_split_wait_ticks`, always on) next to the end-to-end time; the difference is the host-side
-launch cost (shim BD re-arm, go lock, cache sync). palmyra, 7680 x 512 x 2560, launches 2-8, GOLDEN PASS:
+launch cost (shim BD re-arm, go lock, cache sync). VEK385_2, 7680 x 512 x 2560, launches 2-8, GOLDEN PASS:
 
 | basis | per launch | of peak |
 |---|---|---|
@@ -942,14 +942,14 @@ launch cost (shim BD re-arm, go lock, cache sync). palmyra, 7680 x 512 x 2560, l
 streams B as `memtile_ring 2`, re-read from DDR for every output tile, and the launch is DDR-bound. On this array
 a fast shape needs B's K strip to fit the MemTile (K 2560 does); a large K needs a K split first.
 
-## Loss tables: gemm_plan on palmyra and VEK385 (2026-11-25)
+## Loss tables: gemm_plan on VEK385_2 and VEK385 (2026-11-25)
 
 Measured with the loss counters (`perftest/gemm90/`: `runtime_coreloss.patch` = `__Runtime_core_loss_arm` /
 `_read`, `gemm_plan_loss.patch` = `gemm_plan.cc --define GP_LOSS=1`, `losstable.py`; skill **coreloss**): one ELF, 7680 x 512 x 2560
 int8, 4 x 4, GOLDEN PASS on both boards, launches 3-6 (one DM bank pair each), per core, median over the 16
 cores. Shares of the launch time:
 
-| item | palmyra (1000 MHz, 1.435 ms) | VEK385 (1250 MHz, 1.150 ms) |
+| item | VEK385_2 (1000 MHz, 1.435 ms) | VEK385 (1250 MHz, 1.150 ms) |
 |---|---|---|
 | VMAC (1,228,860 vector instructions; 1,228,800 MAC instructions expected) | 85.6 % | 85.5 % |
 | other instructions (chunk / tile boundaries, accumulator spill, convert) | 6.1 % | 6.1 % |
@@ -960,7 +960,7 @@ cores. Shares of the launch time:
 DM bank conflicts per core per launch: banks 4-7 (operand chunks) 41-45 k each, banks 2-3 ~2 k, banks 0-1 ~0,
 on both boards. Every core within ~0.3 points of the median.
 
-- **The two boards are the same, cycle for cycle**: with DDR no longer binding on palmyra, the design is
+- **The two boards are the same, cycle for cycle**: with DDR no longer binding on VEK385_2, the design is
   core-bound everywhere and its losses are properties of the kernel and the plan's memory layout.
 - **"Other instructions" 6.1 %** matches the static bound of the kernel listing (94.7 %, "Static bound of the
   current kernel" above), so the schedule itself is the largest single loss.
@@ -986,9 +986,9 @@ Removing that chain entirely is worth ~1.3 points; the inner loop's 3 extra bund
 first / last chunk are worth ~1.7 % together but have resisted earlier attempts (see "Static bound of the
 current kernel").
 
-**Trying to shrink the chunk boundary (2026-11-25, not kept).** Board: palmyra, 8 launches, GOLDEN PASS each.
+**Trying to shrink the chunk boundary (2026-11-25, not kept).** Board: VEK385_2, 8 launches, GOLDEN PASS each.
 
-| attempt | middle boundary (bundles per 128 MACs) | palmyra steady (other instr) | why |
+| attempt | middle boundary (bundles per 128 MACs) | VEK385_2 steady (other instr) | why |
 |---|---|---|---|
 | baseline | 153 (+5 loop setup) | 1.435 ms, 85.63 % (6.1 %) | -- |
 | spill block 14's accumulators before the next chunk's locks (they do not depend on it) | 189 | 1.468 ms, 83.72 % (8.1 %) | the spill used to overlap block 15's MACs; ahead of the plan's memory fence it cannot |

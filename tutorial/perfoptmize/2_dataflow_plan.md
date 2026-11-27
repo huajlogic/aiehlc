@@ -89,7 +89,7 @@ The generated `host.cc` differs from step 3 in three places only: B's MemTile lo
 second-launch values (`later` = 4 ready, 0 free), and both the MemTile S2MM channel start and the shim
 `__Runtime_startio` for B become first-launch-only (`__Runtime_startio_first`). `kernel.cc` is unchanged.
 
-History: 64.7 % on palmyra was the weight-resident 4 x 4 design (hand-edited); here it comes from one
+History: 64.7 % on VEK385_2 was the weight-resident 4 x 4 design (hand-edited); here it comes from one
 option.
 
 ## Step 5: the kernel stays (`step5_persistent.cc`) -- 1.287 ms per launch, 76.4 % of peak

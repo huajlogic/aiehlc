@@ -155,13 +155,15 @@ def host_of(board):
 
 
 def board_type(board, explicit=None):
-    """palmyra for 10.23.224.*, vek385 for farm hosts / vek385 names, else HwsError(2)."""
+    """palmyra for $AIE2PS_LOCAL_TEST_BOX_IP or 10.23.224.*, vek385 for farm hosts / vek385 names,
+    else HwsError(2)."""
     if explicit:
         if explicit not in ("palmyra", "vek385"):
             raise HwsError(RC_USAGE, f"unknown board type {explicit!r}")
         return explicit
     host = host_of(board)
-    if host.startswith("10.23.224."):
+    local_box = os.environ.get("AIE2PS_LOCAL_TEST_BOX_IP", "").strip()
+    if (local_box and host == local_box) or host.startswith("10.23.224."):
         return "palmyra"
     if re.match(r"^(vek385|palmyra-|crimini|gomphus|hydnum|parasol)", host):  # farm hosts: hws_vek385.py
         return "vek385"

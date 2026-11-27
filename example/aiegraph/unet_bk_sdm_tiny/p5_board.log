@@ -2,24 +2,24 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
-[devlock] acquired 10.23.224.213 (/scratch/staff/huaj/tmp/board_locks/10.23.224.213_3121.lock)
-[hws] preflight (palmyra, netload) on 10.23.224.213
+[devlock] acquired ${AIE2PS_LOCAL_TEST_BOX_IP} (/scratch/staff/huaj/tmp/board_locks/${AIE2PS_LOCAL_TEST_BOX_IP}_3121.lock)
+[hws] preflight (palmyra, netload) on ${AIE2PS_LOCAL_TEST_BOX_IP}
 [hws] netload: hw_server is checked only if the supervisor needs JTAG
 Using: /scratch/staff/huaj/tmp/sprint1113_unet/p5_aie/main.elf
 
 ============================================================
 Palboard ELF Test Script
 Board: palmyra, console com0
-Host: huaj@10.23.224.213
+Host: huaj@${AIE2PS_LOCAL_TEST_BOX_IP}
 ELF File: /scratch/staff/huaj/tmp/sprint1113_unet/p5_aie/main.elf
 ============================================================
-[netload] staged on 10.23.224.213: nothing (up to date)
+[netload] staged on ${AIE2PS_LOCAL_TEST_BOX_IP}: nothing (up to date)
 [netload] asking the supervisor at 10.10.70.50 to run main.elf (waits up to 120 s if the board is busy)
-[netload] systest-client closed while attaching com0 (User signal 1 Shared connection to 10.23.224.213 closed.); retrying
+[netload] systest-client closed while attaching com0 (User signal 1 Shared connection to ${AIE2PS_LOCAL_TEST_BOX_IP} closed.); retrying
 [21:44:22 DEBUG] console_reader thread started
-[netload] load rc=0 state=running runs=19 | 651.70 MB sent via huaj@10.23.224.213 in 11.332 s (57.5 MB/s), board rx 11182 ms, place 64 ms, entry 0x0
+[netload] load rc=0 state=running runs=19 | 651.70 MB sent via huaj@${AIE2PS_LOCAL_TEST_BOX_IP} in 11.332 s (57.5 MB/s), board rx 11182 ms, place 64 ms, entry 0x0
 [netload] board: placed 649502792 bytes, zeroed 223362204 bss bytes, entry 0x0, _exit -> park
-[netload] streamed /scratch/staff/huaj/tmp/sprint1113_unet/p5_aie/main.elf through the proxy on 10.23.224.213 in 12.27s (no scp)
+[netload] streamed /scratch/staff/huaj/tmp/sprint1113_unet/p5_aie/main.elf through the proxy on ${AIE2PS_LOCAL_TEST_BOX_IP} in 12.27s (no scp)
 
 >>> Waiting for console output (max 2520s, no-output timeout 2520s)...
 [netboot] LOAD_RUN 651703072 B received and placed in 11182 ms (stream=1, staging copy none), sha256 ok

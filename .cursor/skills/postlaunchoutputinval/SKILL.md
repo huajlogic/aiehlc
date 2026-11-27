@@ -11,7 +11,7 @@ description: A launch got slower after merging main although kernel.cc / routing
 `tilinglinalg_pipeline.cpp emitSyncCalls`: after `host_canonicalized` and `__Runtime_dsync_drain()`,
 every output argument gets `__Runtime_sync_for_cpu`. It is a correctness fix: while the array runs the
 A78 may speculatively prefetch output lines, so without a post-launch invalidate the CPU can read the
-buffer's old bytes (palmyra, FA D40). Do not remove it.
+buffer's old bytes (VEK385_2, FA D40). Do not remove it.
 
 ## Cost
 On a cached buffer it is a by-VA invalidate of the whole output: ~0.1 ms for 3.9 MB on VEK385 -- 8 %

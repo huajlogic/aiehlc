@@ -12,7 +12,7 @@
 #   1. every core MM2S BD the kernel self-programs (aie_kc_encode_bd on buf_out_p*ng_0) has the length of
 #      that kernel's own output buffer -- the bug armed every later kernel with kernel #0's length (the
 #      ResourceMgr singleton's core_offload_plan was never reset between kernels; first entry per tile won),
-#      so on palmyra213 the 960x320x512 cores sent 5120 B windows into 8192 B shim S2MM BDs -> wait_io hang;
+#      so on VEK385_2 the 960x320x512 cores sent 5120 B windows into 8192 B shim S2MM BDs -> wait_io hang;
 #   2. each kernel attaches a plan of its own size (not the running total of all kernels compiled so far).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

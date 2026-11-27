@@ -64,7 +64,7 @@ outputs and fails beyond 1 ULP. Real data would need a tolerance.
   that use `_window_bfloat16`; unconditionally they added 2 lines to every
   host.cc). `_opts`, `_less`, `simplegemm_dataflow` still build with the new
   block pointer.
-- palmyra 213: **802,816 / 802,816 bit-exact in 15 of 15 runs** with the
+- VEK385_2: **802,816 / 802,816 bit-exact in 15 of 15 runs** with the
   post-launch invalidate (12, then 3 with the final compiler; 2031 ms, scalar
   fp32 on the core). Without the host's post-launch invalidate, 1 of 6 runs
   showed 191 outputs still reading the host's `memset` 0 -- the known

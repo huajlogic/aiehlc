@@ -236,7 +236,7 @@ depth, buffer rule) and `kernel_trace_cases.py` DATAFLOW_CASES (each option's
 error); `simplegemm_dataflow.cc` bit-exact on x86 (kemu-style emulation with the
 panel-major gather, 524,288 outputs). Skill **gemmdataflowoptions**.
 
-**Board (palmyra 213, 2026-11-11, `apppaltest.py --netload`).**
+**Board (VEK385_2, 2026-11-11, `apppaltest.py --netload`).**
 `simplegemm_dataflow.cc`: `GOLDEN PASS: all 524288 output elements match`,
 79.55 ms per launch (first call 79.94 ms), 3.37 GOPS for 8 x 256^3 -- the
 followed A strips (panel-major `.tile` BD, ping-pong) and the once-sent,
@@ -256,7 +256,7 @@ checked / followed (`resolveKernelBlock`): the weights get one 3136 B buffer,
 sent once. The conv cross-check (`convCrossCheck`) ignores the port's
 `pp_depth` (a scheduling choice, like `spaceDiff`); `{.depth = 1}` on a halo
 port is an analysis error (its window lowering is ping-pong). `.tile` needs a
-2-D block, so it does not apply to the 3-D slab. palmyra 213: `PASS: 0
+2-D block, so it does not apply to the 3-D slab. VEK385_2: `PASS: 0
 mismatches out of 802816`, 85.8 ms; `simpleconv2dkernel_port.cc` byte-identical.
 
 **Output depth (2026-11-15).** An output port is always ping-pong
@@ -276,7 +276,7 @@ analysis error. Skill **outputpingponghang**.
    `fullconnect_auto = 0`).
    **Done 2026-11-10** -- `example/tileprogram/ccode/simplegemm_kernel_port.cc`
    (kernel-only) and `simplegemm_kernel_space.cc` (hand-written GemmSpaces) run on
-   palmyra 213, 18.5 ms, bit-exact (`PASS: all 4096 output elements match`).
+   VEK385_2, 18.5 ms, bit-exact (`PASS: all 4096 output elements match`).
    Before, both built and passed the trace check but hung in `wait_io TIMEOUT
    tile(3,0) ch=0/1 dir=0`. Three compiler bugs, none in the examples:
    1. **No M/N/K.** The GEMM tiling derivation took M/N/K only from extra launch
@@ -304,7 +304,7 @@ analysis error. Skill **outputpingponghang**.
 4. ~~Full build + `simpleconv2d_new_load.cc` compile + `apppaltest.py` on board~~
    (done below).
 
-## Board result (palmyra 10.23.224.213, 2026-11-10)
+## Board result (VEK385_2 $AIE2PS_LOCAL_TEST_BOX_IP, 2026-11-10)
 
 `apppaltest.py --netload` from `xiaojiang/apppaltest-devlock` (devlock +
 watchdog), ELFs built by this branch (4267fb3) with `aiehlc.sh --aie-version 5`.

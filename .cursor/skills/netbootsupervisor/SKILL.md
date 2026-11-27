@@ -1,6 +1,6 @@
 ---
 name: netbootsupervisor
-description: Working on src/tool/netboot (lwIP ELF supervisor on the baremetal A78, `apppaltest.py --netload`). Use when the supervisor dies or goes silent during LOAD_RUN, uploads crawl, the app core will not relaunch ("app core busy", PLM 0x7DB / 0x7D2 / "ERR XPm_ForcePowerdown: 0x2"), the watchdog fires right after launch, a client wants to know whether the board is busy / how long to wait ("board busy", "overtime", "stuck", "serving", netload exit 3/4/5), setting a run's max run time or forcing an overdue app off, a bootstrap prints `[netboot] ready` but every load says `No route to host` ("Auto negotiation timeout", "Phy setup failure init_emacps", `NOT ready: Ethernet link down`), or when choosing memory for any second resident program on palmyra.
+description: Working on src/tool/netboot (lwIP ELF supervisor on the baremetal A78, `apppaltest.py --netload`). Use when the supervisor dies or goes silent during LOAD_RUN, uploads crawl, the app core will not relaunch ("app core busy", PLM 0x7DB / 0x7D2 / "ERR XPm_ForcePowerdown: 0x2"), the watchdog fires right after launch, a client wants to know whether the board is busy / how long to wait ("board busy", "overtime", "stuck", "serving", netload exit 3/4/5), setting a run's max run time or forcing an overdue app off, a bootstrap prints `[netboot] ready` but every load says `No route to host` ("Auto negotiation timeout", "Phy setup failure init_emacps", `NOT ready: Ethernet link down`), or when choosing memory for any second resident program on VEK385_2.
 ---
 
 # netboot supervisor: board facts that are not in the design's assumptions
@@ -8,7 +8,7 @@ description: Working on src/tool/netboot (lwIP ELF supervisor on the baremetal A
 Design and status: `doc/design/lwip_elf_bootloader.md` (section 12). Usage:
 `src/tool/netboot/README.md`.
 
-## 1. `0x8_0000_0000` is NOT free memory on palmyra
+## 1. `0x8_0000_0000` is NOT free memory on VEK385_2
 
 "DDR_LOW1" mirrors the 2 GB DDR_LOW0. Proven with xsdb physical writes: a value
 written at `0x8_0000_0000` reads back at `0x0`. A program linked there physically
@@ -48,7 +48,7 @@ So `STATUS` says `app core busy` after any run, and `apppaltest --netload`
 re-bootstraps the supervisor (`device program` frees core 1). Only a BOOT.BIN
 subsystem-permission change lifts this.
 
-**This applies to palmyra only.** On VEK385 the supervisor patches the app's `_exit` to park the core
+**This applies to VEK385_2 only.** On VEK385 the supervisor patches the app's `_exit` to park the core
 (`_exit -> park`), so load and rerun can be repeated with no re-bootstrap (15 loads in a row on vek385-11).
 See `.cursor/skills/vek385netboot/SKILL.md`.
 
@@ -81,7 +81,7 @@ the core: re-bootstrap) / `serving` (another client mid-request).
 - `retry_after_ms` is the time to the run's *limit*, not to its exit: a waiting
   client must poll (netload polls every <= 2 s), or it sleeps through an early
   exit.
-- On palmyra a forced run is always `stuck` (can_stop = 0): only
+- On VEK385_2 a forced run is always `stuck` (can_stop = 0): only
   `apppaltest --netload` (re-bootstrap) frees the core. An app *within* its limit
   is never preempted, so a shared board is never power-cycled under someone
   else's live run unless it is overdue.

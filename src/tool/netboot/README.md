@@ -61,7 +61,7 @@ python3 script/test/apppaltest.py -y -nonreboot --netload aout/main.elf
    or until the supervisor reports the app exited;
 5. leaves the board up with the supervisor resident.
 
-**Reuse without re-bootstrap (park).** The palmyra PDI does not let the supervisor
+**Reuse without re-bootstrap (park).** The VEK385_2 PDI does not let the supervisor
 power down or reset core 1 (design section 12, item 4). To reuse it anyway, the
 supervisor patches each app's `_exit` (the BSP's `b .`, padded to 16 bytes) into
 `ldr x16,#8; br x16; .quad nb_park`. When the app returns from `main`, core 1
@@ -71,7 +71,7 @@ release turns MMU/caches off and jumps to the next entry. `status` reports
 ELF directly, with no JTAG and no power commands. It still re-bootstraps when
 nothing answers, when core 1 is `busy` (app running or hung, or `_exit` not
 patchable), or with `--netload-bootstrap`.
-Verified on palmyra: after one bootstrap, a ResNet run and a conv2dstem run were
+Verified on VEK385_2: after one bootstrap, a ResNet run and a conv2dstem run were
 each sent directly (`released to 0x0 (no PLM call)`). They took **11 s** and
 **15 s** wall, against ~50 s with a bootstrap. `--netload` also ends the console
 wait when the supervisor reports `state=exited`, so apps that print no
@@ -107,7 +107,7 @@ Flags: `--netload-bootstrap` forces a supervisor reload (use it after rebuilding
 `--netload-timeout-ms`) sets this app's max run time, 0 = the supervisor default
 60 s; `--netload-wait S` (default 120) waits for a board busy with a run still
 within its max; `--netload-no-force` refuses to terminate a previous app past its
-max (by default it is forced off, which on palmyra means a re-bootstrap).
+max (by default it is forced off, which on VEK385_2 means a re-bootstrap).
 `--netload-force-now` does not wait at all: a run still within its max is taken
 over at once -- the app core is parked over JTAG (stop, `rst -proc`, pc =
 `nb_park` from the busy ack's `park_addr`, `con`) and this ELF is sent; if the
@@ -122,10 +122,10 @@ python3 script/test/apppaltest.py -board vek385 -host gomphus3 -y aout/main.elf 
 ```
 
 `-board`/`-host`/`-board-rev` override `BOARDNAME`/`PALIP`/`VEK385_REV`. Same
-flow, same IP 10.10.70.50 (the farm host's eth1 is laid out like palmyra's), with
+flow, same IP 10.10.70.50 (the farm host's eth1 is laid out like VEK385_2's), with
 these board differences, each learned on vek385-3 (skill **vek385netboot**):
 
-| | palmyra | VEK385 |
+| | VEK385_2 | VEK385 |
 |---|---|---|
 | systest | `/bin/systest` + `become` | `systest-client` only, prompt must be `[vek385-N]` |
 | JTAG | `conn` | the farm host's running hw_server, `connect -url TCP:<host>:3121` |

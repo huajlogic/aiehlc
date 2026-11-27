@@ -43,16 +43,16 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
       gemm_plan steady 1.150 ms mean (85.47 % of peak), best 1.147 ms (85.71 %) | 0 wait_io timeouts`;
       4 x 2 `GOLDEN PASS: 94428 / 94428 ... | PERF SUMMARY gemm_plan steady 1.134 ms mean (86.70 % of peak),
       best 1.133 ms (86.80 %) | 0 wait_io timeouts`.
-- [x] palmyra213: the same two builds (or the reason they cannot run there). Evidence (2026-11-24,
+- [x] VEK385_2: the same two builds (or the reason they cannot run there). Evidence (2026-11-24,
       same ELFs): 4 x 4 `GOLDEN PASS: 187758 / 187758 | PERF SUMMARY gemm_plan steady 2.657 ms mean
       (37.00 % of peak)`; 4 x 2 `GOLDEN PASS: 94428 / 94428 | PERF SUMMARY gemm_plan steady 1.993 ms mean
-      (49.33 % of peak)`. The printed % assumes VEK385's 1250 MHz; at palmyra's 998 MHz the peak share is
+      (49.33 % of peak)`. The printed % assumes VEK385's 1250 MHz; at VEK385_2's 998 MHz the peak share is
       46.3 % (4 x 4) and 61.8 % (4 x 2).
-- [x] DDR bound per shape and board computed and recorded next to the % of peak. Evidence: palmyra's
+- [x] DDR bound per shape and board computed and recorded next to the % of peak. Evidence: VEK385_2's
       measured model (`script/perf/gemm_plan.py` BOARDS: reads / 16.1 GB/s + writes / 3.58 GB/s, one
       controller, no overlap). 4 x 4: A 19.66 MB read (B kept), C 3.93 MB written -> 2.320 ms bound;
       measured 2.657 ms = **87.3 % of the DDR bound** (46.3 % of peak). 4 x 2: C 1.97 MB -> 1.770 ms
-      bound, measured 1.993 ms = **88.8 % of the DDR bound** (61.8 % of peak). palmyra is DDR-bound
+      bound, measured 1.993 ms = **88.8 % of the DDR bound** (61.8 % of peak). VEK385_2 is DDR-bound
       (writes at 3.58 GB/s cost as much as all of A); VEK385 is not (3 interleaved controllers; the
       DMA-only twin moves A in ~0.85 ms against 1.150 ms, `gemm_plan.py` profile), so there the bound
       is the cores: 85.5 % of peak.
@@ -63,7 +63,7 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
       (`wait_io TIMEOUT tile(0,0) ch=0 dir=1`, watchdog) while the 3ff40966 build ran -- 0a4ac5d1's
       whole-K-walk repeat collapse also hit a GemmSpace kernel; gated on traced kernel-only ports (skill
       `kwalkrepeatcollapse`), now `aie matmul time: 26614.954 ms`, no timeout; simplegemm_kacc (the case
-      0a4ac5d1 fixed) still `GOLDEN PASS: 112384 / 112384` on palmyra, host.cc identical to 12109fc7. `routing_ir_roundtrip.sh`
+      0a4ac5d1 fixed) still `GOLDEN PASS: 112384 / 112384` on VEK385_2, host.cc identical to 12109fc7. `routing_ir_roundtrip.sh`
       simplematmul2.cc and simpleconv2d.cc: `[roundtrip] PASS`.
 - [x] A build without a plan is byte-identical to main before the plan work (host.cc / kernel.cc /
       routing.cc). Evidence: baseline aiehlc built at 3ff40966 (worktree `dfplan_base`); simplematmul2 and
@@ -97,7 +97,7 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
       `routing.cc`, `aiehlc_plan.h` byte-identical to the stage-0 build (`host.cc` differs only by the
       generic body from bdca2fc1: shape knobs, GOLDEN via `gplan_ref.h`); VEK385 `GOLDEN PASS
       shape=7680x512x2560 dtype=int8 launch=8 checked=562176 bad=0 | PERF SUMMARY gemm_plan steady 1.148 ms
-      median (85.62 % of peak @ 1250 MHz), best 1.147 ms (85.68 %)`; palmyra 2.613 ms (47.02 %).
+      median (85.62 % of peak @ 1250 MHz), best 1.147 ms (85.68 %)`; VEK385_2 2.613 ms (47.02 %).
 
 ## Stage 2: core data-memory budget owns the accumulator (L5)
 
@@ -111,7 +111,7 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 - [x] bf16 4096 x 512 x 4096 (fp32 accumulate) builds without hand-edited macros and runs GOLDEN PASS
       on VEK385. Evidence: VEK385 `GOLDEN PASS shape=4096x512x4096 dtype=bf16 launch=101 checked=300032
       bad=0 in_crc=63c4a919 ref_crc=a10c5ff4 out_crc=a10c5ff4 | PERF SUMMARY gemm_plan steady 6.209 ms
-      median (27.02 % of peak @ 1250 MHz)`; palmyra same crc, 18.253 ms (11.49 %). Needed two more fixes:
+      median (27.02 % of peak @ 1250 MHz)`; VEK385_2 same crc, 18.253 ms (11.49 %). Needed two more fixes:
       the bf16 C (declared N x 2 bytes) had no GEMM tiling, so `output_tile_major` was not applied and the
       tiles were scattered -- now taken from the traced blocks; and fp32 -> bf16 rounding set to RNE
       (skill `kbtilemajoroutput`).
@@ -151,7 +151,7 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
       measured table in `gemm_plan.py` becomes calibration data. Override knob documented. Evidence:
       time = max(cores = tiles x chunks x cycles per chunk, busiest shim channel, DDR) + launch; MemTile
       capacity / BD length decide B kept or re-read; packet ids and the A ring's divisibility decide
-      feasibility. Calibration: int8 1188 cycles / chunk and palmyra's DDR rates from `gemm_plan.py`;
+      feasibility. Calibration: int8 1188 cycles / chunk and VEK385_2's DDR rates from `gemm_plan.py`;
       VEK385 shim 5.2 GB/s per channel and 24 GB/s aggregate DDR read fitted on the runs below; bf16 2600
       cycles / chunk. Override: `--define GP_HW_ROWS/GP_HW_COLS/GP_RING` (the source's value wins and is
       logged), board `#pragma gemm_autotile(palmyra)` / `AIEHLC_GEMM_BOARD`. Ranking printed per build
@@ -239,9 +239,9 @@ PERF SUMMARY line, or the command output). Branch: `gemm-dmaphop-ir`; commit per
 
 | date | stage | result | commit |
 |---|---|---|---|
-| 2026-11-24 | 0 | baseline re-measured (VEK385 85.5 % / 86.7 %, palmyra 87-89 % of its DDR bound); a plan-less GemmSpace GEMM (simplematmul2) hung on this branch -- fixed, files identical to 3ff40966 again (skill `kwalkrepeatcollapse`) | 46ae6afc |
-| 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | 5f75d43e |
-| 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + palmyra (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | 57b2d949 |
+| 2026-11-24 | 0 | baseline re-measured (VEK385 85.5 % / 86.7 %, VEK385_2 87-89 % of its DDR bound); a plan-less GemmSpace GEMM (simplematmul2) hung on this branch -- fixed, files identical to 3ff40966 again (skill `kwalkrepeatcollapse`) | 46ae6afc |
+| 2026-11-24 | 1 | B staged by MemTile capacity (keep or ring, re-read per output tile); int8 4096 x 512 x 4096 GOLDEN PASS on VEK385 + VEK385_2 (26.8 % / 11.4 %, DDR-bound by B re-reads); 7680 unchanged at 85.6 %; three silently truncating DMA fields now limits + build errors (skill `planbdfieldlimits`); generic shape / dtype body from bdca2fc1 | 5f75d43e |
+| 2026-11-24 | 2 | the plan owns the K accumulator when it does not fit (one slot per channel, AIEHLC_PLAN_ACC); bf16 4096 x 512 x 4096 GOLDEN PASS on VEK385 + VEK385_2 (27.0 % / 11.5 %); tile-major output from the traced blocks + RNE bf16 rounding (skill `kbtilemajoroutput`) | 57b2d949 |
 | 2026-11-24 | 3 | `--define` / `AIEHLC_DEFINES` reach every stage (macros injected into the source text); EXTRA_DEFS refused for a source macro; gemm_plan.cc + --define == the 4096 entry file (GOLDEN PASS, 3.138 ms) | 4c38e5e0 |
 | 2026-11-25 | 4 | `#pragma gemm_autotile`: mesh + A ring by a calibrated cost model, 8 shapes (int8 / bf16, N 512 / 768, K 1024..4096) GOLDEN PASS from one source, model within +-13 %; 32-core kernel load, packet-id limit as an error, channel start queue split | c0d9168b |
 | 2026-11-25 | 5 | per-core copies: `.share = broadcast` (row / column) and per-core streams; eltwise 0.365 ms (main: 57 ms, wrong) and kernel-only conv 0.098 ms (main 54.2 ms) GOLDEN PASS; GEMM unchanged | d37fd2ef |

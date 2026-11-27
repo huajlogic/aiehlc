@@ -67,7 +67,7 @@ GOLDEN PASS).
   _exclusive`. `readIROverride` now ignores them and prints the first differing line otherwise.
 - **The farm host refuses scp** (`Permission denied (publickey)`) once the systest hold lapses:
   `python3 script/test/hws.py --board gomphus6 --type vek385 up`, then rerun apppaltest.
-- The printed % of `gemm_plan.cc` uses GEMM_AIE_MHZ = 1250 (VEK385); palmyra is 998.
+- The printed % of `gemm_plan.cc` uses GEMM_AIE_MHZ = 1250 (VEK385); VEK385_2 is 998.
 
 ## One kernel body (no `__chess__` split) -- what cost performance and how it came back
 - Shared-port state read from a global on every load: 77 %. Copy to a local at kernel entry (the

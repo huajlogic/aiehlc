@@ -340,7 +340,7 @@ def _interp_cols(points: List[List[float]], n: int) -> float:
     return pts[-1][1]
 
 
-# Host issue cost per BD config (us) for the bdgraph form, per board.  palmyra213: median of
+# Host issue cost per BD config (us) for the bdgraph form, per board.  VEK385_2: median of
 # (bdcfg+startio ms) / measured bdcfg calls over Arthur's 17 kacc kernels (k_pred_vs_meas.tsv, profiling on);
 # leave-one-out median |rel| of launch ~ issue + ddr_floor = 7.4%, same as in-sample.  Conv kernels run
 # 6.5-9.5 us (issue blocks when DMA per config is slower); see xiaojiang/tasks/2026-11-20_ddr-floor-vs-meas.
@@ -357,7 +357,7 @@ BD_US_FIT_PATH = {"palmyra213": "jit_ctrlpkt"}
 # Short-DDR-run penalty, per board: {run_b: {"issue": f, "dma": f}, "r_switch": r} -- launch ~ issue + floor x
 # f(run_b, regime), regime "dma" when ddr_floor > r_switch x host issue (default r_switch 1), else "issue" (part of
 # the slow DMA runs under BD configuration).  A plain number applies to both regimes; run_b not listed -> factor 1.
-# palmyra213, nine 32 B-run kernels, f_eff = (launch - issue) / floor, sorted by r = floor / issue
+# VEK385_2, nine 32 B-run kernels, f_eff = (launch - issue) / floor, sorted by r = floor / issue
 # (xiaojiang/tasks/2026-11-20_runb-p4h, loo2.py):
 #   issue  u_lin_1024x320x320 r.15 1.35, 1024x320x960 r.23 1.38, 1024x320x2560 r.27 1.45, 1024x1280x320 r.62 1.50
 #   dma    u_lin_1024x1600x320 r.77 1.96, 1024x1920x320 r.93 1.97, 1024x2560x320 r1.24 2.06,
@@ -372,7 +372,7 @@ RUN_B_FACTOR_FIT_P4I = {"palmyra213": {32: {"issue": 1.42, "dma": 1.99}, "r_swit
 # P4j (2026-11-20, xiaojiang/tasks/2026-11-20_runb-decomp RESULT5/RESULT6): the P4i "regime" was mostly an error in
 # the issue term.  Measured issue (kload+bdcfg+startio+coreen) grows with bytes (bdcfg host glue, startio cache
 # flush), so with the board's ISSUE_FIT below one factor per run_b, no regime switch:
-#   palmyra213 32 B: wait_io / floor_rd over the 7 kernels at >= 1.5 (mean 1.87; 1.77..2.02).
+#   VEK385_2 32 B: wait_io / floor_rd over the 7 kernels at >= 1.5 (mean 1.87; 1.77..2.02).
 #   16 B: u_lin_1024x1280x640 only (n=1, in-sample) 2.53.
 # Known miss: M=1024 N=320 K<=1280 waits only ~1.37 x floor (u_lin_1024x320x320 +7%, u_lin_1024x1280x320 +16%).
 # Over the 10 TKW=8 kernels: |rel| <= 2.4% on 7, +6.8% / +15.8% (low-wait pair), -5.9% (u_lin_512x2560x320).
@@ -380,7 +380,7 @@ RUN_B_FACTOR_FIT_P4J = {"palmyra213": {32: 1.87, 16: 2.53}}
 
 # P4k (2026-11-20, xiaojiang/tasks/2026-11-20_runb-stride RESULT7-9): at 32 B runs the factor follows the DDR row
 # stride of the read BD (dim_strides[1] in bytes = kp x 2 for the W/X tensor) and nothing else measured -- not M
-# (512/1024/2048), not the buffer base address, not rows per stream.  palmyra213 TKW=8, wait_io / floor_rd:
+# (512/1024/2048), not the buffer base address, not rows per stream.  VEK385_2 TKW=8, wait_io / floor_rd:
 #   fast strides 640 / 1312 / 2560 B (kp 320/656/1280): 1.13..1.41, mean 1.33
 #   other strides 1920, 3200, 3840, 5120, 5760, 11520 B: 1.74..2.02, mean 1.87
 # EMPIRICAL: the cause is unknown (single-stream and 8-stream open-page bank models and the base offset were all
@@ -392,7 +392,7 @@ RUN_B_FACTOR_FIT = {"palmyra213": {32: {"by_stride": {640: 1.33, 1312: 1.33, 204
                                    16: 2.53}}
 
 # Host issue time per launch, per board (P4j): issue_ms = bd_ms x bd_configs_per_launch + rd_frac x ddr_floor rd term
-# (ms) + c_ms.  palmyra213: least squares over nine 32 B-run kernels in three BD-count families (216/480/864 configs
+# (ms) + c_ms.  VEK385_2: least squares over nine 32 B-run kernels in three BD-count families (216/480/864 configs
 # per launch), max residual 39 us; the bare (cfg+2) x 5.67 us form was 0.22-0.31 ms low at M=2048 / M=512.
 # Only used for the board fit (an op or params bd_us keeps the plain cfg x bd_us form).
 ISSUE_FIT = {"palmyra213": {"bd_ms": 5.31e-3, "rd_frac": 0.160, "c_ms": 0.111}}

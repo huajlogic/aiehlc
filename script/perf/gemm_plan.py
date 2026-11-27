@@ -25,7 +25,7 @@ usage: gemm_plan.py --board palmyra|vek385|<profile.json> [--m M --n N --k K] [-
 import argparse
 import json
 
-# Measured board facts. ddr_rd_gbps / ddr_wr_gbps: fitted on the DDR-bound palmyra runs, where
+# Measured board facts. ddr_rd_gbps / ddr_wr_gbps: fitted on the DDR-bound VEK385_2 runs, where
 # time = reads / rd + writes / wr predicts all four within 0.1 ms -- reads and writes do NOT
 # overlap on one controller, and writes are slow. VEK385 was never DDR-bound (lower bounds).
 BOARDS = {
@@ -34,7 +34,7 @@ BOARDS = {
     # (33-36 GB/s together)
     'palmyra': {
         'aie_mhz': 1000, 'mcs': 1, 'ddr_rd_gbps': 26.0, 'ddr_wr_gbps': 25.0, 'rw_overlap': True,
-        # 0x8_0000_0000 mirrors 0x0 on palmyra (one controller, 2 GB)
+        # 0x8_0000_0000 mirrors 0x0 on VEK385_2 (one controller, 2 GB)
         'zones': [{'name': 'DDR_LOW0', 'base': 0x0, 'size': 0x80000000, 'mc': 0, 'heap': True}],
         'shim_ch_gbps': 7.6,
     },

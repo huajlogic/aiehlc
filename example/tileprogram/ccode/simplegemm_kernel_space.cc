@@ -19,7 +19,7 @@
  * GemmSpace alone does not say which is which -- the kernel's blocks do, and
  * the check compares against them instead of guessing.
  *
- * Status (palmyra 213, 2026-11-10): runs, 18.5 ms, PASS (all 4096 outputs
+ * Status (VEK385_2, 2026-11-10): runs, 18.5 ms, PASS (all 4096 outputs
  * bit-exact). It hung until three compiler fixes; see
  * doc/design/trace_to_routing.md, next step 3.
  ******************************************************************************/

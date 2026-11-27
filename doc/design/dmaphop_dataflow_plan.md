@@ -78,7 +78,7 @@ and the 32-core kernel load. `src/llvm/convautotile/gemm_autotile.cpp`
 ranks every feasible choice by max(cores, shim channels, DDR) + launch: cores = tiles x K chunks x
 cycles per chunk (int8 1188 measured, bf16 calibrated on the board), shim = the busiest channel's bytes
 at the board's per-channel rate (B re-read per output tile when it cannot be held), DDR = reads /
-writes at the board's rates (palmyra: one controller, no overlap; VEK385: 24 GB/s aggregate read, fitted
+writes at the board's rates (VEK385_2: one controller, no overlap; VEK385: 24 GB/s aggregate read, fitted
 on the B-re-read runs). Measured on 8 shapes (doc/plan/dataflowplan_generalize.md stage 4): within
 +-13 %. Board facts: `vek385`, `palmyra`
 (`#pragma gemm_autotile(palmyra)` or `AIEHLC_GEMM_BOARD`); device facts: `plantarget.h`. It writes
@@ -390,7 +390,7 @@ the shim reading a natural layout in place -- a per-core stream is still laid ou
 ### Device facts: one table per target
 
 `plantarget.h` holds every device fact the plan and the flow-transfer helpers use, per target: `aie2ps`
-(`--aie-version 5`: VEK385, palmyra) and `aie2` (AIE-ML, `--aie-version 2`), selected by the pipeline from the build's
+(`--aie-version 5`: VEK385, VEK385_2) and `aie2` (AIE-ML, `--aie-version 2`), selected by the pipeline from the build's
 generation (`selectPlanTarget`). Their DMA, lock and memory facts agree; the array differs (36 x 4 vs 38 x 8
 core rows) and so do the shim tiles with a DMA: every column on aie2ps, only the NoC shim columns on AIE-ML
 (2, 3, 6, 7, 14, 15, ...). A plan whose shim streams leave from a column without one is refused by name

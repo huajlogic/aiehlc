@@ -368,7 +368,7 @@ def test_l_static_ignores_log_counts(tmp_path):
     assert s == pytest.approx(launch_l.predict_l(p0["calls"], p0["words"], "off", prm), abs=1e-12)
 
 
-# N (host glue) segment, costmodel M2/N-P2: frozen params vs the M2c b board run (palmyra213, off + aot-kco).
+# N (host glue) segment, costmodel M2/N-P2: frozen params vs the M2c b board run (VEK385_2, off + aot-kco).
 # Excerpts = PROF / [UCL] / LAUNCH (warm + split*) / CMP / BOARD lines of
 # shuhua/clones/cost/tasks/2026-11-20_M2c/unet_{off,aot-kco}.b.log ('LAUNCH warm' carries launches= for NSUM).
 # The site features come from the UNet build dirs (~10 MB of host.cc / graph_driver.c / aiek_unetconv.cc read

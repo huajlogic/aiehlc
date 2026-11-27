@@ -1,13 +1,13 @@
 <!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
      SPDX-License-Identifier: Apache-2.0 -->
 
-# Plan: Qwen3.5-9B / Qwen3.8-9B-Distill on palmyra (baremetal A78 + AIE), >= 6 token/s
+# Plan: Qwen3.5-9B / Qwen3.8-9B-Distill on VEK385_2 (baremetal A78 + AIE), >= 6 token/s
 
 Goals (2026-11-26):
 
 1. The GEMM in the "activations resident, weights streamed once" form, measured on Qwen's real layer shapes,
    target 80 % of the 16-core int8 peak; written up in the GEMMOP report.
-2. A 9B Qwen (Qwen3.5-9B, or the Qwen3.8-9B-Distill built on it) answering on palmyra at >= 6 token/s, and
+2. A 9B Qwen (Qwen3.5-9B, or the Qwen3.8-9B-Distill built on it) answering on VEK385_2 at >= 6 token/s, and
    answering fast (short time to the first token).
 3. Baremetal and the aiehlc framework; llama.cpp ported to baremetal only if it is the shortest way.
 
@@ -88,7 +88,7 @@ qwen_ref.py: torch reference      AIE (persistent kernel): small-M GEMM -- int4 
   chain of BDs (`plandma.cpp` `deriveResident`, runtime `__Runtime_tile_bd_config` one-sided locks).
   M = 12288 in one launch exceeds the 64 output tiles per core (6-bit OOO counter): a layer is 2 launches.
 * 2026-11-26: G1 done -- with the BD chain the weights-streamed GEMM reaches 86.55 % (6144 x 512 x 4096),
-  86.15 % (5120), 85.41 % (4096) on palmyra; 36.20 % before the fix. GEMMOP chapter 12.
+  86.15 % (5120), 85.41 % (4096) on VEK385_2; 36.20 % before the fix. GEMMOP chapter 12.
 * 2026-11-26: M0 -- DDR_LOW1 (`0x8_0000_0000`) is 6 GB of real DDR on the 2026-11-25 PDI, readable and
   writable by the AIE; the blob goes there in 3 segments of <= 1.75 GB via loader ELFs (checksummed).
   VEK385 ruled out: its A78 hangs on the 0x500_/0x600_/0x700_ windows and AIE accesses there are ~25 % wrong.

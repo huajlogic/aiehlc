@@ -509,7 +509,7 @@ Unit tests: `unitest/test_trace_routing.cpp` (parse / defaults / errors, spaceDi
 render -> parse round trip for conv, GEMM and eltwise plans, descriptors equal to
 the kernel-only build), `unitest/kernel_trace_cases.py` `SPACE_CASES` (10).
 
-**Open, not caused by this:** on the board (palmyra 213) the example's output
+**Open, not caused by this:** on the board (VEK385_2) the example's output
 does **not** match `verify_conv2d` -- 128+ mismatches starting in the output
 channels of the last two mesh columns (first at f=32 or f=48, varying run to
 run). `simpleconv2dkernel_port.cc` gives the same failure (its `main()` never
@@ -638,7 +638,7 @@ generated kernel on x86, windows 32-byte aligned): the vector build passes
 cases (unshifted last K-block, aligned 64-byte load on a window).
 
 **On the board the dense output races (2026-11-14).** With a golden-checking
-host, `simpleconv2dkernel_port.cc` FAILS on palmyra (483,593 / 802,816) although
+host, `simpleconv2dkernel_port.cc` FAILS on VEK385_2 (483,593 / 802,816) although
 the x86 emulation above passes: the vector kernel is fast enough to send an
 output block while the host re-programs the shim S2MM BDs between height slabs
 (skill **outputtilemajorrace**). `simpleconv2dkernel_port_vec_opts.cc` adds

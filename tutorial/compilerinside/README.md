@@ -13,7 +13,7 @@ Every excerpt is copied from the dumps of one build of the step with this compil
 into the hop graph and the blueprint, `doc/plan/dataflowplan_unify_ir.md`); `0_pipeline.md` says where the dumps
 are and how to read them.
 
-| chapter | level (palmyra, % of peak) | step | what the compiler does differently |
+| chapter | level (VEK385_2, % of peak) | step | what the compiler does differently |
 |---|---|---|---|
 | [0](0_pipeline.md) | -- | -- | the levels, the passes, the dump files |
 | [1](1_level_0.01.md) | ~0.01 % (step 0: 0.012 %) | `step0_baseline.cc` | the generic path once through every level: a host loop of BD writes and waits per launch |
@@ -23,7 +23,7 @@ are and how to read them.
 | [5](5_level_85.md) | 85 % (step 6: 85.67 %, step 7: 85.68 %) | `step6_banks.cc`, `step7_ring.cc` | the chunk split over two memory banks and a deeper A ring: two fields of the stream |
 
 The levels are the ones this GEMM passed through on its way up (`doc/performance/gemm_e2e_progress.md`); the
-numbers are today's, measured on palmyra (AIE2PS, 1.0 GHz, 16 x 512 MAC / cycle peak) with this compiler, every
+numbers are today's, measured on VEK385_2 (AIE2PS, 1.0 GHz, 16 x 512 MAC / cycle peak) with this compiler, every
 run GOLDEN PASS (2026-11-26):
 
 | step | per launch | % of peak |

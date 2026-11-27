@@ -37,7 +37,7 @@ SYSTEST = "/proj/systest/bin/systest"
 TARGETS_MIN = {"Cortex-A78AE": 1, "Cortex-R52": 1}
 # What healthy vek385-12 (crimini2, rev A1) listed in the s4 run 2026-11-10: Versal Gen 2
 # xc2ve3858, RPU 5 clusters x2 R52, APU 4 clusters x2 A78AE, PPU, ASU, PMC, PL, DPC.
-# Same silicon as palmyra; informational, the pass bar stays TARGETS_MIN.
+# Same silicon as VEK385_2; informational, the pass bar stays TARGETS_MIN.
 EXPECTED_SEEN = {"Cortex-A78AE": 8, "Cortex-R52": 10}
 
 PROMPT_RE = r"\[((?:vek385|palmyra)-\d+)\] Systest#"  # also farm palmyras (same silicon, same flow)

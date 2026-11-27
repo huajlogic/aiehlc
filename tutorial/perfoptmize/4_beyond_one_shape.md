@@ -171,7 +171,7 @@ links carry: the router says `no free path` (skill `plancopystreams`).
 
 ## 6. Another device: AIE-ML
 
-`plantarget.h` holds a table per target: `aie2ps` (VEK385, palmyra) and `aie2` (AIE-ML, `--aie-version 2`).
+`plantarget.h` holds a table per target: `aie2ps` (VEK385, VEK385_2) and `aie2` (AIE-ML, `--aie-version 2`).
 AIE-ML has shim DMAs on its NoC columns only (2, 3, 6, 7, 14, 15, ...), in pairs: a layout with a shim
 stream per column must sit there, and there is no third such column for the control-packet plane.
 `gemm_plan_aie2.cc` puts the 4 x 2 mesh on columns 2, 3 without it and builds; the 4 x 4 layout is

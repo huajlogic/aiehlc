@@ -54,7 +54,7 @@ The calibrated constants and their uncalibrated defaults are `CAL_DEFAULTS` (`de
 
 Which files `estimate()` loads is fixed in code: UNet `KLN_PARAMS` (`estimate.py:186-194`), CNN nets
 `NET_PARAMS` → md5 file (`estimate.py:344-348`); every file is md5-checked when loaded
-(`estimate.py:351-367`) and reported in the result's `"params"`. Only **palmyra213** has a full set;
+(`estimate.py:351-367`) and reported in the result's `"params"`. Only **VEK385_2** has a full set;
 `board_params()` raises for any other board (`estimate.py:63-68`).
 
 ### 1.5 Static core cycles from the kernel listing (`tools/kcyc_lst.py`)
@@ -69,7 +69,7 @@ walks the `kernel.lst` of F, multiplies every zero-overhead loop body by its `lc
 stream waits): those come from the core counters (`perftest/gemm90/`, skill **coreloss**).
 
 Validation, the int8 dataflow-plan GEMM (`gemm_plan.cc`, 7680 x 512 x 2560, 60 tiles of 20 K chunks per core,
-palmyra, 2026-11-25): the static count against the board's counted VMAC + other-instruction cycles per core
+VEK385_2, 2026-11-25): the static count against the board's counted VMAC + other-instruction cycles per core
 (median of 16 cores):
 
 | build | `kcyc_lst` kernel cycles | board VMAC + other | error | static_eff |
@@ -248,7 +248,7 @@ instrumentation and were not touched. The build-input keys (`INPUT_PATHS` of
    pre-compile estimate.
 2. **Unpriced terms count as 0** in op-mode `total_ms` (`estimate.py:480`); `resident`, the `aot_window`
    BD path and locks are listed in `unpriced`, not priced.
-3. **One board calibrated.** Full parameter sets exist only for palmyra213 (`KLN_PARAMS`, `NET_PARAMS`);
+3. **One board calibrated.** Full parameter sets exist only for VEK385_2 (`KLN_PARAMS`, `NET_PARAMS`);
    VEK385 has a kernel-level comparison only (M7.2.2).
 4. **Thin margin.** UNet per-site maxrel 0.177 against a 0.20 gate (M7 report 3a); per-site board jitter
    alone is ~2–4 %. K kernel fit: maxrel 0.253, LOO 0.295 (M7 report 3b).

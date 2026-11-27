@@ -7,7 +7,7 @@
  *   C[GP_M, GP_N] = A[GP_M, GP_K] . B[GP_N, GP_K]^T on the 4x4 mesh; core (pm, pn)
  *   computes the (GP_M / 4) x (GP_N / 4) block (pm, pn) of C.
  *
- * Measured on palmyra (AIE2PS), all 16 cores identical, GOLDEN PASS:
+ * Measured on VEK385_2 (AIE2PS), all 16 cores identical, GOLDEN PASS:
  *   32 x 32 x 384 per core: 768 MAC instructions in 839 cycles = 91.5 % of peak
  *   64 x 64 x 128 per core: 1024 in 1359 cycles = 75.4 % (K too short, see below)
  * That is the core's compute. The launch around it is ~226 ms, nearly all of it

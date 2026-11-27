@@ -1,10 +1,10 @@
 # Run the tiny-SD UNet on the AIE with aiegraph and generate an orange
 
-This tutorial walks you step by step through deploying the UNet of **bk-sdm-tiny** (a small 256×256 Stable Diffusion model) to a first-generation VEK385 board (palmyra, A78 APU + AIE2PS): the A78 runs the C code TVM generates, and conv, Linear and attention run on the AIE. Then the text encoder and the VAE run on the host while every UNet step runs on the board, and together they generate a picture of an orange.
+This tutorial walks you step by step through deploying the UNet of **bk-sdm-tiny** (a small 256×256 Stable Diffusion model) to a first-generation VEK385 board (VEK385_2, A78 APU + AIE2PS): the A78 runs the C code TVM generates, and conv, Linear and attention run on the AIE. Then the text encoder and the VAE run on the host while every UNet step runs on the board, and together they generate a picture of an orange.
 
 The whole flow uses only **aiegraph**, the same framework as the [ResNet18](02_resnet18.md) and [YOLOv26](04_yolov26.md) tutorials. On the user side you write only `build_unet.py` (listed in full in section 5) and an offload declaration, `unet_offload.py`. All C text (AIE kernels, host glue, the board main) lives in aiegraph and in the templates under [`src/aiednn/`](../../src/aiednn/).
 
-Every command was run on palmyra213 (10.23.224.213); the results are in [Measured results](#measured-results) at the end.
+Every command was run on VEK385_2 ($AIE2PS_LOCAL_TEST_BOX_IP); the results are in [Measured results](#measured-results) at the end.
 
 ![The orange generated on the board](tiny-sdm-unet-orange.png)
 
@@ -45,7 +45,7 @@ Key points:
 ## 1. Prerequisites
 
 **Hardware**
-- A palmyra board with the streaming ("receive while placing") netboot supervisor installed, e.g. palmyra213 (10.23.224.213). The full-network ELF is about 1 GB, which does not fit in the old supervisor's 94 MiB staging buffer.
+- A VEK385_2 board with the streaming ("receive while placing") netboot supervisor installed, e.g. VEK385_2 ($AIE2PS_LOCAL_TEST_BOX_IP). The full-network ELF is about 1 GB, which does not fit in the old supervisor's 94 MiB staging buffer.
 - This machine can reach the board through `script/test/apppaltest.py --netload`.
 
 **Software**
@@ -364,7 +364,7 @@ First run once with the input built into the ELF, to confirm the ELF is correct 
 
 ```bash
 cd $T
-$PY script/test/apppaltest.py -board palmyra -host 10.23.224.213 -y --netload \
+$PY script/test/apppaltest.py -board palmyra -host $AIE2PS_LOCAL_TEST_BOX_IP -y --netload \
     --netload-wait 1800 --netload-reply-timeout 600 --netload-max-run-ms 300000 \
     $WORK/build/main.elf 2>&1 | tee $WORK/smoke.log | grep -v DEBUG | \
     grep -E "^Host: |\[netboot\] run|in_crc32_board|^unet: graph_run|^LAUNCH warm|^CMP unet"
@@ -417,7 +417,7 @@ REF=$WORK/host_seed2.png ./run_orange.sh $WORK/build/main.elf $WORK/img 2 25
 
 ## Measured results
 
-Measured 2026-11-18 on palmyra213 (unet_m4, pure aiegraph flow), seed 2, 25 steps:
+Measured 2026-11-18 on VEK385_2 (unet_m4, pure aiegraph flow), seed 2, 25 steps:
 
 ```
 [run_orange] UNet calls on the board: 50, cos_OK: 50, mean graph_run_ms: 1307.9

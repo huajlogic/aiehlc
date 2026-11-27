@@ -1,6 +1,6 @@
 <!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
      SPDX-License-Identifier: Apache-2.0 -->
-# bk-sdm-tiny UNet on the Palmyra APU + AIE
+# bk-sdm-tiny UNet on the VEK385_2 APU + AIE
 
 One UNet step of bk-sdm-tiny (256×256 image, latent 4×32×32, timestep, text
 states 77×768) built with aiegraph → TVM C for the A78, with the conv layers in
@@ -57,7 +57,7 @@ Needs from this branch:
   has to fit the 94 MiB staging area.
 - `AIEGRAPH_WDTYPE=bf16`, `AIEGRAPH_PARAMS_INPLACE=1`, multi-input graphs (aiegraph).
 
-## Result (palmyra213, 2026-11-13)
+## Result (VEK385_2, 2026-11-13)
 - `cos=1.000000 maxabs=0.00272` vs x86 ORT, 86,600 AIE launches, `kloads=1`.
 - One UNet call: 437.6 s with AIE (392 s of it launch overhead), 61 s A78-only.
 

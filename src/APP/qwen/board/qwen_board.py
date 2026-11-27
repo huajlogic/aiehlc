@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Put the qwen weight blob into a palmyra's DDR_LOW1 and build the baremetal apps.
+"""Put the qwen weight blob into a vek385_2's DDR_LOW1 and build the baremetal apps.
 
   qwen_board.py loaders <blob> <outdir>     one loader ELF per <= 1.75 GiB chunk (qwen_load.c + the chunk)
   qwen_board.py load <outdir>               run them in order on the board (apppaltest --netload), check sums

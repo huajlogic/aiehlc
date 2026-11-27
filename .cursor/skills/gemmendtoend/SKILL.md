@@ -5,7 +5,7 @@ description: End-to-end (launch + kernel load + DDR in/out) performance of a ker
 <!-- Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
      SPDX-License-Identifier: Apache-2.0 -->
 
-# Streaming GEMM end to end (palmyra, AIE2PS, 4x4)
+# Streaming GEMM end to end (VEK385_2, AIE2PS, 4x4)
 
 Peak = 16 cores x 512 int8 MAC/cycle (`mmul<8,8,8,int8,int8>` = one
 `mac_8x8_8x8`) x 998 MHz = 8.18 TMAC/s. A single core's compute loop reaches
@@ -74,7 +74,7 @@ core, written once) + `memtile_ab.py`, which edits the generated host.cc / routi
 - B is resident in each column's MemTile and replayed once per m tile;
 - A is double-buffered per mesh row and replayed once per n tile;
 - the shim sends every byte once.
-2.20 ms / 4.83 G MAC (26.8 %) on palmyra, GOLDEN PASS (two-block kernel).
+2.20 ms / 4.83 G MAC (26.8 %) on VEK385_2, GOLDEN PASS (two-block kernel).
 
 Traps:
 - **The kernel analysis takes 2-level block sequences only.** Trace (x86 `#else`) what
@@ -90,7 +90,7 @@ Traps:
   give 33 %; no tile that fits 64 KB (int32 accumulator + ping-pong + C ping-pong)
   gives more than ~42 %. A 32-B K chunk makes the accumulator reload dominate
   (96 x 80, kc 32: 14.9 %).
-- AIE clock on palmyra: 1000 MHz.
+- AIE clock on VEK385_2: 1000 MHz.
 
 ## MEASURED DDR rate (2026-11-20): 7.8 GB/s mixed
 These are DMA-only probes at 16/32/64 rounds: 0.311 / 0.515 / 0.909 ms end to
@@ -111,7 +111,7 @@ they are bytes / the wait_io PMU phase of a whole launch. The "input only ~37
 GB/s" is not physical (4 row streams x 4 B/cycle at ~1 GHz cap near 16 GB/s) and
 the "output only 20.5 GB/s" needs 5.1 GB/s per 32-bit S2MM channel: wait_io most
 likely does not cover the whole transfer in those two probes. Amit's dedicated
-palmyra213 probes (amit/tasks/2026-11-14_palmyra-ddr-cap: read 9.9, write 8.0,
+VEK385_2 probes (amit/tasks/2026-11-14_palmyra-ddr-cap: read 9.9, write 8.0,
 r+w 7.4 GB/s) are the reference; the conclusions below that lean on 37/20.5
 (phase separation gains, projections) are unverified.
 Probes on the 32-row-strip shape (A 2.1 MB in, C 4.2 MB out per launch):
@@ -172,9 +172,9 @@ per row, <= 64 output rounds per core). 60 % needs a persistent kernel re-armed 
 
 ## VEK385: the clock is 1.25 GHz
 
-`gemm_kacc_ntile.cc` computes % of peak at a hard-coded 998 MHz (palmyra). On the farm VEK385
+`gemm_kacc_ntile.cc` computes % of peak at a hard-coded 998 MHz (VEK385_2). On the farm VEK385
 (measured: timer 0x340F8, xsdb, 1249-1250 MHz), divide its printed % by 1.25: gs79 62.8 %,
-gs90 65.5 %, versus 57.0 % / 64.7 % on palmyra. See `doc/performance/gemm_e2e_progress.md`
+gs90 65.5 %, versus 57.0 % / 64.7 % on VEK385_2. See `doc/performance/gemm_e2e_progress.md`
 "VEK385 farm board".
 
 ## 2 x 8 shared-operand layout (VEK385 74.2 %, see gemm_e2e_progress.md)
@@ -189,7 +189,7 @@ gs90 65.5 %, versus 57.0 % / 64.7 % on palmyra. See `doc/performance/gemm_e2e_pr
 - Per-core KCYC stamps (`--kcyc`) are the tool: in-wait / mac / out-wait / convert per core.
 
 ## Which design for which board: `script/perf/gemm_plan.py --board palmyra|vek385|x.json`
-- One controller and DDR-bound (palmyra: reads 16.1, writes 3.58 GB/s, not overlapping) ->
+- One controller and DDR-bound (VEK385_2: reads 16.1, writes 3.58 GB/s, not overlapping) ->
   4 x 4 MemTile-staged (fewest DDR bytes per MAC). DDR not binding (VEK385, 3 MCs interleaved)
   -> 2 x 8 shared, persistent, `--tile`. Separate zones on separate MCs -> `--zones`.
 - `--check` holds the model against the measured runs; re-fit when a new run disagrees.
