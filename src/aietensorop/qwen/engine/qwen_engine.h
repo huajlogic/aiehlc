@@ -18,18 +18,7 @@ extern "C" {
 
 #define QW_MAX_SEG 8 /* blob segments */
 
-/* the DeltaNet recurrent state's storage: fp32, or fp16 (QW_STATE_F16: half the memory traffic per token) */
-#if defined(QW_STATE_F16) && defined(__aarch64__)
-typedef __fp16 qw_state_t;
-#define QW_SSTORE(v) ((qw_state_t)(v))
-#elif defined(QW_STATE_F16) /* elsewhere: fp32 storage rounded to fp16 (the same values, for checking) */
-typedef float qw_state_t;
-float qw_round_f16(float v);
-#define QW_SSTORE(v) qw_round_f16(v)
-#else
-typedef float qw_state_t;
-#define QW_SSTORE(v) (v)
-#endif
+typedef float qw_state_t; /* the DeltaNet recurrent state (fp16 storage measured slower on the A78) */
 
 typedef struct {
     const char *name;
@@ -65,6 +54,7 @@ typedef struct {
     float *kcache, *vcache; /* [full layer][ctx][kv_heads * head_dim] */
     qw_state_t *la_state;   /* [2][la layer][v heads][k dim][v dim]: two banks, la_cur[layer] is live */
     unsigned char *la_cur;
+    float *la_sigma;         /* [2][la layer][v heads]: the state is sigma x the stored matrix (lazy decay) */
     float *conv_state;       /* [la layer][conv channels][conv_k - 1] */
     int n_full, n_la, *slot; /* layer -> its index among full / linear layers */
     /* scratch (sized for max_batch tokens) */
@@ -84,6 +74,7 @@ typedef struct {
     int mtp_hid_pre; /* feed the MTP the hidden state before (1) or after (0) the final norm */
     int mtp_pos_off; /* the MTP layer's position: the hidden's position + mtp_pos_off */
     int mtp_vocab;   /* the draft picks among token ids < mtp_vocab only (0: all): fewer lm_head rows per draft */
+    int mtp_fill;    /* after an accepted draft, also enter the skipped (token, hidden) pair in the MTP's KV cache */
     qw_matmul_fn matmul;
     void *matmul_ctx;
     /* optional profile: seconds per part (QW_P_*), when now is set */

@@ -133,7 +133,11 @@ int main(void) {
     actx.xcached = 1;
     /* cached: invalidated after each launch, then the glue reads only the tokens in use (uncached reads are slow) */
     actx.ybuf = (float *)aligned_alloc(64, QA_YB);
-    actx.ycached = 0; /* the launch already invalidates its outputs (__Runtime_sync_for_cpu) */
+    /* x and y: the glue does their cache maintenance (clean x after writing it, invalidate y before reading it), so
+     * the launches skip theirs: registered device-only */
+    actx.ycached = 1;
+    __Runtime_buffer_device_only(actx.xbuf, QA_XCOPIES * QA_XB);
+    __Runtime_buffer_device_only(actx.ybuf, QA_YB);
     actx.now = now_s;
     m.matmul = qw_matmul_aie, m.matmul_ctx = &actx;
     m.now = now_s;

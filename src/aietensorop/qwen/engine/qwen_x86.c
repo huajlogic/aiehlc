@@ -119,6 +119,7 @@ int main(int argc, char **argv) {
     m.mtp_hid_pre = getenv("QW_MTP_PRE") ? atoi(getenv("QW_MTP_PRE")) : 0;
     m.mtp_pos_off = getenv("QW_MTP_POS") ? atoi(getenv("QW_MTP_POS")) : 1;
     m.mtp_vocab = getenv("QW_MTP_VOCAB") ? atoi(getenv("QW_MTP_VOCAB")) : 0;
+    m.mtp_fill = getenv("QW_MTP_FILL") ? atoi(getenv("QW_MTP_FILL")) : 0;
     const int stop[] = {248046, 248044};
     qw_gen_stats gs;
     printf("GEN");

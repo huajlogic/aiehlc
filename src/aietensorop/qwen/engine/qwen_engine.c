@@ -17,19 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(QW_STATE_F16) && !defined(__aarch64__)
-float qw_round_f16(float v) { /* round to the nearest fp16 value (normal range; tiny values flush to 0) */
-    uint32_t u;
-    memcpy(&u, &v, 4);
-    const uint32_t e = (u >> 23) & 0xFF;
-    if (e < 127 - 14)
-        return 0.0f;
-    u = (u + 0x0FFF + ((u >> 13) & 1)) & ~0x1FFFu;
-    memcpy(&v, &u, 4);
-    return v;
-}
-#endif
-
 float qw_bf16(uint16_t h) {
     uint32_t u = (uint32_t)h << 16;
     float r;
@@ -190,6 +177,9 @@ int qw_open_seg(qw_model *m, const void *const *segs, int nseg, int max_ctx, int
     m->vcache = (float *)calloc((size_t)m->n_full * max_ctx * kvd, sizeof(float));
     m->la_state = (qw_state_t *)calloc((size_t)2 * m->n_la * m->la_vh * m->la_kd * m->la_vd, sizeof(qw_state_t));
     m->la_cur = (unsigned char *)calloc((size_t)m->n_la + 1, 1);
+    m->la_sigma = (float *)malloc(sizeof(float) * 2 * (size_t)m->n_la * m->la_vh + 4);
+    for (size_t i = 0; i < 2 * (size_t)m->n_la * m->la_vh; i++)
+        m->la_sigma[i] = 1.0f;
     m->conv_state = (float *)calloc((size_t)m->n_la * convc * (m->conv_k - 1), sizeof(float));
     /* widest activation: the fused MLP gate + up (2 x ffn) or the linear attention qkvz */
     size_t wide = (size_t)2 * m->ffn;
@@ -227,8 +217,8 @@ int qw_open_seg(qw_model *m, const void *const *segs, int nseg, int max_ctx, int
 void qw_close(qw_model *m) {
     free(m->layer), free(m->slot), free(m->kcache), free(m->vcache), free(m->la_state), free(m->conv_state);
     free(m->x), free(m->xn), free(m->buf0), free(m->buf1), free(m->buf2), free(m->logits);
-    free(m->hid), free(m->hid_pre), free(m->la_cur), free(m->conv_ckpt), free(m->mtp_k), free(m->mtp_v),
-        free(m->mlogits);
+    free(m->hid), free(m->hid_pre), free(m->la_cur), free(m->la_sigma), free(m->conv_ckpt), free(m->mtp_k),
+        free(m->mtp_v), free(m->mlogits);
     memset(m, 0, sizeof *m);
 }
 
@@ -236,6 +226,8 @@ void qw_reset(qw_model *m) {
     const size_t convc = (size_t)2 * m->la_kh * m->la_kd + (size_t)m->la_vh * m->la_vd;
     memset(m->la_state, 0, (size_t)2 * m->n_la * m->la_vh * m->la_kd * m->la_vd * sizeof(qw_state_t));
     memset(m->la_cur, 0, (size_t)m->n_la);
+    for (size_t i = 0; i < 2 * (size_t)m->n_la * m->la_vh; i++)
+        m->la_sigma[i] = 1.0f;
     memset(m->conv_state, 0, (size_t)m->n_la * convc * (m->conv_k - 1) * sizeof(float));
 }
 
@@ -343,7 +335,7 @@ static void rmsnorm(float *o, const float *x, const float *w, int n, float eps, 
     for (int i = 0; i < n; i++)
         o[i] = x[i] * r * (one_plus ? 1.0f + w[i] : w[i]);
 }
-static float silu(float v) { return v / (1.0f + expf(-v)); }
+static float silu(float v) { return v / (1.0f + expf(-v)); } /* libm expf: a polynomial was slower on the A78 */
 static float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
 static float softplus(float v) { return v > 20.0f ? v : log1pf(expf(v)); }
 
@@ -359,42 +351,6 @@ static void embed_row(const qw_model *m, int tok, float *o) {
         }
     }
 }
-
-#if defined(__aarch64__) && defined(QW_STATE_F16)
-#include <arm_neon.h>
-/* one DeltaNet head on an fp16 state, 8 lanes at a time (fp32 math): pass 1 kv = S^T k, pass 2
- * S' = decay S + k kv^T, out = S'^T q (the generic loops below, vectorized; vd % 8 == 0) */
-static void qw_dnet_neon(const qw_state_t *Si, qw_state_t *So, const float *k, const float *q, const float *v,
-                         float decay, float beta, int kd, int vd, float *kv, float *out) {
-    for (int j = 0; j < vd; j++)
-        kv[j] = 0, out[j] = 0;
-    for (int i = 0; i < kd; i++) {
-        const float16_t *row = (const float16_t *)(Si + (size_t)i * vd);
-        const float ki = k[i];
-        for (int j = 0; j < vd; j += 8) {
-            const float16x8_t h = vld1q_f16(row + j);
-            vst1q_f32(kv + j, vfmaq_n_f32(vld1q_f32(kv + j), vcvt_f32_f16(vget_low_f16(h)), ki));
-            vst1q_f32(kv + j + 4, vfmaq_n_f32(vld1q_f32(kv + j + 4), vcvt_high_f32_f16(h), ki));
-        }
-    }
-    for (int j = 0; j < vd; j++)
-        kv[j] = (v[j] - decay * kv[j]) * beta;
-    for (int i = 0; i < kd; i++) {
-        const float16_t *row = (const float16_t *)(Si + (size_t)i * vd);
-        float16_t *orow = (float16_t *)(So + (size_t)i * vd);
-        const float ki = k[i], qi = q[i];
-        for (int j = 0; j < vd; j += 8) {
-            const float16x8_t h = vld1q_f16(row + j);
-            const float32x4_t s0 =
-                vfmaq_n_f32(vmulq_n_f32(vcvt_f32_f16(vget_low_f16(h)), decay), vld1q_f32(kv + j), ki);
-            const float32x4_t s1 = vfmaq_n_f32(vmulq_n_f32(vcvt_high_f32_f16(h), decay), vld1q_f32(kv + j + 4), ki);
-            vst1q_f16(orow + j, vcombine_f16(vcvt_f16_f32(s0), vcvt_f16_f32(s1)));
-            vst1q_f32(out + j, vfmaq_n_f32(vld1q_f32(out + j), s0, qi));
-            vst1q_f32(out + j + 4, vfmaq_n_f32(vld1q_f32(out + j + 4), s1, qi));
-        }
-    }
-}
-#endif
 
 /* linear attention for n tokens: m->xn (normed) -> m->buf2 (out_proj input -> output via matmul) */
 static void linear_attn(qw_model *m, int li, int n) {
@@ -416,6 +372,9 @@ static void linear_attn(qw_model *m, int li, int n) {
     const size_t ssz = (size_t)vh * kd * vd, bank = (size_t)m->n_la * ssz;
     qw_state_t *Slive = m->la_state + m->la_cur[m->slot[li]] * bank + (size_t)m->slot[li] * ssz;
     qw_state_t *Sspec = m->la_state + (1 - m->la_cur[m->slot[li]]) * bank + (size_t)m->slot[li] * ssz;
+    const size_t gbank = (size_t)m->n_la * vh;
+    float *Glive = m->la_sigma + m->la_cur[m->slot[li]] * gbank + (size_t)m->slot[li] * vh;
+    float *Gspec = m->la_sigma + (1 - m->la_cur[m->slot[li]]) * gbank + (size_t)m->slot[li] * vh;
     float *cs = m->conv_state + (size_t)m->slot[li] * convc * (K - 1);
     const float *cw = (const float *)L->conv.data, *Alog = (const float *)L->A_log.data;
     const float *dtb = (const float *)L->dt_bias.data, *nw = (const float *)L->la_norm.data;
@@ -426,6 +385,7 @@ static void linear_attn(qw_model *m, int li, int n) {
         /* tokens after the checkpoint read the live bank (first one) and write the speculative bank */
         const int spec = m->ckpt_t >= 0 && t > m->ckpt_t;
         qw_state_t *S_in = spec && t > m->ckpt_t + 1 ? Sspec : Slive, *S_out = spec ? Sspec : Slive;
+        float *G_in = spec && t > m->ckpt_t + 1 ? Gspec : Glive, *G_out = spec ? Gspec : Glive;
         const double tc0 = m->now ? m->now() : 0;
         for (int c = 0; c < convc; c++) { /* causal conv1d over [state, x] + SiLU, shift the state */
             float *st = cs + (size_t)c * (K - 1), acc = cw[c * K + K - 1] * in[c];
@@ -455,34 +415,38 @@ static void linear_attn(qw_model *m, int li, int n) {
             const qw_state_t *Si = S_in + (size_t)h * kd * vd;
             qw_state_t *So = S_out + (size_t)h * kd * vd;
             float kv[256], *out = core + h * vd;
-#if defined(__aarch64__) && defined(QW_STATE_F16)
-            qw_dnet_neon(Si, So, k, q, v, decay, beta, kd, vd, kv, out);
-#else
-            /* pass 1 (read): kv = (decay S)^T k = decay (S^T k) */
+            /* lazy decay: the state is sigma x Sm. With sigma' = decay sigma:
+             *   kv  = (v - sigma' Sm^T k) beta,   out = sigma' Sm^T q + kv (k . q)   (S'^T q, S' = decay S + k kv^T)
+             *   Sm' = Sm + (k / sigma') kv^T      (one FMA per element; the decay multiply is on sigma only) */
+            float qq[256], kq = 0;
             for (int j = 0; j < vd; j++)
-                kv[j] = 0;
-            for (int i = 0; i < kd; i++) {
-                const float ki = k[i];
-                const qw_state_t *row = Si + (size_t)i * vd;
-                for (int j = 0; j < vd; j++)
-                    kv[j] += (float)row[j] * ki;
-            }
-            for (int j = 0; j < vd; j++)
-                kv[j] = (v[j] - decay * kv[j]) * beta;
-            /* pass 2 (read + write): S = decay S + k kv^T, out = S^T q */
-            for (int j = 0; j < vd; j++)
-                out[j] = 0;
-            for (int i = 0; i < kd; i++) {
+                kv[j] = 0, qq[j] = 0;
+            for (int i = 0; i < kd; i++) { /* pass 1 (read): Sm^T k and Sm^T q together */
                 const float ki = k[i], qi = q[i];
                 const qw_state_t *row = Si + (size_t)i * vd;
-                qw_state_t *orow = So + (size_t)i * vd;
-                for (int j = 0; j < vd; j++) {
-                    const float sv = decay * (float)row[j] + ki * kv[j];
-                    orow[j] = QW_SSTORE(sv);
-                    out[j] += sv * qi;
-                }
+                kq += ki * qi;
+                for (int j = 0; j < vd; j++)
+                    kv[j] += row[j] * ki, qq[j] += row[j] * qi;
             }
-#endif
+            float sig = G_in[h] * decay, keep = 1.0f;
+            if (sig < 1e-20f) /* renormalize: fold sigma into the matrix (also covers a decay of ~0) */
+                keep = sig, sig = 1.0f;
+            for (int j = 0; j < vd; j++) {
+                kv[j] = (v[j] - (keep * sig) * kv[j]) * beta;
+                out[j] = (keep * sig) * qq[j] + kv[j] * kq;
+            }
+            for (int i = 0; i < kd; i++) { /* pass 2 (read + write): the rank-1 update */
+                const float ci = k[i] / sig;
+                const qw_state_t *row = Si + (size_t)i * vd;
+                qw_state_t *orow = So + (size_t)i * vd;
+                if (keep == 1.0f)
+                    for (int j = 0; j < vd; j++)
+                        orow[j] = row[j] + ci * kv[j];
+                else
+                    for (int j = 0; j < vd; j++)
+                        orow[j] = keep * row[j] + ci * kv[j];
+            }
+            G_out[h] = sig;
             rmsnorm(out, out, nw, vd, m->eps, 0);
             for (int j = 0; j < vd; j++)
                 out[j] *= silu(z[h * vd + j]);
@@ -732,6 +696,8 @@ int qw_generate(qw_model *m, const int *prompt, int n, int ngen, int spec, const
                 break;
             t = qw_token(m, m->logits + m->vocab, m->vocab);
             memcpy(last, hsrc + Hd, sizeof(float) * Hd);
+            if (m->mtp_fill) /* the pair (d, hidden of t) the draft skipped: keeps the MTP's attention gap-free */
+                qw_mtp(m, &d, m->hid_pre == hsrc ? m->hid_pre : hsrc, 1, pos + m->mtp_pos_off, 0);
             pos += 2;
         } else { /* drop the draft: back to the state after t */
             qw_rollback(m);
